@@ -355,6 +355,10 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
             // indexer tensors exist; a model built from this metadata alone gets all of them,
             // so every compressed layer is its own source.
             ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS,        std::vector<uint32_t>({0, 2, 2, 1, 1}));
+            // First-level indexer on layer 3, applied by layer 4 in the MoE pass. It keeps 5 blocks of 2 rows, at least 9 visible rows, so the top-k of 8 never picks among -inf ties, where the order can differ between backends.
+            ms.add_kv(LLM_KV_ATTENTION_CANDIDATE_SOURCE_LAYER, uint32_t(3));
+            ms.add_kv(LLM_KV_ATTENTION_CANDIDATE_BLOCK_SIZE,   uint32_t(2));
+            ms.add_kv(LLM_KV_ATTENTION_CANDIDATE_TOPK_BLOCKS,  uint32_t(5));
         } else {
             ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS,        std::vector<uint32_t>({0, 0, 4, 128}));
             ms.add_kv(LLM_KV_HASH_LAYER_COUNT,                  uint32_t(0));

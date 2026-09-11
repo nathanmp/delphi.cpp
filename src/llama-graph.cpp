@@ -913,6 +913,38 @@ static bool dsv4_compress_debug() {
     return debug;
 }
 
+// +inf on the block that holds the newest compressed position of each query, 0 elsewhere. A query that sees no compressed position yet pins no block.
+static void dsv4_set_cand_pin(
+        ggml_tensor * dst,
+        const llama_kv_cache_dsv4_context::comp_plan & plan,
+        uint32_t n_tokens,
+        int64_t n_stream) {
+    if (!dst || !dst->buffer) {
+        return;
+    }
+
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(n_stream > 0);
+    GGML_ASSERT(dst->ne[1] == (int64_t) n_tokens/n_stream);
+    GGML_ASSERT(dst->ne[3] == n_stream);
+    GGML_ASSERT(plan.n_kv % dst->ne[0] == 0);
+    GGML_ASSERT((int64_t) plan.n_visible.size() == (int64_t) n_tokens);
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+
+    const int64_t n_blocks = dst->ne[0];
+    const int64_t block    = plan.n_kv/n_blocks;
+    float * data = (float *) dst->data;
+
+    for (int64_t i = 0; i < (int64_t) n_tokens; ++i) {
+        const int32_t n_visible = plan.n_visible[i];
+        const int64_t last = n_visible > 0 ? (n_visible - 1)/block : -1;
+
+        for (int64_t j = 0; j < n_blocks; ++j) {
+            data[i*n_blocks + j] = j == last ? INFINITY : 0.0f;
+        }
+    }
+}
+
 static void dsv4_set_comp_inputs(
         const llm_graph_input_dsv4::comp_input & inp,
         const llama_kv_cache_dsv4_context::comp_plan & plan,
@@ -931,6 +963,7 @@ static void dsv4_set_comp_inputs(
     dsv4_set_i64(inp.state_write_idxs, plan.state_write_idxs);
     dsv4_set_i32(inp.state_write_pos, plan.state_write_pos);
     dsv4_set_kq_mask(inp.kq_mask, plan, n_tokens, n_stream);
+    dsv4_set_cand_pin(inp.cand_pin, plan, n_tokens, n_stream);
 
     if (debug || dsv4_compress_debug()) {
         LLAMA_LOG_INFO("%s: %s n_tokens=%u, n_stream=%d, state_persist_dst=%s, state_write_pos=%s\n",
@@ -1005,7 +1038,9 @@ static void dsv4_build_comp_inputs(
         const llama_kv_cache_dsv4_context::comp_plan & plan,
         const char * name,
         const llama_cparams & cparams,
-        int64_t n_stream) {
+        int64_t n_stream,
+        uint32_t cand_block,
+        uint32_t cand_topk) {
     inp.state_pos = dsv4_build_input_1d(ctx, GGML_TYPE_I32, plan.state_pos.size(), std::string("dsv4_") + name + "_state_pos");
     inp.state_persist_src_idxs = dsv4_build_input_1d(ctx, GGML_TYPE_I32, plan.state_persist_src_idxs.size(), std::string("dsv4_") + name + "_state_persist_src_idxs");
     inp.state_persist_dst_idxs = dsv4_build_input_1d(ctx, GGML_TYPE_I32, plan.state_persist_dst_idxs.size(), std::string("dsv4_") + name + "_state_persist_dst_idxs");
@@ -1026,6 +1061,14 @@ static void dsv4_build_comp_inputs(
         inp.kq_mask = ggml_new_tensor_4d(ctx, (strcmp(name, "lid") != 0 && cparams.flash_attn) || (strcmp(name, "lid") == 0 && cparams.fused_lid) ? GGML_TYPE_F16 : GGML_TYPE_F32, plan.n_kv, n_tokens/n_stream, 1, n_stream);
         ggml_set_input(inp.kq_mask);
         ggml_set_name(inp.kq_mask, (std::string("dsv4_") + name + "_kq_mask").c_str());
+
+        // When all blocks fit in the top-k, the selection keeps all of them, so the pin is only built when there are more blocks. It depends only on n_kv, as kq_mask does, so graph reuse needs no check of its own.
+        if (cand_block > 0 && plan.n_kv/cand_block > cand_topk) {
+            GGML_ASSERT(plan.n_kv % cand_block == 0);
+            inp.cand_pin = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, plan.n_kv/cand_block, n_tokens/n_stream, 1, n_stream);
+            ggml_set_input(inp.cand_pin);
+            ggml_set_name(inp.cand_pin, (std::string("dsv4_") + name + "_cand_pin").c_str());
+        }
     }
 }
 
@@ -3528,9 +3571,12 @@ llm_graph_input_dsv4 * llm_graph_context::build_inp_dsv4() const {
     inp_raw->self_k_rot = raw_ctx->build_input_k_rot(ctx0);
     auto inp = std::make_unique<llm_graph_input_dsv4>(cparams, std::move(inp_raw), mctx_cur);
 
-    dsv4_build_comp_inputs(ctx0, inp->inp_csa, mctx_cur->get_csa_plan(ubatch), "csa", cparams, n_stream);
-    dsv4_build_comp_inputs(ctx0, inp->inp_hca, mctx_cur->get_hca_plan(ubatch), "hca", cparams, n_stream);
-    dsv4_build_comp_inputs(ctx0, inp->inp_lid, mctx_cur->get_lid_plan(ubatch), "lid", cparams, n_stream);
+    // the candidate block mask covers a csa or hca stream, never the index key cache
+    const uint32_t cand_block = hparams.dsv41_candidate_block_size;
+    const uint32_t cand_topk  = hparams.dsv41_candidate_topk_blocks;
+    dsv4_build_comp_inputs(ctx0, inp->inp_csa, mctx_cur->get_csa_plan(ubatch), "csa", cparams, n_stream, cand_block, cand_topk);
+    dsv4_build_comp_inputs(ctx0, inp->inp_hca, mctx_cur->get_hca_plan(ubatch), "hca", cparams, n_stream, cand_block, cand_topk);
+    dsv4_build_comp_inputs(ctx0, inp->inp_lid, mctx_cur->get_lid_plan(ubatch), "lid", cparams, n_stream, 0, 0);
     inp->inp_csa.k_rot = mctx_cur->get_csa()->build_input_k_rot(ctx0);
     inp->inp_hca.k_rot = mctx_cur->get_hca()->build_input_k_rot(ctx0);
     inp->inp_lid.k_rot = mctx_cur->get_lid()->build_input_k_rot(ctx0);

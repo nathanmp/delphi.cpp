@@ -830,6 +830,11 @@ class GGUFWriter:
         key = Keys.Attention.Indexer.TYPES.format(arch=self.arch)
         self.add_array(key, value)
 
+    def add_candidate_blocks(self, source_layer: int, block_size: int, topk_blocks: int) -> None:
+        self.add_uint32(Keys.Attention.CANDIDATE_SOURCE_LAYER.format(arch=self.arch), source_layer)
+        self.add_uint32(Keys.Attention.CANDIDATE_BLOCK_SIZE.format(arch=self.arch), block_size)
+        self.add_uint32(Keys.Attention.CANDIDATE_TOPK_BLOCKS.format(arch=self.arch), topk_blocks)
+
     def add_max_alibi_bias(self, bias: float) -> None:
         self.add_float32(Keys.Attention.MAX_ALIBI_BIAS.format(arch=self.arch), bias)
 

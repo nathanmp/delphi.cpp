@@ -328,6 +328,11 @@ struct llama_hparams {
     bool dsv41_owns_index_k   (uint32_t il) const { return dsv41_index_key_source[il] == (int32_t) il; }
     bool dsv41_is_index_source(uint32_t il) const { return dsv41_topk_source[il]      == (int32_t) il; }
 
+    // The first level of the V4.1 indexer: the candidate source scores blocks of dsv41_candidate_block_size compressed positions, and the index sources after it pick only inside its dsv41_candidate_topk_blocks best blocks. -1 when the model has no first level.
+    int32_t  dsv41_candidate_source      = -1;
+    uint32_t dsv41_candidate_block_size  = 0;
+    uint32_t dsv41_candidate_topk_blocks = 0;
+
     uint32_t ple_ngram_size      = 0;
     uint32_t ple_heads_per_ngram = 0;
     uint32_t ple_conv_kernel     = 0;

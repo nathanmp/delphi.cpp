@@ -218,6 +218,9 @@ class Keys:
         RECURRENT_LAYERS             = "{arch}.attention.recurrent_layers"
         TEMPERATURE_SCALE            = "{arch}.attention.temperature_scale"
         ROPE_PATTERN                 = "{arch}.attention.rope_pattern"
+        CANDIDATE_SOURCE_LAYER       = "{arch}.attention.candidate_source_layer_id"
+        CANDIDATE_BLOCK_SIZE         = "{arch}.attention.candidate_block_size"
+        CANDIDATE_TOPK_BLOCKS        = "{arch}.attention.candidate_topk_blocks"
 
         class Indexer:
             HEAD_COUNT = "{arch}.attention.indexer.head_count"
