@@ -878,6 +878,64 @@ static std::vector<float> get_logits(
     return ret;
 }
 
+struct shared_gguf {
+    gguf_context_ptr gguf;
+    ggml_context_ptr data; // holds the tensor data that gguf refers to
+};
+
+// DeepSeek-V4.1 publishes each compressed stream on a few source layers and the layers after them
+// read it. A model built from metadata alone has every optional role tensor, so each layer is its
+// own source. Save such a model and drop the role tensors of the reader layers to get one that
+// shares its streams. Compress ratios are {0, 2, 2, 1, 1}: layers 1 and 3 publish, layer 2 still
+// scores layer 1's index keys, layer 4 reuses layer 3's top-k pick, and layer 3 pools without a
+// gate, as the real model does at ratio 1.
+static shared_gguf get_deepseek41_shared_gguf(gguf_context * gguf_ctx, const size_t seed) {
+    shared_gguf ret;
+
+    FILE * full = tmpfile();
+    GGML_ASSERT(full != nullptr);
+    {
+        auto model_and_ctx = get_model_and_ctx(gguf_ctx, nullptr, seed, {});
+        llama_model_saver ms(model_and_ctx.first.get());
+        ms.add_kv_from_model();
+        ms.add_tensors_from_model();
+        ms.save(full);
+    }
+    rewind(full);
+
+    ggml_context * ctx_data = nullptr;
+    gguf_context_ptr src(gguf_init_from_file_ptr(full, { /*no_alloc =*/ false, /*ctx =*/ &ctx_data }));
+    fclose(full);
+    GGML_ASSERT(src && ctx_data);
+    ret.data.reset(ctx_data);
+
+    const std::vector<std::string> drop = {
+        "blk.2.attn_compressor_", "blk.2.indexer.attn_k", "blk.2.indexer.k_norm",
+        "blk.3.attn_compressor_gate",
+        "blk.4.attn_compressor_", "blk.4.indexer.",
+    };
+
+    ret.gguf.reset(gguf_init_empty());
+    gguf_set_kv(ret.gguf.get(), src.get());
+    for (int64_t i = 0; i < gguf_get_n_tensors(src.get()); i++) {
+        const std::string name = gguf_get_tensor_name(src.get(), i);
+        const bool dropped = std::any_of(drop.begin(), drop.end(),
+                [&](const std::string & prefix) { return name.rfind(prefix, 0) == 0; });
+        if (!dropped) {
+            gguf_add_tensor(ret.gguf.get(), ggml_get_tensor(ctx_data, name.c_str()));
+        }
+    }
+    return ret;
+}
+
+static FILE * get_shared_gguf_file(const shared_gguf & shared) {
+    FILE * file = tmpfile();
+    GGML_ASSERT(file != nullptr);
+    GGML_ASSERT(gguf_write_to_file_ptr(shared.gguf.get(), file, /*only_meta =*/ false));
+    rewind(file);
+    return file;
+}
+
 static bool moe_mandatory(const llm_arch arch) {
     switch (arch) {
         case LLM_ARCH_LLAMA4:
@@ -1291,6 +1349,35 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
                 // log the results for this test case
                 printf(template_row_res.c_str(),
                     status_nmse.c_str(), nmse_str, status_roundtrip.c_str());
+            }
+
+            // shared compressed streams, see get_deepseek41_shared_gguf()
+            if (arch == LLM_ARCH_DEEPSEEK41 && arch_supported(arch)) {
+                const shared_gguf shared = get_deepseek41_shared_gguf(gguf_ctx.get(), seed);
+                std::vector<float> logits_shared_cpu;
+                for (device_config & dc : dev_configs) {
+                    printf(template_row_cfg.c_str(), llm_arch_name(arch), dc.label.c_str(), "Shared");
+                    fflush(stdout);
+
+                    std::string status_nmse = "\033[1;33mSKIP\033[0m";
+                    char nmse_str[12] = {0};
+                    if (dc.split_mode != LLAMA_SPLIT_MODE_TENSOR) {
+                        if (logits_shared_cpu.empty()) {
+                            auto model_and_ctx = get_model_and_ctx(nullptr, get_shared_gguf_file(shared), seed, {});
+                            logits_shared_cpu = get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), tokens);
+                        }
+                        auto model_and_ctx = get_model_and_ctx(nullptr, get_shared_gguf_file(shared), seed, dc.devs, dc.split_mode);
+                        const double nmse_val = nmse(logits_shared_cpu,
+                                get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), tokens));
+                        snprintf(nmse_str, sizeof(nmse_str), "(%.2e)", nmse_val);
+                        status_nmse = "\033[1;32mOK\033[0m";
+                        if (nmse_val > 1e-4) {
+                            all_ok = false;
+                            status_nmse = "\033[1;31mFAIL\033[0m";
+                        }
+                    }
+                    printf(template_row_res.c_str(), status_nmse.c_str(), nmse_str, "\033[1;33mSKIP\033[0m");
+                }
             }
         }
     }
