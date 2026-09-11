@@ -237,15 +237,33 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
 
         // the row layout of a stream follows the ratio it was compressed at, so a reader that
         // disagrees with its source would index into rows that stand for different positions
-        if (hparams.dsv4_compress_ratios[i] != hparams.dsv4_compress_ratios[last_kv_source]) {
-            throw std::runtime_error(format("layer %d compresses at ratio %u but reads layer %d, compressed at %u",
-                                            i, hparams.dsv4_compress_ratios[i],
-                                            last_kv_source, hparams.dsv4_compress_ratios[last_kv_source]));
+        // the same holds for the index keys and for a top-k pick, which name positions in a stream
+        for (const int32_t src : { last_kv_source, last_key_owner, last_index_source }) {
+            if (hparams.dsv4_compress_ratios[i] != hparams.dsv4_compress_ratios[src]) {
+                throw std::runtime_error(format("layer %d compresses at ratio %u but reads layer %d, compressed at %u",
+                                                i, hparams.dsv4_compress_ratios[i],
+                                                src, hparams.dsv4_compress_ratios[src]));
+            }
         }
 
         hparams.dsv41_kv_source[i]        = last_kv_source;
         hparams.dsv41_index_key_source[i] = last_key_owner;
         hparams.dsv41_topk_source[i]      = last_index_source;
+    }
+
+    {
+        std::string kv_sources;
+        std::string index_sources;
+        for (int i = 0; i < n_layer; ++i) {
+            if (hparams.dsv41_is_kv_source(i)) {
+                kv_sources += (kv_sources.empty() ? "" : ",") + std::to_string(i);
+            }
+            if (hparams.dsv41_is_index_source(i)) {
+                index_sources += (index_sources.empty() ? "" : ",") + std::to_string(i);
+            }
+        }
+        LLAMA_LOG_INFO("%s: DeepSeek-V4.1 compressed stream sources: kv = [%s], index = [%s]\n",
+                __func__, kv_sources.c_str(), index_sources.c_str());
     }
 
     // a compressor with no gate only makes sense where there is nothing to pool
@@ -601,6 +619,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
         llm_graph_input_dsv4 * inp_dsv4,
         ggml_tensor * cur,
         ggml_tensor * inp_pos,
+        ggml_tensor ** shared_top_k,
         int il) const {
     const auto & layer = model.layers[il];
     llm_graph_input_dsv4_raw * inp_attn = inp_dsv4->get_raw();
@@ -747,10 +766,16 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
                     ctx0, persist_score, inp_comp.state_persist_dst_idxs, il));
     }
 
-    // an index source picks the positions; the layers in between reuse what it picked
+    // An index source picks the positions. The layers after it reuse that pick, as the reference
+    // passes topk_idxs through a layer without an indexer; attending to every compressed row there
+    // is only the same once the stream has no more rows than the top-k.
     ggml_tensor * top_k = nullptr;
     if (hparams.dsv41_is_index_source(il)) {
         top_k = build_indexer_top_k(model, inp_dsv4, inp_comp, qr, cur, inp_pos, il);
+        *shared_top_k = top_k;
+    } else if (hparams.dsv41_topk_source[il] >= 0) {
+        GGML_ASSERT(*shared_top_k != nullptr && "the top-k source must build before its readers");
+        top_k = *shared_top_k;
     }
 
     ggml_tensor * k_rot = inp_attn->self_k_rot;
@@ -830,6 +855,8 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
             ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hc - 1, n_tokens), 0.0f), 0);
     cb(pre_mix, "hc_pre_init", -1);
 
+    ggml_tensor * shared_top_k = nullptr;
+
     for (int il = 0; il < n_layer; ++il) {
         if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
             res->t_layer_inp[il] = dsv41_hc_mean(ctx0, inpL);
@@ -861,7 +888,7 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
         cur = build_norm(cur, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
         cb(cur, "attn_norm", il);
 
-        cur = build_attention_v41(model, inp_dsv4, cur, inp_pos, il);
+        cur = build_attention_v41(model, inp_dsv4, cur, inp_pos, &shared_top_k, il);
 
         inpL = build_hc_post(cur, residual, post, comb, il);
         cb(inpL, "hc_attn_post", il);

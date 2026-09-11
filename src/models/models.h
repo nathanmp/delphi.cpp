@@ -1433,11 +1433,13 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
                 ggml_tensor * inp_pos,
                 int il) const;
 
+        // shared_top_k carries the last index source's pick to the layers after it
         ggml_tensor * build_attention_v41(
                 const llama_model & model,
                 llm_graph_input_dsv4 * inp_dsv4,
                 ggml_tensor * cur,
                 ggml_tensor * inp_pos,
+                ggml_tensor ** shared_top_k,
                 int il) const;
     };
 
