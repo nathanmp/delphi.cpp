@@ -8,6 +8,7 @@
 #include "llama-hparams.h"
 #include "llama-model.h"
 #include "llama-vocab.h"
+#include "models/models.h"
 
 #include <cstdint>
 #include <string>
@@ -134,6 +135,7 @@ void llama_model_saver::add_kv(const enum llm_kv key, const Container & value, c
 template void llama_model_saver::add_kv<std::vector<uint32_t>>(const enum llm_kv, const std::vector<uint32_t> &, const bool);
 template void llama_model_saver::add_kv<std::vector<float>>(const enum llm_kv, const std::vector<float> &, const bool);
 template void llama_model_saver::add_kv<std::vector<uint64_t>>(const enum llm_kv, const std::vector<uint64_t> &, const bool);
+template void llama_model_saver::add_kv<std::vector<int32_t>>(const enum llm_kv, const std::vector<int32_t> &, const bool);
 
 void llama_model_saver::add_kv(const enum llm_kv key, const std::vector<std::string> & value) {
     std::vector<const char *> tmp(value.size());
@@ -332,7 +334,18 @@ void llama_model_saver::add_kv_from_model() {
     add_kv(LLM_KV_ENGRAM_HEAD_COUNT,                     hparams.engram_n_head);
     add_kv(LLM_KV_ENGRAM_KEY_LENGTH,                     hparams.engram_key_length);
     add_kv(LLM_KV_ENGRAM_MAX_NGRAM_SIZE,                 hparams.engram_max_ngram_size);
-    add_kv(LLM_KV_ENGRAM_LAYER_IDS,                      hparams.engram_layer_ids, true);
+    if (model->arch == LLM_ARCH_DEEPSEEK41) {
+        // engram_layer_ids is a list of engram_n_layer ids, not a per-layer array, and the hash
+        // constants live on the model; write them with the converter's element types
+        const auto * m41 = static_cast<const llama_model_deepseek41 *>(model);
+        add_kv(LLM_KV_ENGRAM_LAYER_IDS, std::vector<uint32_t>(
+                hparams.engram_layer_ids.begin(), hparams.engram_layer_ids.begin() + m41->engram_n_layer));
+        add_kv(LLM_KV_ENGRAM_MULTIPLIERS, m41->engram_multipliers);
+        add_kv(LLM_KV_ENGRAM_PRIMES,      m41->engram_primes);
+        add_kv(LLM_KV_ENGRAM_OFFSETS,     m41->engram_offsets);
+        add_kv(LLM_KV_ENGRAM_TOKEN_MAP,   m41->engram_token_map);
+        add_kv(LLM_KV_ENGRAM_PAD_ID,      m41->engram_pad_id);
+    }
 
     // the PLE group only means anything whole: write all of it or none
     if (hparams.ple_n_heads > 0) {

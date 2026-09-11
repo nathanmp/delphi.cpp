@@ -107,12 +107,12 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         n_head = 1;
         n_ff   = 96;
         n_layer = 22; // hparams.n_layer_kv_from_start = 20 is hardcoded
-    } else if (arch == LLM_ARCH_DEEPSEEK4) {
+    } else if (arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK41) {
         // head size 64 so that GPU flash attention kernels support the model
         n_embd  = 512;
         n_head  = 8;
         n_ff    = 1024;
-        n_layer = 4;
+        n_layer = arch == LLM_ARCH_DEEPSEEK41 ? 5 : 4;
     } else if (arch == LLM_ARCH_STEP35 || arch == LLM_ARCH_LAGUNA) {
         n_embd = 160; // exercise per-head tensor split granularity with head size 80
     } else if (arch == LLM_ARCH_QWEN3 || arch == LLM_ARCH_MUSE_GLIMMER || arch == LLM_ARCH_AFMOE) {
@@ -205,11 +205,11 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, n_head_kv_per_layer);
     } else {
         ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT, n_head);
-        ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, arch == LLM_ARCH_DEEPSEEK4 ? uint32_t(1) : n_head_kv);
+        ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK41 ? uint32_t(1) : n_head_kv);
     }
 
     ms.add_kv(LLM_KV_ATTENTION_MAX_ALIBI_BIAS, 8.0f);
-    if (arch == LLM_ARCH_DEEPSEEK4) {
+    if (arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK41) {
         ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH,   n_embd_head);
         ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH, n_embd_head);
         ms.add_kv(LLM_KV_ROPE_DIMENSION_COUNT,   n_embd_head/2);
@@ -261,7 +261,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
     ms.add_kv(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,      1e-5f);
     ms.add_kv(LLM_KV_ATTENTION_GROUPNORM_EPS,          1e-5f);
     ms.add_kv(LLM_KV_ATTENTION_GROUPNORM_GROUPS,       uint32_t(8));
-    ms.add_kv(LLM_KV_ATTENTION_Q_LORA_RANK,            arch == LLM_ARCH_DEEPSEEK4 ? uint32_t(64) : uint32_t(512));
+    ms.add_kv(LLM_KV_ATTENTION_Q_LORA_RANK,            arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK41 ? uint32_t(64) : uint32_t(512));
     ms.add_kv(LLM_KV_ATTENTION_KV_LORA_RANK,           uint32_t(512));
     ms.add_kv(LLM_KV_ATTENTION_RELATIVE_BUCKETS_COUNT, uint32_t(8));
     ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW,         n_ctx/8);
@@ -347,18 +347,58 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         ms.add_kv(LLM_KV_ATTENTION_INDEXER_TYPES, indexer_types);
     }
 
-    if (arch == LLM_ARCH_DEEPSEEK4) {
+    if (arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK41) {
         ms.add_kv(LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT,         uint32_t(8));
         ms.add_kv(LLM_KV_ATTENTION_OUTPUT_LORA_RANK,           uint32_t(32));
-        ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS,            std::vector<uint32_t>({0, 0, 4, 128}));
+        if (arch == LLM_ARCH_DEEPSEEK41) {
+            // Two ratios, as in the real model. Layer roles come from which compressor and
+            // indexer tensors exist; a model built from this metadata alone gets all of them,
+            // so every compressed layer is its own source.
+            ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS,        std::vector<uint32_t>({0, 2, 2, 1, 1}));
+        } else {
+            ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS,        std::vector<uint32_t>({0, 0, 4, 128}));
+            ms.add_kv(LLM_KV_HASH_LAYER_COUNT,                  uint32_t(0));
+        }
         ms.add_kv(LLM_KV_ATTENTION_COMPRESS_ROPE_FREQ_BASE,    160000.0f);
         ms.add_kv(LLM_KV_HYPER_CONNECTION_COUNT,               uint32_t(4));
         ms.add_kv(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS, uint32_t(2));
         ms.add_kv(LLM_KV_HYPER_CONNECTION_EPSILON,             1.0e-6f);
-        ms.add_kv(LLM_KV_HASH_LAYER_COUNT,                      uint32_t(0));
         ms.add_kv(LLM_KV_SWIGLU_CLAMP_EXP,                      10.0f);
         ms.add_kv(LLM_KV_EXPERT_WEIGHTS_SCALE,                  1.0f);
         ms.add_kv(LLM_KV_EXPERT_WEIGHTS_NORM,                   true);
+    }
+    if (arch == LLM_ARCH_DEEPSEEK41) {
+        // engram on two layers, 3-grams, 2 heads: 4 buckets per layer with small primes
+        const uint32_t n_engram_layer = 2;
+        const uint32_t n_gram         = 3;
+        const uint32_t n_engram_head  = 2;
+        const std::vector<uint64_t> primes({31, 37, 41, 43,  47, 53, 59, 61});
+
+        std::vector<uint64_t> offsets(primes.size());
+        for (uint32_t eg = 0; eg < n_engram_layer; eg++) {
+            uint64_t off = 0;
+            for (uint32_t b = 0; b < (n_gram - 1)*n_engram_head; b++) {
+                const size_t k = eg*(n_gram - 1)*n_engram_head + b;
+                offsets[k] = off;
+                off += primes[k];
+            }
+        }
+
+        // fold the vocab onto fewer ids, as the real compressed token map does
+        std::vector<int32_t> token_map(n_vocab);
+        for (uint32_t t = 0; t < n_vocab; t++) {
+            token_map[t] = int32_t(t % 100);
+        }
+
+        ms.add_kv(LLM_KV_ENGRAM_LAYER_IDS,      std::vector<uint32_t>({1, 3}));
+        ms.add_kv(LLM_KV_ENGRAM_HEAD_COUNT,     n_engram_head);
+        ms.add_kv(LLM_KV_ENGRAM_KEY_LENGTH,     uint32_t(16));
+        ms.add_kv(LLM_KV_ENGRAM_MAX_NGRAM_SIZE, n_gram);
+        ms.add_kv(LLM_KV_ENGRAM_MULTIPLIERS,    std::vector<uint64_t>({3, 5, 7,  11, 13, 17}));
+        ms.add_kv(LLM_KV_ENGRAM_PRIMES,         primes);
+        ms.add_kv(LLM_KV_ENGRAM_OFFSETS,        offsets);
+        ms.add_kv(LLM_KV_ENGRAM_TOKEN_MAP,      token_map);
+        ms.add_kv(LLM_KV_ENGRAM_PAD_ID,         uint32_t(2));
     } else if (arch == LLM_ARCH_GLM5NEXT) {
         ms.add_kv(LLM_KV_HYPER_CONNECTION_COUNT,               uint32_t(4)); // build_hc_pre asserts exactly 4 streams
         ms.add_kv(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS, uint32_t(2));
@@ -394,7 +434,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         ms.add_kv(LLM_KV_EXPERT_COUNT,               uint32_t(2));
         ms.add_kv(LLM_KV_EXPERT_USED_COUNT,          uint32_t(1));
         ms.add_kv(LLM_KV_EXPERT_SHARED_COUNT,        uint32_t(1));
-        ms.add_kv(LLM_KV_EXPERT_GATING_FUNC,         arch == LLM_ARCH_DEEPSEEK4 ? uint32_t(4) : uint32_t(2)); // sqrtsoftplus : sigmoid
+        ms.add_kv(LLM_KV_EXPERT_GATING_FUNC,         arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK41 ? uint32_t(4) : uint32_t(2)); // sqrtsoftplus : sigmoid
         ms.add_kv(LLM_KV_EXPERT_GROUP_SCALE,         1.0f);
         ms.add_kv(LLM_KV_EXPERTS_PER_GROUP,          uint32_t(1));
     }
@@ -858,6 +898,7 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_DEEPSEEK32:
         case LLM_ARCH_DOTS3NOTE:
         case LLM_ARCH_DEEPSEEK4:
+        case LLM_ARCH_DEEPSEEK41:
         case LLM_ARCH_GLM4_MOE:
         case LLM_ARCH_GLM_DSA:
         case LLM_ARCH_GLM5NEXT:
