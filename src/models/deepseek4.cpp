@@ -17,6 +17,7 @@ float dsv4_rope_attn_factor(float freq_scale, float ext_factor) {
 }
 
 void llama_model_deepseek4::load_arch_hparams(llama_model_loader & ml) {
+    hparams.dsv4_v41 = arch == LLM_ARCH_DEEPSEEK41;
     if (hparams.n_layer_nextn > 0) {
         const uint32_t n_layer_main = hparams.n_layer_all - hparams.n_layer_nextn;
         const std::string mtp_probe = "blk." + std::to_string(n_layer_main) + ".nextn.eh_proj.weight";
@@ -935,8 +936,13 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
 
     ggml_tensor * q = build_lora_mm(layer.wq_b, qr);
     q = ggml_reshape_3d(ctx0, q, n_embd_head, n_head, nt);
-    q = ggml_rms_norm(ctx0, q, norm_rms_eps);
-    cb(q, "q_norm", il);
+    if (!hparams.dsv4_v41) {
+        // V4 normalises each head of q after wq_b; V4.1 does not, and doing it anyway pins every
+        // head to RMS 1. The V4.1 model has its own build_attention_v41; this is the path a
+        // V4.1 DSpark draft takes, which reads the flag from dflash.dsv41_semantics.
+        q = ggml_rms_norm(ctx0, q, norm_rms_eps);
+        cb(q, "q_norm", il);
+    }
 
     q = ggml_rope_ext(ctx0, q, inp_pos, nullptr, n_embd_head_rope, rope_type, n_ctx_orig_l,
             freq_base_l, freq_scale_l, ext_factor_l, attn_factor_l, beta_fast_l, beta_slow_l);
