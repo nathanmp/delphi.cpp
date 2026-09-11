@@ -29,6 +29,17 @@ int main(int argc, char ** argv){
     // max. number of additional tokens to draft if match is found
     const int n_draft = params.speculative.draft.n_max;
 
+    // This example drafts and rejects like any other speculative type, so the context has to
+    // be able to roll its recurrent state back. Declaring the type is what turns that on.
+    {
+        auto & types = params.speculative.types;
+        const bool has_real = std::any_of(types.begin(), types.end(),
+                [](auto t) { return t != COMMON_SPECULATIVE_TYPE_NONE; });
+        if (!has_real) {
+            types = { COMMON_SPECULATIVE_TYPE_NGRAM_CACHE };   // the default is { NONE }, not empty
+        }
+    }
+
     const auto output_limits = common_speculative_get_output_limits(params.n_batch, params.n_parallel, n_draft);
     params.n_outputs_max = output_limits.total;
     params.n_outputs_max_per_seq = output_limits.per_seq;
