@@ -1357,10 +1357,12 @@ class DeepseekV41Model(DeepseekV4Model):
                 gguf.GGUFValueType.ARRAY,
                 gguf.GGUFValueType.INT32,
             )
-            # the reference stores the padding token already mapped, so do the same here
+            # the reference stores the padding token already mapped, so do the same here. The
+            # released config names it engram_pad_token_id; the reference ModelArgs uses engram_pad_id.
+            pad_id = hparams.get("engram_pad_token_id", hparams.get("engram_pad_id", 2))
             self.gguf_writer.add_uint32(
                 gguf.Keys.Engram.PAD_ID.format(arch=arch),
-                int(token_map[hparams.get("engram_pad_id", 2)]),
+                int(token_map[pad_id]),
             )
             logger.info("Engram constants written: multipliers %s, primes %s, offsets %s, token_map %d",
                         multipliers.shape, primes_array.shape, offsets_array.shape, len(token_map))
