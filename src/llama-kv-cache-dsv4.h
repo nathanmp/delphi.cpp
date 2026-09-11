@@ -167,6 +167,12 @@ private:
 
     std::vector<uint32_t> rs_idx;
 
+    // tokens per row that each compressed cache is indexed at, for trimming and saving its used rows.
+    // V4.1 keeps every compressed row in kv_csa and kv_lid at its finest ratio.
+    uint32_t row_ratio_csa = 0;
+    uint32_t row_ratio_hca = 0;
+    uint32_t row_ratio_lid = 0;
+
     std::unique_ptr<llama_kv_cache_iswa> kv_raw;
     std::unique_ptr<llama_kv_cache>      kv_csa;
     std::unique_ptr<llama_kv_cache>      kv_hca;

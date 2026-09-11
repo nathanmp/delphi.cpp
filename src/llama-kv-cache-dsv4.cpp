@@ -1409,12 +1409,18 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
             v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, ratio_kv), 256u), n_seq_max, n_pad,
             0, LLAMA_SWA_TYPE_NONE, nullptr, filter_csa, reuse_kv, nullptr);
 
+    // V4.1 stores no rows in kv_hca, but its second-ratio sources are planned through this slot and
+    // write into kv_csa, so the per-stream row offsets of the two caches must agree
+    row_ratio_csa = ratio_kv;
+    row_ratio_hca = is_v41 ? ratio_kv : ratio_b;
+    row_ratio_lid = ratio_kv;
+
     LLAMA_LOG_INFO("%s: creating DSV4 HCA compressed KV cache, ratio = %u, size = %u cells\n",
-            __func__, ratio_b, dsv4_comp_size(kv_size, ratio_b));
+            __func__, ratio_b, dsv4_comp_size(kv_size, row_ratio_hca));
 
     kv_hca = std::make_unique<llama_kv_cache>(
             model, hparams_hca, type_k, type_v,
-            v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, ratio_b), 256u), n_seq_max, n_pad,
+            v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, row_ratio_hca), 256u), n_seq_max, n_pad,
             0, LLAMA_SWA_TYPE_NONE, nullptr, filter_hca, nullptr, nullptr);
 
     LLAMA_LOG_INFO("%s: creating DSV4 lightning-indexer KV cache, size = %u cells\n",
@@ -1586,9 +1592,9 @@ bool llama_kv_cache_dsv4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
             bool res = true;
 
             res = res & kv_raw->seq_rm(seq_id, p0, -1);
-            res = res & kv_csa->seq_rm(seq_id, p0/DSV4_CSA_RATIO, -1);
-            res = res & kv_hca->seq_rm(seq_id, p0/DSV4_HCA_RATIO, -1);
-            res = res & kv_lid->seq_rm(seq_id, p0/DSV4_CSA_RATIO, -1);
+            res = res & kv_csa->seq_rm(seq_id, p0/row_ratio_csa, -1);
+            res = res & kv_hca->seq_rm(seq_id, p0/row_ratio_hca, -1);
+            res = res & kv_lid->seq_rm(seq_id, p0/row_ratio_lid, -1);
 
             return res;
         }
@@ -1724,11 +1730,11 @@ void llama_kv_cache_dsv4::state_write(llama_io_write_i & io, llama_seq_id seq_id
 
         //FIXME : note that we conflate token positions with rows, which is not true for multi-modal case.
         const uint32_t n_rows_csa = seq_id >= 0 ?
-            dsv4_state_n_used_k_rows(pos_max, DSV4_CSA_RATIO, kv_csa->get_size()) : kv_csa->get_size();
+            dsv4_state_n_used_k_rows(pos_max, row_ratio_csa, kv_csa->get_size()) : kv_csa->get_size();
         const uint32_t n_rows_hca = seq_id >= 0 ?
-            dsv4_state_n_used_k_rows(pos_max, DSV4_HCA_RATIO, kv_hca->get_size()) : kv_hca->get_size();
+            dsv4_state_n_used_k_rows(pos_max, row_ratio_hca, kv_hca->get_size()) : kv_hca->get_size();
         const uint32_t n_rows_lid = seq_id >= 0 ?
-            dsv4_state_n_used_k_rows(pos_max, DSV4_CSA_RATIO, kv_lid->get_size()) : kv_lid->get_size();
+            dsv4_state_n_used_k_rows(pos_max, row_ratio_lid, kv_lid->get_size()) : kv_lid->get_size();
 
         dsv4_state_write_k_cache(io, kv_csa.get(), seq_id, flags, n_rows_csa);
         dsv4_state_write_k_cache(io, kv_hca.get(), seq_id, flags, n_rows_hca);
