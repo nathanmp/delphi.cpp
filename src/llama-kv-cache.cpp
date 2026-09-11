@@ -260,11 +260,11 @@ llama_kv_cache::llama_kv_cache(
                 continue;
             }
 
-            // A layer the filter rejected has no storage of its own, which is the case that most
-            // needs to borrow another layer's. Owning storage and reading storage are separate
-            // questions, so only a layer with no KV at all is skipped here.
-            if (!hparams.has_kv(il)) {
-                LLAMA_LOG_DEBUG("%s: - layer %3d: does not have KV cache\n", __func__, il);
+            // A filtered-out layer may still borrow storage from a layer that this cache owns
+            // (DeepSeek-V4.1 compressed streams). Skip it only when its source is in another
+            // cache, e.g. the other half of an iSWA pair (gemma3n/gemma4 shared KV).
+            if (filter && !filter(il) && map_layer_ids.find(il_reuse) == map_layer_ids.end()) {
+                LLAMA_LOG_DEBUG("%s: - layer %3d: filtered\n", __func__, il);
                 continue;
             }
 
