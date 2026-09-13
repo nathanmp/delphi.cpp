@@ -160,6 +160,12 @@ static bool category_is_attn_v(tensor_category cat) {
            cat == tensor_category::ATTENTION_KV_B;
 }
 
+static bool tensor_name_is_routed_expert(const std::string & name) {
+    return name.find("ffn_gate_exps.weight") != std::string::npos ||
+           name.find("ffn_down_exps.weight") != std::string::npos ||
+           name.find("ffn_up_exps.weight")   != std::string::npos;
+}
+
 //
 // quantization state
 //
@@ -504,6 +510,11 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
 
     // TODO: avoid hardcoded tensor names - use the TN_* constants
     const llm_arch arch = qs.model.arch;
+
+    // Routed experts dominate DeepSeek-V4.1 file size. Keep every always-on or state-dependent weight at the converter-selected type.
+    if (arch == LLM_ARCH_DEEPSEEK41 && !tensor_name_is_routed_expert(name)) {
+        return tensor->type;
+    }
 
     auto use_more_bits = [](int i_layer, int n_layers) -> bool {
         return i_layer < n_layers/8 || i_layer >= 7*n_layers/8 || (i_layer - n_layers/8)%3 == 2;

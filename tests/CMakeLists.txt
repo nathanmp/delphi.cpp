@@ -116,6 +116,8 @@ function(llama_build_and_test source)
     set_property(TEST ${TEST_TARGET} PROPERTY LABELS ${LLAMA_TEST_LABEL})
 endfunction()
 
+llama_build_and_test(test-quant-rules.cpp)
+
 # build test-tokenizer-0 target once and add many tests
 llama_build(test-tokenizer-0.cpp)
 
@@ -330,6 +332,8 @@ llama_test(test-exec-trace NAME test-exec-trace-gpu-timing-backend ARGS gpu-timi
 llama_test(test-exec-trace NAME test-exec-trace-gpu-timing-pool ARGS gpu-timing-pool ${CMAKE_CURRENT_BINARY_DIR}/test-exec-trace-gpu-timing-pool.bin)
 find_program(LLAMA_TEST_PYTHON NAMES python3 python)
 if (LLAMA_TEST_PYTHON)
+    llama_test_cmd(${LLAMA_TEST_PYTHON} NAME test-convert-deepseek41 ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-convert-deepseek41.py)
+    set_tests_properties(test-convert-deepseek41 PROPERTIES SKIP_RETURN_CODE 77)
     llama_test_cmd(${LLAMA_TEST_PYTHON} NAME test-exec-trace-dump ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-exec-trace-dump.py)
     llama_test_cmd(${LLAMA_TEST_PYTHON} NAME test-exec-trace-integrity-script ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-exec-trace-integrity.py)
     llama_test_cmd(${LLAMA_TEST_PYTHON} NAME test-exec-trace-gpu-activity ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-exec-trace-gpu-activity.py)

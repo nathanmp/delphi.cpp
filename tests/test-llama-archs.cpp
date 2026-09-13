@@ -913,6 +913,15 @@ static shared_gguf get_deepseek41_shared_gguf(gguf_context * gguf_ctx, const siz
     GGML_ASSERT(src && ctx_data);
     ret.data.reset(ctx_data);
 
+    const auto get_u32 = [&](const char * key) {
+        const int64_t key_id = gguf_find_key(src.get(), key);
+        GGML_ASSERT(key_id >= 0);
+        return gguf_get_val_u32(src.get(), key_id);
+    };
+    GGML_ASSERT(get_u32("deepseek41.attention.candidate_source_layer_id") == 3);
+    GGML_ASSERT(get_u32("deepseek41.attention.candidate_block_size") == 2);
+    GGML_ASSERT(get_u32("deepseek41.attention.candidate_topk_blocks") == 5);
+
     const std::vector<std::string> drop = {
         "blk.2.attn_compressor_", "blk.2.indexer.attn_k", "blk.2.indexer.k_norm",
         "blk.3.attn_compressor_gate",

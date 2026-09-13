@@ -1274,12 +1274,38 @@ class DeepseekV41Model(DeepseekV4Model):
         for name in tensors_to_remove:
             del self.model_tensors[name]
 
+    def _write_candidate_metadata(self):
+        hparams = self.hparams
+        keys = (
+            "candidate_source_layer_id",
+            "candidate_block_size",
+            "candidate_topk_blocks",
+        )
+        missing = [key for key in keys if hparams.get(key) is None]
+        if missing:
+            raise ValueError(f"DeepSeek V4.1 config is missing required candidate metadata: {', '.join(missing)}")
+
+        source = int(hparams["candidate_source_layer_id"])
+        block_size = int(hparams["candidate_block_size"])
+        topk_blocks = int(hparams["candidate_topk_blocks"])
+
+        if source < 0 or source >= int(hparams["num_hidden_layers"]):
+            raise ValueError(f"candidate source layer {source} is out of range")
+        if block_size <= 0 or topk_blocks <= 0:
+            raise ValueError("candidate block size and top-k block count must be positive")
+        if 256 % block_size != 0:
+            raise ValueError(f"candidate block size {block_size} does not divide 256")
+
+        index_sources = hparams.get("index_source_layer_ids")
+        if index_sources is not None and source not in index_sources:
+            raise ValueError(f"candidate source layer {source} is not an index source")
+
+        self.gguf_writer.add_candidate_blocks(source, block_size, topk_blocks)
+
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
         hparams = self.hparams
-        # the first level of the indexer; a source below 0 means the model has none
-        if (cand_source := hparams.get("candidate_source_layer_id")) is not None and cand_source >= 0:
-            self.gguf_writer.add_candidate_blocks(cand_source, hparams["candidate_block_size"], hparams["candidate_topk_blocks"])
+        self._write_candidate_metadata()
         if (engram_ids := hparams.get("engram_layer_ids")) is not None:
             # These MUST carry the arch prefix, not a literal "deepseek4.". llama.cpp resolves
             # every LLM_KV_* as "{arch}.{key}", so a hardcoded prefix means the runtime looks up
