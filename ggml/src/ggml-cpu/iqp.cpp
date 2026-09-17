@@ -1132,14 +1132,18 @@ void ggml_compute_forward_mul_mat_id_iqp(const struct ggml_compute_params * para
                                          int64_t                            cur_a,
                                          int64_t                            cne1,
                                          const int32_t *                    expert_rows,
-                                         void *                             panels) {
+                                         void *                             panels,
+                                         const void *                       src1_wdata,
+                                         int64_t                            row_start,
+                                         int64_t                            row_end,
+                                         int                                work_ith,
+                                         int                                work_nth) {
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int ith = params->ith;
-    const int nth = params->nth;
 
     const int64_t nblocks = ne00 / QK_K;
 
@@ -1149,10 +1153,12 @@ void ggml_compute_forward_mul_mat_id_iqp(const struct ggml_compute_params * para
 
     const char * src0_cur = (const char *) src0->data + cur_a * nb02;
 
-    const int64_t ngroups = ne01 / IQP_NB_ROWS;
+    // [row_start, row_end) is this NUMA node's slice of ne01, the whole dimension outside --numa tensors
+    const int64_t group_start = row_start / IQP_NB_ROWS;
+    const int64_t ngroups     = (row_end - row_start) / IQP_NB_ROWS;
 
-    const int64_t g0 = (ngroups * ith) / nth;
-    const int64_t g1 = (ngroups * (ith + 1)) / nth;
+    const int64_t g0 = group_start + (ngroups * work_ith) / work_nth;
+    const int64_t g1 = group_start + (ngroups * (work_ith + 1)) / work_nth;
 
     for (int64_t g = g0; g < g1; g++) {
         const int64_t r = g * IQP_NB_ROWS;
@@ -1171,7 +1177,7 @@ void ggml_compute_forward_mul_mat_id_iqp(const struct ggml_compute_params * para
             for (int64_t m = 0; m < 4; m++) {
                 const int64_t kk = k + MIN(m, nrows - 1);
 
-                rows[m] = (const char *) params->wdata +
+                rows[m] = (const char *) src1_wdata +
                           ((expert_rows[2 * kk + 0] % ne11) + expert_rows[2 * kk + 1] * ne11) * nbw1;
             }
 

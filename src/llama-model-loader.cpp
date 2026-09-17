@@ -556,6 +556,13 @@ llama_model_loader::llama_model_loader(
 
     tensor_buft_overrides = param_tensor_buft_overrides_p;
 
+    if (auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) {
+        auto * reg = ggml_backend_dev_backend_reg(cpu_dev);
+        auto * is_tensor_mode = (bool (*)(void))
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_is_numa_tensor_mode");
+        numa_tensors = is_tensor_mode && is_tensor_mode();
+    }
+
     this->use_mmap      = load_mode == LLAMA_LOAD_MODE_MMAP || load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK || load_mode == LLAMA_LOAD_MODE_AUTO;
     this->use_direct_io = load_mode == LLAMA_LOAD_MODE_DIRECT_IO;
 
@@ -1113,6 +1120,47 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
     return true;
 }
 
+static bool is_routed_expert_weight(llm_tensor tensor, ggml_op op) {
+    if (op != GGML_OP_MUL_MAT_ID) {
+        return false;
+    }
+
+    switch (tensor) {
+        case LLM_TENSOR_FFN_DOWN_EXPS:
+        case LLM_TENSOR_FFN_GATE_EXPS:
+        case LLM_TENSOR_FFN_UP_EXPS:
+        case LLM_TENSOR_FFN_GATE_UP_EXPS:
+        case LLM_TENSOR_FFN_DOWN_CHEXPS:
+        case LLM_TENSOR_FFN_GATE_CHEXPS:
+        case LLM_TENSOR_FFN_UP_CHEXPS:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool buft_is_cpu_resident(ggml_backend_buffer_type_t buft) {
+    if (ggml_backend_buft_is_host(buft)) {
+        return true;
+    }
+    auto * dev = ggml_backend_buft_get_device(buft);
+    return dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
+}
+
+// The NUMA buffer must own its pages so that every node can first-touch its own
+// row range, so a routed-expert weight cannot stay mapped or go to CPU_REPACK.
+static ggml_backend_buffer_type_t select_cpu_expert_buft(
+        const llama_hparams & hparams,
+        ggml_tensor * tensor,
+        ggml_op op) {
+    auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    auto * reg = cpu_dev ? ggml_backend_dev_backend_reg(cpu_dev) : nullptr;
+    auto * get_numa_buft = reg ? (ggml_backend_buffer_type_t (*)(void))
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_numa_buffer_type") : nullptr;
+    auto * buft = get_numa_buft ? get_numa_buft() : nullptr;
+    return buft && weight_buft_supported(hparams, tensor, op, buft, cpu_dev) ? buft : nullptr;
+}
+
 struct ggml_tensor * llama_model_loader::create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
@@ -1266,6 +1314,21 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             }
         }
 
+        const bool numa_expert = numa_tensors && is_routed_expert_weight(tn_tensor, op) && buft_is_cpu_resident(buft);
+        if (numa_expert) {
+            auto * expert_buft = select_cpu_expert_buft(hparams, t_meta, op);
+            if (!expert_buft) {
+                throw std::runtime_error(format("failed to find a CPU buffer for NUMA expert tensor %s", tn.str().c_str()));
+            }
+            buft = expert_buft;
+
+            const std::string tensor_name = tn.str();
+            if (numa_expert_names.insert(tensor_name).second) {
+                LLAMA_LOG_INFO("numa tensors: tensor %s, %" PRId64 " experts, %zu bytes/expert, buffer %s\n",
+                        tensor_name.c_str(), t_meta->ne[2], t_meta->nb[2], ggml_backend_buft_name(buft));
+            }
+        }
+
         // avoid using a host buffer when using mmap
         auto * buft_dev = ggml_backend_buft_get_device(buft);
         if (use_mmap && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev)) {
@@ -1330,6 +1393,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         ggml_context * ctx = ctx_for_buft(buft);
         ggml_tensor * ret = ggml_dup_tensor(ctx, &t_meta);
         ggml_set_name(ret, tn.str().c_str());
+        if (numa_expert_names.count(tn.str())) {
+            ret->flags |= GGML_TENSOR_FLAG_NUMA_EXPERT;
+        }
         return ret;
     }
 
@@ -1379,6 +1445,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
     struct ggml_tensor * tensor = ggml_dup_tensor(ctx, &t_meta);
     ggml_set_name(tensor, ggml_get_name(&t_meta));
+    if (numa_expert_names.count(tn.str())) {
+        tensor->flags |= GGML_TENSOR_FLAG_NUMA_EXPERT;
+    }
 
     if (duplicated) {
         size_data += ggml_nbytes(&t_meta);
@@ -1404,6 +1473,13 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
         LLAMA_LOG_DEBUG("%s: tensor '%s' (%s) (and %zu others) cannot be used with preferred buffer type %s, using %s instead\n",
             __func__, first_tensor_moved_name.c_str(), first_tensor_moved_type_name.c_str(), n_tensors_moved - 1,
             ggml_backend_buft_name(first_moved_from_buft), ggml_backend_buft_name(first_moved_to_buft));
+    }
+    if (numa_tensors) {
+        if (numa_expert_names.empty()) {
+            LLAMA_LOG_WARN("numa tensors: no applicable CPU routed-expert tensors were found\n");
+        } else {
+            LLAMA_LOG_INFO("numa tensors: selected %zu routed-expert tensors\n", numa_expert_names.size());
+        }
     }
 }
 
@@ -1605,6 +1681,21 @@ bool llama_model_loader::load_all_data(
     }
 
     std::vector<ggml_tensor *> tensors;
+
+    // staging buffer for the no-mmap path, kept out of the loop so it is reused
+    std::vector<no_init<uint8_t>> numa_read_buf;
+
+    bool (*numa_load_expert_tensor)(ggml_tensor *, const void *, size_t) = nullptr;
+    if (numa_tensors) {
+        auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        auto * reg = cpu_dev ? ggml_backend_dev_backend_reg(cpu_dev) : nullptr;
+        numa_load_expert_tensor = reg ? (bool (*)(ggml_tensor *, const void *, size_t))
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_numa_load_expert_tensor") : nullptr;
+        if (!numa_load_expert_tensor) {
+            throw std::runtime_error("numa tensors: expert loader hook is unavailable in the CPU backend");
+        }
+    }
+
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
         tensors.push_back(cur);
     }
@@ -1636,6 +1727,34 @@ bool llama_model_loader::load_all_data(
         }
 
         size_t n_size = ggml_nbytes(cur);
+
+        if (cur->flags & GGML_TENSOR_FLAG_NUMA_EXPERT) {
+            const void * source = nullptr;
+            if (use_mmap) {
+                const auto & mapping = mappings.at(weight->idx);
+                source = (const uint8_t *) mapping->addr() + weight->offs;
+                if (check_tensors) {
+                    validation_result.emplace_back(std::async(std::launch::async, [cur, source, n_size] {
+                        return std::make_pair(cur, ggml_validate_row_data(cur->type, source, n_size));
+                    }));
+                }
+            } else {
+                const auto & file = files.at(weight->idx);
+                numa_read_buf.resize(n_size);
+                file->seek(weight->offs, SEEK_SET);
+                file->read_raw(numa_read_buf.data(), n_size);
+                source = numa_read_buf.data();
+                if (check_tensors && !ggml_validate_row_data(cur->type, source, n_size)) {
+                    throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
+                }
+            }
+
+            if (!numa_load_expert_tensor(cur, source, n_size)) {
+                throw std::runtime_error(format("failed NUMA first-touch load for tensor '%s'", ggml_get_name(cur)));
+            }
+            size_done += n_size;
+            continue;
+        }
 
         const bool from_mapping = use_mmap || lazy.has(cur);
 

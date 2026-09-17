@@ -25,6 +25,12 @@ struct ggml_compute_params {
 
     struct ggml_threadpool * threadpool;
 
+    // node-local worker identity, zero outside GGML_NUMA_STRATEGY_TENSORS
+    int numa_node;
+    int numa_rank;
+    int numa_n_threads;
+    bool numa_node_leader;
+
     // use reference implementation
     bool use_ref;
 };
@@ -530,6 +536,134 @@ static __m256 __lasx_xvreplfr2vr_s(const float val) {
 
 // TODO: move to ggml-threading
 void ggml_barrier(struct ggml_threadpool * tp);
+
+#define GGML_NUMA_MAX_NODES 8
+
+// Row-split granularity for tensors that are not repacked.
+// A 16-row (64 byte) boundary stops two nodes from sharing a dst cache line.
+#define GGML_NUMA_TP_PLAIN_ALIGN 16
+
+bool ggml_numa_is_tensor_mode(void);
+uint32_t ggml_numa_get_node_count(void);
+void ggml_numa_tp_row_range_for_node(
+        uint32_t node, int64_t n_rows, int64_t align, int64_t * row_start, int64_t * row_end);
+bool ggml_numa_load_expert_tensor(struct ggml_tensor * tensor, const void * data, size_t size);
+
+// Column split: every node computes every expert, but only a row range of it.
+// `shares` are relative weights, and the ranges tile [0, n_rows) with no gap and no overlap.
+// `align` must divide n_rows, or the last node's end falls below n_rows.
+static inline void ggml_numa_tp_row_range(
+        const double * shares,
+        uint32_t n_nodes,
+        uint32_t node,
+        int64_t n_rows,
+        int64_t align,
+        int64_t * row_start,
+        int64_t * row_end) {
+    double total = 0.0;
+    for (uint32_t n = 0; n < n_nodes; ++n) {
+        total += shares[n];
+    }
+
+    double cum_prev = 0.0;
+    for (uint32_t n = 0; n < node; ++n) {
+        cum_prev += shares[n];
+    }
+    double cum_cur = cum_prev + shares[node];
+
+    int64_t start = (int64_t) ((cum_prev / total) * (double) n_rows);
+    int64_t end   = node + 1 == n_nodes ? n_rows : (int64_t) ((cum_cur / total) * (double) n_rows);
+
+    if (align > 1) {
+        start = (start / align) * align;
+        end   = node + 1 == n_nodes ? n_rows : (end / align) * align;
+    }
+
+    if (end < start) {
+        end = start;
+    }
+
+    *row_start = start;
+    *row_end   = end;
+}
+
+// Parses "37,63" style env values into shares. Returns false if unset, malformed, or the wrong count.
+static inline bool ggml_numa_tp_parse_shares(const char * value, uint32_t n_nodes, double * shares) {
+    if (!value || !*value) {
+        return false;
+    }
+
+    double parsed[GGML_NUMA_MAX_NODES];
+    uint32_t count = 0;
+
+    const char * p = value;
+    while (*p && count < n_nodes) {
+        char * end = NULL;
+        double v = strtod(p, &end);
+        if (end == p || v <= 0.0) {
+            return false;
+        }
+        parsed[count++] = v;
+        p = end;
+        while (*p == ',' || *p == ' ') {
+            ++p;
+        }
+    }
+
+    if (count != n_nodes || *p != '\0') {
+        return false;
+    }
+
+    for (uint32_t n = 0; n < n_nodes; ++n) {
+        shares[n] = parsed[n];
+    }
+    return true;
+}
+
+// Give every node one worker, then split the rest in proportion to each node's CPU count.
+// Largest remainders win ties in node order, which keeps the result deterministic.
+static inline bool ggml_numa_partition_workers(
+        const uint32_t * node_cpus,
+        uint32_t n_nodes,
+        uint32_t n_threads,
+        uint32_t * node_workers) {
+    if (n_nodes == 0 || n_nodes > GGML_NUMA_MAX_NODES || n_threads < n_nodes) {
+        return false;
+    }
+
+    uint64_t total_cpus = 0;
+    for (uint32_t node = 0; node < n_nodes; ++node) {
+        if (node_cpus[node] == 0) {
+            return false;
+        }
+        total_cpus += node_cpus[node];
+        node_workers[node] = 1;
+    }
+
+    const uint32_t remaining = n_threads - n_nodes;
+    uint64_t remainders[GGML_NUMA_MAX_NODES] = {0};
+    uint32_t assigned = 0;
+    for (uint32_t node = 0; node < n_nodes; ++node) {
+        const uint64_t scaled = (uint64_t) remaining * node_cpus[node];
+        const uint32_t extra = (uint32_t) (scaled / total_cpus);
+        node_workers[node] += extra;
+        assigned += extra;
+        remainders[node] = scaled % total_cpus;
+    }
+
+    for (uint32_t left = remaining - assigned; left > 0; --left) {
+        uint32_t best = 0;
+        for (uint32_t node = 1; node < n_nodes; ++node) {
+            if (remainders[node] > remainders[best]) {
+                best = node;
+            }
+        }
+        node_workers[best]++;
+        remainders[best] = 0;
+    }
+
+    return true;
+}
 
 void ggml_threadpool_chunk_set(struct ggml_threadpool * tp, int value);
 int  ggml_threadpool_chunk_add(struct ggml_threadpool * tp, int value);

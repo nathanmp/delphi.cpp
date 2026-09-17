@@ -1,6 +1,7 @@
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
 #include "ggml-cpu.h"
+#include "ggml-cpu-impl.h"
 #include "repack.h"
 #include "traits.h"
 #include "ggml-impl.h"
@@ -30,6 +31,9 @@
 #    include <windows.h>
 #else
 #    include <unistd.h>
+#    if defined(__linux__)
+#        include <sys/mman.h>
+#    endif
 #endif
 
 #if defined(__APPLE__)
@@ -38,6 +42,119 @@
 #endif
 
 // ggml-backend interface
+
+ggml_backend_buffer_type_t ggml_backend_cpu_numa_buffer_type(void);
+
+static const char * ggml_backend_cpu_numa_buffer_type_get_name(ggml_backend_buffer_type_t buft) {
+    GGML_UNUSED(buft);
+    return "CPU_NUMA";
+}
+
+static void ggml_backend_cpu_numa_buffer_free(ggml_backend_buffer_t buffer) {
+#if defined(__linux__)
+    if (munmap(buffer->context, buffer->size) != 0) {
+        GGML_LOG_ERROR("%s: munmap failed: %s\n", __func__, strerror(errno));
+    }
+#else
+    ggml_aligned_free(buffer->context, buffer->size);
+#endif
+}
+
+static void * ggml_backend_cpu_numa_buffer_base(ggml_backend_buffer_t buffer) {
+    return buffer->context;
+}
+
+static void ggml_backend_cpu_numa_buffer_memset(
+        ggml_backend_buffer_t buffer, struct ggml_tensor * tensor,
+        uint8_t value, size_t offset, size_t size) {
+    GGML_UNUSED(buffer);
+    memset((char *) tensor->data + offset, value, size);
+}
+
+static void ggml_backend_cpu_numa_buffer_set(
+        ggml_backend_buffer_t buffer, struct ggml_tensor * tensor,
+        const void * data, size_t offset, size_t size) {
+    GGML_UNUSED(buffer);
+    memcpy((char *) tensor->data + offset, data, size);
+}
+
+static void ggml_backend_cpu_numa_buffer_get(
+        ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor,
+        void * data, size_t offset, size_t size) {
+    GGML_UNUSED(buffer);
+    memcpy(data, (const char *) tensor->data + offset, size);
+}
+
+static bool ggml_backend_cpu_numa_buffer_cpy(
+        ggml_backend_buffer_t buffer, const struct ggml_tensor * src, struct ggml_tensor * dst) {
+    GGML_UNUSED(buffer);
+    if (!ggml_backend_buffer_is_host(src->buffer)) {
+        return false;
+    }
+    memcpy(dst->data, src->data, ggml_nbytes(src));
+    return true;
+}
+
+static void ggml_backend_cpu_numa_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
+    memset(buffer->context, value, buffer->size);
+}
+
+static const struct ggml_backend_buffer_i ggml_backend_cpu_numa_buffer_iface = {
+    /* .free_buffer   = */ ggml_backend_cpu_numa_buffer_free,
+    /* .get_base      = */ ggml_backend_cpu_numa_buffer_base,
+    /* .init_tensor   = */ nullptr,
+    /* .memset_tensor = */ ggml_backend_cpu_numa_buffer_memset,
+    /* .set_tensor    = */ ggml_backend_cpu_numa_buffer_set,
+    /* .get_tensor    = */ ggml_backend_cpu_numa_buffer_get,
+    /* .set_tensor_2d = */ nullptr,
+    /* .get_tensor_2d = */ nullptr,
+    /* .cpy_tensor    = */ ggml_backend_cpu_numa_buffer_cpy,
+    /* .clear         = */ ggml_backend_cpu_numa_buffer_clear,
+    /* .reset         = */ nullptr,
+};
+
+static ggml_backend_buffer_t ggml_backend_cpu_numa_buffer_type_alloc_buffer(
+        ggml_backend_buffer_type_t buft, size_t size) {
+#if defined(__linux__)
+    void * data = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (data == MAP_FAILED) {
+        GGML_LOG_ERROR("%s: mmap failed for %zu bytes: %s\n", __func__, size, strerror(errno));
+        return nullptr;
+    }
+    // Keep the default 4 KiB pages: an expert stores its nodes' row ranges back to back.
+    // A 2 MiB page often spans two of those ranges, and first touch would put it on one node only.
+    return ggml_backend_buffer_init(buft, ggml_backend_cpu_numa_buffer_iface, data, size);
+#else
+    void * data = ggml_aligned_malloc(size);
+    return data ? ggml_backend_buffer_init(buft, ggml_backend_cpu_numa_buffer_iface, data, size) : nullptr;
+#endif
+}
+
+static size_t ggml_backend_cpu_numa_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
+    GGML_UNUSED(buft);
+    return ggml_backend_buft_get_alignment(ggml_backend_cpu_buffer_type());
+}
+
+static bool ggml_backend_cpu_numa_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
+    GGML_UNUSED(buft);
+    return true;
+}
+
+ggml_backend_buffer_type_t ggml_backend_cpu_numa_buffer_type(void) {
+    static struct ggml_backend_buffer_type buft = {
+        /* .iface   = */ {
+            /* .get_name       = */ ggml_backend_cpu_numa_buffer_type_get_name,
+            /* .alloc_buffer   = */ ggml_backend_cpu_numa_buffer_type_alloc_buffer,
+            /* .get_alignment  = */ ggml_backend_cpu_numa_buffer_type_get_alignment,
+            /* .get_max_size   = */ nullptr,
+            /* .get_alloc_size = */ nullptr,
+            /* .is_host        = */ ggml_backend_cpu_numa_buffer_type_is_host,
+        },
+        /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_cpu_reg(), 0),
+        /* .context = */ nullptr,
+    };
+    return &buft;
+}
 
 std::vector<ggml_backend_buffer_type_t> & ggml_backend_cpu_get_extra_buffer_types() {
     static std::vector<ggml_backend_buffer_type_t> bufts = []() {
@@ -668,6 +785,15 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (strcmp(name, "ggml_backend_cpu_is_numa") == 0) {
         return (void *)ggml_is_numa;
+    }
+    if (strcmp(name, "ggml_backend_cpu_is_numa_tensor_mode") == 0) {
+        return (void *)ggml_numa_is_tensor_mode;
+    }
+    if (strcmp(name, "ggml_backend_cpu_numa_load_expert_tensor") == 0) {
+        return (void *)ggml_numa_load_expert_tensor;
+    }
+    if (strcmp(name, "ggml_backend_cpu_numa_buffer_type") == 0) {
+        return (void *)ggml_backend_cpu_numa_buffer_type;
     }
     if (strcmp(name, "ggml_backend_cpu_set_use_ref") == 0) {
         return (void *)ggml_backend_cpu_set_use_ref;

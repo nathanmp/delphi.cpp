@@ -2525,6 +2525,8 @@ struct common_speculative_init_result::impl {
     ~impl() = default;
 
     // note: the order in which model, context, etc. are declared matters because their destructors will be called bottom-to-top
+    common_threadpools threadpools;
+
     llama_model_ptr   model;
     llama_context_ptr context;
 };
@@ -2574,6 +2576,7 @@ common_speculative_init_result::common_speculative_init_result(
         }
 
         pimpl->context.reset(ctx_dft);
+        pimpl->threadpools.init(ctx_dft, params);
     } else if (spec_mtp) {
         model_path = params.model.path;
 
@@ -2586,6 +2589,7 @@ common_speculative_init_result::common_speculative_init_result(
         }
 
         pimpl->context.reset(ctx_dft);
+        pimpl->threadpools.init(ctx_dft, params);
     }
 }
 

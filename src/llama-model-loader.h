@@ -15,6 +15,7 @@
 #include <set>
 #include <stdexcept>
 #include <unordered_map>
+#include <unordered_set>
 
 using llama_buf_map = std::unordered_map<uint32_t, ggml_backend_buffer_t>;
 
@@ -83,6 +84,7 @@ struct llama_model_loader {
     bool check_tensors;
     bool no_alloc;
     bool load_mtp;
+    bool numa_tensors = false;
 
     // handle TENSOR_READ_LAZY
     // use case: keep PLE / engrams embd tensors on disk, read them on demand
@@ -163,6 +165,8 @@ struct llama_model_loader {
     };
 
     std::map<ctx_key, ggml_context_ptr, ctx_key_comparator> ctx_map;
+
+    std::unordered_set<std::string> numa_expert_names;
 
     // track tensors that had to be moved for debugging:
     size_t n_tensors_moved = 0;

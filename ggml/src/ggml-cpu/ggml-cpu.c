@@ -36,7 +36,9 @@
 #include <stdarg.h>
 #include <signal.h>
 #if defined(__gnu_linux__)
+#include <linux/mempolicy.h>
 #include <syscall.h>
+#include <unistd.h>
 #endif
 
 #ifdef GGML_USE_OPENMP
@@ -514,6 +516,11 @@ struct ggml_compute_state {
     bool cpumask[GGML_MAX_N_THREADS];
     struct ggml_threadpool * threadpool;
     int ith;
+    int numa_node;
+    int numa_cpu;
+    int numa_rank;
+    int numa_n_threads;
+    bool numa_node_leader;
 };
 
 // Helpers for polling loops
@@ -542,12 +549,12 @@ static inline void ggml_thread_cpu_relax(void) {;}
 // NUMA support
 //
 
-#define GGML_NUMA_MAX_NODES 8
 #define GGML_NUMA_MAX_CPUS 512
 
 struct ggml_numa_node {
     uint32_t cpus[GGML_NUMA_MAX_CPUS]; // hardware threads on this node
     uint32_t n_cpus;
+    uint32_t id; // physical Linux NUMA node id
 };
 
 struct ggml_numa_nodes {
@@ -556,6 +563,7 @@ struct ggml_numa_nodes {
     uint32_t n_nodes;
     uint32_t total_cpus; // hardware threads on system
     uint32_t current_node; // node on which main process is execting
+    double tp_share[GGML_NUMA_MAX_NODES]; // GGML_NUMA_STRATEGY_TENSORS column-split weights
 #if defined(__gnu_linux__)
     cpu_set_t cpuset; // cpuset from numactl
 #else
@@ -634,6 +642,29 @@ static uint32_t ggml_get_numa_affinity(void) {
 }
 #endif
 
+static void ggml_numa_init_tp_shares(void) {
+    const uint32_t n_nodes = g_state.numa.n_nodes;
+    double shares[GGML_NUMA_MAX_NODES];
+
+    if (!ggml_numa_tp_parse_shares(getenv("GGML_NUMA_TP_SHARES"), n_nodes, shares)) {
+        for (uint32_t n = 0; n < n_nodes; ++n) {
+            shares[n] = 1.0;
+        }
+    }
+
+    double total = 0.0;
+    for (uint32_t n = 0; n < n_nodes; ++n) {
+        total += shares[n];
+    }
+
+    GGML_LOG_INFO("numa tensors: column-split shares:");
+    for (uint32_t n = 0; n < n_nodes; ++n) {
+        g_state.numa.tp_share[n] = shares[n];
+        GGML_LOG_CONT(" node%u=%.1f%%", g_state.numa.nodes[n].id, 100.0 * shares[n] / total);
+    }
+    GGML_LOG_CONT("\n");
+}
+
 void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
     if (g_state.numa.n_nodes > 0) {
         fprintf(stderr, "ggml_numa_init: NUMA already initialized\n");
@@ -653,12 +684,13 @@ void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
 
     g_state.numa.cpuset = ggml_get_numa_affinity();
 
-    // enumerate nodes
-    while (g_state.numa.n_nodes < GGML_NUMA_MAX_NODES) {
-        rv = snprintf(path, sizeof(path), "/sys/devices/system/node/node%u", g_state.numa.n_nodes);
+    // enumerate physical nodes
+    uint32_t n_system_nodes = 0;
+    while (n_system_nodes < GGML_NUMA_MAX_NODES) {
+        rv = snprintf(path, sizeof(path), "/sys/devices/system/node/node%u", n_system_nodes);
         GGML_ASSERT(rv > 0 && (unsigned)rv < sizeof(path));
         if (stat(path, &st) != 0) { break; }
-        ++g_state.numa.n_nodes;
+        ++n_system_nodes;
     }
 
     // enumerate CPUs
@@ -669,7 +701,7 @@ void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
         ++g_state.numa.total_cpus;
     }
 
-    GGML_PRINT_DEBUG("found %u numa nodes, %u CPUs\n", g_state.numa.n_nodes, g_state.numa.total_cpus);
+    GGML_PRINT_DEBUG("found %u numa nodes, %u CPUs\n", n_system_nodes, g_state.numa.total_cpus);
 
     // figure out which node we're on
     uint current_cpu;
@@ -684,26 +716,53 @@ void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
     getcpu_ret = syscall(SYS_getcpu, &current_cpu, &g_state.numa.current_node);
 #endif
 
-    if (g_state.numa.n_nodes < 1 || g_state.numa.total_cpus < 1 || getcpu_ret != 0) {
+    if (n_system_nodes < 1 || g_state.numa.total_cpus < 1 || getcpu_ret != 0) {
         g_state.numa.n_nodes = 0;
         return;
     }
 
     GGML_PRINT_DEBUG("found our process on numa node %u, CPU %u\n", g_state.numa.current_node, current_cpu);
 
-    for (uint32_t n = 0; n < g_state.numa.n_nodes; ++n) {
-        struct ggml_numa_node * node = &g_state.numa.nodes[n];
+    uint32_t n_active_nodes = 0;
+    for (uint32_t n = 0; n < n_system_nodes; ++n) {
+        struct ggml_numa_node node = {0};
+        node.id = n;
         GGML_PRINT_DEBUG("CPUs on node %u:", n);
-        node->n_cpus = 0;
         for (uint32_t c = 0; c < g_state.numa.total_cpus; ++c) {
             rv = snprintf(path, sizeof(path), "/sys/devices/system/node/node%u/cpu%u", n, c);
             GGML_ASSERT(rv > 0 && (unsigned)rv < sizeof(path));
-            if (stat(path, &st) == 0) {
-                node->cpus[node->n_cpus++] = c;
+            if (stat(path, &st) == 0 &&
+                    (numa_flag != GGML_NUMA_STRATEGY_TENSORS || CPU_ISSET(c, &g_state.numa.cpuset))) {
+                node.cpus[node.n_cpus++] = c;
                 GGML_PRINT_DEBUG(" %u", c);
             }
         }
         GGML_PRINT_DEBUG("\n");
+
+        if (numa_flag == GGML_NUMA_STRATEGY_TENSORS) {
+            if (node.n_cpus > 0) {
+                g_state.numa.nodes[n_active_nodes++] = node;
+            }
+        } else {
+            g_state.numa.nodes[n] = node;
+        }
+    }
+    g_state.numa.n_nodes = (numa_flag == GGML_NUMA_STRATEGY_TENSORS) ? n_active_nodes : n_system_nodes;
+
+    if (numa_flag == GGML_NUMA_STRATEGY_TENSORS) {
+        if (g_state.numa.n_nodes < 2) {
+            GGML_ABORT("--numa tensors requires at least two NUMA nodes allowed by the process affinity mask");
+        }
+        GGML_LOG_INFO("numa tensors: active nodes and affinity-allowed CPUs:\n");
+        for (uint32_t n = 0; n < g_state.numa.n_nodes; ++n) {
+            const struct ggml_numa_node * node = &g_state.numa.nodes[n];
+            GGML_LOG_INFO("numa tensors: node %u CPUs", node->id);
+            for (uint32_t c = 0; c < node->n_cpus; ++c) {
+                GGML_LOG_CONT(" %u", node->cpus[c]);
+            }
+            GGML_LOG_CONT("\n");
+        }
+        ggml_numa_init_tp_shares();
     }
 
     if (ggml_is_numa()) {
@@ -717,6 +776,9 @@ void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
         }
     }
 #else
+    if (numa_flag == GGML_NUMA_STRATEGY_TENSORS) {
+        GGML_ABORT("--numa tensors is supported only on Linux");
+    }
     UNUSED(numa_flag);
     // TODO
 #endif
@@ -724,6 +786,126 @@ void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
 
 bool ggml_is_numa(void) {
     return g_state.numa.n_nodes > 1;
+}
+
+bool ggml_numa_is_tensor_mode(void) {
+    return g_state.numa.numa_strategy == GGML_NUMA_STRATEGY_TENSORS;
+}
+
+uint32_t ggml_numa_get_node_count(void) {
+    return ggml_numa_is_tensor_mode() ? g_state.numa.n_nodes : 0;
+}
+
+void ggml_numa_tp_row_range_for_node(
+        uint32_t node, int64_t n_rows, int64_t align, int64_t * row_start, int64_t * row_end) {
+    ggml_numa_tp_row_range(g_state.numa.tp_share, g_state.numa.n_nodes, node, n_rows, align, row_start, row_end);
+}
+
+#if defined(__gnu_linux__)
+struct ggml_numa_load_worker {
+    struct ggml_tensor * tensor;
+    const void * data;
+    uint32_t node;
+    uint32_t rank;      // index of this worker inside its node
+    uint32_t n_workers; // workers on this node
+    int result;
+};
+
+// Loader threads per node. One thread per node makes the copy and repack single-threaded per socket, which is slow for a large model.
+#define GGML_NUMA_LOAD_WORKERS_PER_NODE 8
+
+static void * ggml_numa_load_expert_worker(void * userdata) {
+    struct ggml_numa_load_worker * worker = (struct ggml_numa_load_worker *) userdata;
+    const struct ggml_numa_node * node = &g_state.numa.nodes[worker->node];
+
+    const uint32_t cpu = node->cpus[worker->rank % node->n_cpus];
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(cpu, &cpuset);
+    const int rv = pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+    if (rv != 0) {
+        GGML_LOG_ERROR("numa tensors: failed to pin loader for node %u to CPU %u: %s\n",
+                node->id, cpu, strerror(rv));
+        worker->result = rv;
+        return NULL;
+    }
+    // Linux memory policy is per-thread, so this bind makes first touch land on the wanted node.
+    // The policy goes away with the loader thread and never moves a page that exists.
+    unsigned long node_mask = 1UL << node->id;
+    const long policy_result = syscall(
+            SYS_set_mempolicy, MPOL_BIND, &node_mask, sizeof(node_mask) * CHAR_BIT);
+    if (policy_result != 0) {
+        GGML_LOG_ERROR("numa tensors: failed to bind loader memory policy to node %u: %s\n",
+                node->id, strerror(errno));
+        worker->result = errno;
+        return NULL;
+    }
+
+    // column split: this node touches every expert, but only its own row range of each one
+    int64_t row_start, row_end;
+    ggml_numa_tp_row_range(g_state.numa.tp_share, g_state.numa.n_nodes, worker->node,
+            worker->tensor->ne[1], GGML_NUMA_TP_PLAIN_ALIGN, &row_start, &row_end);
+
+    if (row_start >= row_end) {
+        return NULL;
+    }
+
+    const size_t expert_size = worker->tensor->nb[2];
+    const size_t row_size    = worker->tensor->nb[1];
+
+    for (int64_t expert = worker->rank; expert < worker->tensor->ne[2]; expert += worker->n_workers) {
+        memcpy(
+                (char *) worker->tensor->data + expert * expert_size + row_start * row_size,
+                (const char *) worker->data + expert * expert_size + row_start * row_size,
+                (size_t) (row_end - row_start) * row_size);
+    }
+
+    return NULL;
+}
+
+#endif
+
+bool ggml_numa_load_expert_tensor(struct ggml_tensor * tensor, const void * data, size_t size) {
+    if (!ggml_numa_is_tensor_mode() || !tensor || !data || tensor->ne[2] < 1 ||
+            tensor->ne[3] != 1 || size != ggml_nbytes(tensor)) {
+        return false;
+    }
+
+#if defined(__gnu_linux__)
+    struct ggml_numa_load_worker workers[GGML_NUMA_MAX_NODES * GGML_NUMA_LOAD_WORKERS_PER_NODE] = {0};
+    pthread_t threads[GGML_NUMA_MAX_NODES * GGML_NUMA_LOAD_WORKERS_PER_NODE] = {0};
+
+    uint32_t n_workers = 0;
+    for (uint32_t node = 0; node < g_state.numa.n_nodes; ++node) {
+        const uint32_t per_node = MIN(
+                (uint32_t) GGML_NUMA_LOAD_WORKERS_PER_NODE, g_state.numa.nodes[node].n_cpus);
+        for (uint32_t rank = 0; rank < per_node; ++rank, ++n_workers) {
+            workers[n_workers].tensor    = tensor;
+            workers[n_workers].data      = data;
+            workers[n_workers].node      = node;
+            workers[n_workers].rank      = rank;
+            workers[n_workers].n_workers = per_node;
+            const int result = pthread_create(
+                    &threads[n_workers], NULL, ggml_numa_load_expert_worker, &workers[n_workers]);
+            if (result != 0) {
+                GGML_ABORT("numa tensors: failed to create loader for node %u: %s",
+                        g_state.numa.nodes[node].id, strerror(result));
+            }
+        }
+    }
+
+    bool ok = true;
+    for (uint32_t i = 0; i < n_workers; ++i) {
+        pthread_join(threads[i], NULL);
+        ok = ok && workers[i].result == 0;
+    }
+    return ok;
+#else
+    UNUSED(tensor);
+    UNUSED(data);
+    UNUSED(size);
+    return false;
+#endif
 }
 
 #if defined(__ARM_ARCH)
@@ -1551,6 +1733,11 @@ static void ggml_compute_forward_mul_mat_id(
 
     const int ith = params->ith;
     const int nth = params->nth;
+    const bool numa_tensors = ggml_numa_is_tensor_mode() && (src0->flags & GGML_TENSOR_FLAG_NUMA_EXPERT) != 0;
+    const int work_ith = numa_tensors ? params->numa_rank : ith;
+    const int work_nth = numa_tensors ? params->numa_n_threads : nth;
+    const uint32_t n_nodes = numa_tensors ? ggml_numa_get_node_count() : 1;
+    const uint32_t numa_node = numa_tensors ? (uint32_t) params->numa_node : 0;
 
     const enum ggml_type type = src0->type;
 
@@ -1574,9 +1761,12 @@ static void ggml_compute_forward_mul_mat_id(
     const int n_as  = ne02;       // n_expert
 
     void * wdata_cur = params->wdata;
+    size_t src1_scratch_stride = 0;
 
     if (src1->type != vec_dot_type) {
-        incr_ptr_aligned(&wdata_cur, ggml_row_size(vec_dot_type, ggml_nelements(src1)), sizeof(int64_t));
+        src1_scratch_stride = GGML_PAD(
+                ggml_row_size(vec_dot_type, ggml_nelements(src1)), sizeof(int64_t));
+        incr_ptr_aligned(&wdata_cur, src1_scratch_stride * n_nodes, sizeof(int64_t));
     }
 
     int64_t * matrix_row_counts = // [n_as]
@@ -1585,8 +1775,11 @@ static void ggml_compute_forward_mul_mat_id(
     struct mmid_row_mapping * matrix_rows = // [n_as][ids->ne[0]*ids->ne[1]]
         incr_ptr_aligned(&wdata_cur, n_as*ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping), sizeof(int64_t));
 
-    char (*atomic_current_chunk)[CACHE_LINE_SIZE] = // [n_as]
-        incr_ptr_aligned(&wdata_cur, CACHE_LINE_SIZE * n_as, CACHE_LINE_SIZE);
+    // Every node claims chunks over the same experts, so each node needs its own counter block.
+    // The block is node-major to keep a node's counters in its own cache lines.
+    char (*atomic_current_chunk)[CACHE_LINE_SIZE] = // [n_nodes][n_as]
+        incr_ptr_aligned(&wdata_cur, CACHE_LINE_SIZE * n_as * n_nodes, CACHE_LINE_SIZE);
+    char (*node_current_chunk)[CACHE_LINE_SIZE] = atomic_current_chunk + (size_t) numa_node * n_as;
 
     // IQ panel gemm (see iqp.h); per expert eligibility is decided below, but the work buffer is
     // reserved for the whole node (ggml_graph_plan sizes it without params, use_ref only skips the dispatch)
@@ -1601,14 +1794,14 @@ static void ggml_compute_forward_mul_mat_id(
     GGML_ASSERT(params->wsize >= (size_t)((char *) wdata_cur - (char *) params->wdata));
 
     if (src1->type != vec_dot_type) {
-        char * wdata = params->wdata;
+        char * wdata = (char *) params->wdata + numa_node * src1_scratch_stride;
 
         const size_t nbw0 = ggml_type_size(vec_dot_type);
         const size_t nbw1 = ggml_row_size(vec_dot_type, ne10);
         const size_t nbw2 = nbw1*ne11;
         const size_t nbw3 = nbw2*ne12;
 
-        assert(params->wsize >= ne13*nbw3);
+        assert(params->wsize >= src1_scratch_stride * n_nodes);
         GGML_ASSERT(src1->type == GGML_TYPE_F32);
 
 #if 0
@@ -1626,8 +1819,8 @@ static void ggml_compute_forward_mul_mat_id(
             for (int64_t i12 = 0; i12 < ne12; ++i12) {
                 for (int64_t i11 = 0; i11 < ne11; ++i11) {
                     size_t bs = ggml_blck_size(vec_dot_type);
-                    int64_t ne10_block_start = (ith * ne10/bs) / nth;
-                    int64_t ne10_block_end   = ((ith + 1) * ne10/bs) / nth;
+                    int64_t ne10_block_start = (work_ith * ne10/bs) / work_nth;
+                    int64_t ne10_block_end   = ((work_ith + 1) * ne10/bs) / work_nth;
                     from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10),
                                (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0),
                                (ne10_block_end - ne10_block_start) * bs);
@@ -1654,33 +1847,44 @@ static void ggml_compute_forward_mul_mat_id(
         }
     }
 
-    // reset current_chunk
-    for (int cur_a = ith; cur_a < n_as; cur_a += nth) {
-        atomic_int * current_chunk_ctr = (atomic_int *)(atomic_current_chunk + cur_a);
-        *current_chunk_ctr = nth;
+    // reset the per-expert work counter - each node writes its own block, so the stores stay local
+    for (int cur_a = work_ith; cur_a < n_as; cur_a += work_nth) {
+        atomic_int * current_chunk_ctr = (atomic_int *)(node_current_chunk + cur_a);
+        *current_chunk_ctr = work_nth;
     }
 
     ggml_barrier(params->threadpool);
 
-    for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+    // column split: this node owns rows [numa_row0_start, numa_row0_end) of every expert, and its workers share that range
+    int64_t numa_row0_start = 0;
+    int64_t numa_row0_end   = ne01;
+    if (numa_tensors) {
+        ggml_numa_tp_row_range_for_node(
+                numa_node, ne01, GGML_NUMA_TP_PLAIN_ALIGN, &numa_row0_start, &numa_row0_end);
+    }
+
+    for (int cur_a = 0; cur_a < n_as && numa_row0_start < numa_row0_end; ++cur_a) {
         const int64_t cne1 = matrix_row_counts[cur_a];
 
         if (cne1 == 0) {
             continue;
         }
 
+        const char * src0_cur = (const char *) src0->data + cur_a * nb02;
+        const void * wdata = (src1->type == vec_dot_type)
+            ? src1->data
+            : (const char *) params->wdata + numa_node * src1_scratch_stride;
+
         if (iqp && ggml_cpu_iqp_mul_mat_id_min_batch(cne1)) {
             ggml_compute_forward_mul_mat_id_iqp(params, dst, cur_a, cne1, (const int32_t *) &MMID_MATRIX_ROW(cur_a, 0),
-                                                iqp_panels);
+                                                iqp_panels, wdata,
+                                                numa_row0_start, numa_row0_end, work_ith, work_nth);
 
             continue;
         }
-
-        const char * src0_cur = (const char *) src0->data + cur_a * nb02;
-        const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
-        const int64_t nr0 = ne01;
+        const int64_t nr0 = numa_row0_end - numa_row0_start;
         const int64_t nr1 = cne1;
 
         int chunk_size = 16;
@@ -1694,24 +1898,24 @@ static void ggml_compute_forward_mul_mat_id(
         int64_t nchunk0 = (nr0 + chunk_size - 1) / chunk_size;
         int64_t nchunk1 = (nr1 + chunk_size - 1) / chunk_size;
 
-        if (nchunk0 * nchunk1 < nth * 4 || disable_chunking) {
-            nchunk0 = nr0 > nr1 ? nth : 1;
-            nchunk1 = nr0 > nr1 ? 1 : nth;
+        if (nchunk0 * nchunk1 < work_nth * 4 || disable_chunking) {
+            nchunk0 = nr0 > nr1 ? work_nth : 1;
+            nchunk1 = nr0 > nr1 ? 1 : work_nth;
         }
 
         const int64_t dr0 = (nr0 + nchunk0 - 1) / nchunk0;
         const int64_t dr1 = (nr1 + nchunk1 - 1) / nchunk1;
 
-        int current_chunk = ith;
+        int current_chunk = work_ith;
 
-        atomic_int * current_chunk_ctr = (atomic_int *)(atomic_current_chunk + cur_a);
+        atomic_int * current_chunk_ctr = (atomic_int *)(node_current_chunk + cur_a);
 
         while (current_chunk < nchunk0 * nchunk1) {
             const int64_t ith0 = current_chunk % nchunk0;
             const int64_t ith1 = current_chunk / nchunk0;
 
-            const int64_t ir0_start = dr0 * ith0;
-            const int64_t ir0_end = MIN(ir0_start + dr0, nr0);
+            const int64_t ir0_start = numa_row0_start + dr0 * ith0;
+            const int64_t ir0_end = MIN(ir0_start + dr0, numa_row0_end);
 
             const int64_t ir1_start = dr1 * ith1;
             const int64_t ir1_end = MIN(ir1_start + dr1, nr1);
@@ -1722,7 +1926,7 @@ static void ggml_compute_forward_mul_mat_id(
                 src0_cur, matrix_rows, row_size, src1_cont, wdata
             );
 
-            if (nth >= nchunk0 * nchunk1) {
+            if (work_nth >= nchunk0 * nchunk1) {
                 break;
             }
 
@@ -2170,11 +2374,15 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
 
 // Android's libc implementation "bionic" does not support setting affinity
 #if defined(__gnu_linux__)
-static void set_numa_thread_affinity(int thread_n) {
+// CPU this thread is pinned to under --numa tensors, -1 when not pinned
+static _Thread_local int ggml_numa_pinned_cpu = -1;
+
+static void set_numa_thread_affinity(const struct ggml_compute_state * state) {
     if (!ggml_is_numa()) {
         return;
     }
 
+    const int thread_n = state->ith;
     int node_num;
     int rv;
     size_t setsize = CPU_ALLOC_SIZE(g_state.numa.total_cpus);
@@ -2195,6 +2403,25 @@ static void set_numa_thread_affinity(int thread_n) {
                 fprintf(stderr, "warning: pthread_setaffinity_np() failed: %s\n",strerror(rv));
             }
             return;
+        case GGML_NUMA_STRATEGY_TENSORS: {
+            // A worker keeps its CPU for the life of the threadpool, but this runs once per graph split.
+            // The syscall costs more than the node split saves, so only call it when the CPU changes.
+            if (ggml_numa_pinned_cpu == state->numa_cpu) {
+                return;
+            }
+            cpu_set_t * cpus = CPU_ALLOC(g_state.numa.total_cpus);
+            CPU_ZERO_S(setsize, cpus);
+            CPU_SET_S(state->numa_cpu, setsize, cpus);
+            rv = pthread_setaffinity_np(pthread_self(), setsize, cpus);
+            if (rv) {
+                fprintf(stderr, "warning: failed to pin NUMA tensor worker %d to CPU %d: %s\n",
+                        thread_n, state->numa_cpu, strerror(rv));
+            } else {
+                ggml_numa_pinned_cpu = state->numa_cpu;
+            }
+            CPU_FREE(cpus);
+            return;
+        }
         default:
             return;
     }
@@ -2225,20 +2452,23 @@ static void clear_numa_thread_affinity(void) {
     cpu_set_t * cpus = CPU_ALLOC(g_state.numa.total_cpus);
     CPU_ZERO_S(setsize, cpus);
     for (unsigned i = 0; i < g_state.numa.total_cpus; ++i) {
-        CPU_SET_S(i, setsize, cpus);
+        if (!ggml_numa_is_tensor_mode() || CPU_ISSET(i, &g_state.numa.cpuset)) {
+            CPU_SET_S(i, setsize, cpus);
+        }
     }
 
     int rv = pthread_setaffinity_np(pthread_self(), setsize, cpus);
     if (rv) {
         fprintf(stderr, "warning: pthread_setaffinity_np() failed: %s\n", strerror(rv));
     }
+    ggml_numa_pinned_cpu = -1;
 
     CPU_FREE(cpus);
 }
 #else
 // TODO: Windows etc.
 // (the linux implementation may also work on BSD, someone should test)
-static void set_numa_thread_affinity(int thread_n) { UNUSED(thread_n);  }
+static void set_numa_thread_affinity(const struct ggml_compute_state * state) { UNUSED(state); }
 static void clear_numa_thread_affinity(void) {}
 #endif
 
@@ -2734,6 +2964,64 @@ static void ggml_thread_cpumask_next(const bool * global_mask, bool * local_mask
     }
 }
 
+static void ggml_numa_assign_workers(
+        const struct ggml_threadpool_params * tpp,
+        struct ggml_compute_state * workers) {
+    if (!ggml_numa_is_tensor_mode()) {
+        return;
+    }
+
+#if defined(__gnu_linux__)
+    if ((uint32_t) tpp->n_threads < g_state.numa.n_nodes) {
+        GGML_ABORT("--numa tensors needs at least one worker per active NUMA node (%d workers, %u nodes)",
+                tpp->n_threads, g_state.numa.n_nodes);
+    }
+
+    const bool has_user_mask = ggml_thread_cpumask_is_valid(tpp->cpumask);
+    uint32_t allowed_cpus[GGML_NUMA_MAX_NODES][GGML_NUMA_MAX_CPUS] = {{0}};
+    uint32_t node_cpus[GGML_NUMA_MAX_NODES] = {0};
+    uint32_t node_workers[GGML_NUMA_MAX_NODES] = {0};
+
+    for (uint32_t node = 0; node < g_state.numa.n_nodes; ++node) {
+        const struct ggml_numa_node * topology = &g_state.numa.nodes[node];
+        for (uint32_t i = 0; i < topology->n_cpus; ++i) {
+            const uint32_t cpu = topology->cpus[i];
+            if (!has_user_mask || (cpu < GGML_MAX_N_THREADS && tpp->cpumask[cpu])) {
+                allowed_cpus[node][node_cpus[node]++] = cpu;
+            }
+        }
+        if (node_cpus[node] == 0) {
+            GGML_ABORT("--numa tensors CPU mask leaves NUMA node %u without a usable CPU", topology->id);
+        }
+    }
+
+    GGML_ASSERT(ggml_numa_partition_workers(
+            node_cpus, g_state.numa.n_nodes, tpp->n_threads, node_workers));
+
+    uint32_t ith = 0;
+    for (uint32_t node = 0; node < g_state.numa.n_nodes; ++node) {
+        const uint32_t first = ith;
+        GGML_LOG_INFO("numa tensors: node %u workers %u-%u CPUs",
+                g_state.numa.nodes[node].id, first, first + node_workers[node] - 1);
+        for (uint32_t rank = 0; rank < node_workers[node]; ++rank, ++ith) {
+            const uint32_t cpu = allowed_cpus[node][rank % node_cpus[node]];
+            workers[ith].numa_node        = node;
+            workers[ith].numa_cpu         = cpu;
+            workers[ith].numa_rank        = rank;
+            workers[ith].numa_n_threads   = node_workers[node];
+            workers[ith].numa_node_leader = rank == 0;
+            memset(workers[ith].cpumask, 0, sizeof(workers[ith].cpumask));
+            workers[ith].cpumask[cpu] = true;
+            GGML_LOG_CONT(" %u", cpu);
+        }
+        GGML_LOG_CONT("\n");
+    }
+#else
+    UNUSED(tpp);
+    UNUSED(workers);
+#endif
+}
+
 void ggml_threadpool_free(struct ggml_threadpool* threadpool) {
     if (!threadpool) return;
 
@@ -2897,16 +3185,23 @@ struct ggml_cplan ggml_graph_plan(
                         const struct ggml_tensor * ids = node->src[2];
                         const enum ggml_type vec_dot_type = type_traits_cpu[src0->type].vec_dot_type;
                         const int n_as = src0->ne[2];
+                        // --numa tensors gives every NUMA node a private src1 conversion and chunk counter block
+                        const bool numa_tensors = ggml_numa_is_tensor_mode() &&
+                            (src0->flags & GGML_TENSOR_FLAG_NUMA_EXPERT) != 0;
+                        const size_t n_nodes = numa_tensors ? ggml_numa_get_node_count() : 1;
                         // src1
                         if (src1->type != vec_dot_type) {
-                            cur += ggml_row_size(vec_dot_type, ggml_nelements(src1)) + sizeof(int64_t);
+                            const size_t src1_size = ggml_row_size(vec_dot_type, ggml_nelements(src1));
+                            cur += numa_tensors
+                                ? GGML_PAD(src1_size, sizeof(int64_t)) * n_nodes
+                                : src1_size + sizeof(int64_t);
                         }
                         // matrix_row_counts
                         cur += n_as * sizeof(int64_t) + sizeof(int64_t);
                         // matrix_rows
                         cur += n_as*ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping) + sizeof(int64_t);
                         // atomic_current_chunk
-                        cur += CACHE_LINE_SIZE*n_as + CACHE_LINE_SIZE;
+                        cur += CACHE_LINE_SIZE*n_as*n_nodes + CACHE_LINE_SIZE;
                         // the IQ panel path needs one scratch panel per thread on top of that
                         if (ggml_cpu_iqp_supports_mul_mat_id(node)) {
                             cur += n_tasks * ggml_cpu_iqp_scratch_size(node) + 64;
@@ -3108,7 +3403,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 #ifdef GGML_USE_CPU_RISCV64_SPACEMIT
     ggml_backend_cpu_riscv64_spacemit_set_numa_thread_affinity(state->ith);
 #else
-    set_numa_thread_affinity(state->ith);
+    set_numa_thread_affinity(state);
 #endif
 
     struct ggml_compute_params params = {
@@ -3117,6 +3412,10 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         /*.wsize      =*/ cplan->work_size,
         /*.wdata      =*/ cplan->work_data,
         /*.threadpool =*/ tp,
+        /*.numa_node  =*/ state->numa_node,
+        /*.numa_rank  =*/ state->numa_rank,
+        /*.numa_n_threads =*/ state->numa_n_threads,
+        /*.numa_node_leader =*/ state->numa_node_leader,
         /*.use_ref    =*/ cplan->use_ref,
     };
 
@@ -3343,16 +3642,20 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
     for (int j = 0; j < tpp->n_threads; j++) {
         workers[j].threadpool = threadpool;
         workers[j].ith        = j;
+        workers[j].numa_cpu   = -1;
     }
 
     threadpool->workers = workers;
+    ggml_numa_assign_workers(tpp, workers);
 
 #ifdef GGML_USE_OPENMP
     int32_t cpumask_iter = 0;
 
     // Compute CPU masks for each thread
     for (int j = 0; j < tpp->n_threads; j++) {
-        ggml_thread_cpumask_next(tpp->cpumask, workers[j].cpumask, tpp->strict_cpu, &cpumask_iter);
+        if (!ggml_numa_is_tensor_mode()) {
+            ggml_thread_cpumask_next(tpp->cpumask, workers[j].cpumask, tpp->strict_cpu, &cpumask_iter);
+        }
     }
 #else // GGML_USE_OPENMP
     ggml_mutex_init(&threadpool->mutex);
@@ -3364,13 +3667,17 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
     int32_t cpumask_iter = 0;
 
     for (int j = 1; j < tpp->n_threads; j++) {
-        ggml_thread_cpumask_next(tpp->cpumask, workers[j].cpumask, tpp->strict_cpu, &cpumask_iter);
+        if (!ggml_numa_is_tensor_mode()) {
+            ggml_thread_cpumask_next(tpp->cpumask, workers[j].cpumask, tpp->strict_cpu, &cpumask_iter);
+        }
 
         int32_t rc = ggml_thread_create(&workers[j].thrd, NULL, ggml_graph_compute_secondary_thread, &workers[j]);
         GGML_ASSERT(rc == 0);
     }
 
-    ggml_thread_cpumask_next(tpp->cpumask, workers[0].cpumask, tpp->strict_cpu, &cpumask_iter);
+    if (!ggml_numa_is_tensor_mode()) {
+        ggml_thread_cpumask_next(tpp->cpumask, workers[0].cpumask, tpp->strict_cpu, &cpumask_iter);
+    }
 
     if (!threadpool->pause) {
         // Update main thread prio and affinity at the start, otherwise we'll do it in resume
@@ -3431,7 +3738,8 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
             int ith = omp_get_thread_num();
 
             ggml_thread_apply_priority(threadpool->prio);
-            if (ggml_thread_cpumask_is_valid(threadpool->workers[ith].cpumask)) {
+            // --numa tensors pins in set_numa_thread_affinity() and caches it, so do not apply the mask again here
+            if (!ggml_numa_is_tensor_mode() && ggml_thread_cpumask_is_valid(threadpool->workers[ith].cpumask)) {
                 ggml_thread_apply_affinity(threadpool->workers[ith].cpumask);
             }
             ggml_graph_compute_thread(&threadpool->workers[ith]);

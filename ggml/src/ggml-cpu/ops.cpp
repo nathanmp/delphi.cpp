@@ -1,6 +1,7 @@
 #include "ops.h"
 
 #include "ggml-cpu.h"
+#include "ggml-cpu-impl.h"
 #include "ggml-impl.h"
 #include "binary-ops.h"
 #include "simd-gemm.h"
@@ -3173,6 +3174,35 @@ static void ggml_compute_forward_geglu(
     }
 }
 
+// Column split for the MoE GLU under --numa tensors.
+// The fused-expert GLU has only n_expert_used rows, so the row split leaves most workers idle and runs the stage on one node.
+// A split of the element dimension instead keeps each node on the columns it wrote in the preceding MUL_MAT_ID.
+// The op is elementwise, so any partition of (row, element) gives the same result.
+static bool ggml_numa_glu_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char * v = getenv("GGML_NUMA_GLU");
+        enabled = v ? atoi(v) != 0 : 1;
+    }
+    return enabled != 0;
+}
+
+static bool ggml_numa_glu_range(
+        const ggml_compute_params * params, int nc, int nr, int64_t * c0, int64_t * c1) {
+    if (!ggml_numa_glu_enabled() || !ggml_numa_is_tensor_mode() ||
+            nr >= params->nth || params->numa_n_threads <= 0) {
+        return false;
+    }
+
+    int64_t node_start, node_end;
+    ggml_numa_tp_row_range_for_node((uint32_t) params->numa_node, nc, 1, &node_start, &node_end);
+
+    const int64_t node_cols = node_end - node_start;
+    *c0 = node_start + ((int64_t) params->numa_rank       * node_cols) / params->numa_n_threads;
+    *c1 = node_start + ((int64_t) (params->numa_rank + 1) * node_cols) / params->numa_n_threads;
+    return true;
+}
+
 // ggml_compute_forward_swiglu
 
 static void ggml_compute_forward_swiglu_f32(
@@ -3206,11 +3236,18 @@ static void ggml_compute_forward_swiglu_f32(
     const int32_t swapped = ggml_get_op_params_i32(dst, 1);
 
     // rows per thread
-    const int dr = (nr + nth - 1)/nth;
+    int dr = (nr + nth - 1)/nth;
 
     // row range for this thread
-    const int ir0 = dr*ith;
-    const int ir1 = MIN(ir0 + dr, nr);
+    int ir0 = dr*ith;
+    int ir1 = MIN(ir0 + dr, nr);
+
+    // --numa tensors: split the element dimension instead when the row split leaves workers idle
+    int64_t kc0 = 0, kc1 = nc;
+    if (src1 && ggml_numa_glu_range(params, nc, nr, &kc0, &kc1)) {
+        ir0 = 0;
+        ir1 = nr;
+    }
 
     for (int i1 = ir0; i1 < ir1; i1++) {
         float * src0_p = (float *) (src0_d + i1*src0_o);
@@ -3221,10 +3258,11 @@ static void ggml_compute_forward_swiglu_f32(
             src1_p += swapped ? 0 : nc;
         }
 
-        ggml_vec_swiglu_f32(nc, (float *) ((char *) dst->data + i1*(dst->nb[1])), src0_p, src1_p);
+        ggml_vec_swiglu_f32(kc1 - kc0, (float *) ((char *) dst->data + i1*(dst->nb[1])) + kc0,
+                            src0_p + kc0, src1_p + kc0);
 
 #ifndef NDEBUG
-        for (int k = 0; k < nc; k++) {
+        for (int64_t k = kc0; k < kc1; k++) {
             const float x = ((float *) ((char *) dst->data + i1*( dst->nb[1])))[k];
             GGML_UNUSED(x);
             assert(!isnan(x));
@@ -3433,9 +3471,16 @@ static void ggml_compute_forward_swiglu_clamp_f32(const ggml_compute_params * pa
     const int32_t swapped = ggml_get_op_params_i32(dst, 1);
     const float   limit   = ggml_get_op_params_f32(dst, 3);
 
-    const int dr  = (nr + nth - 1) / nth;
-    const int ir0 = dr * ith;
-    const int ir1 = MIN(ir0 + dr, nr);
+    int dr  = (nr + nth - 1) / nth;
+    int ir0 = dr * ith;
+    int ir1 = MIN(ir0 + dr, nr);
+
+    // --numa tensors: split the element dimension instead when the row split leaves workers idle
+    int64_t kc0 = 0, kc1 = nc;
+    if (src1 && ggml_numa_glu_range(params, nc, nr, &kc0, &kc1)) {
+        ir0 = 0;
+        ir1 = nr;
+    }
 
     for (int i1 = ir0; i1 < ir1; i1++) {
         float * src0_p = (float *) (src0_d + i1 * src0_o);
@@ -3447,14 +3492,14 @@ static void ggml_compute_forward_swiglu_clamp_f32(const ggml_compute_params * pa
             src1_p += swapped ? 0 : nc;
         }
 
-        for (int k = 0; k < nc; k++) {
+        for (int64_t k = kc0; k < kc1; k++) {
             const float gate = std::min(src0_p[k], limit);
             const float up   = std::clamp(src1_p[k], -limit, limit);
             dst_p[k]         = gate / (1.f + expf(-gate)) * up;
         }
 
 #ifndef NDEBUG
-        for (int k = 0; k < nc; k++) {
+        for (int64_t k = kc0; k < kc1; k++) {
             const float x = dst_p[k];
             GGML_UNUSED(x);
             assert(!isnan(x));

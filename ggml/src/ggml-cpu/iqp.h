@@ -27,12 +27,19 @@ size_t ggml_cpu_iqp_scratch_size(const struct ggml_tensor * dst);
 void ggml_compute_forward_mul_mat_iqp(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 
 // one expert: expert_rows points at its row of the matrix_rows table of (i1, i2) int32 pairs, panels at the base of the per thread panel scratches
+// src1_wdata is the src1 conversion this caller must read - --numa tensors keeps one copy per node
+// [row_start, row_end) is the ne01 slice to compute, work_ith/work_nth the worker team that shares it
 void ggml_compute_forward_mul_mat_id_iqp(const struct ggml_compute_params * params,
                                          struct ggml_tensor *               dst,
                                          int64_t                            cur_a,
                                          int64_t                            cne1,
                                          const int32_t *                    expert_rows,
-                                         void *                             panels);
+                                         void *                             panels,
+                                         const void *                       src1_wdata,
+                                         int64_t                            row_start,
+                                         int64_t                            row_end,
+                                         int                                work_ith,
+                                         int                                work_nth);
 
 #ifdef __cplusplus
 }

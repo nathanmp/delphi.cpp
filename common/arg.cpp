@@ -2721,12 +2721,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "- distribute: spread execution evenly over all nodes\n"
         "- isolate: only spawn threads on CPUs on the node that execution started on\n"
         "- numactl: use the CPU map provided by numactl\n"
+        "- tensors: column-split each CPU MoE expert's weights across every affinity-allowed NUMA\n"
+        "  node and compute every node's share of every expert (set GGML_NUMA_TP_SHARES=w0,w1,...\n"
+        "  to weight nodes unevenly; default is an even split)\n"
         "if run without this previously, it is recommended to drop the system page cache before using this\n"
         "see https://github.com/ggml-org/llama.cpp/issues/1437",
         [](common_params & params, const std::string & value) {
             /**/ if (value == "distribute" || value == "") { params.numa = GGML_NUMA_STRATEGY_DISTRIBUTE; }
             else if (value == "isolate") { params.numa = GGML_NUMA_STRATEGY_ISOLATE; }
             else if (value == "numactl") { params.numa = GGML_NUMA_STRATEGY_NUMACTL; }
+            else if (value == "tensors") { params.numa = GGML_NUMA_STRATEGY_TENSORS; }
             else { throw std::invalid_argument("invalid value"); }
         }
     ).set_env("LLAMA_ARG_NUMA"));
