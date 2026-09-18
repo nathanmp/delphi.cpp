@@ -1,5 +1,6 @@
 #include "cpy.cuh"
 #include "dequantize.cuh"
+#include "dequantize-iqk.cuh"
 #include "cpy-utils.cuh"
 #if defined(GGML_USE_MUSA) && defined(GGML_MUSA_MUDNN_COPY)
 #include "ggml-musa/mudnn.cuh"
@@ -374,6 +375,24 @@ static void ggml_cpy_q5_1_f32_cuda(
         ne10, ne11, ne12, nb10, nb11, nb12, nb13);
 }
 
+static void ggml_cpy_iqk_f32_cuda(
+        const char * cx, char * cdst, const ggml_type type, const int64_t nrows,
+        const int64_t n_per_row, cudaStream_t stream) {
+    float * dst = (float *) cdst;
+    switch (type) {
+        case GGML_TYPE_IQ2_K:  return dequantize_row_iq2_k_cuda<float>(cx, dst, nrows, n_per_row, stream);
+        case GGML_TYPE_IQ3_K:  return dequantize_row_iq3_k_cuda<float>(cx, dst, nrows, n_per_row, stream);
+        case GGML_TYPE_IQ4_K:  return dequantize_row_iq4_k_cuda<float>(cx, dst, nrows, n_per_row, stream);
+        case GGML_TYPE_IQ5_K:  return dequantize_row_iq5_k_cuda<float>(cx, dst, nrows, n_per_row, stream);
+        case GGML_TYPE_IQ6_K:  return dequantize_row_iq6_k_cuda<float>(cx, dst, nrows, n_per_row, stream);
+        case GGML_TYPE_IQ2_KS: return dequantize_row_iq2_ks_cuda<float>(cx, dst, nrows, n_per_row, stream);
+        case GGML_TYPE_IQ3_KS: return dequantize_row_iq3_ks_cuda<float>(cx, dst, nrows, n_per_row, stream);
+        case GGML_TYPE_IQ4_KS: return dequantize_row_iq4_ks_cuda<float>(cx, dst, nrows, n_per_row, stream);
+        case GGML_TYPE_IQ5_KS: return dequantize_row_iq5_ks_cuda<float>(cx, dst, nrows, n_per_row, stream);
+        default: GGML_ABORT("unsupported IQ*_K copy type");
+    }
+}
+
 static void ggml_cpy_f32_iq4_nl_cuda(
     const char * cx, char * cdst, const int64_t ne,
     const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01, const int64_t nb02,
@@ -533,6 +552,14 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
     } else if (src0->type == GGML_TYPE_Q5_1 && src1->type == GGML_TYPE_F32) {
         ggml_cpy_q5_1_f32_cuda
                 (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
+    } else if (src1->type == GGML_TYPE_F32 &&
+            (src0->type == GGML_TYPE_IQ2_K  || src0->type == GGML_TYPE_IQ3_K  ||
+             src0->type == GGML_TYPE_IQ4_K  || src0->type == GGML_TYPE_IQ5_K  ||
+             src0->type == GGML_TYPE_IQ6_K  || src0->type == GGML_TYPE_IQ2_KS ||
+             src0->type == GGML_TYPE_IQ3_KS || src0->type == GGML_TYPE_IQ4_KS ||
+             src0->type == GGML_TYPE_IQ5_KS)) {
+        GGML_ASSERT(contiguous_srcs);
+        ggml_cpy_iqk_f32_cuda(src0_ddc, src1_ddc, src0->type, ne / ne00, ne00, main_stream);
     } else if (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F16) {
         if (can_be_transposed) {
             ggml_cpy_scalar_cuda<half, half, true>

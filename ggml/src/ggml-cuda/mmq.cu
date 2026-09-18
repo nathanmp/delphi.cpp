@@ -69,6 +69,33 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
         case GGML_TYPE_IQ4_NL:
             mul_mat_q_case<GGML_TYPE_IQ4_NL>(ctx, args, stream);
             break;
+        case GGML_TYPE_IQ2_K:
+            mul_mat_q_case<GGML_TYPE_IQ2_K>(ctx, args, stream);
+            break;
+        case GGML_TYPE_IQ3_K:
+            mul_mat_q_case<GGML_TYPE_IQ3_K>(ctx, args, stream);
+            break;
+        case GGML_TYPE_IQ4_K:
+            mul_mat_q_case<GGML_TYPE_IQ4_K>(ctx, args, stream);
+            break;
+        case GGML_TYPE_IQ5_K:
+            mul_mat_q_case<GGML_TYPE_IQ5_K>(ctx, args, stream);
+            break;
+        case GGML_TYPE_IQ6_K:
+            mul_mat_q_case<GGML_TYPE_IQ6_K>(ctx, args, stream);
+            break;
+        case GGML_TYPE_IQ2_KS:
+            mul_mat_q_case<GGML_TYPE_IQ2_KS>(ctx, args, stream);
+            break;
+        case GGML_TYPE_IQ3_KS:
+            mul_mat_q_case<GGML_TYPE_IQ3_KS>(ctx, args, stream);
+            break;
+        case GGML_TYPE_IQ4_KS:
+            mul_mat_q_case<GGML_TYPE_IQ4_KS>(ctx, args, stream);
+            break;
+        case GGML_TYPE_IQ5_KS:
+            mul_mat_q_case<GGML_TYPE_IQ5_KS>(ctx, args, stream);
+            break;
 // -----------------------------------------------------------------------
         case GGML_TYPE_MXFP4:
             mul_mat_q_case<GGML_TYPE_MXFP4>(ctx, args, stream);
@@ -119,11 +146,12 @@ void ggml_cuda_mul_mat_q(
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
 
-    const int64_t s01 = src0->nb[1] / ts_src0;
+    const bool has_row_meta = ggml_row_meta_size(src0->type) != 0;
+    const int64_t s01 = has_row_meta ? ne00 / ggml_blck_size(src0->type) : src0->nb[1] / ts_src0;
     const int64_t s1  =  dst->nb[1] / ts_dst;
-    const int64_t s02 = src0->nb[2] / ts_src0;
+    const int64_t s02 = has_row_meta ? ne01*s01 : src0->nb[2] / ts_src0;
     const int64_t s2  =  dst->nb[2] / ts_dst;
-    const int64_t s03 = src0->nb[3] / ts_src0;
+    const int64_t s03 = has_row_meta ? ne02*s02 : src0->nb[3] / ts_src0;
     const int64_t s3  =  dst->nb[3] / ts_dst;
 
     const bool fallback = ne01 % 128 != 0;
@@ -293,6 +321,15 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
         case GGML_TYPE_IQ3_S:
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_IQ2_K:
+        case GGML_TYPE_IQ3_K:
+        case GGML_TYPE_IQ4_K:
+        case GGML_TYPE_IQ5_K:
+        case GGML_TYPE_IQ6_K:
+        case GGML_TYPE_IQ2_KS:
+        case GGML_TYPE_IQ3_KS:
+        case GGML_TYPE_IQ4_KS:
+        case GGML_TYPE_IQ5_KS:
 // -------------------------------------------------
         case GGML_TYPE_MXFP4:
         case GGML_TYPE_NVFP4:

@@ -818,7 +818,7 @@ bool ggml_cuda_ar_allreduce(
             bf16_tmp[i].alloc(ne);
             ggml_cuda_set_device(p->devices[i]);
             if (compute_flag[i]) {
-                to_bf16(tensors[i]->data, bf16_tmp[i].get(), ne, cuda_ctx->stream());
+                to_bf16(tensors[i]->data, bf16_tmp[i].get(), 1, ne, cuda_ctx->stream());
                 CUDA_CHECK(cudaGetLastError());
             } else {
                 CUDA_CHECK(cudaMemsetAsync(bf16_tmp[i].get(), 0, nbytes, cuda_ctx->stream()));
