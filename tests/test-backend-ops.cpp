@@ -20,9 +20,12 @@
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
 
+#include "moe-routing.h"
+
 #include <algorithm>
 #include <atomic>
 #include <array>
+#include <cctype>
 #include <cfloat>
 #include <cinttypes>
 #include <cstdarg>
@@ -35,6 +38,7 @@
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <random>
 #include <regex>
 #include <set>
@@ -1137,6 +1141,12 @@ struct csv_printer : public printer {
             "supported",
             "error_message",
             "test_mode",
+            // the measurement itself, so that a perf run is readable from the CSV alone
+            "time_us",
+            "flops",
+            "bandwidth_gb_s",
+            "memory_kb",
+            "n_runs",
             "backend_reg_name",
             "backend_name",
         };
@@ -1624,7 +1634,11 @@ struct test_case {
         // determine number of runs
         int n_runs;
         bool is_cpu = ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
-        if (op_flops(out) > 0) {
+        if (run_whole_graph()) {
+            // Repeating only the final node does not repeat its producers and
+            // therefore does not measure a whole-graph fusion.
+            n_runs = 1;
+        } else if (op_flops(out) > 0) {
             // based on flops
             const uint64_t GFLOP = 1000 * 1000 * 1000;
             const uint64_t target_flops_cpu =   8ULL * GFLOP;
@@ -8412,6 +8426,14 @@ struct test_lightning_indexer : public test_case {
                 init_tensor_uniform(t);
             }
         }
+
+        // This override replaces the base implementation, which initializes every tensor of the context. The
+        // sentinels are not sources, so they would keep whatever the buffer held, and eval() compares them.
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (std::find(sentinels.begin(), sentinels.end(), t) != sentinels.end()) {
+                init_tensor_uniform(t);
+            }
+        }
     }
 };
 
@@ -11768,6 +11790,458 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_from_file(const c
     return test_cases;
 }
 
+// ---- one explicit (op, shape, type) case: --custom ----
+//
+// The built-in perf list holds the shapes upstream cares about, which are not the shapes of any one model. A
+// --custom spec names an operation, its source-0 shape and type and, for the routed matmuls, the batch and the
+// expert routing. A caller that already knows the tensors it cares about - a quantization planner reading the
+// tensor list of a GGUF, for example - can then measure those exact tensors instead of looking for a near
+// match in the built-in list.
+//
+// Spec: comma separated key=value pairs, with shapes written as n0xn1xn2xn3.
+//
+//   op=MUL_MAT_ID,type=iq3_s,ne=4096x2048x288,n=512,top_k=8,dist=hottail
+//   op=MUL_MAT,type=q8_0,ne=4096x2048,n=512
+//   op=RMS_NORM,type=f32,ne=4096x512
+//
+// MUL_MAT and MUL_MAT_ID derive every tensor from ne, n and top_k because their operand layout is fixed. Any
+// other op uses the explicit src<i>= and out= values it is given, because only the caller knows what shapes
+// that op requires; a wrong shape reaches the backend as it was given.
+
+static std::vector<std::string> split_spec(const std::string & text, char sep) {
+    std::vector<std::string> out;
+    std::stringstream ss(text);
+    for (std::string field; std::getline(ss, field, sep);) {
+        out.push_back(field);
+    }
+    return out;
+}
+
+// ggml spells its names inconsistently ("q4_K", "iq4_xs", "MUL_MAT"), so match without regard to case.
+static bool equal_ignore_case(const std::string & a, const char * b) {
+    if (!b) {
+        return false;
+    }
+    size_t i = 0;
+    for (; i < a.size() && b[i]; i++) {
+        if (std::tolower((unsigned char) a[i]) != std::tolower((unsigned char) b[i])) {
+            return false;
+        }
+    }
+    return i == a.size() && b[i] == '\0';
+}
+
+static bool parse_type_name(const std::string & name, ggml_type & out) {
+    for (int i = 0; i < GGML_TYPE_COUNT; i++) {
+        if (equal_ignore_case(name, ggml_type_name((ggml_type) i))) {
+            out = (ggml_type) i;
+            return true;
+        }
+    }
+    return false;
+}
+
+// --list-ops also prints the unary and GLU op names. Those are not ops of their own: ggml puts them in
+// op_params[0] of GGML_OP_UNARY and GGML_OP_GLU. Accept them here so that every name the list prints is a
+// name a spec can use, and report the sub-op so that the caller can place it.
+static bool parse_op_name(const std::string & name, ggml_op & out, int32_t & out_sub_op, bool & out_has_sub_op) {
+    out_sub_op     = 0;
+    out_has_sub_op = false;
+
+    for (int i = 1; i < GGML_OP_COUNT; i++) {
+        if (equal_ignore_case(name, ggml_op_name((ggml_op) i))) {
+            out = (ggml_op) i;
+            return true;
+        }
+    }
+    for (int i = 0; i < GGML_UNARY_OP_COUNT; i++) {
+        if (equal_ignore_case(name, ggml_unary_op_name((ggml_unary_op) i))) {
+            out            = GGML_OP_UNARY;
+            out_sub_op     = i;
+            out_has_sub_op = true;
+            return true;
+        }
+    }
+    for (int i = 0; i < GGML_GLU_OP_COUNT; i++) {
+        if (equal_ignore_case(name, ggml_glu_op_name((ggml_glu_op) i))) {
+            out            = GGML_OP_GLU;
+            out_sub_op     = i;
+            out_has_sub_op = true;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool parse_shape(const std::string & spec, std::array<int64_t, 4> & ne, std::string & error) {
+    ne = { 1, 1, 1, 1 };
+    const std::vector<std::string> dims = split_spec(spec, 'x');
+    if (dims.empty() || dims.size() > 4) {
+        error = "shape '" + spec + "' needs 1 to 4 dimensions";
+        return false;
+    }
+    for (size_t i = 0; i < dims.size(); i++) {
+        ne[i] = strtoll(dims[i].c_str(), nullptr, 10);
+        if (ne[i] <= 0) {
+            error = "shape '" + spec + "' has a non-positive dimension";
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool parse_source(const std::string & spec, input_tensor & out, std::string & error) {
+    const size_t colon = spec.find(':');
+    if (colon == std::string::npos) {
+        error = "source '" + spec + "' must be <type>:<n0>x<n1>x<n2>x<n3>";
+        return false;
+    }
+    if (!parse_type_name(spec.substr(0, colon), out.type)) {
+        error = "unknown type in source '" + spec + "'";
+        return false;
+    }
+    if (!parse_shape(spec.substr(colon + 1), out.ne, error)) {
+        return false;
+    }
+    out.nb = { 0, 0, 0, 0 };
+    return true;
+}
+
+// A generic op whose routed-expert ids follow a named distribution instead of the even spread that
+// test_generic_op writes. The distribution decides how many rows each expert receives, which is what selects
+// the batched GEMM path inside a MUL_MAT_ID, so it changes the measured cost as much as the shape does.
+struct test_custom_op : public test_generic_op {
+    const moe_routing::routing route; // ids stay empty unless the op routes experts
+    const bool zero_weights;
+    const std::string desc;
+
+    test_custom_op(ggml_op op, ggml_type type, std::array<int64_t, 4> ne,
+                   std::array<int32_t, GGML_MAX_OP_PARAMS / sizeof(int32_t)> op_params,
+                   std::vector<input_tensor> sources, moe_routing::routing route, bool zero_weights,
+                   std::string desc)
+        : test_generic_op(op, type, ne, op_params, std::move(sources)),
+          route(std::move(route)), zero_weights(zero_weights), desc(std::move(desc)) {}
+
+    std::string vars() override {
+        return desc;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        // one multiply and one add for each result element and each element of a source-0 row
+        if (op == GGML_OP_MUL_MAT || op == GGML_OP_MUL_MAT_ID) {
+            return 2 * ggml_nelements(t) * t->src[0]->ne[0];
+        }
+        return 0;
+    }
+
+    // Writing zeros in place of quantized random data removes the quantization pass, which for a routed
+    // expert tensor of a real model is far more expensive than the measurement itself. The kernels do the
+    // same work either way, so this only applies where the contents cannot change the answer.
+    static void fill_zero(ggml_tensor * t) {
+        const size_t total = ggml_nbytes(t);
+        const size_t chunk = std::min<size_t>(total, 32u << 20);
+        const std::vector<uint8_t> zeros(chunk, 0);
+        for (size_t offset = 0; offset < total; offset += chunk) {
+            ggml_backend_tensor_set(t, zeros.data(), offset, std::min(chunk, total - offset));
+        }
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        ggml_tensor * out = ggml_get_tensor(ctx, "out");
+
+        if (zero_weights && mode == MODE_PERF) {
+            for (size_t i = 0; i < sources.size() && i < GGML_MAX_SRC; i++) {
+                ggml_tensor * t = out->src[i];
+                if (!t) {
+                    break;
+                }
+                // Source 0 holds the weights; an id source is rewritten from the routing below.
+                if (i == 0) {
+                    fill_zero(t);
+                } else if (t->type != GGML_TYPE_I32) {
+                    init_tensor_uniform(t);
+                } else {
+                    fill_zero(t);
+                }
+            }
+        } else {
+            test_generic_op::initialize_tensors(ctx);
+        }
+
+        if (route.ids.empty()) {
+            return;
+        }
+        ggml_tensor * ids = out->src[2];
+        GGML_ASSERT(ids && ids->type == GGML_TYPE_I32);
+        GGML_ASSERT((size_t) (ids->ne[0] * ids->ne[1]) == route.ids.size());
+        for (int64_t token = 0; token < ids->ne[1]; token++) {
+            ggml_backend_tensor_set(ids, route.ids.data() + token * ids->ne[0],
+                                    token * ids->nb[1], ids->ne[0] * sizeof(int32_t));
+        }
+    }
+};
+
+static std::unique_ptr<test_case> make_custom_test_case(const std::string & spec, test_mode mode, std::string & error) {
+    std::unordered_map<std::string, std::string> kv;
+    for (const std::string & field : split_spec(spec, ',')) {
+        if (field.empty()) {
+            continue;
+        }
+        const size_t eq = field.find('=');
+        if (eq == std::string::npos) {
+            error = "'" + field + "' is not a key=value pair";
+            return nullptr;
+        }
+        kv[field.substr(0, eq)] = field.substr(eq + 1);
+    }
+
+    auto str_of = [&](const char * key, const std::string & fallback) {
+        const auto it = kv.find(key);
+        return it == kv.end() ? fallback : it->second;
+    };
+    auto num_of = [&](const char * key, int64_t fallback) {
+        const auto it = kv.find(key);
+        return it == kv.end() ? fallback : strtoll(it->second.c_str(), nullptr, 10);
+    };
+
+    if (!kv.count("op")) {
+        error = "spec needs op=<NAME>, see --list-ops";
+        return nullptr;
+    }
+    ggml_op op;
+    int32_t sub_op     = 0;
+    bool    has_sub_op = false;
+    if (!parse_op_name(kv["op"], op, sub_op, has_sub_op)) {
+        error = "unknown op '" + kv["op"] + "', see --list-ops";
+        return nullptr;
+    }
+
+    ggml_type type   = GGML_TYPE_F32;
+    ggml_type type_b = GGML_TYPE_F32;
+    if (!parse_type_name(str_of("type", "f32"), type)) {
+        error = "unknown type '" + str_of("type", "") + "'";
+        return nullptr;
+    }
+    if (!parse_type_name(str_of("type_b", "f32"), type_b)) {
+        error = "unknown type_b '" + str_of("type_b", "") + "'";
+        return nullptr;
+    }
+
+    std::array<int64_t, 4> ne;
+    if (!parse_shape(str_of("ne", "1"), ne, error)) {
+        return nullptr;
+    }
+
+    std::array<int32_t, GGML_MAX_OP_PARAMS / sizeof(int32_t)> op_params = {};
+    for (size_t i = 0; i < op_params.size(); i++) {
+        const auto it = kv.find("op_param" + std::to_string(i));
+        if (it != kv.end()) {
+            op_params[i] = (int32_t) strtol(it->second.c_str(), nullptr, 10);
+        }
+    }
+    if (has_sub_op) {
+        // A named unary or GLU op is op_params[0], so an explicit op_param0 would silently contradict the name.
+        if (kv.count("op_param0")) {
+            error = "op=" + kv["op"] + " already sets op_param0, so it cannot be given as well";
+            return nullptr;
+        }
+        op_params[0] = sub_op;
+    }
+
+    const int64_t n_tokens = num_of("n", 1);
+    const int64_t top_k    = num_of("top_k", 1);
+
+    const std::string weights = str_of("weights", "random");
+    if (weights != "random" && weights != "zero") {
+        error = "weights must be random or zero";
+        return nullptr;
+    }
+    const bool zero_weights = weights == "zero";
+    if (zero_weights && op != GGML_OP_MUL_MAT && op != GGML_OP_MUL_MAT_ID) {
+        error = "weights=zero is defined only for MUL_MAT and MUL_MAT_ID, whose source 0 holds the weights";
+        return nullptr;
+    }
+
+    std::vector<input_tensor> sources;
+    std::array<int64_t, 4> out_ne = ne;
+    ggml_type out_type = type;
+    moe_routing::routing route;
+
+    // ggml models CPY as a write into its destination operand, and the node is only a view of it. The CPU
+    // backend writes the node instead, so comparing the node cannot agree between backends. The kernel still
+    // does the copy, so the timing is meaningful and perf mode stays available.
+    if (op == GGML_OP_CPY && (mode == MODE_TEST || mode == MODE_GRAD)) {
+        error = "op=CPY writes its destination operand rather than the result node, so the backends cannot be"
+                " compared; measure it in perf mode instead";
+        return nullptr;
+    }
+
+    // Report the name the spec used: a unary or GLU op would otherwise be reported as UNARY or GLU.
+    const char * op_display = ggml_op_name(op);
+    if (has_sub_op) {
+        op_display = op == GGML_OP_UNARY ? ggml_unary_op_name((ggml_unary_op) sub_op)
+                                         : ggml_glu_op_name((ggml_glu_op) sub_op);
+    }
+
+    auto shape_str = [](const std::array<int64_t, 4> & s) {
+        std::ostringstream o;
+        o << "[" << s[0] << "," << s[1] << "," << s[2] << "," << s[3] << "]";
+        return o.str();
+    };
+
+    std::ostringstream desc;
+    desc << "op=" << op_display;
+
+    // MUL_MAT and MUL_MAT_ID derive their operands from ne, so ne describes the case. Every other op takes
+    // explicit operands, and printing ne there would report a key the case never used.
+    if (op == GGML_OP_MUL_MAT || op == GGML_OP_MUL_MAT_ID) {
+        desc << ",type=" << ggml_type_name(type) << ",ne=" << shape_str(ne);
+    }
+
+    if (op == GGML_OP_MUL_MAT_ID) {
+        const int64_t k = ne[0], m = ne[1], n_experts = ne[2];
+        // A gate/up projection sends one activation row to every expert a token selected; a down projection
+        // gives each selected expert its own row.
+        const bool broadcast = num_of("broadcast", 1) != 0;
+        if (ne[3] != 1) {
+            error = "MUL_MAT_ID needs a 3d expert tensor, so ne3 must be 1";
+            return nullptr;
+        }
+        if (top_k < 1 || top_k > n_experts) {
+            error = "top_k " + std::to_string(top_k) + " is outside [1, " + std::to_string(n_experts) + "]";
+            return nullptr;
+        }
+
+        moe_routing::params rp;
+        rp.n_experts     = (int) n_experts;
+        rp.top_k         = (int) top_k;
+        rp.n_tokens      = n_tokens;
+        rp.alpha         = strtod(str_of("alpha", "1.0").c_str(), nullptr);
+        rp.tpe_target    = num_of("tpe", 0);
+        rp.replay_file   = str_of("replay", "");
+        rp.replay_layer  = (int) num_of("replay_layer", -1);
+        rp.replay_ubatch = (int) num_of("replay_ubatch", -1);
+        rp.seed          = (uint32_t) num_of("seed", 1234);
+
+        if (!moe_routing::build(str_of("dist", "uniform"), rp, route, error)) {
+            return nullptr;
+        }
+
+        sources.push_back({ type,          { k, m, n_experts, 1 },                  { 0, 0, 0, 0 } });
+        sources.push_back({ type_b,        { k, broadcast ? 1 : top_k, n_tokens, 1 }, { 0, 0, 0, 0 } });
+        sources.push_back({ GGML_TYPE_I32, { top_k, n_tokens, 1, 1 },               { 0, 0, 0, 0 } });
+        out_type = GGML_TYPE_F32;
+        out_ne   = { m, top_k, n_tokens, 1 };
+
+        desc << ",n=" << n_tokens << ",top_k=" << top_k << ",bcast=" << (broadcast ? 1 : 0)
+             << ",dist=" << route.name << ",n_active=" << route.n_active << ",tpe_max=" << route.tpe_max;
+    } else if (op == GGML_OP_MUL_MAT) {
+        const int64_t k = ne[0], m = ne[1];
+        sources.push_back({ type,   { k, m,        ne[2], ne[3] }, { 0, 0, 0, 0 } });
+        sources.push_back({ type_b, { k, n_tokens, ne[2], ne[3] }, { 0, 0, 0, 0 } });
+        out_type = GGML_TYPE_F32;
+        out_ne   = { m, n_tokens, ne[2], ne[3] };
+
+        desc << ",n=" << n_tokens;
+    } else {
+        for (int i = 0; i < GGML_MAX_SRC; i++) {
+            const auto it = kv.find("src" + std::to_string(i));
+            if (it == kv.end()) {
+                if (i == 0) {
+                    sources.push_back({ type, ne, { 0, 0, 0, 0 } });
+                    continue;
+                }
+                break;
+            }
+            input_tensor src;
+            if (!parse_source(it->second, src, error)) {
+                return nullptr;
+            }
+            sources.push_back(src);
+        }
+        if (kv.count("out") && !parse_shape(kv["out"], out_ne, error)) {
+            return nullptr;
+        }
+        if (kv.count("out_type") && !parse_type_name(kv["out_type"], out_type)) {
+            error = "unknown out_type '" + kv["out_type"] + "'";
+            return nullptr;
+        }
+
+        // ggml_cpy(a, b) writes into b: the destination is src1, and the node is only a view of it. The
+        // backends dereference src[1] without checking, so derive it from out when the spec omits it.
+        if (op == GGML_OP_CPY && sources.size() < 2) {
+            sources.push_back({ out_type, out_ne, { 0, 0, 0, 0 } });
+        }
+
+        for (size_t i = 0; i < sources.size(); i++) {
+            desc << ",src" << i << "=" << ggml_type_name(sources[i].type) << ":" << shape_str(sources[i].ne);
+        }
+        desc << ",out=" << ggml_type_name(out_type) << ":" << shape_str(out_ne);
+    }
+
+    if (zero_weights) {
+        desc << ",weights=zero";
+    }
+
+    // A quantized row must be a whole number of blocks. ggml does not check this when the tensor is created:
+    // the row then holds zero blocks, the CPU backend quantizes nothing and still compares equal, and the
+    // CUDA backend aborts in init_fastdiv_values. Reject the shape instead of measuring a meaningless case.
+    for (size_t i = 0; i < sources.size(); i++) {
+        const int64_t blck = ggml_blck_size(sources[i].type);
+        if (sources[i].ne[0] % blck != 0) {
+            error = "src" + std::to_string(i) + " has ne0 " + std::to_string(sources[i].ne[0]) + ", which is not"
+                    " a multiple of the " + std::to_string(blck) + "-element block of " +
+                    ggml_type_name(sources[i].type);
+            return nullptr;
+        }
+    }
+    if (out_ne[0] % ggml_blck_size(out_type) != 0) {
+        error = "out has ne0 " + std::to_string(out_ne[0]) + ", which is not a multiple of the " +
+                std::to_string(ggml_blck_size(out_type)) + "-element block of " + ggml_type_name(out_type);
+        return nullptr;
+    }
+
+    return std::unique_ptr<test_case>(new test_custom_op(
+        op, out_type, out_ne, op_params, std::move(sources), std::move(route), zero_weights, desc.str()));
+}
+
+static std::vector<std::unique_ptr<test_case>> make_test_cases_custom(
+        const std::vector<std::string> & specs, test_mode mode, std::string & error) {
+    std::vector<std::unique_ptr<test_case>> test_cases;
+    for (const std::string & spec : specs) {
+        std::unique_ptr<test_case> test_case = make_custom_test_case(spec, mode, error);
+        if (!test_case) {
+            error = "--custom '" + spec + "': " + error;
+            return {};
+        }
+        test_cases.push_back(std::move(test_case));
+    }
+    return test_cases;
+}
+
+// One spec for each non-empty, non-comment line.
+static bool read_custom_spec_file(const char * path, std::vector<std::string> & specs, std::string & error) {
+    std::ifstream f(path);
+    if (!f.is_open()) {
+        error = std::string("cannot read custom spec file ") + path;
+        return false;
+    }
+    std::string line;
+    while (std::getline(f, line)) {
+        const size_t begin = line.find_first_not_of(" \t\r");
+        if (begin == std::string::npos || line[begin] == '#') {
+            continue;
+        }
+        const size_t end = line.find_last_not_of(" \t\r");
+        specs.push_back(line.substr(begin, end - begin + 1));
+    }
+    if (specs.empty()) {
+        error = std::string(path) + " holds no spec";
+        return false;
+    }
+    return true;
+}
+
 // ---- FA vec (Q,NE): forced-config numerical slice (Metal only) ----
 using set_fa_vec_override_t   = void (*)(int, int);
 using clear_fa_vec_override_t = void (*)(void);
@@ -11871,7 +12345,8 @@ static bool run_fa_vec_slice(ggml_backend_t backend, ggml_backend_t backend_cpu,
 }
 
 static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mode mode, const char * op_names_filter, const char * params_filter,
-                         printer * output_printer, const char * test_file_path, int parallel_workers) {
+                         printer * output_printer, const char * test_file_path, int parallel_workers,
+                         const std::vector<std::string> & custom_specs) {
     auto filter_test_cases = [](std::vector<std::unique_ptr<test_case>> & test_cases, const char * params_filter) {
         if (params_filter == nullptr) {
             return;
@@ -11891,7 +12366,12 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
 
     std::vector<std::unique_ptr<test_case>> test_cases;
 
-    if (test_file_path == nullptr) {
+    if (!custom_specs.empty()) {
+        // main() already accepted these specs, so a failure here is a bug rather than user input.
+        std::string error;
+        test_cases = make_test_cases_custom(custom_specs, mode, error);
+        GGML_ASSERT(!test_cases.empty());
+    } else if (test_file_path == nullptr) {
         switch (mode) {
         case MODE_TEST:
         case MODE_GRAD:
@@ -12170,6 +12650,35 @@ static void usage(char ** argv) {
     printf("    --show-coverage shows test coverage\n");
     printf("    --test-file reads test operators from a test file generated by test-export-graph-ops\n");
     printf("    -j <n> runs tests using <n> parallel worker threads (default: 1, test mode only)\n");
+    printf("    --threads <n> sets the backend thread count (default: hardware concurrency)\n");
+    printf("    --custom <spec> runs one explicit case instead of the built-in list; repeatable\n");
+    printf("    --custom-file <path> reads one --custom spec for each non-empty, non-# line\n");
+    printf("\n");
+    printf("    a --custom spec is a comma separated key=value list, with shapes written n0xn1xn2xn3:\n");
+    printf("      op=<NAME>        operation, as given by --list-ops (required)\n");
+    printf("      type=<type>      source-0 type, for example q8_0 or iq3_s (default f32)\n");
+    printf("      ne=<shape>       source-0 shape, in the order a GGUF stores it (default 1)\n");
+    printf("      type_b=<type>    activation type for MUL_MAT and MUL_MAT_ID (default f32)\n");
+    printf("      n=<tokens>       token count for MUL_MAT and MUL_MAT_ID (default 1)\n");
+    printf("      top_k=<k>        experts for each token, MUL_MAT_ID only (default 1)\n");
+    printf("      broadcast=<0|1>  1 shares one activation row over the experts of a token, as a gate/up\n");
+    printf("                       projection does; 0 gives each expert its own row, as a down projection\n");
+    printf("                       does (default 1)\n");
+    printf("      dist=<name>      MUL_MAT_ID expert routing: %s (default uniform)\n", moe_routing::dist_names());
+    printf("      alpha=<f>        zipf exponent (default 1.0)\n");
+    printf("      tpe=<n>          concentration assignments for each active expert\n");
+    printf("      replay=<path>    llama-moe-schedule-stats CSV for dist=replay\n");
+    printf("      replay_layer=<n>, replay_ubatch=<n>   select one record of that CSV\n");
+    printf("      seed=<n>         routing seed (default 1234)\n");
+    printf("      weights=<random|zero>  zero skips the quantization of random weights, which dominates the\n");
+    printf("                       setup of a large expert tensor. MUL_MAT and MUL_MAT_ID only, and it only\n");
+    printf("                       applies in perf mode, where the weight values cannot change the answer\n");
+    printf("      src<i>=<type>:<shape>, out=<shape>, out_type=<type>, op_param<i>=<n>\n");
+    printf("                       explicit operands, for every op other than MUL_MAT and MUL_MAT_ID\n");
+    printf("\n");
+    printf("    examples:\n");
+    printf("      %s perf -b CPU --custom \"op=MUL_MAT_ID,type=iq3_s,ne=4096x2048x288,n=512,top_k=8,dist=hottail\"\n", argv[0]);
+    printf("      %s perf -b CPU --custom \"op=MUL_MAT,type=q8_0,ne=4096x2048,n=512\"\n", argv[0]);
 }
 
 int main(int argc, char ** argv) {
@@ -12180,6 +12689,8 @@ int main(int argc, char ** argv) {
     const char * params_filter = nullptr;
     const char * test_file_path = nullptr;
     int parallel_workers = 1;
+    int n_threads = 0;
+    std::vector<std::string> custom_specs;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "test") == 0) {
@@ -12245,8 +12756,45 @@ int main(int argc, char ** argv) {
                 usage(argv);
                 return 1;
             }
+        } else if (strcmp(argv[i], "--threads") == 0) {
+            if (i + 1 < argc) {
+                n_threads = atoi(argv[++i]);
+                if (n_threads < 1) {
+                    usage(argv);
+                    return 1;
+                }
+            } else {
+                usage(argv);
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--custom") == 0) {
+            if (i + 1 < argc) {
+                custom_specs.push_back(argv[++i]);
+            } else {
+                usage(argv);
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--custom-file") == 0) {
+            std::string error;
+            if (i + 1 >= argc || !read_custom_spec_file(argv[++i], custom_specs, error)) {
+                if (!error.empty()) {
+                    fprintf(stderr, "%s\n", error.c_str());
+                    return 1;
+                }
+                usage(argv);
+                return 1;
+            }
         } else {
             usage(argv);
+            return 1;
+        }
+    }
+
+    // Reject a bad spec once, with its own message, instead of once for each backend.
+    if (!custom_specs.empty()) {
+        std::string error;
+        if (make_test_cases_custom(custom_specs, mode, error).empty()) {
+            fprintf(stderr, "%s\n", error.c_str());
             return 1;
         }
     }
@@ -12287,7 +12835,7 @@ int main(int argc, char ** argv) {
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
         auto ggml_backend_set_n_threads_fn = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
         if (ggml_backend_set_n_threads_fn) {
-            ggml_backend_set_n_threads_fn(backend.get(), std::max<int>(1, N_THREADS/2));
+            ggml_backend_set_n_threads_fn(backend.get(), n_threads > 0 ? n_threads : std::max<int>(1, N_THREADS/2));
         }
 
         size_t free, total;  // NOLINT
@@ -12296,7 +12844,7 @@ int main(int argc, char ** argv) {
                                                              false, "", ggml_backend_dev_description(dev),
                                                              total / 1024 / 1024, free / 1024 / 1024, true));
 
-        bool ok = test_backend(backend.get(), dev, mode, op_names_filter, params_filter, output_printer.get(), test_file_path, parallel_workers);
+        bool ok = test_backend(backend.get(), dev, mode, op_names_filter, params_filter, output_printer.get(), test_file_path, parallel_workers, custom_specs);
 
         if (ok) {
             n_ok++;
