@@ -1,4 +1,8 @@
 #include "mmvq.cuh"
+#include "moe-packed.cuh"
+#ifdef GGML_CUDA_MOE_PACKED_AVAILABLE
+#include "moe-packed-q.cuh"
+#endif
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
@@ -1571,12 +1575,537 @@ static void mul_mat_vec_q_switch_type(
     }
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+#ifdef GGML_CUDA_MOE_PACKED_AVAILABLE
+// delphi: MUL_MAT_ID with expert weights packed in place (moe-packed.cuh). The results are bitwise those of mul_mat_vec_q (one
+// token), mul_mat_vec_q_moe (several tokens) and moe_down_q_reduction on the GGUF layout: each partial sum of a thread of those
+// kernels is computed with the same vec_dot calls in the same order, and the partial sums of a row are added in the same order.
+// Only the assignment of the work to threads is different, so that the 32 lanes of a warp read contiguous memory of the layout. A
+// thread block computes one 16-row group. Upstream thread v has position p = v % T in its QK_K blocks (T = QK_K/qk * qi/vdr threads
+// per QK_K block: 8, 16 or 32) and starts at QK_K block v / T. Work item a is quad q = a % (T/4) of the upstream threads of QK_K
+// block a / (T/4): lane (ks = lane/8, g = lane%8) computes rows g and g + 8 of position 4*q + ks. The partial sums go to shared
+// memory, then one warp reduces a row.
+
+#define MMVQ_PACKED_WARPS_1 4 // warps per thread block of the one-token kernel (the fastest of 1 to 32 for OLMoE gate/up on SM80)
+#define MMVQ_PACKED_WARPS   8 // warps per thread block of the other kernels
+
+static __device__ __forceinline__ float mmvq_packed_glu(const float x, const float gate, const ggml_glu_op op, const float limit) {
+    switch (op) {
+        case GGML_GLU_OP_SWIGLU:       return x * ggml_cuda_op_silu_single(gate);
+        case GGML_GLU_OP_GEGLU:        return x * ggml_cuda_op_gelu_single(gate);
+        case GGML_GLU_OP_SWIGLU_OAI:   return ggml_cuda_op_swiglu_oai_single(gate, x);
+        case GGML_GLU_OP_SWIGLU_CLAMP: return ggml_cuda_op_swiglu_clamp_single(gate, x, limit);
+        default:                       return x * gate;
+    }
+}
+
+// Upstream MMVQ threads per QK_K block (T above).
+template <int fmt>
+static constexpr __device__ int mmvq_packed_threads() {
+    using pq = moe_packed_q<fmt>;
+    constexpr int T = QK_K/ggml_cuda_type_traits<pq::type>::qk * ggml_cuda_type_traits<pq::type>::qi/get_vdr_mmvq(pq::type);
+    static_assert(T == 8 || T == 16 || T == 32, "the lane layout needs 8, 16 or 32 upstream threads per QK_K block");
+    return T;
+}
+
+template <int fmt>
+static __device__ __forceinline__ float2 mmvq_packed_vec_dot(const char * sb, const char * row_meta, const int mg, const int g,
+        const int p, const block_q8_1 * y) {
+    using pq = moe_packed_q<fmt>;
+    if constexpr (moe_packed_row_meta_bytes<fmt>() != 0) {
+        return pq::vec_dot2_row_meta(sb, row_meta, mg, g, p, y); // IQ*_KS keeps its row scale outside the packed superblocks.
+    } else {
+        GGML_UNUSED(row_meta);
+        return pq::vec_dot2(sb, mg, g, p, y);
+    }
+}
+
+template <int fmt>
+static __device__ __forceinline__ const char * mmvq_packed_row_meta(const char * vx, const int64_t stride_channel_x, const int nrows_x,
+        const int channel, const int row_tile) {
+    using pq = moe_packed_q<fmt>;
+    if constexpr (moe_packed_row_meta_bytes<fmt>() != 0) {
+        const int64_t payload = stride_channel_x - (int64_t) nrows_x*moe_packed_row_meta_bytes<fmt>();
+        return vx + (int64_t) channel*stride_channel_x + payload + (int64_t) row_tile*MOE_PACKED_I*moe_packed_row_meta_bytes<fmt>();
+    } else {
+        GGML_UNUSED_VARS(vx, stride_channel_x, nrows_x, channel, row_tile);
+        return nullptr;
+    }
+}
+
+// The partial sums of rows g and g + 8 of 16-row group mg of upstream thread T*vq + p, in a kernel with T*nvq threads per row
+// (nvq QK_K blocks per iteration): x points to the superblocks of the row tile, y to the q8_1 blocks of the column.
+template <int fmt, int nvq>
+static __device__ __forceinline__ float2 mmvq_packed_partial(
+        const char * __restrict__ x, const char * __restrict__ row_meta, const block_q8_1 * __restrict__ y, const int blocks_per_row_x, const int mg, const int g,
+        const int p, const int vq) {
+    using pq = moe_packed_q<fmt>;
+
+    float2 sum = make_float2(0.0f, 0.0f);
+    for (int kbx = vq; kbx < blocks_per_row_x; kbx += nvq) {
+        const float2 v = mmvq_packed_vec_dot<fmt>(x + (int64_t) kbx*pq::sb_bytes, row_meta, mg, g, p, y + kbx*(QK_K/QK8_1));
+        sum.x += v.x;
+        sum.y += v.y;
+    }
+    return sum;
+}
+
+// blockDim: (warp_size, MMVQ_PACKED_WARPS_1), gridDim: (nrows/16, nchannels_dst). mul_mat_vec_q has nwarps*warp_size threads per row.
+template <int fmt, bool has_fusion>
+__launch_bounds__(MMVQ_PACKED_WARPS_1*ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void mul_mat_vec_q_packed(
+        const char * __restrict__ vx, const void * __restrict__ vy, const int32_t * __restrict__ ids,
+        const ggml_cuda_mm_fusion_args_device fusion, float * __restrict__ dst,
+        const uint32_t ncols_x, const uint32_t nrows_x, const uint3 nchannels_y, const int64_t stride_channel_x, const uint32_t stride_channel_y,
+        const uint32_t stride_channel_dst) {
+    using pq = moe_packed_q<fmt>;
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps    = calc_nwarps(pq::type, 1, get_device_table_id());
+    constexpr int nthreads  = nwarps*warp_size;
+    constexpr int T         = mmvq_packed_threads<fmt>();
+    constexpr int nvq       = nthreads/T;
+    static_assert(warp_size == 32, "the lane layout needs 32 lanes");
+
+    const int mg = blockIdx.x % (MOE_PACKED_I/16);
+    const int ks = threadIdx.x / 8;
+    const int g  = threadIdx.x % 8;
+    const int blocks_per_row_x = ncols_x / QK_K;
+
+    const uint32_t channel_dst = blockIdx.y;
+    const uint32_t channel_x   = ids[channel_dst];
+    const uint32_t channel_y   = fastmodulo(channel_dst, nchannels_y);
+
+    const int row_tile = blockIdx.x / (MOE_PACKED_I/16);
+    const int64_t off  = channel_x*stride_channel_x + (int64_t) row_tile*blocks_per_row_x*pq::sb_bytes;
+    const char *  x    = vx + off;
+    const char *  gate = has_fusion && fusion.gate ? (const char *) fusion.gate + off : nullptr;
+    const char * row_meta = mmvq_packed_row_meta<fmt>(vx, stride_channel_x, nrows_x, channel_x, row_tile);
+    const char * row_meta_gate = has_fusion && fusion.gate ? mmvq_packed_row_meta<fmt>((const char *) fusion.gate, stride_channel_x, nrows_x,
+        channel_x, row_tile) : nullptr;
+    const block_q8_1 * y = (const block_q8_1 *) vy + channel_y*stride_channel_y;
+
+    // [row][upstream thread], 4 floats of padding per row: the lanes of a warp write to 32 different banks
+    __shared__ float part[16][nthreads + 4];
+    [[maybe_unused]] __shared__ float part_gate[has_fusion ? 16 : 1][nthreads + 4];
+    for (int a = threadIdx.y; a < nthreads/4; a += MMVQ_PACKED_WARPS_1) {
+        const int p = 4*(a % (T/4)) + ks;
+        const int v = T*(a/(T/4)) + p;
+        const float2 sum = mmvq_packed_partial<fmt, nvq>(x, row_meta, y, blocks_per_row_x, mg, g, p, a/(T/4));
+        part[g][v]     = sum.x;
+        part[g + 8][v] = sum.y;
+        if constexpr (has_fusion) {
+            if (gate) {
+                const float2 sum_gate = mmvq_packed_partial<fmt, nvq>(gate, row_meta_gate, y, blocks_per_row_x, mg, g, p, a/(T/4));
+                part_gate[g][v]     = sum_gate.x;
+                part_gate[g + 8][v] = sum_gate.y;
+            }
+        }
+    }
+    __syncthreads();
+
+    // as mul_mat_vec_q: the sum of lane l of warp 0, then of lane l of warps 1 .. nwarps - 1 in order, then the reduction over the lanes
+    for (int i = threadIdx.y; i < 16; i += MMVQ_PACKED_WARPS_1) {
+        float tmp = part[i][threadIdx.x];
+#pragma unroll
+        for (int w = 1; w < nwarps; ++w) {
+            tmp += part[i][w*warp_size + threadIdx.x];
+        }
+        tmp = warp_reduce_sum<warp_size>(tmp);
+
+        float tmp_gate = 0.0f;
+        if constexpr (has_fusion) {
+            if (gate) {
+                tmp_gate = part_gate[i][threadIdx.x];
+#pragma unroll
+                for (int w = 1; w < nwarps; ++w) {
+                    tmp_gate += part_gate[i][w*warp_size + threadIdx.x];
+                }
+                tmp_gate = warp_reduce_sum<warp_size>(tmp_gate);
+            }
+        }
+
+        if (threadIdx.x == 0) {
+            const int r = 16*blockIdx.x + i;
+            float result = tmp;
+            if constexpr (has_fusion) {
+                // as mul_mat_vec_q: the biases are added even when they are zero
+                const float * x_bias    = (const float *) fusion.x_bias;
+                const float * gate_bias = (const float *) fusion.gate_bias;
+                result += x_bias ? x_bias[channel_x*stride_channel_dst + r] : 0.0f;
+                if (gate) {
+                    const float gate_value = tmp_gate + (gate_bias ? gate_bias[channel_x*stride_channel_dst + r] : 0.0f);
+                    result = mmvq_packed_glu(result, gate_value, fusion.glu_op, fusion.glu_limit);
+                }
+            }
+            dst[channel_dst*stride_channel_dst + r] = result;
+        }
+    }
+}
+
+// blockDim: (warp_size, MMVQ_PACKED_WARPS), gridDim: (nrows/16, nchannels_dst). mul_mat_vec_q_moe has one warp per row and token.
+template <int fmt, bool has_fusion>
+__launch_bounds__(MMVQ_PACKED_WARPS*ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void mul_mat_vec_q_packed_moe(
+        const char * __restrict__ vx, const void * __restrict__ vy, const int32_t * __restrict__ ids,
+        const ggml_cuda_mm_fusion_args_device fusion, float * __restrict__ dst,
+        const uint32_t ncols_x, const uint32_t nrows_x, const uint3 nchannels_y, const uint32_t stride_col_y, const uint32_t stride_col_dst,
+        const int64_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
+        const uint32_t ncols_dst, const uint32_t ids_stride) {
+    using pq = moe_packed_q<fmt>;
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int max_batch = get_mmvq_mmid_max_batch_for_device<pq::type>();
+    constexpr int T         = mmvq_packed_threads<fmt>();
+    constexpr int nvq       = warp_size/T;
+    static_assert(warp_size == 32, "the lane layout needs 32 lanes");
+
+    const int mg = blockIdx.x % (MOE_PACKED_I/16);
+    const int ks = threadIdx.x / 8;
+    const int g  = threadIdx.x % 8;
+    const int blocks_per_row_x = ncols_x / QK_K;
+    const int row_tile = blockIdx.x / (MOE_PACKED_I/16);
+    const int64_t off_tile = (int64_t) row_tile*blocks_per_row_x*pq::sb_bytes;
+
+    const uint32_t channel_dst = blockIdx.y;
+    const uint32_t channel_y   = fastmodulo(channel_dst, nchannels_y);
+
+    __shared__ float part[max_batch][16][warp_size + 4];
+    [[maybe_unused]] __shared__ float part_gate[has_fusion ? max_batch : 1][16][warp_size + 4];
+    for (int it = threadIdx.y; it < (int) ncols_dst*(warp_size/4); it += MMVQ_PACKED_WARPS) {
+        const int t = it / (warp_size/4);
+        const int a = it % (warp_size/4);
+        const int p = 4*(a % (T/4)) + ks;
+        const int v = T*(a/(T/4)) + p;
+        const int channel_x = ids[channel_dst + t*ids_stride];
+        const int64_t off = channel_x*stride_channel_x + off_tile;
+        const block_q8_1 * y = (const block_q8_1 *) vy + channel_y*stride_channel_y + t*stride_col_y;
+        const char * row_meta = mmvq_packed_row_meta<fmt>(vx, stride_channel_x, nrows_x, channel_x, row_tile);
+        const float2 sum = mmvq_packed_partial<fmt, nvq>(vx + off, row_meta, y, blocks_per_row_x, mg, g, p, a/(T/4));
+        part[t][g][v]     = sum.x;
+        part[t][g + 8][v] = sum.y;
+        if constexpr (has_fusion) {
+            if (fusion.gate) {
+                const char * row_meta_gate = mmvq_packed_row_meta<fmt>((const char *) fusion.gate, stride_channel_x, nrows_x, channel_x, row_tile);
+                const float2 sum_gate = mmvq_packed_partial<fmt, nvq>((const char *) fusion.gate + off, row_meta_gate, y, blocks_per_row_x, mg, g,
+                    p, a/(T/4));
+                part_gate[t][g][v]     = sum_gate.x;
+                part_gate[t][g + 8][v] = sum_gate.y;
+            }
+        }
+    }
+    __syncthreads();
+
+    // as mul_mat_vec_q_moe: the reduction over the lanes of the warp of the row and token
+    for (int it = threadIdx.y; it < (int) ncols_dst*16; it += MMVQ_PACKED_WARPS) {
+        const int t = it / 16;
+        const int i = it % 16;
+        const float tmp = warp_reduce_sum<warp_size>(part[t][i][threadIdx.x]);
+        float tmp_gate = 0.0f;
+        if constexpr (has_fusion) {
+            if (fusion.gate) {
+                tmp_gate = warp_reduce_sum<warp_size>(part_gate[t][i][threadIdx.x]);
+            }
+        }
+
+        if (threadIdx.x == 0) {
+            const int r = 16*blockIdx.x + i;
+            float result = tmp;
+            if constexpr (has_fusion) {
+                const float * x_bias    = (const float *) fusion.x_bias;
+                const float * gate_bias = (const float *) fusion.gate_bias;
+                const uint32_t bias_idx = ids[channel_dst + t*ids_stride]*stride_channel_dst + r;
+                if (x_bias) {
+                    result += x_bias[bias_idx];
+                }
+                if (fusion.gate) {
+                    float gate_value = tmp_gate;
+                    if (gate_bias) {
+                        gate_value += gate_bias[bias_idx];
+                    }
+                    result = mmvq_packed_glu(result, gate_value, fusion.glu_op, fusion.glu_limit);
+                }
+            }
+            dst[channel_dst*stride_channel_dst + t*stride_col_dst + r] = result;
+        }
+    }
+}
+
+template <int fmt>
+static void mul_mat_vec_q_packed_launch(
+        const char * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device & fusion, float * dst,
+        const int ncols_x, const int nrows_x, const int ncols_dst, const int stride_col_y, const int stride_col_dst,
+        const int nchannels_y, const int nchannels_dst, const int64_t stride_channel_x, const int stride_channel_y,
+        const int stride_channel_dst, const int ids_stride, cudaStream_t stream) {
+    GGML_ASSERT(nrows_x % MOE_PACKED_I == 0 && ncols_x % QK_K == 0);
+
+    const int  warp_size  = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+    const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
+    const uint3 nchannels_y_fd = init_fastdiv_values(nchannels_y);
+    const dim3 block_nums(nrows_x/16, nchannels_dst);
+    const dim3 block_dims(warp_size, MMVQ_PACKED_WARPS);
+
+    if (ncols_dst == 1) {
+        const dim3 block_dims_1(warp_size, MMVQ_PACKED_WARPS_1);
+        if (has_fusion) {
+            mul_mat_vec_q_packed<fmt, true><<<block_nums, block_dims_1, 0, stream>>>
+                (vx, vy, ids, fusion, dst, ncols_x, nrows_x, nchannels_y_fd, stride_channel_x, stride_channel_y, stride_channel_dst);
+        } else {
+            mul_mat_vec_q_packed<fmt, false><<<block_nums, block_dims_1, 0, stream>>>
+                (vx, vy, ids, fusion, dst, ncols_x, nrows_x, nchannels_y_fd, stride_channel_x, stride_channel_y, stride_channel_dst);
+        }
+    } else {
+        if (has_fusion) {
+            mul_mat_vec_q_packed_moe<fmt, true><<<block_nums, block_dims, 0, stream>>>
+                (vx, vy, ids, fusion, dst, ncols_x, nrows_x, nchannels_y_fd, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y,
+                 stride_channel_dst, ncols_dst, ids_stride);
+        } else {
+            mul_mat_vec_q_packed_moe<fmt, false><<<block_nums, block_dims, 0, stream>>>
+                (vx, vy, ids, fusion, dst, ncols_x, nrows_x, nchannels_y_fd, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y,
+                 stride_channel_dst, ncols_dst, ids_stride);
+        }
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+static void mul_mat_vec_q_packed_switch_fmt(
+        const int fmt, const char * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device & fusion, float * dst,
+        const int ncols_x, const int nrows_x, const int ncols_dst, const int stride_col_y, const int stride_col_dst,
+        const int nchannels_y, const int nchannels_dst, const int64_t stride_channel_x, const int stride_channel_y,
+        const int stride_channel_dst, const int ids_stride, cudaStream_t stream) {
+    switch (fmt) {
+        case GGML_CUDA_MOE_PACKED_Q80:
+            mul_mat_vec_q_packed_launch<GGML_CUDA_MOE_PACKED_Q80>(vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_col_y,
+                stride_col_dst, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst, ids_stride, stream);
+            break;
+        case GGML_CUDA_MOE_PACKED_Q50:
+            mul_mat_vec_q_packed_launch<GGML_CUDA_MOE_PACKED_Q50>(vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_col_y,
+                stride_col_dst, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst, ids_stride, stream);
+            break;
+        case GGML_CUDA_MOE_PACKED_IQ4NL:
+            mul_mat_vec_q_packed_launch<GGML_CUDA_MOE_PACKED_IQ4NL>(vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_col_y,
+                stride_col_dst, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst, ids_stride, stream);
+            break;
+        case GGML_CUDA_MOE_PACKED_MXFP4:
+            mul_mat_vec_q_packed_launch<GGML_CUDA_MOE_PACKED_MXFP4>(vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_col_y,
+                stride_col_dst, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst, ids_stride, stream);
+            break;
+        case GGML_CUDA_MOE_PACKED_Q5K:
+            mul_mat_vec_q_packed_launch<GGML_CUDA_MOE_PACKED_Q5K>(vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_col_y,
+                stride_col_dst, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst, ids_stride, stream);
+            break;
+        case GGML_CUDA_MOE_PACKED_Q41:
+            mul_mat_vec_q_packed_launch<GGML_CUDA_MOE_PACKED_Q41>(vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_col_y,
+                stride_col_dst, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst, ids_stride, stream);
+            break;
+        case GGML_CUDA_MOE_PACKED_Q51:
+            mul_mat_vec_q_packed_launch<GGML_CUDA_MOE_PACKED_Q51>(vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_col_y,
+                stride_col_dst, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst, ids_stride, stream);
+            break;
+        case GGML_CUDA_MOE_PACKED_Q3K:
+            mul_mat_vec_q_packed_launch<GGML_CUDA_MOE_PACKED_Q3K>(vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_col_y,
+                stride_col_dst, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst, ids_stride, stream);
+            break;
+        case GGML_CUDA_MOE_PACKED_IQ3XXS:
+            mul_mat_vec_q_packed_launch<GGML_CUDA_MOE_PACKED_IQ3XXS>(vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_col_y,
+                stride_col_dst, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst, ids_stride, stream);
+            break;
+        case GGML_CUDA_MOE_PACKED_IQ2XXS:
+            mul_mat_vec_q_packed_launch<GGML_CUDA_MOE_PACKED_IQ2XXS>(vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_col_y,
+                stride_col_dst, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst, ids_stride, stream);
+            break;
+        case GGML_CUDA_MOE_PACKED_IQ2XS:
+            mul_mat_vec_q_packed_launch<GGML_CUDA_MOE_PACKED_IQ2XS>(vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_col_y,
+                stride_col_dst, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst, ids_stride, stream);
+            break;
+        case GGML_CUDA_MOE_PACKED_IQ2S:
+            mul_mat_vec_q_packed_launch<GGML_CUDA_MOE_PACKED_IQ2S>(vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_col_y,
+                stride_col_dst, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst, ids_stride, stream);
+            break;
+        case GGML_CUDA_MOE_PACKED_IQ2K:
+            mul_mat_vec_q_packed_launch<GGML_CUDA_MOE_PACKED_IQ2K>(vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_col_y,
+                stride_col_dst, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst, ids_stride, stream);
+            break;
+        case GGML_CUDA_MOE_PACKED_IQ3K:
+            mul_mat_vec_q_packed_launch<GGML_CUDA_MOE_PACKED_IQ3K>(vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_col_y,
+                stride_col_dst, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst, ids_stride, stream);
+            break;
+        case GGML_CUDA_MOE_PACKED_IQ4K:
+            mul_mat_vec_q_packed_launch<GGML_CUDA_MOE_PACKED_IQ4K>(vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_col_y,
+                stride_col_dst, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst, ids_stride, stream);
+            break;
+        case GGML_CUDA_MOE_PACKED_IQ5K:
+            mul_mat_vec_q_packed_launch<GGML_CUDA_MOE_PACKED_IQ5K>(vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_col_y,
+                stride_col_dst, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst, ids_stride, stream);
+            break;
+        case GGML_CUDA_MOE_PACKED_IQ2KS:
+            mul_mat_vec_q_packed_launch<GGML_CUDA_MOE_PACKED_IQ2KS>(vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_col_y,
+                stride_col_dst, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst, ids_stride, stream);
+            break;
+        case GGML_CUDA_MOE_PACKED_IQ3KS:
+            mul_mat_vec_q_packed_launch<GGML_CUDA_MOE_PACKED_IQ3KS>(vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_col_y,
+                stride_col_dst, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst, ids_stride, stream);
+            break;
+        case GGML_CUDA_MOE_PACKED_IQ4KS:
+            mul_mat_vec_q_packed_launch<GGML_CUDA_MOE_PACKED_IQ4KS>(vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_col_y,
+                stride_col_dst, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst, ids_stride, stream);
+            break;
+        case GGML_CUDA_MOE_PACKED_IQ5KS:
+            mul_mat_vec_q_packed_launch<GGML_CUDA_MOE_PACKED_IQ5KS>(vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_col_y,
+                stride_col_dst, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst, ids_stride, stream);
+            break;
+        case GGML_CUDA_MOE_PACKED_IQ3S:
+            mul_mat_vec_q_packed_launch<GGML_CUDA_MOE_PACKED_IQ3S>(vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_col_y,
+                stride_col_dst, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst, ids_stride, stream);
+            break;
+        case GGML_CUDA_MOE_PACKED_IQ4XS:
+            mul_mat_vec_q_packed_launch<GGML_CUDA_MOE_PACKED_IQ4XS>(vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_col_y,
+                stride_col_dst, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst, ids_stride, stream);
+            break;
+        case GGML_CUDA_MOE_PACKED_Q4K:
+            mul_mat_vec_q_packed_launch<GGML_CUDA_MOE_PACKED_Q4K>(vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_col_y,
+                stride_col_dst, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst, ids_stride, stream);
+            break;
+        case GGML_CUDA_MOE_PACKED_Q6K:
+            mul_mat_vec_q_packed_launch<GGML_CUDA_MOE_PACKED_Q6K>(vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_col_y,
+                stride_col_dst, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst, ids_stride, stream);
+            break;
+        default:
+            GGML_ABORT("MMVQ: no kernel for packed format %d", fmt);
+    }
+}
+
+// moe_down_q_reduction on weights packed in place: its partial sums, and its reductions in its order. mul_mat_vec_q_moe has one
+// warp per row and expert slot. blockDim: (warp_size, MMVQ_PACKED_WARPS), gridDim: nrows/16.
+template <int fmt>
+__launch_bounds__(MMVQ_PACKED_WARPS*ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void moe_down_q_reduction_packed(
+        const char * __restrict__ vx, const block_q8_1 * __restrict__ vy, const int32_t * __restrict__ ids,
+        const float * __restrict__ weights, float * __restrict__ dst, const uint32_t ncols_x, const uint32_t nrows_x, const int64_t stride_channel_x,
+        const uint32_t stride_channel_y) {
+    using pq = moe_packed_q<fmt>;
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int T         = mmvq_packed_threads<fmt>();
+    constexpr int nvq       = warp_size/T;
+    static_assert(warp_size == 32, "the lane layout needs 32 lanes");
+
+    const int mg = blockIdx.x % (MOE_PACKED_I/16);
+    const int ks = threadIdx.x / 8;
+    const int g  = threadIdx.x % 8;
+    const int blocks_per_row_x = ncols_x / QK_K;
+    const int row_tile = blockIdx.x / (MOE_PACKED_I/16);
+    const int64_t off_tile = (int64_t) row_tile*blocks_per_row_x*pq::sb_bytes;
+
+    __shared__ float part[MMVQ_MAX_BATCH_SIZE][16][warp_size + 4];
+    __shared__ float expert_values[MMVQ_MAX_BATCH_SIZE][16];
+    for (int it = threadIdx.y; it < MMVQ_MAX_BATCH_SIZE*(warp_size/4); it += MMVQ_PACKED_WARPS) {
+        const int e = it / (warp_size/4);
+        const int a = it % (warp_size/4);
+        const int p = 4*(a % (T/4)) + ks;
+        const int v = T*(a/(T/4)) + p;
+        const int channel_x = ids[e];
+        const char * row_meta = mmvq_packed_row_meta<fmt>(vx, stride_channel_x, nrows_x, channel_x, row_tile);
+        const float2 sum = mmvq_packed_partial<fmt, nvq>(vx + channel_x*stride_channel_x + off_tile, row_meta, vy + e*stride_channel_y,
+            blocks_per_row_x, mg, g, p, a/(T/4));
+        part[e][g][v]     = sum.x;
+        part[e][g + 8][v] = sum.y;
+    }
+    __syncthreads();
+
+    for (int it = threadIdx.y; it < MMVQ_MAX_BATCH_SIZE*16; it += MMVQ_PACKED_WARPS) {
+        const float value = warp_reduce_sum<warp_size>(part[it / 16][it % 16][threadIdx.x]);
+        if (threadIdx.x == 0) {
+            expert_values[it / 16][it % 16] = value;
+        }
+    }
+    __syncthreads();
+
+    if (threadIdx.y == 0 && threadIdx.x < 16) {
+        float sum = 0.0f;
+#pragma unroll
+        for (int e = 0; e < MMVQ_MAX_BATCH_SIZE; ++e) {
+            sum += expert_values[e][threadIdx.x] * weights[e];
+        }
+        dst[16*blockIdx.x + threadIdx.x] = sum;
+    }
+}
+
+static void moe_down_q_reduction_packed_switch_fmt(
+        const int fmt, const char * vx, const block_q8_1 * vy, const int32_t * ids, const float * weights, float * dst,
+        const int ncols_x, const int nrows_x, const int64_t stride_channel_x, const int stride_channel_y, cudaStream_t stream) {
+    GGML_ASSERT(nrows_x % MOE_PACKED_I == 0 && ncols_x % QK_K == 0);
+    const dim3 blocks(nrows_x/16);
+    const dim3 threads(ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size, MMVQ_PACKED_WARPS);
+    switch (fmt) {
+        case GGML_CUDA_MOE_PACKED_Q5K:
+            moe_down_q_reduction_packed<GGML_CUDA_MOE_PACKED_Q5K><<<blocks, threads, 0, stream>>>
+                (vx, vy, ids, weights, dst, ncols_x, nrows_x, stride_channel_x, stride_channel_y);
+            break;
+        case GGML_CUDA_MOE_PACKED_IQ2KS:
+            moe_down_q_reduction_packed<GGML_CUDA_MOE_PACKED_IQ2KS><<<blocks, threads, 0, stream>>>
+                (vx, vy, ids, weights, dst, ncols_x, nrows_x, stride_channel_x, stride_channel_y);
+            break;
+        case GGML_CUDA_MOE_PACKED_IQ3KS:
+            moe_down_q_reduction_packed<GGML_CUDA_MOE_PACKED_IQ3KS><<<blocks, threads, 0, stream>>>
+                (vx, vy, ids, weights, dst, ncols_x, nrows_x, stride_channel_x, stride_channel_y);
+            break;
+        case GGML_CUDA_MOE_PACKED_IQ4KS:
+            moe_down_q_reduction_packed<GGML_CUDA_MOE_PACKED_IQ4KS><<<blocks, threads, 0, stream>>>
+                (vx, vy, ids, weights, dst, ncols_x, nrows_x, stride_channel_x, stride_channel_y);
+            break;
+        case GGML_CUDA_MOE_PACKED_IQ5KS:
+            moe_down_q_reduction_packed<GGML_CUDA_MOE_PACKED_IQ5KS><<<blocks, threads, 0, stream>>>
+                (vx, vy, ids, weights, dst, ncols_x, nrows_x, stride_channel_x, stride_channel_y);
+            break;
+        case GGML_CUDA_MOE_PACKED_IQ4XS:
+            moe_down_q_reduction_packed<GGML_CUDA_MOE_PACKED_IQ4XS><<<blocks, threads, 0, stream>>>
+                (vx, vy, ids, weights, dst, ncols_x, nrows_x, stride_channel_x, stride_channel_y);
+            break;
+        case GGML_CUDA_MOE_PACKED_Q4K:
+            moe_down_q_reduction_packed<GGML_CUDA_MOE_PACKED_Q4K><<<blocks, threads, 0, stream>>>
+                (vx, vy, ids, weights, dst, ncols_x, nrows_x, stride_channel_x, stride_channel_y);
+            break;
+        case GGML_CUDA_MOE_PACKED_Q6K:
+            moe_down_q_reduction_packed<GGML_CUDA_MOE_PACKED_Q6K><<<blocks, threads, 0, stream>>>
+                (vx, vy, ids, weights, dst, ncols_x, nrows_x, stride_channel_x, stride_channel_y);
+            break;
+        default:
+            GGML_ABORT("fused MoE down: no kernel for packed format %d", fmt);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+#else
+
+static void mul_mat_vec_q_packed_switch_fmt(
+        const int fmt, const char * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device & fusion, float * dst,
+        const int ncols_x, const int nrows_x, const int ncols_dst, const int stride_col_y, const int stride_col_dst,
+        const int nchannels_y, const int nchannels_dst, const int64_t stride_channel_x, const int stride_channel_y,
+        const int stride_channel_dst, const int ids_stride, cudaStream_t stream) {
+    GGML_UNUSED_VARS(vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_col_y, stride_col_dst, nchannels_y, nchannels_dst,
+        stride_channel_x, stride_channel_y, stride_channel_dst, ids_stride, stream);
+    GGML_ABORT("MMVQ: no kernel for packed format %d on this backend", fmt);
+}
+
+static void moe_down_q_reduction_packed_switch_fmt(
+        const int fmt, const char * vx, const block_q8_1 * vy, const int32_t * ids, const float * weights, float * dst,
+        const int ncols_x, const int nrows_x, const int64_t stride_channel_x, const int stride_channel_y, cudaStream_t stream) {
+    GGML_UNUSED_VARS(vx, vy, ids, weights, dst, ncols_x, nrows_x, stride_channel_x, stride_channel_y, stream);
+    GGML_ABORT("fused MoE down: no kernel for packed format %d on this backend", fmt);
+}
+
+#endif // GGML_CUDA_MOE_PACKED_AVAILABLE
+
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
+
+    // delphi: MUL_MAT_ID reads expert weights packed in place in their packed layout (moe-packed.cuh)
+    const int packed = ids ? ggml_cuda_moe_packed_inplace_fmt(src0) : GGML_CUDA_MOE_PACKED_NONE;
+    if (fusion && fusion->gate) {
+        GGML_ASSERT(ggml_cuda_moe_packed_inplace_fmt(fusion->gate) == packed && "gate and up must have the same layout");
+    }
 
     GGML_TENSOR_BINARY_OP_LOCALS;
 
@@ -1682,6 +2211,13 @@ void ggml_cuda_mul_mat_vec_q(
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
+    if (packed != GGML_CUDA_MOE_PACKED_NONE) {
+        GGML_ASSERT(fusion_local.x_scale == nullptr && fusion_local.gate_scale == nullptr);
+        mul_mat_vec_q_packed_switch_fmt(packed, (const char *) src0->data, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00, ne01,
+            ncols_dst, stride_col_y, stride_col_dst, nchannels_y, nchannels_dst, nb02, stride_channel_y, stride_channel_dst, ids_stride, stream);
+        return;
+    }
+
     mul_mat_vec_q_switch_type(
         src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
@@ -1739,6 +2275,15 @@ void ggml_cuda_moe_down_q_reduction(
         (const float *) src1->data, nullptr, src1_q8_1.get(), src0->type,
         src1->ne[0], src1->nb[1] / sizeof(float), src1->nb[2] / sizeof(float),
         src1->nb[3] / sizeof(float), ncols_padded, src1->ne[1], 1, 1, stream);
+
+    // delphi: expert weights packed in place (moe-packed.cuh)
+    const int packed = ggml_cuda_moe_packed_inplace_fmt(src0);
+    if (packed != GGML_CUDA_MOE_PACKED_NONE) {
+        moe_down_q_reduction_packed_switch_fmt(packed, (const char *) src0->data, (const block_q8_1 *) src1_q8_1.get(),
+            (const int32_t *) ids->data, (const float *) weights->data, (float *) dst->data, src0->ne[0], src0->ne[1], src0->nb[2],
+            ncols_padded / QK8_1, stream);
+        return;
+    }
 
 #define MOE_DOWN_Q_REDUCTION_CASE(type_name)                                      \
         case type_name:                                                          \

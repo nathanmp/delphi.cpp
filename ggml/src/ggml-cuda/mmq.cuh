@@ -1639,11 +1639,28 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
 
 // Each expert only sees ncols*n_expert_used/n_experts tokens on average.
 // On RDNA3 and RDNA4 it is faster to pick the tile size against this value instead of ncols.
+// delphi: elsewhere, size J for 3x the mean slice (routing is skewed), at most 96; experts with more columns take more tiles.
+// From a mean slice of 96 up, keep J sized for ncols.
+// GGML_CUDA_MMQ_MOE_COLS: 0 -> size J for ncols, N > 0 -> size J for N columns (all GPUs).
 static int64_t ggml_cuda_mmq_moe_ncols_opt(const int cc, const int64_t ncols, const int64_t n_expert_used, const int64_t n_experts) {
-    if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
-        return (ncols*n_expert_used + n_experts - 1) / n_experts;
+    static const int64_t env = [] {
+        const char * s = getenv("GGML_CUDA_MMQ_MOE_COLS");
+        return s ? (int64_t) atoll(s) : int64_t(-1);
+    }();
+    if (env == 0 || n_experts <= 0) {
+        return ncols;
     }
-    return ncols;
+    if (env > 0) {
+        return std::max<int64_t>(1, std::min(env, ncols));
+    }
+    const int64_t mean = (ncols*n_expert_used + n_experts - 1) / n_experts;
+    if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
+        return mean;
+    }
+    if (mean >= 96) {
+        return ncols;
+    }
+    return std::max<int64_t>(1, std::min<int64_t>(std::min<int64_t>(3*mean, 96), ncols));
 }
 
 static int ggml_cuda_mmq_get_J_best(ggml_type type, bool fallback, int cc, size_t smpbo, int64_t ncols_opt) {

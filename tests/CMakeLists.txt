@@ -312,6 +312,12 @@ endif()
 # TODO: make this test (and others) not link `libllama` as it is not needed [TAG_TESTS_LLAMA_LINK]
 llama_build(test-backend-ops.cpp)
 
+# Grouped routed-MoE schedule: host builder, device builders and grouped reference execution.
+llama_build_and_test(test-moe-schedule.cpp)
+
+# Logits of a model over a mixed prefill/decode sequence, saved or compared with another run (needs a model: build only).
+llama_build(test-mixed-logits.cpp)
+
 llama_build(test-exec-trace.cpp)
 llama_test(test-exec-trace NAME test-exec-trace-disabled ARGS disabled)
 llama_test(test-exec-trace NAME test-exec-trace-enabled ARGS enabled ${CMAKE_CURRENT_BINARY_DIR}/test-exec-trace.bin)

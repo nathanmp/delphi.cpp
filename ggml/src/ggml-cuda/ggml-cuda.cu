@@ -35,6 +35,8 @@
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/moe-devsort.cuh"
+#include "ggml-cuda/moe-schedule.cuh"
+#include "ggml-cuda/moe-grouped.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
@@ -759,6 +761,8 @@ struct ggml_backend_cuda_buffer_context {
 
 static void ggml_backend_cuda_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
+    // delphi: the packed MoE weights are keyed by the tensor address, which a later buffer can reuse
+    ggml_cuda_moe_packed_forget(ctx->device, ctx->dev_ptr, buffer->size);
     delete ctx;
 }
 
@@ -1998,6 +2002,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     // note: this path should not be reached when recording CUDA graphs, because it requires stream synchronization
     GGML_ASSERT(ggml_cuda_mul_mat_id_needs_sync(dst, cc));
+    ggml_cuda_moe_packed_check_not_inplace(src0); // delphi: the per-expert fallback reads the GGUF layout
     ggml_exec_trace_dispatch(dst->op, GGML_EXEC_TRACE_DISPATCH_GPU_MUL_MAT_ID_FALLBACK,
             GGML_EXEC_TRACE_DISPATCH_VARIANT_SORTED_FALLBACK, cc, (uint32_t) ne02);
     cudaStream_t stream = ctx.stream();
@@ -2467,6 +2472,7 @@ static const char * ggml_backend_cuda_get_name(ggml_backend_t backend) {
 static void ggml_backend_cuda_free(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
+    ggml_cuda_moe_grouped_log_stats(cuda_ctx->device);
     delete cuda_ctx;
     delete backend;
 }
@@ -4653,6 +4659,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_set_device(cuda_ctx->device);
 
+    // delphi: build packed MoE weights before a CUDA graph can capture a MUL_MAT_ID that reads them (moe-packed.cuh)
+    ggml_cuda_moe_packed_prepare(*cuda_ctx, cgraph);
+
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
     enum ggml_exec_trace_gpu_graph_reason fallback_reason = GGML_EXEC_TRACE_GPU_GRAPH_REASON_DISABLED;
@@ -6001,6 +6010,24 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    if (strcmp(name, "ggml_backend_cuda_moe_schedule_set_mode") == 0) {
+        return (void *)ggml_backend_cuda_moe_schedule_set_mode;
+    }
+    if (strcmp(name, "ggml_backend_cuda_moe_schedule_build_host") == 0) {
+        return (void *)ggml_backend_cuda_moe_schedule_build_host;
+    }
+    if (strcmp(name, "ggml_backend_cuda_moe_grouped_set_mode") == 0) {
+        return (void *)ggml_backend_cuda_moe_grouped_set_mode;
+    }
+    if (strcmp(name, "ggml_backend_cuda_moe_grouped_get_counts") == 0) {
+        return (void *)ggml_backend_cuda_moe_grouped_get_counts;
+    }
+    if (strcmp(name, "ggml_backend_cuda_moe_packed_clear") == 0) {
+        return (void *)ggml_backend_cuda_moe_packed_clear;
+    }
+    if (strcmp(name, "ggml_backend_cuda_moe_packed_set_inplace") == 0) {
+        return (void *)ggml_backend_cuda_moe_packed_set_inplace;
     }
     return nullptr;
 }

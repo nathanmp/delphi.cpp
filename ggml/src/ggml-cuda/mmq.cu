@@ -2,7 +2,10 @@
 #include "mmq.cuh"
 #include "quantize.cuh"
 #include "mmid.cuh"
+#include "moe-schedule.cuh"
+#include "moe-grouped.cuh"
 
+#include <cinttypes>
 #include <cstdint>
 
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
@@ -220,18 +223,54 @@ void ggml_cuda_mul_mat_q(
     // scatter to its slots. ids_src1 then holds the inverse map (token slot -> compact row).
     const bool dedup_bcast = ne11 == 1 && n_expert_used > 1;
 
-    {
-        GGML_ASSERT(ids->nb[0] == ggml_element_size(ids));
-        const int si1  = ids->nb[1] / ggml_element_size(ids);
-        const int sis1 = nb12 / nb11;
+    const int32_t * ids_src1_d = ids_src1.get();
 
-        ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
-            ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast, stream);
+    GGML_ASSERT(ids->nb[0] == ggml_element_size(ids));
+    const int si1  = ids->nb[1] / ggml_element_size(ids);
+    const int sis1 = nb12 / nb11;
+
+    // delphi: the grouped schedule serves a broadcast src1, and a src1 packed as [ne10, n_expert_used, ne12], whose slot array is also the forward gather map.
+    const bool schedule_ok = dedup_bcast || (ne11 == n_expert_used && sis1 == n_expert_used);
+    const bool grouped     = ggml_cuda_moe_grouped_select(ctx.device, src0->type, cc, ne12, schedule_ok);
+
+    // delphi: grouped execution with packed weights (moe-packed.cuh). A packed-only type such as MXFP4 has no grouped MMQ case;
+    // in packed mode, try the lossless layout before falling back to the old path for shapes that cannot be packed.
+    const int packed = schedule_ok ? ggml_cuda_moe_packed_select(src0, /*warn =*/ true) : GGML_CUDA_MOE_PACKED_NONE;
+    const bool use_packed = packed != GGML_CUDA_MOE_PACKED_NONE;
+    if (!use_packed) {
+        ggml_cuda_moe_packed_check_not_inplace(src0);
+    }
+
+    {
+        if ((grouped || ggml_cuda_moe_schedule_enabled()) && schedule_ok) {
+            ggml_cuda_pool_alloc<int32_t> scratch(ctx.pool(), ggml_cuda_moe_schedule_scratch_size(ne02, ne_get_rows));
+            ggml_cuda_moe_schedule_build((const int32_t *) ids->data, si1, ne12, n_expert_used, ne02,
+                expert_bounds.get(), ids_dst.get(), dedup_bcast ? ids_src1.get() : nullptr, scratch.get(), stream);
+            if (!dedup_bcast) {
+                ids_src1_d = ids_dst.get();
+            }
+        } else {
+            ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
+                ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast, stream);
+        }
         CUDA_CHECK(cudaGetLastError());
     }
 
+    if (use_packed && packed == GGML_CUDA_MOE_PACKED_F16) {
+        ggml_cuda_pool_alloc<char> packed_storage(ctx.pool());
+        const moe_packed_weights w = ggml_cuda_moe_packed_get(packed_storage, packed, src0, stream);
+        ggml_cuda_pool_alloc<half> src1_f16(ctx.pool(), (ne_get_rows + GGML_CUDA_MOE_GROUPED_Y_PAD)*ne10);
+        const int64_t s11 = src1->nb[1] / ts_src1;
+        const int64_t s12 = src1->nb[2] / ts_src1;
+        ggml_cuda_moe_packed_y_f16(src1_d, ids_src1_d, src1_f16.get(), ne10, dedup_bcast ? s12 : s11,
+            dedup_bcast ? ne12 : ne_get_rows, n_expert_used, dedup_bcast, stream);
+        ggml_cuda_mul_mat_id_packed(ctx, packed, w, (const char *) src1_f16.get(), ne_get_rows, ids_dst.get(), expert_bounds.get(),
+            dst_d, ne01, ne00, ne02, ne_get_rows, s1, stream);
+        return;
+    }
+
     const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * y_block_size/y_values_per_block +
-        ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * sizeof(block_q8_1_mmq);
+        std::max(ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11), grouped ? GGML_CUDA_MOE_GROUPED_Y_PAD : 0) * sizeof(block_q8_1_mmq);
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
     ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
     if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {
@@ -251,17 +290,17 @@ void ggml_cuda_mul_mat_q(
             static constexpr size_t align_float8 = 32;
             const bool use_aligned_float8 = ggml_cuda_is_aligned(src1, align_float8);
             if (dedup_bcast) {
-                quantize_scatter_mmq_fp4_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10,
+                quantize_scatter_mmq_fp4_cuda(src1_d, ids_src1_d, src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10,
                                         /*stride_token=*/s12, ne10_padded, ne12, ne11_flat, n_expert_used, stream);
             } else {
-                quantize_mmq_fp4_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13,
+                quantize_mmq_fp4_cuda(src1_d, ids_src1_d, src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13,
                                         ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
             }
         } else if (dedup_bcast) {
-            quantize_scatter_mmq_q8_1_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10,
+            quantize_scatter_mmq_q8_1_cuda(src1_d, ids_src1_d, src1_q8_1.get(), src0->type, ne10,
                                     /*stride_token=*/s12, ne10_padded, ne12, ne11_flat, n_expert_used, stream);
         } else {
-            quantize_mmq_q8_1_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
+            quantize_mmq_q8_1_cuda(src1_d, ids_src1_d, src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
                                    ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
         }
         CUDA_CHECK(cudaGetLastError());
@@ -282,6 +321,19 @@ void ggml_cuda_mul_mat_q(
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
         ne12, ncols_opt};
+
+    if (use_packed) {
+        ggml_cuda_pool_alloc<char> packed_storage(ctx.pool());
+        const moe_packed_weights w = ggml_cuda_moe_packed_get(packed_storage, packed, src0, stream);
+        ggml_cuda_mul_mat_id_packed(ctx, packed, w, src1_q8_1.get(), ne_get_rows, ids_dst.get(), expert_bounds.get(),
+            dst_d, ne01, ne00, ne02, ne_get_rows, s1, stream);
+        return;
+    }
+
+    if (grouped) {
+        ggml_cuda_mul_mat_q_grouped(ctx, args, stream);
+        return;
+    }
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 }
