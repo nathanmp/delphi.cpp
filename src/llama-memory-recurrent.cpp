@@ -471,6 +471,14 @@ llama_memory_context_ptr llama_memory_recurrent::init_full() {
     return std::make_unique<llama_memory_recurrent_context>(this);
 }
 
+llama_memory_context_ptr llama_memory_recurrent::init_full_n_seq(
+        uint32_t n_seq, uint32_t n_kv, bool kpool_rebuild) {
+    GGML_UNUSED(n_kv);
+    GGML_UNUSED(kpool_rebuild);
+    GGML_ASSERT(n_seq <= size);
+    return std::make_unique<llama_memory_recurrent_context>(this, n_seq);
+}
+
 llama_memory_context_ptr llama_memory_recurrent::init_update(llama_context * lctx, bool optimize) {
     GGML_UNUSED(lctx);
     GGML_UNUSED(optimize);
@@ -479,6 +487,12 @@ llama_memory_context_ptr llama_memory_recurrent::init_update(llama_context * lct
 }
 
 bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches) {
+    // A hybrid memory may use an intentionally empty recurrent component.
+    // It has no state or position continuity to validate.
+    if (!has_layers()) {
+        return true;
+    }
+
     // simply remember the full state because it is very small for this type of cache
     // TODO: optimize
     auto org_cells = cells;
@@ -503,6 +517,10 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
 }
 
 bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
+    if (!has_layers()) {
+        return true;
+    }
+
     const uint32_t n_seq_tokens = ubatch.n_seq_tokens;
     const uint32_t n_seqs       = ubatch.n_seqs;
 
@@ -716,6 +734,12 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
 bool llama_memory_recurrent::get_can_shift() const {
     // shifting the pos is trivial for recurrent models
     return true;
+}
+
+bool llama_memory_recurrent::has_layers() const {
+    return std::any_of(r_l.begin(), r_l.end(), [](const ggml_tensor * tensor) {
+        return tensor != nullptr;
+    });
 }
 
 size_t llama_memory_recurrent::total_size() const {
@@ -1237,6 +1261,12 @@ llama_memory_recurrent_context::llama_memory_recurrent_context(
         llama_memory_recurrent * mem,
         std::vector<llama_ubatch> ubatches) : status(LLAMA_MEMORY_STATUS_SUCCESS), mem(mem), ubatches(std::move(ubatches)) {}
 
+llama_memory_recurrent_context::llama_memory_recurrent_context(
+        llama_memory_recurrent * mem,
+                     uint32_t   n_rs) :
+    status(LLAMA_MEMORY_STATUS_SUCCESS), mem(mem), n_rs_override(n_rs) {
+}
+
 llama_memory_recurrent_context::~llama_memory_recurrent_context() = default;
 
 bool llama_memory_recurrent_context::next() {
@@ -1276,15 +1306,15 @@ const llama_ubatch & llama_memory_recurrent_context::get_ubatch() const {
 }
 
 uint32_t llama_memory_recurrent_context::get_n_rs() const {
-    return is_full ? mem->size : mem->n;
+    return n_rs_override != UINT32_MAX ? n_rs_override : (is_full ? mem->size : mem->n);
 }
 
 uint32_t llama_memory_recurrent_context::get_head() const {
-    return is_full ? 0 : mem->head;
+    return n_rs_override != UINT32_MAX ? 0 : (is_full ? 0 : mem->head);
 }
 
 int32_t llama_memory_recurrent_context::get_rs_z() const {
-    return is_full ? 0 : mem->rs_z;
+    return n_rs_override != UINT32_MAX ? 0 : (is_full ? 0 : mem->rs_z);
 }
 
 uint32_t llama_memory_recurrent_context::get_size() const {

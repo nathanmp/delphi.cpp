@@ -1506,16 +1506,17 @@ class TextModel(ModelBase):
         return seems_special
 
     # used for GPT-2 BPE and WordPiece vocabs
-    def get_vocab_base(self) -> tuple[list[str], list[int], str]:
+    def get_vocab_base(self, tokenizer=None, tokpre: str | None = None) -> tuple[list[str], list[int], str]:
         tokens: list[str] = []
         toktypes: list[int] = []
 
-        from transformers import AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained(self.dir_model)
+        if tokenizer is None:
+            from transformers import AutoTokenizer
+            tokenizer = AutoTokenizer.from_pretrained(self.dir_model)
         vocab_size = self.hparams.get("vocab_size", len(tokenizer.vocab))  # ty: ignore[unresolved-attribute]
         assert max(tokenizer.vocab.values()) < vocab_size  # ty: ignore[unresolved-attribute]
 
-        tokpre = self.get_vocab_base_pre(tokenizer)
+        tokpre = tokpre or self.get_vocab_base_pre(tokenizer)
 
         reverse_vocab = {id_: encoded_tok for encoded_tok, id_ in tokenizer.vocab.items()}  # ty: ignore[unresolved-attribute]
         added_vocab = tokenizer.get_added_vocab()  # ty: ignore[unresolved-attribute]
@@ -2266,11 +2267,12 @@ class TextModel(ModelBase):
         special_vocab._set_special_token("bos", tokenizer.get_added_vocab()["<|endoftext|>"])  # ty: ignore[unresolved-attribute]
         special_vocab.add_to_gguf(self.gguf_writer)
 
-    def _set_vocab_glm(self):
-        from transformers import AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained(self.dir_model)
+    def _set_vocab_glm(self, tokenizer=None, tokpre: str | None = None):
+        if tokenizer is None:
+            from transformers import AutoTokenizer
+            tokenizer = AutoTokenizer.from_pretrained(self.dir_model)
         special_vocab = gguf.SpecialVocab(self.dir_model, load_merges=True)
-        tokens, toktypes, tokpre = self.get_vocab_base()
+        tokens, toktypes, tokpre = self.get_vocab_base(tokenizer, tokpre=tokpre)
         self.gguf_writer.add_tokenizer_model("gpt2")
         self.gguf_writer.add_tokenizer_pre(tokpre)
         self.gguf_writer.add_token_list(tokens)
@@ -2639,6 +2641,20 @@ class MmprojModel(ModelBase):
 
         if not self.has_vision_encoder and not self.has_audio_encoder:
             raise ValueError("MmprojModel must have either vision or audio encoder")
+
+    def prepare_tensors(self):
+        super().prepare_tensors()
+
+        # an mmproj has no vocab-only mode, so an empty one is always a silent mapping failure
+        # rather than a supported output; count and size are both checked because a tensor map
+        # that produces only zero-sized entries is just as broken as one that produces none
+        n_tensors = sum(len(t) for t in self.gguf_writer.tensors)
+        n_bytes = sum(ti.nbytes for t in self.gguf_writer.tensors for ti in t.values())
+        if n_tensors == 0 or n_bytes == 0:
+            raise ValueError(
+                f"refusing to write an mmproj with no tensor data (n_tensors = {n_tensors}, n_bytes = {n_bytes}); "
+                "check that the model's vision/audio tensors are named as the tensor map expects"
+            )
 
     def write_vocab(self):
         raise ValueError("MmprojModel does not support vocab writing")

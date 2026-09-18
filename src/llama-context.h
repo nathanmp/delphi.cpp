@@ -88,6 +88,7 @@ struct llama_context {
 
     float * get_embeddings_nextn();
     float * get_embeddings_nextn_ith(int32_t i);
+    ggml_tensor * get_embeddings_nextn_tensor();
 
     float * get_embeddings_layer_inp(uint32_t lid);
 
@@ -115,8 +116,13 @@ struct llama_context {
 
     void set_embeddings (bool value);
     void set_embeddings_nextn(bool value, bool masked);
+    void set_embeddings_nextn_host(bool value);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
+    void set_mtp_index_reuse(bool reuse);
+    bool mtp_device_draft_begin(uint32_t n_steps);
+    void mtp_device_draft_advance();
+    bool mtp_device_draft_finish(llama_token * tokens, float * probs, size_t n_results);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
@@ -228,6 +234,8 @@ private:
 
     void output_reorder();
 
+    bool store_embeddings_nextn_backend(ggml_tensor * src, size_t row_offset, size_t n_rows);
+
     // map the output row index `i` to batch index
     int64_t output_resolve_row(int32_t i) const;
 
@@ -302,6 +310,16 @@ private:
     // populated only when cparams.embeddings_nextn is enabled and the model graph
     // sets llm_graph_result::t_h_nextn
     buffer_view<float> embd_nextn = {nullptr, 0};
+    bool embd_nextn_host = true;
+    ggml_context_ptr        embd_nextn_backend_ctx;
+    ggml_backend_buffer_ptr embd_nextn_backend_buf;
+    ggml_tensor *           embd_nextn_backend = nullptr;
+    ggml_tensor             embd_nextn_backend_view = {};
+    size_t                  embd_nextn_backend_rows = 0;
+
+    llama_mtp_device_draft_cache mtp_device_draft_cache;
+    ggml_context_ptr             mtp_device_draft_ctx;
+    ggml_backend_buffer_ptr      mtp_device_draft_buf;
 
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true

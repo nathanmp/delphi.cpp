@@ -33,6 +33,9 @@ class llama_memory_recurrent_context;
 class llama_memory_hybrid_context;
 class llama_memory_hybrid_iswa_context;
 
+// defined in llama-kv-cache-kpool.h, which includes this header, so forward declared only
+class llm_graph_input_kpool;
+
 // certain models (typically multi-modal) can produce different types of graphs
 enum llm_graph_type {
     LLM_GRAPH_TYPE_DEFAULT,
@@ -145,6 +148,8 @@ public:
     llm_graph_input_embd_h(int64_t n_embd) : n_embd(n_embd) {}
     virtual ~llm_graph_input_embd_h() = default;
 
+    ggml_tensor * build_h(ggml_context * ctx, const llama_ubatch & ubatch);
+
     void set_input(const llama_ubatch * ubatch) override;
 
     bool can_reuse(const llm_graph_params & params) override;
@@ -152,6 +157,8 @@ public:
     ggml_tensor * tokens = nullptr; // I32 [n_batch]
     ggml_tensor * embd   = nullptr; // F32 [n_embd, n_batch]
     ggml_tensor * h      = nullptr; // F32 [n_embd, n_batch]
+    ggml_tensor * h_rows = nullptr; // I32 [n_batch]
+    ggml_tensor   h_src  = {};
 
     const int64_t n_embd = 0;
 };
@@ -268,12 +275,12 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override;
 
-    ggml_tensor * s_copy;  // I32 [n_rs]
+    ggml_tensor * s_copy = nullptr;  // I32 [n_rs]
 
     // views of s_copy, computed once per graph
     // and shared across layers which use build_rs
-    ggml_tensor * s_copy_main;   // I32 [n_seqs]
-    ggml_tensor * s_copy_extra;  // I32 [n_rs - n_seqs]
+    ggml_tensor * s_copy_main  = nullptr;  // I32 [n_seqs]
+    ggml_tensor * s_copy_extra = nullptr;  // I32 [n_rs - n_seqs]
 
     const llama_memory_recurrent_context * mctx;
 
@@ -786,6 +793,7 @@ struct llm_graph_params {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+    const llama_mtp_device_draft_cache * mtp_device_draft_cache;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -822,9 +830,14 @@ struct llm_graph_params {
             ubatch.n_seqs_unq   == other.ubatch.n_seqs_unq &&
             (
                 (!ubatch.token && !other.ubatch.token) ||
-                (!ubatch.embd  && !other.ubatch.embd)  ||
-                (ubatch.token && other.ubatch.token && ubatch.embd && other.ubatch.embd)
-            );
+                ((!ubatch.embd && !ubatch.embd_tensor) &&
+                 (!other.ubatch.embd && !other.ubatch.embd_tensor)) ||
+                (ubatch.token && other.ubatch.token &&
+                 (ubatch.embd || ubatch.embd_tensor) &&
+                 (other.ubatch.embd || other.ubatch.embd_tensor))
+            ) && ((bool(ubatch.embd_h) || bool(ubatch.embd_h_tensor)) ==
+                  (bool(other.ubatch.embd_h) || bool(other.ubatch.embd_h_tensor))) &&
+                 (bool(ubatch.embd_h_tensor_rows) == bool(other.ubatch.embd_h_tensor_rows));
 
         // when we split the batch using "equal_seqs" we have to verify that the participating sequences are the same
         //   the reason is because the set of attention streams would be different for different sequences
@@ -868,6 +881,10 @@ struct llm_graph_params {
 
         // TODO: https://github.com/ggml-org/llama.cpp/pull/24340#discussion_r3448035248
         if (cparams.nextn_layer_offset != other.cparams.nextn_layer_offset) {
+            return false;
+        }
+
+        if (cparams.mtp_device_draft_mode != other.cparams.mtp_device_draft_mode) {
             return false;
         }
 
@@ -936,6 +953,10 @@ public:
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
+    ggml_tensor * t_mtp_device_seq_ids    = nullptr;
+    ggml_tensor * t_mtp_device_result_ids = nullptr;
+
+    std::vector<ggml_tensor *> t_mtp_device_writes;
 
     std::vector<ggml_tensor *> t_layer_inp;
 
@@ -1026,6 +1047,7 @@ struct llm_graph_context {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+    const llama_mtp_device_draft_cache * mtp_device_draft_cache;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -1187,7 +1209,8 @@ struct llm_graph_context {
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                 int64_t   n_kv_max,
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+            ggml_tensor * kv_indices = nullptr) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 
@@ -1359,6 +1382,33 @@ struct llm_graph_context {
 
     llm_graph_input_mem_hybrid_iswa * build_inp_mem_hybrid_iswa() const;
 
+    // one pooling map per ubatch (see llama-kv-cache-kpool.h); `scoring` false gives only k_idxs
+    llm_graph_input_kpool * build_inp_kpool(
+            const llama_memory_hybrid_context * mctx_cur,
+            ggml_tensor * kq_mask,
+            bool scoring) const;
+
+    // build_attn, but masking with `top_k` over `sel_mask`; `cand_mask` drops over-budget picks
+    ggml_tensor * build_attn_sparse(
+            llm_graph_input_attn_k * inp,
+            ggml_tensor * wo,
+            ggml_tensor * wo_b,
+            ggml_tensor * wo_s,
+            ggml_tensor * q_cur,     // [n_embd_head_q, n_head_q, n_tokens]
+            ggml_tensor * k_cur,     // [n_embd_head_k, n_head_k, n_tokens]
+            ggml_tensor * v_cur,     // [n_embd_head_v, n_head_v, n_tokens]
+            ggml_tensor * kq_b,
+            ggml_tensor * sinks,     // [n_head_q]
+            ggml_tensor * v_mla,     // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
+            ggml_tensor * top_k,     // I32 [n_select, n_tokens/n_stream, n_stream]
+            ggml_tensor * top_k_mask,// F16 [n_select, n_tokens/n_stream, n_stream]
+            ggml_tensor * tail_cells,// I32 [n_tail_pad, n_tokens/n_stream, n_stream]
+            ggml_tensor * tail_mask, // F16 [n_tail_pad, n_tokens/n_stream, n_stream]
+            ggml_tensor * sel_mask,  // F16/F32 [n_kv, n_batch, 1, n_stream]
+            ggml_tensor * cand_mask, // F16/F32 [n_kv, n_batch, 1, n_stream]
+                  float   kq_scale,
+                    int   il) const;
+
     //
     // pooling
     //
@@ -1375,6 +1425,7 @@ struct llm_graph_context {
     //
 
     void build_sampling() const;
+    void build_mtp_device_draft() const;
 
     //
     // dense (out)

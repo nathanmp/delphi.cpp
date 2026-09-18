@@ -71,6 +71,7 @@
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
+#include "ggml-cuda/kpool-expand.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -2460,6 +2461,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_LIGHTNING_INDEXER:
             ggml_cuda_lightning_indexer(ctx, dst);
             break;
+        case GGML_OP_KPOOL_EXPAND:
+            ggml_cuda_kpool_expand(ctx, dst);
+            break;
         default:
             return false;
     }
@@ -2641,14 +2645,63 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
     return use_cuda_graph;
 }
 
-static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
-    return cgraph->nodes[0];
+static void ggml_cuda_graph_hash(uint64_t & hash, const void * data, size_t size) {
+    const uint8_t * bytes = static_cast<const uint8_t *>(data);
+    for (size_t i = 0; i < size; ++i) {
+        hash ^= bytes[i];
+        hash *= 1099511628211ULL;
+    }
 }
 
-static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
+static uint64_t ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
+    uint64_t hash = 14695981039346656037ULL;
+    const uintptr_t anchor = reinterpret_cast<uintptr_t>(cgraph->nodes[0]);
+    ggml_cuda_graph_hash(hash, &anchor, sizeof(anchor));
+
+    static const bool shape_cache = [] {
+        const char * env = std::getenv("GGML_CUDA_GRAPH_SHAPE_CACHE");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+    if (!shape_cache) {
+        return hash;
+    }
+
+    ggml_cuda_graph_hash(hash, &cgraph->n_nodes, sizeof(cgraph->n_nodes));
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        ggml_cuda_graph_hash(hash, &node->type,      sizeof(node->type));
+        ggml_cuda_graph_hash(hash, &node->op,        sizeof(node->op));
+        ggml_cuda_graph_hash(hash, &node->flags,     sizeof(node->flags));
+        ggml_cuda_graph_hash(hash,  node->ne,        sizeof(node->ne));
+        ggml_cuda_graph_hash(hash,  node->nb,        sizeof(node->nb));
+        ggml_cuda_graph_hash(hash,  node->op_params, sizeof(node->op_params));
+        ggml_cuda_graph_hash(hash,  node->name,      sizeof(node->name));
+        ggml_cuda_graph_hash(hash, &node->view_offs, sizeof(node->view_offs));
+
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            const ggml_tensor * src = node->src[j];
+            const bool present = src != nullptr;
+            ggml_cuda_graph_hash(hash, &present, sizeof(present));
+            if (!present) {
+                continue;
+            }
+            ggml_cuda_graph_hash(hash, &src->type,      sizeof(src->type));
+            ggml_cuda_graph_hash(hash, &src->op,        sizeof(src->op));
+            ggml_cuda_graph_hash(hash,  src->ne,        sizeof(src->ne));
+            ggml_cuda_graph_hash(hash,  src->nb,        sizeof(src->nb));
+            ggml_cuda_graph_hash(hash,  src->op_params, sizeof(src->op_params));
+            ggml_cuda_graph_hash(hash,  src->name,      sizeof(src->name));
+            ggml_cuda_graph_hash(hash, &src->view_offs, sizeof(src->view_offs));
+        }
+    }
+
+    return hash;
+}
+
+static bool ggml_cuda_graph_update_required(
+        ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, uint64_t graph_key) {
     bool res = false;
 
-    const void * graph_key = ggml_cuda_graph_get_key(cgraph);
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
     if (cgraph->uid != 0 &&
@@ -2687,7 +2740,7 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     return res;
 }
 
-static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
+static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, uint64_t graph_key) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
 #if CUDART_VERSION >= 12000
@@ -3105,7 +3158,8 @@ struct ggml_cuda_moe_weighted_reduction_match {
 static bool ggml_cuda_match_moe_weighted_reduction(
         const ggml_cgraph * cgraph,
         int node_idx,
-        ggml_cuda_moe_weighted_reduction_match & match) {
+        ggml_cuda_moe_weighted_reduction_match & match,
+        bool allow_single_token = false) {
     const ggml_tensor * first = cgraph->nodes[node_idx];
     if (first->op != GGML_OP_MUL || first->type != GGML_TYPE_F32 || !ggml_is_contiguous(first)) {
         return false;
@@ -3164,9 +3218,13 @@ static bool ggml_cuda_match_moe_weighted_reduction(
         return false;
     }
 
-    const int     n_expert_used = (int) weighted->ne[1];
-    const int64_t n_tokens      = weighted->ne[2] * weighted->ne[3];
-    if (n_expert_used < 2 || n_expert_used > MOE_WEIGHTED_REDUCTION_MAX_EXPERTS || n_tokens <= 0) {
+    const int n_expert_used = (int) weighted->ne[1];
+    const int64_t n_tokens = weighted->ne[2] * weighted->ne[3];
+    // For single-token decode, launching one reduction kernel is slower than the
+    // existing chain of vector operations. Keep the fusion for multi-token
+    // prefill and speculative verification batches.
+    if (n_expert_used < 2 || n_expert_used > MOE_WEIGHTED_REDUCTION_MAX_EXPERTS ||
+            (n_tokens <= 1 && !allow_single_token)) {
         return false;
     }
 
@@ -3231,6 +3289,58 @@ static bool ggml_cuda_match_moe_weighted_reduction(
     match.weights      = weights;
     match.dst          = cgraph->nodes[output_idx];
     match.node_count   = node_count;
+    return true;
+}
+
+struct ggml_cuda_moe_down_reduction_match {
+    const ggml_tensor * matrix  = nullptr;
+    const ggml_tensor * input   = nullptr;
+    const ggml_tensor * ids     = nullptr;
+    const ggml_tensor * weights = nullptr;
+    ggml_tensor * dst           = nullptr;
+    int node_count              = 0;
+};
+
+static bool ggml_cuda_match_moe_down_reduction(
+        const ggml_cgraph * cgraph,
+        int node_idx,
+        ggml_cuda_moe_down_reduction_match & match) {
+    if (node_idx + 1 >= cgraph->n_nodes) {
+        return false;
+    }
+
+    const ggml_tensor * mmid = cgraph->nodes[node_idx];
+    if (mmid->op != GGML_OP_MUL_MAT_ID || mmid->type != GGML_TYPE_F32 || !ggml_is_contiguous(mmid)) {
+        return false;
+    }
+
+    ggml_cuda_moe_weighted_reduction_match reduction;
+    if (!ggml_cuda_match_moe_weighted_reduction(cgraph, node_idx + 1, reduction, true) ||
+            reduction.experts != mmid || reduction.expert_scale != nullptr) {
+        return false;
+    }
+
+    const int node_count = reduction.node_count + 1;
+    const int output_idx = node_idx + node_count - 1;
+    std::vector<ggml_op> ops(node_count);
+    for (int i = 0; i < node_count; ++i) {
+        ops[i] = cgraph->nodes[node_idx + i]->op;
+    }
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, node_count, ops.data(), &output_idx, 1)) {
+        return false;
+    }
+
+    if (!ggml_cuda_moe_down_q_reduction_supported(
+            mmid->src[0], mmid->src[1], mmid->src[2], reduction.weights, reduction.dst)) {
+        return false;
+    }
+
+    match.matrix = mmid->src[0];
+    match.input = mmid->src[1];
+    match.ids = mmid->src[2];
+    match.weights = reduction.weights;
+    match.dst = reduction.dst;
+    match.node_count = node_count;
     return true;
 }
 
@@ -3504,6 +3614,19 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         ggml_exec_trace_set_node(node_index);
         ggml_exec_trace_dispatch(op, implementation, GGML_EXEC_TRACE_DISPATCH_VARIANT_FUSED, device.cc, device.warp_size);
     };
+
+    if (node->op == GGML_OP_MUL_MAT_ID) {
+        ggml_cuda_moe_down_reduction_match match;
+        if (ggml_cuda_match_moe_down_reduction(cgraph, i, match)) {
+            const int output_idx = i + match.node_count - 1;
+            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, match.node_count, &output_idx, 1)) {
+                trace_fused_mul_mat(i, node->op, GGML_EXEC_TRACE_DISPATCH_GPU_MMVQ);
+                ggml_cuda_moe_down_q_reduction(
+                    *cuda_ctx, match.matrix, match.input, match.ids, match.weights, match.dst);
+                return match.node_count - 1;
+            }
+        }
+    }
 
     if (node->op == GGML_OP_MUL) {
         ggml_cuda_moe_weighted_reduction_match match;
@@ -4264,7 +4387,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
-static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
+static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, uint64_t graph_key) {
     bool graph_evaluated_or_captured = false;
 
     // flag used to determine whether it is an integrated_gpu
@@ -4526,7 +4649,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 }
 
 #ifdef USE_CUDA_GRAPH
-static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
+static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, uint64_t graph_key) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
     if (graph->graph == nullptr) {
@@ -4551,7 +4674,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     bool cuda_graph_update_required = false;
     enum ggml_exec_trace_gpu_graph_reason fallback_reason = GGML_EXEC_TRACE_GPU_GRAPH_REASON_DISABLED;
     uint32_t trace_dispatch_count = 0;
-    const void * graph_key = nullptr;
+    uint64_t graph_key = 0;
 
 #ifdef USE_CUDA_GRAPH
     graph_key = ggml_cuda_graph_get_key(cgraph);
@@ -4562,7 +4685,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     if (graph->is_enabled()) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
-            const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
+            const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph, graph_key);
 
             if (!graph->warmup_complete) {
                 // Warmup: need at least 2 calls with no property change on the 2nd call
@@ -4665,6 +4788,20 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
     if (!disable_fusion) {
         for (int i = 0; i < cgraph->n_nodes; ++i) {
+            if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT_ID) {
+                ggml_cuda_moe_down_reduction_match match;
+                if (ggml_cuda_match_moe_down_reduction(cgraph, i, match)) {
+                    params->add_alloc_dep(
+                        params->user_data, const_cast<ggml_tensor *>(match.input), match.dst);
+                    params->add_alloc_dep(
+                        params->user_data, const_cast<ggml_tensor *>(match.ids), match.dst);
+                    params->add_alloc_dep(
+                        params->user_data, const_cast<ggml_tensor *>(match.weights), match.dst);
+                    i += match.node_count - 1;
+                    continue;
+                }
+            }
+
             if (cgraph->nodes[i]->op != GGML_OP_MUL) {
                 continue;
             }
@@ -4685,7 +4822,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     }
 
 #ifdef USE_CUDA_GRAPH
-    const void * graph_key = ggml_cuda_graph_get_key(cgraph);
+    const uint64_t graph_key = ggml_cuda_graph_get_key(cgraph);
     const bool use_cuda_graph = ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 #else
     const bool use_cuda_graph = false;
@@ -5699,6 +5836,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return true;
         case GGML_OP_LIGHTNING_INDEXER:
             return ggml_cuda_lightning_indexer_supported(dev_ctx->device, op);
+        case GGML_OP_KPOOL_EXPAND:
+            return ggml_cuda_kpool_expand_supported(op);
 
         default:
             return false;

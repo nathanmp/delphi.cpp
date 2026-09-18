@@ -16,6 +16,9 @@ LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         uint32_t n_seqs,
         uint32_t n_outputs);
 
+// Apply a pending scheduler reserve after changing graph-shaping context flags.
+LLAMA_API void llama_context_sched_reserve(struct llama_context * ctx);
+
 // Get the default ggml_type for a given ftype.
 LLAMA_API ggml_type llama_ftype_get_default_type(llama_ftype ftype);
 
@@ -95,10 +98,24 @@ LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_c
 // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits
 LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked);
 
+// Control the host copy of nextn embeddings. Backend output remains available.
+LLAMA_API void llama_set_embeddings_nextn_host(struct llama_context * ctx, bool value);
+
 // Select which appended NextN block the DECODER_MTP graph runs (offset past
 // the trunk: il = n_layer() + offset). Used by the speculative NextN driver to
 // chain multiple trained NextN heads. Default 0 (first head).
 LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t offset);
+
+// Reuse the DSA Top-K selected by the first MTP draft iteration. This is a
+// no-op for models/memory types without a persistent sparse-index buffer.
+LLAMA_API void llama_set_mtp_index_reuse(struct llama_context * ctx, bool reuse);
+
+// Run a compatible GLM5NEXT MTP draft group without reading tokens or hidden
+// states between iterations. The final call performs the single compact readback.
+LLAMA_API bool llama_mtp_device_draft_begin(struct llama_context * ctx, uint32_t n_steps);
+LLAMA_API void llama_mtp_device_draft_advance(struct llama_context * ctx);
+LLAMA_API bool llama_mtp_device_draft_finish(
+        struct llama_context * ctx, llama_token * tokens, float * probs, size_t n_results);
 
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
@@ -106,6 +123,9 @@ LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
 
 // LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
 LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int32_t i);
+
+// Valid until the next encode/decode call on ctx. The caller must synchronize ctx before copying the tensor.
+LLAMA_API struct ggml_tensor * llama_get_embeddings_nextn_tensor(struct llama_context * ctx);
 
 // Set whether the context outputs the input embeddings of a specific layer
 LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);

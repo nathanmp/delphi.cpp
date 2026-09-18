@@ -12,12 +12,14 @@
 #include "llama-kv-cache-dsa-iswa.h"
 #include "llama-kv-cache-msa.h"
 #include "llama-kv-cache-dsv4.h"
+#include "llama-kv-cache-kpool.h"
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <numeric>
 #include <sstream>
@@ -79,6 +81,11 @@ void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
         const int64_t n_tokens = ubatch->n_tokens;
 
         ggml_backend_tensor_set(embd, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(embd));
+    } else if (ubatch->embd_tensor) {
+        GGML_ASSERT(n_embd == embd->ne[0]);
+        GGML_ASSERT(ggml_are_same_shape(ubatch->embd_tensor, embd));
+
+        ggml_backend_tensor_copy(ubatch->embd_tensor, embd);
     }
 }
 
@@ -86,9 +93,24 @@ bool llm_graph_input_embd::can_reuse(const llm_graph_params & params) {
     bool res = true;
 
     res &= (!params.ubatch.token) || (tokens && tokens->ne[0] == params.ubatch.n_tokens);
-    res &= (!params.ubatch.embd)  || (embd   &&   embd->ne[1] == params.ubatch.n_tokens);
+    res &= (!params.ubatch.embd && !params.ubatch.embd_tensor) ||
+        (embd && embd->ne[1] == params.ubatch.n_tokens);
 
     return res;
+}
+
+ggml_tensor * llm_graph_input_embd_h::build_h(ggml_context * ctx, const llama_ubatch & ubatch) {
+    if (ubatch.embd_h_tensor_rows) {
+        GGML_ASSERT(ubatch.embd_h_tensor);
+        h_src = *ubatch.embd_h_tensor;
+        h_rows = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, ubatch.n_tokens);
+        ggml_set_input(h_rows);
+        h = ggml_get_rows(ctx, &h_src, h_rows);
+    } else {
+        h = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, ubatch.n_tokens);
+        ggml_set_input(h);
+    }
+    return h;
 }
 
 void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
@@ -98,19 +120,33 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
         ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
     } else {
         // note: mtmd embedding input goes through here
-        GGML_ASSERT(ubatch->embd);
-        GGML_ASSERT(n_embd == embd->ne[0]);
+        GGML_ASSERT(ubatch->embd || ubatch->embd_tensor);
+        const int64_t n_embd_inp = embd->ne[0];
 
-        ggml_backend_tensor_set(embd, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(h));
+        if (ubatch->embd_tensor) {
+            GGML_ASSERT(ggml_are_same_shape(ubatch->embd_tensor, embd));
+            ggml_backend_tensor_copy(ubatch->embd_tensor, embd);
+        } else {
+            ggml_backend_tensor_set(embd, ubatch->embd, 0, n_tokens*n_embd_inp*ggml_element_size(embd));
+        }
     }
 
-    // TODO: extend llama_ubatch to differentiate between token embeddings and hidden states
-    //       for now, we assume that the hidden state is always provided as an embedding
-    //       ref: https://github.com/ggml-org/llama.cpp/pull/23643
-    if (ubatch->embd) {
-        GGML_ASSERT(n_embd == h->ne[0]);
+    GGML_ASSERT(ubatch->embd_h || ubatch->embd_h_tensor);
+    const int64_t n_embd_h = h->ne[0];
 
-        ggml_backend_tensor_set(h, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(h));
+    if (ubatch->embd_h_tensor_rows) {
+        GGML_ASSERT(h_rows && ubatch->embd_h_tensor);
+        GGML_ASSERT(h_rows->ne[0] == n_tokens);
+        GGML_ASSERT(h_src.type == ubatch->embd_h_tensor->type);
+        GGML_ASSERT(ggml_are_same_shape(&h_src, ubatch->embd_h_tensor));
+        GGML_ASSERT(ggml_are_same_stride(&h_src, ubatch->embd_h_tensor));
+        h_src = *ubatch->embd_h_tensor;
+        ggml_backend_tensor_set(h_rows, ubatch->embd_h_tensor_rows, 0, n_tokens*sizeof(int32_t));
+    } else if (ubatch->embd_h_tensor) {
+        GGML_ASSERT(ggml_are_same_shape(ubatch->embd_h_tensor, h));
+        ggml_backend_tensor_copy(ubatch->embd_h_tensor, h);
+    } else {
+        ggml_backend_tensor_set(h, ubatch->embd_h, 0, n_tokens*n_embd_h*ggml_element_size(h));
     }
 }
 
@@ -118,8 +154,17 @@ bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
     bool res = true;
 
     res &= (!params.ubatch.token) || (tokens && tokens->ne[0] == params.ubatch.n_tokens);
-    res &= (!params.ubatch.embd)  || (embd   && embd->ne[1]   == params.ubatch.n_tokens);
-    res &= (!params.ubatch.embd)  || (h      && h->ne[1]      == params.ubatch.n_tokens);
+    res &= (!params.ubatch.embd && !params.ubatch.embd_tensor) ||
+        (embd && embd->ne[1] == params.ubatch.n_tokens);
+    res &= (!params.ubatch.embd_h && !params.ubatch.embd_h_tensor) ||
+        (h && h->ne[1] == params.ubatch.n_tokens);
+    res &= bool(h_rows) == bool(params.ubatch.embd_h_tensor_rows);
+    if (params.ubatch.embd_h_tensor_rows) {
+        res &= params.ubatch.embd_h_tensor &&
+            h_src.type == params.ubatch.embd_h_tensor->type &&
+            ggml_are_same_shape(&h_src, params.ubatch.embd_h_tensor) &&
+            ggml_are_same_stride(&h_src, params.ubatch.embd_h_tensor);
+    }
 
     return res;
 }
@@ -346,6 +391,10 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
     const auto * mctx = static_cast<const llama_memory_recurrent_context *>(params.mctx);
 
     this->mctx = mctx;
+
+    if (mctx->get_n_rs() == 0) {
+        return s_copy == nullptr && s_copy_main == nullptr && s_copy_extra == nullptr;
+    }
 
     bool res = true;
 
@@ -1102,7 +1151,10 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
-    if (inp_rs->s_copy) {
+    // A hybrid context may intentionally filter out every recurrent layer
+    // (e.g. the plain-DSA GLM NextN block). In that case this unused input is
+    // present in metadata but receives no scheduler allocation.
+    if (inp_rs->s_copy && inp_rs->s_copy->buffer) {
         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
         int32_t * data = (int32_t *) inp_rs->s_copy->data;
 
@@ -1125,10 +1177,14 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
 
-    res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
+    if (mctx->get_recr()->get_n_rs() == 0) {
+        res &= inp_rs->s_copy == nullptr && inp_rs->s_copy_main == nullptr && inp_rs->s_copy_extra == nullptr;
+    } else {
+        res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
-    res &= inp_rs->s_copy_main->ne[0]  == params.ubatch.n_seqs;
-    res &= inp_rs->s_copy_extra->ne[0] == mctx->get_recr()->get_n_rs() - params.ubatch.n_seqs;
+        res &= inp_rs->s_copy_main->ne[0]  == params.ubatch.n_seqs;
+        res &= inp_rs->s_copy_extra->ne[0] == mctx->get_recr()->get_n_rs() - params.ubatch.n_seqs;
+    }
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
@@ -1142,11 +1198,15 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
     mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
 
-    mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    // Indexed sparse attention carries a compact validity mask and intentionally
+    // leaves the O(n_kv*n_tokens) dense KQ mask without an allocator buffer.
+    if (inp_attn->self_kq_mask && inp_attn->self_kq_mask->buffer) {
+        mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    }
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
-    if (inp_rs->s_copy) {
+    if (inp_rs->s_copy && inp_rs->s_copy->buffer) {
         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
         int32_t * data = (int32_t *) inp_rs->s_copy->data;
 
@@ -1168,10 +1228,14 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
 
     res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
 
-    res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
+    if (mctx->get_recr()->get_n_rs() == 0) {
+        res &= inp_rs->s_copy == nullptr && inp_rs->s_copy_main == nullptr && inp_rs->s_copy_extra == nullptr;
+    } else {
+        res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
-    res &= inp_rs->s_copy_main->ne[0]  == params.ubatch.n_seqs;
-    res &= inp_rs->s_copy_extra->ne[0] == mctx->get_recr()->get_n_rs() - params.ubatch.n_seqs;
+        res &= inp_rs->s_copy_main->ne[0]  == params.ubatch.n_seqs;
+        res &= inp_rs->s_copy_extra->ne[0] == mctx->get_recr()->get_n_rs() - params.ubatch.n_seqs;
+    }
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
@@ -1326,6 +1390,9 @@ void llm_graph_result::reset() {
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
     t_h_nextn     = nullptr;
+    t_mtp_device_seq_ids    = nullptr;
+    t_mtp_device_result_ids = nullptr;
+    t_mtp_device_writes.clear();
 
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
@@ -1371,6 +1438,9 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
     }
     if (t_h_nextn != nullptr) {
         ggml_set_output(t_h_nextn);
+    }
+    for (auto * tensor : t_mtp_device_writes) {
+        ggml_set_output(tensor);
     }
     {
         const auto & embeddings_layer_inp = params.cparams.embeddings_layer_inp;
@@ -1489,6 +1559,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     loras            (params.loras),
     mctx             (params.mctx),
     cross            (params.cross),
+    mtp_device_draft_cache(params.mtp_device_draft_cache),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -1831,7 +1902,7 @@ ggml_tensor * llm_graph_context::build_ffn(
                     const float limit = hparams.swiglu_clamp_shexp[il];
                     constexpr float eps = 1e-6f;
                     if (limit > eps) {
-                        if (arch == LLM_ARCH_DEEPSEEK4 || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0)) {
+                        if (arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_GLM5NEXT || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0)) {
                             cur = ggml_swiglu_clamp(ctx0, cur, tmp, limit);
                         } else {
                             tmp = ggml_clamp(ctx0, tmp, -limit, limit);
@@ -2225,7 +2296,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                     const float limit = hparams.swiglu_clamp_exp[il];
                     constexpr float eps = 1e-6f;
                     if (limit > eps) {
-                        if (arch == LLM_ARCH_MAPLE || arch == LLM_ARCH_DEEPSEEK4 || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0) || arch == LLM_ARCH_HY_V4) {
+                        if (arch == LLM_ARCH_MAPLE || arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_GLM5NEXT || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0) || arch == LLM_ARCH_HY_V4) {
                             cur = ggml_swiglu_clamp(ctx0, cur, up, limit);
                         } else {
                             up = ggml_clamp(ctx0, up, -limit, limit);
@@ -2598,7 +2669,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * v_mla,
              int64_t   n_kv_max,
                float   kq_scale,
-                 int   il) const {
+                 int   il,
+         ggml_tensor * kv_indices) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -2631,6 +2703,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
                                   hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+        if (kv_indices != nullptr) {
+            ggml_flash_attn_ext_set_indices(cur, kv_indices);
+        }
         res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);
@@ -3509,6 +3584,17 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
     const int64_t n_rs   = mctx_cur->get_n_rs();
     const int64_t n_seqs = ubatch.n_seqs;
 
+    // A hybrid memory can intentionally have no recurrent layers. The graph
+    // then has no recurrent state to copy, and creating an n_seqs-wide view of
+    // the zero-sized copy tensor would extend beyond its source.
+    if (n_rs == 0) {
+        inp->head = mctx_cur->get_head();
+        inp->rs_z = mctx_cur->get_rs_z();
+        return inp;
+    }
+
+    GGML_ASSERT(n_rs >= n_seqs);
+
     inp->s_copy = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_rs);
     ggml_set_input(inp->s_copy);
 
@@ -3603,6 +3689,315 @@ llm_graph_input_mem_hybrid_k * llm_graph_context::build_inp_mem_hybrid_k() const
     auto inp = std::make_unique<llm_graph_input_mem_hybrid_k>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
 
     return (llm_graph_input_mem_hybrid_k *) res->add_input(std::move(inp));
+}
+
+llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
+        const llama_memory_hybrid_context * mctx_cur,
+        ggml_tensor * kq_mask,
+        bool scoring) const {
+    const auto * mctx_attn = mctx_cur->get_attn();
+    const auto * mctx_idx  = mctx_cur->get_idx();
+    auto * pool_cache = mctx_cur->get_kpool_cache();
+
+    GGML_ASSERT(mctx_idx != nullptr && "a pooled indexer needs the indexer KV cache");
+    GGML_ASSERT(pool_cache != nullptr && "a pooling indexer needs persistent pool-key storage");
+
+    const char * pool_cache_env = getenv("LLAMA_GLM5_POOL_CACHE");
+    if (pool_cache_env != nullptr && atoi(pool_cache_env) == 0) {
+        pool_cache = nullptr;
+    }
+
+    const uint32_t kpool = hparams.indexer_kpool;
+    GGML_ASSERT(kpool > 0);
+
+    const uint32_t stream0 = mctx_idx->get_stream_base();
+    const uint32_t n_stream_cache = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
+    bool rebuild_pool_cache = pool_cache != nullptr && scoring &&
+            pool_cache->needs_rebuild(stream0, n_stream_cache);
+    if (pool_cache != nullptr && scoring && mctx_cur->get_kpool_rebuild_override() >= 0) {
+        rebuild_pool_cache = mctx_cur->get_kpool_rebuild_override() != 0;
+    }
+
+    auto inp = std::make_unique<llm_graph_input_kpool>(
+            mctx_attn, mctx_idx, pool_cache, rebuild_pool_cache,
+            pool_cache != nullptr && pool_cache->get_mtp_index_reuse(),
+            stream0, kpool);
+
+    inp->k_idxs = mctx_idx->build_input_k_idxs(ctx0, ubatch);
+    ggml_set_input(inp->k_idxs);
+    ggml_set_name(inp->k_idxs, "kpool_k_idxs");
+
+    if (scoring) {
+        const int64_t n_kv = mctx_attn->get_n_kv();
+
+        // must match build_attn_inp_kq_mask; get_n_stream() is the stream RANGE and is wrong
+        const int64_t n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
+        const int64_t n_tps    = ubatch.n_tokens/n_stream;
+        const bool indexed_attn = llama_kpool_indexed_attn_enabled(n_kv, n_tps);
+
+        // pool maps are per SEQUENCE; sized on the ubatch, not n_seq_max (256 in llama-embedding)
+        const int64_t n_ps = (int64_t) ubatch.n_seqs_unq/n_stream;
+
+        GGML_ASSERT(n_ps >= 1 && (int64_t) ubatch.n_seqs_unq == n_ps*n_stream);
+
+        const int64_t n_pools = llama_kpool_n_pools(n_kv, kpool, n_ps);
+
+        GGML_ASSERT(kq_mask->ne[0] == n_kv && kq_mask->ne[3] == n_stream);
+        GGML_ASSERT(pool_cache == nullptr || n_pools <= pool_cache->get_max_slots());
+
+        // the selection terms below exist only for real queries
+        GGML_ASSERT(kq_mask->ne[1] == n_tps && "the pooled indexer needs an unpadded KQ mask");
+
+        inp->pool_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool*n_pools, n_stream);
+        ggml_set_input(inp->pool_cells);
+        ggml_set_name(inp->pool_cells, "kpool_pool_cells");
+
+        inp->pool_bias = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_pools, n_tps, n_stream);
+        ggml_set_input(inp->pool_bias);
+        ggml_set_name(inp->pool_bias, "kpool_pool_bias");
+
+        if (pool_cache != nullptr) {
+            inp->pool_cache_slots = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_pools, n_stream);
+            ggml_set_input(inp->pool_cache_slots);
+            ggml_set_name(inp->pool_cache_slots, "kpool_cache_slots");
+
+            if (rebuild_pool_cache) {
+                inp->pool_store_src = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_pools, n_stream);
+                ggml_set_input(inp->pool_store_src);
+                ggml_set_name(inp->pool_store_src, "kpool_store_src");
+
+                inp->pool_store_dst = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_pools, n_stream);
+                ggml_set_input(inp->pool_store_dst);
+                ggml_set_name(inp->pool_store_dst, "kpool_store_dst");
+            } else {
+                // A batch can complete at most ceil(n_tps/kpool) pools per
+                // sequence partition. Keep one extra slot per partition for
+                // boundary/packing changes. Dirty pools can survive an MTP
+                // group until the next normal graph, so reserve room for them
+                // too. This also makes can_reuse reject an undersized graph.
+                const int64_t n_pending = pool_cache->get_max_uncached(
+                        mctx_idx->get_stream_base(), n_stream);
+                const int64_t n_update = std::min<int64_t>(
+                        n_pools, (n_tps + kpool - 1)/kpool + n_ps + n_pending);
+
+                // Flatten the pool/member axes for ggml_get_rows: its index
+                // tensor is [n_indices, n_stream], matching the channel axis
+                // of the cached indexer K/G tensor.
+                inp->pool_update_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool*n_update, n_stream);
+                ggml_set_input(inp->pool_update_cells);
+                ggml_set_name(inp->pool_update_cells, "kpool_update_cells");
+
+                inp->pool_update_dst = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_update, n_stream);
+                ggml_set_input(inp->pool_update_dst);
+                ggml_set_name(inp->pool_update_dst, "kpool_update_dst");
+            }
+        }
+
+        // the fused indexer wants f16; built once, shared by every indexer layer
+        if (cparams.fused_lid) {
+            inp->pool_bias_f16 = ggml_cast(ctx0,
+                    ggml_reshape_4d(ctx0, inp->pool_bias, n_pools, n_tps, 1, n_stream),
+                    GGML_TYPE_F16);
+            ggml_set_name(inp->pool_bias_f16, "kpool_pool_bias_f16");
+        }
+
+        constexpr int64_t k_fa_pad = 256;
+        const int64_t n_pool_select = llama_kpool_select_k(
+                (uint32_t) n_pools, hparams.indexer_top_k, hparams.indexer_kpool);
+        const int64_t n_selected = hparams.indexer_kpool*n_pool_select;
+        const int64_t n_compact = GGML_PAD(
+                n_selected + hparams.indexer_kpool - 1, k_fa_pad);
+        const bool compact_decode = n_tps == 1 && n_kv >= n_compact;
+
+        if (!indexed_attn && !compact_decode) {
+            // Dense compatibility/decode mask. Indexed CUDA attention needs only
+            // the compact validity mask below and avoids this O(n_kv*n_tps)
+            // host input entirely.
+            inp->sel_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, n_kv, n_tps, 1, n_stream);
+            ggml_set_input(inp->sel_mask);
+            ggml_set_name(inp->sel_mask, "kpool_sel_mask");
+
+            inp->cand_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, n_kv, n_tps, 1, n_stream);
+            ggml_set_input(inp->cand_mask);
+            ggml_set_name(inp->cand_mask, "kpool_cand_mask");
+        }
+
+        // Direct compact attention concatenates the selected whole pools with the
+        // incomplete tail. Reserve the rest of the 256-aligned FA width here as
+        // masked cell-zero entries; this tiny input is shared by every DSA layer.
+        const int64_t n_tail_pad = n_compact - n_selected;
+        GGML_ASSERT(n_tail_pad >= (int64_t) hparams.indexer_kpool - 1);
+
+        inp->compact_tail_cells = ggml_new_tensor_3d(
+                ctx0, GGML_TYPE_I32, n_tail_pad, n_tps, n_stream);
+        ggml_set_input(inp->compact_tail_cells);
+        ggml_set_name(inp->compact_tail_cells, "kpool_compact_tail_cells");
+
+        inp->compact_tail_mask = ggml_new_tensor_3d(
+                ctx0, GGML_TYPE_F16, n_tail_pad, n_tps, n_stream);
+        ggml_set_input(inp->compact_tail_mask);
+        ggml_set_name(inp->compact_tail_mask, "kpool_compact_tail_mask");
+    }
+
+    return (llm_graph_input_kpool *) res->add_input(std::move(inp));
+}
+
+ggml_tensor * llm_graph_context::build_attn_sparse(
+        llm_graph_input_attn_k * inp,
+        ggml_tensor * wo,
+        ggml_tensor * wo_b,
+        ggml_tensor * wo_s,
+        ggml_tensor * q_cur,
+        ggml_tensor * k_cur,
+        ggml_tensor * v_cur,
+        ggml_tensor * kq_b,
+        ggml_tensor * sinks,
+        ggml_tensor * v_mla,
+        ggml_tensor * top_k,
+        ggml_tensor * top_k_mask,
+        ggml_tensor * tail_cells,
+        ggml_tensor * tail_mask,
+        ggml_tensor * sel_mask,
+        ggml_tensor * cand_mask,
+            float     kq_scale,
+            int       il) const {
+    ggml_build_forward_expand(gf, q_cur);
+    ggml_build_forward_expand(gf, v_cur);
+    ggml_build_forward_expand(gf, k_cur);
+
+    const auto * mctx_cur = inp->mctx;
+
+    // store to KV cache
+    {
+        const auto & k_idxs = inp->get_k_idxs();
+
+        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+    }
+
+    const auto & kq_mask = inp->get_kq_mask();
+    ggml_tensor * q = q_cur;
+    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+    ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
+
+    ggml_tensor * cur;
+
+    const bool compact_ready = top_k_mask == nullptr;
+    GGML_ASSERT(tail_cells != nullptr && tail_mask != nullptr);
+    GGML_ASSERT(compact_ready || ggml_are_same_shape(top_k_mask, top_k));
+    GGML_ASSERT(ggml_are_same_shape(tail_mask, tail_cells));
+    GGML_ASSERT(top_k->type == GGML_TYPE_I32 && tail_cells->type == GGML_TYPE_I32);
+    GGML_ASSERT(compact_ready || top_k_mask->type == GGML_TYPE_F16);
+    GGML_ASSERT(tail_mask->type == GGML_TYPE_F16);
+    GGML_ASSERT((sel_mask == nullptr) == (cand_mask == nullptr));
+    if (sel_mask != nullptr) {
+        GGML_ASSERT(sel_mask->type == GGML_TYPE_F16 || sel_mask->type == GGML_TYPE_F32);
+        GGML_ASSERT(sel_mask->type == cand_mask->type);
+        GGML_ASSERT(ggml_are_same_shape(sel_mask, cand_mask));
+        GGML_ASSERT(sel_mask->ne[0] == kq_mask->ne[0] && sel_mask->ne[1] == kq_mask->ne[1] &&
+                    sel_mask->ne[3] == kq_mask->ne[3]);
+    }
+
+    const int64_t n_compact = compact_ready ? top_k->ne[0] : top_k->ne[0] + tail_cells->ne[0];
+    GGML_ASSERT(n_compact % 256 == 0);
+
+    ggml_tensor * compact_idx = compact_ready ? top_k : ggml_concat(ctx0, top_k, tail_cells, 0);
+    cb(compact_idx, "sparse_compact_idx", il);
+
+    ggml_tensor * compact_valid = nullptr;
+    if (!compact_ready) {
+        compact_valid = ggml_concat(ctx0, top_k_mask, tail_mask, 0);
+        compact_valid = ggml_reshape_4d(ctx0, compact_valid,
+                n_compact, top_k->ne[1], 1, top_k->ne[2]);
+    }
+
+    auto build_dense_sparse_mask = [&]() {
+        GGML_ASSERT(sel_mask != nullptr && cand_mask != nullptr);
+        // ggml_set_rows writes THROUGH, and sel_mask is shared per ubatch:
+        // scatter into a copy only for the compatibility/decode path.
+        ggml_tensor * mask_all = ggml_dup(ctx0, sel_mask);
+        mask_all = ggml_view_4d(ctx0, mask_all, 1, mask_all->ne[0], mask_all->ne[1], mask_all->ne[3],
+                mask_all->nb[0], mask_all->nb[1], mask_all->nb[2], 0);
+
+        ggml_tensor * top_k_3d = ggml_view_4d(ctx0, top_k,
+                top_k->ne[0], top_k->ne[1], top_k->ne[2], 1,
+                top_k->nb[1], top_k->nb[2], top_k->ne[2]*top_k->nb[2], 0);
+
+        ggml_tensor * zeros = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32,
+                1, top_k_3d->ne[0], top_k_3d->ne[1], top_k_3d->ne[2]);
+        zeros = ggml_fill(ctx0, zeros, 0.0f);
+
+        ggml_tensor * result = ggml_set_rows(ctx0, mask_all, zeros, top_k_3d);
+        result = ggml_view_4d(ctx0, result,
+                result->ne[1], result->ne[2], 1, result->ne[3],
+                result->nb[2], result->nb[3], result->nb[3], 0);
+        result = ggml_add(ctx0, result, cand_mask);
+        if (result->type == GGML_TYPE_F32 && kq_mask->type == GGML_TYPE_F16) {
+            result = ggml_cast(ctx0, result, GGML_TYPE_F16);
+        }
+        result = ggml_add(ctx0, result, kq_mask);
+        cb(result, "kpool_kq_mask", il);
+        return result;
+    };
+
+    const bool is_decode = q->ne[2] == k->ne[3] && k->ne[2] >= n_compact;
+    const bool use_indexed = !is_decode && llama_kpool_indexed_attn_enabled(k->ne[2], top_k->ne[1]);
+    const bool use_mma_indexed_decode = is_decode && k->type == GGML_TYPE_F16 &&
+        k->ne[2] >= std::max<int64_t>(4096, 2*n_compact);
+
+    if (compact_ready) {
+        compact_idx = ggml_reshape_3d(ctx0, compact_idx, n_compact, top_k->ne[1], k->ne[3]);
+        cur = build_attn_mha(q, k, v, kq_b, nullptr, sinks, v_mla,
+                n_compact, kq_scale, il, compact_idx);
+    } else if (use_mma_indexed_decode) {
+        const int64_t n_stream = k->ne[3];
+        compact_idx = ggml_reshape_3d(ctx0, compact_idx, n_compact, 1, n_stream);
+        compact_valid = ggml_reshape_4d(ctx0, compact_valid, n_compact, 1, 1, n_stream);
+
+        cur = build_attn_mha(q, k, v, kq_b, compact_valid, sinks, v_mla,
+                n_compact, kq_scale, il, compact_idx);
+    } else if (is_decode) {
+        // Decode has one query per stream. The indexer already produced all selected
+        // pool members and their validity mask; append the host-built tail/padding
+        // suffix instead of running another full-width top-k over the final mask.
+        const int64_t n_kv     = k->ne[2];
+        const int64_t n_stream = k->ne[3];
+
+        GGML_ASSERT(q->ne[2] == n_stream);
+        GGML_ASSERT(k->ne[1] == 1 && v->ne[1] == 1);
+        GGML_ASSERT(top_k->ne[0] == hparams.indexer_top_k);
+
+        compact_idx = ggml_reshape_2d(ctx0, compact_idx, n_compact, n_stream);
+        compact_valid = ggml_reshape_4d(ctx0, compact_valid, n_compact, 1, 1, n_stream);
+
+        ggml_tensor * k_rows = ggml_view_3d(ctx0, k, k->ne[0], n_kv, n_stream,
+                k->nb[2], k->nb[3], 0);
+        ggml_tensor * kv_compact = ggml_get_rows(ctx0, k_rows, compact_idx);
+        kv_compact = ggml_reshape_4d(ctx0, kv_compact, k->ne[0], 1, n_compact, n_stream);
+        cb(kv_compact, "sparse_compact_kv", il);
+
+        cur = build_attn_mha(q, kv_compact, kv_compact, kq_b,
+                compact_valid, sinks, v_mla, n_compact, kq_scale, il);
+    } else if (use_indexed) {
+        // Each query owns a different compact selection. Let CUDA dereference
+        // those cache rows inside FlashAttention instead of materializing a
+        // [D, n_selected, n_query] K/V tensor or scanning a full-width mask.
+        cur = build_attn_mha(q, k, v, kq_b, compact_valid, sinks, v_mla,
+                n_compact, kq_scale, il, compact_idx);
+    } else {
+        ggml_tensor * mask_top_k = build_dense_sparse_mask();
+        cur = build_attn_mha(q, k, v, kq_b, mask_top_k, sinks, v_mla, n_compact, kq_scale, il);
+    }
+    cb(cur, "kqv_out", il);
+
+    if (wo) {
+        cur = build_lora_mm(wo, cur, wo_s);
+    }
+
+    if (wo_b) {
+        cur = ggml_add(ctx0, cur, wo_b);
+    }
+
+    return cur;
 }
 
 llm_graph_input_mem_hybrid_iswa * llm_graph_context::build_inp_mem_hybrid_iswa() const {
@@ -3872,6 +4267,66 @@ void llm_graph_context::build_sampling() const {
         }
     }
     */
+}
+
+void llm_graph_context::build_mtp_device_draft() const {
+    if (cparams.mtp_device_draft_mode == LLAMA_MTP_DEVICE_DRAFT_DISABLED) {
+        return;
+    }
+
+    GGML_ASSERT(arch == LLM_ARCH_GLM5NEXT);
+    GGML_ASSERT(mtp_device_draft_cache != nullptr);
+    GGML_ASSERT(res->t_h_nextn != nullptr);
+    GGML_ASSERT(res->t_mtp_device_seq_ids != nullptr);
+    GGML_ASSERT(res->t_mtp_device_result_ids != nullptr);
+    GGML_ASSERT(n_outputs == n_tokens);
+    GGML_ASSERT(res->t_candidates.size() == (size_t) n_outputs);
+    GGML_ASSERT(res->t_sampled_logits.size() == (size_t) n_outputs);
+
+    ggml_tensor * tokens = nullptr;
+    ggml_tensor * probs  = nullptr;
+
+    // The MTP draft sampler is top-k only. The CPU path sorts those candidates,
+    // uses candidate zero (greedy), and reads its softmax probability for p_min.
+    // Reproduce that operation in the graph and persist only the two scalars.
+    for (int64_t i = 0; i < n_outputs; ++i) {
+        GGML_ASSERT(res->t_candidates[i] != nullptr);
+        GGML_ASSERT(res->t_sampled_logits[i] != nullptr);
+
+        ggml_tensor * logits = ggml_reshape_1d(
+                ctx0, res->t_sampled_logits[i], ggml_nelements(res->t_sampled_logits[i]));
+        ggml_tensor * max_idx = ggml_argmax(ctx0, logits);
+
+        ggml_tensor * candidates = ggml_reshape_2d(
+                ctx0, res->t_candidates[i], 1, ggml_nelements(res->t_candidates[i]));
+        ggml_tensor * token = ggml_get_rows(ctx0, candidates, max_idx);
+        token = ggml_cast(ctx0, token, GGML_TYPE_F32);
+
+        ggml_tensor * row_probs = ggml_soft_max(ctx0, logits);
+        row_probs = ggml_reshape_2d(ctx0, row_probs, 1, ggml_nelements(row_probs));
+        ggml_tensor * prob = ggml_get_rows(ctx0, row_probs, max_idx);
+
+        tokens = tokens ? ggml_concat(ctx0, tokens, token, 0) : token;
+        probs  = probs  ? ggml_concat(ctx0, probs,  prob,  0) : prob;
+    }
+
+    tokens = ggml_reshape_2d(ctx0, tokens, 1, n_outputs);
+    probs  = ggml_reshape_2d(ctx0, probs,  1, n_outputs);
+
+    auto * cache = mtp_device_draft_cache;
+    res->t_mtp_device_writes.push_back(
+            ggml_set_rows(ctx0, cache->tokens, tokens, res->t_mtp_device_seq_ids));
+    res->t_mtp_device_writes.push_back(
+            ggml_set_rows(ctx0, cache->hidden, res->t_h_nextn, res->t_mtp_device_seq_ids));
+    res->t_mtp_device_writes.push_back(
+            ggml_set_rows(ctx0, cache->result_tokens, tokens, res->t_mtp_device_result_ids));
+    res->t_mtp_device_writes.push_back(
+            ggml_set_rows(ctx0, cache->result_probs, probs, res->t_mtp_device_result_ids));
+
+    for (size_t i = 0; i < res->t_mtp_device_writes.size(); ++i) {
+        ggml_format_name(res->t_mtp_device_writes[i], "mtp_device_write_%zu", i);
+        ggml_build_forward_expand(gf, res->t_mtp_device_writes[i]);
+    }
 }
 
 int32_t llama_relative_position_bucket(llama_pos x, llama_pos y, uint64_t n_buckets, bool bidirectional) {

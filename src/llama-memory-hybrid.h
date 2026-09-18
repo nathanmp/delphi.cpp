@@ -3,6 +3,7 @@
 #include "llama-batch.h"
 #include "llama-graph.h"
 #include "llama-kv-cache.h"
+#include "llama-kv-cache-kpool.h"
 #include "llama-memory.h"
 #include "llama-memory-recurrent.h"
 
@@ -39,7 +40,10 @@ public:
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn = nullptr,
-    const layer_filter_cb & filter_recr = nullptr);
+    const layer_filter_cb & filter_recr = nullptr,
+                            /* optional indexer key cache; absent unless filter_idx */
+    const layer_filter_cb & filter_idx  = nullptr,
+                ggml_type   type_idx    = GGML_TYPE_F16);
 
     ~llama_memory_hybrid() = default;
 
@@ -54,9 +58,16 @@ public:
 
     llama_memory_context_ptr init_full() override;
 
+    llama_memory_context_ptr init_full_n_seq(
+            uint32_t n_seq,
+            uint32_t n_kv = 0,
+                bool kpool_rebuild = true) override;
+
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
     bool get_can_shift() const override;
+
+    void set_mtp_index_reuse(bool reuse) override;
 
     void clear(bool data) override;
 
@@ -82,12 +93,18 @@ public:
 
     llama_kv_cache * get_mem_attn() const;
     llama_memory_recurrent * get_mem_recr() const;
+    llama_kv_cache * get_mem_idx()  const;   // nullptr when the model has no indexer
+    llama_kpool_cache * get_kpool_cache() const;
 
 private:
     const llama_hparams & hparams;
 
+    llama_hparams hparams_idx;
+
     const std::unique_ptr<llama_kv_cache> mem_attn;
     const std::unique_ptr<llama_memory_recurrent> mem_recr;
+    const std::unique_ptr<llama_kv_cache> mem_idx;
+    const std::unique_ptr<llama_kpool_cache> mem_kpool;
 };
 
 class llama_memory_hybrid_context : public llama_memory_context_i {
@@ -100,6 +117,13 @@ public:
     // init full
     explicit llama_memory_hybrid_context(llama_memory_hybrid * mem);
 
+    // init full for the first n_seq cache streams
+    llama_memory_hybrid_context(
+            llama_memory_hybrid * mem,
+                      uint32_t   n_seq,
+                      uint32_t   n_kv = 0,
+                          bool   kpool_rebuild = true);
+
     // init update
     explicit llama_memory_hybrid_context(
         llama_memory_hybrid * mem,
@@ -110,7 +134,8 @@ public:
     llama_memory_hybrid_context(
               llama_memory_hybrid * mem,
                   slot_info_vec_t   sinfos_attn,
-        std::vector<llama_ubatch>   ubatches);
+        std::vector<llama_ubatch>   ubatches,
+                  slot_info_vec_t   sinfos_idx = {});
 
     ~llama_memory_hybrid_context() = default;
 
@@ -126,6 +151,9 @@ public:
 
     const llama_kv_cache_context * get_attn() const;
     const llama_memory_recurrent_context * get_recr() const;
+    const llama_kv_cache_context * get_idx()  const;   // nullptr without an indexer
+    llama_kpool_cache * get_kpool_cache() const;
+    int get_kpool_rebuild_override() const;
 
 private:
     // the index of the next ubatch to process
@@ -135,6 +163,12 @@ private:
 
     const llama_memory_context_ptr ctx_attn;
     const llama_memory_context_ptr ctx_recr;
+    const llama_memory_context_ptr ctx_idx;   // null unless the model has an indexer
+
+    llama_memory_hybrid * const mem;
 
     const llama_memory_status status;
+
+    // -1 follows the live cache state; reserve contexts can force either graph topology.
+    const int kpool_rebuild_override = -1;
 };

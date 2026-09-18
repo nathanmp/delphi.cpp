@@ -360,6 +360,17 @@ public:
     llama_kv_cache_context(
             llama_kv_cache * kv);
 
+    // used to create a full-cache context for the first n_stream cache streams
+    llama_kv_cache_context(
+            llama_kv_cache * kv,
+                   uint32_t   n_stream);
+
+    // used to create a full-cache context with a specific visible KV length
+    llama_kv_cache_context(
+            llama_kv_cache * kv,
+                   uint32_t   n_stream,
+                   uint32_t   n_kv);
+
     // used to create an update context
     llama_kv_cache_context(
             llama_kv_cache * kv,
@@ -390,6 +401,12 @@ public:
     //
 
     uint32_t get_n_kv() const;
+
+    // the stream RANGE s1 - s0 + 1 that get_k/get_v use as `ns`, not n_seqs_unq
+    uint32_t get_n_stream() const;
+    uint32_t get_stream_base() const;
+
+    const llama_kv_cache * get_kv() const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;

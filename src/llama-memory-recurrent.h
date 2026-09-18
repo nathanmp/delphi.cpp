@@ -39,6 +39,11 @@ public:
 
     llama_memory_context_ptr init_full() override;
 
+    llama_memory_context_ptr init_full_n_seq(
+            uint32_t n_seq,
+            uint32_t n_kv = 0,
+                bool kpool_rebuild = true) override;
+
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
     void clear(bool data) override;
@@ -60,6 +65,11 @@ public:
     bool find_slot(const llama_ubatch & ubatch);
 
     bool get_can_shift() const override;
+
+    // True when the layer filter selected at least one recurrent layer.  A
+    // hybrid cache can legitimately have an empty recurrent component (for
+    // example, the attention-only GLM NextN layer).
+    bool has_layers() const;
 
     // state write/load
 
@@ -148,7 +158,12 @@ public:
     // used to create a batch processing context from a batch
     llama_memory_recurrent_context(
             llama_memory_recurrent * mem,
-            std::vector<llama_ubatch> ubatches);
+        std::vector<llama_ubatch> ubatches);
+
+    // used to simulate a full cache for a subset of active sequences
+    llama_memory_recurrent_context(
+            llama_memory_recurrent * mem,
+                         uint32_t   n_rs);
 
     virtual ~llama_memory_recurrent_context();
 
@@ -192,4 +207,7 @@ private:
     //
 
     const bool is_full = false;
+
+    // UINT32_MAX means derive the active range from the live/full cache state.
+    const uint32_t n_rs_override = UINT32_MAX;
 };

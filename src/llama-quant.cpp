@@ -383,6 +383,31 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
     // do not quantize relative position bias (T5)
     quantize &= name.find("attn_rel_b.weight") == std::string::npos;
 
+    // glm5next: quantizing these perturbs pool selection and KDA state retention, errors that
+    // compound over a sequence, for ~1 GiB. note the compressor tensors spell it with an
+    // UNDERSCORE and the projections with a DOT, so one "indexer." prefix test is not enough
+    if (arch == LLM_ARCH_GLM5NEXT) {
+        static const char * const glm5next_full_precision[] = {
+            "hc_",
+            "indexer_compressor_ape",
+            "indexer_compressor_gate",
+            "indexer.proj",
+            "indexer.attn_k",
+            "indexer.attn_q_b",
+            "ssm_f_a",
+            "ssm_f_b",
+            "ssm_g_a",
+            "ssm_g_b",
+            "ssm_beta",
+            "attn_kv_a_mqa",
+            "attn_k_b",
+            "attn_v_b",
+        };
+        for (const char * pin : glm5next_full_precision) {
+            quantize &= name.find(pin) == std::string::npos;
+        }
+    }
+
     // do not quantize specific multimodal tensors
     quantize &= name.find(".position_embd") == std::string::npos;
     quantize &= name.find("sam.pos_embd")   == std::string::npos;
@@ -495,6 +520,20 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
         return std::make_pair(i_layer, n_layer);
     };
 
+    if (arch == LLM_ARCH_GLM5NEXT && (
+            name.find("attn_q_a")      != std::string::npos ||
+            name.find("attn_q_b")      != std::string::npos ||
+            name.find("nextn.eh_proj") != std::string::npos)) {
+        switch (new_type) {
+            case GGML_TYPE_F32:
+            case GGML_TYPE_BF16:
+            case GGML_TYPE_F16:
+                break;
+            default:
+                return GGML_TYPE_Q8_0;
+        }
+    }
+
     // for arches that share the same tensor between the token embeddings and the output, we quantize the token embeddings
     // with the quantization of the output tensor
     if (category == tensor_category::OUTPUT || (qs.has_tied_embeddings && category == tensor_category::TOKEN_EMBD)) {
@@ -536,11 +575,11 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
         // MoE   tensors -> MXFP4
         // other tensors -> Q8_0
         // MLA projection tensors are also 3D, so match expert tensor roles explicitly.
-        const bool is_bailingmoe3_expert = arch == LLM_ARCH_BAILINGMOE3 &&
-            (category == tensor_category::FFN_UP ||
-             category == tensor_category::FFN_GATE ||
-             category == tensor_category::FFN_DOWN);
-        if (tensor->ne[2] > 1 && (arch != LLM_ARCH_BAILINGMOE3 || is_bailingmoe3_expert)) {
+        const bool has_3d_mla = arch == LLM_ARCH_BAILINGMOE3 || arch == LLM_ARCH_GLM5NEXT;
+        const bool is_expert  = category == tensor_category::FFN_UP ||
+                                category == tensor_category::FFN_GATE ||
+                                category == tensor_category::FFN_DOWN;
+        if (tensor->ne[2] > 1 && (!has_3d_mla || is_expert)) {
             new_type = GGML_TYPE_MXFP4;
         } else {
             new_type = GGML_TYPE_Q8_0;

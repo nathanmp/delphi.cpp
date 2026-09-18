@@ -1,5 +1,6 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
+#include "fattn-indexed.cuh"
 #include "fattn-mma-f16.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
@@ -106,27 +107,49 @@ void ggml_cuda_flash_attn_ext_compact_mask(
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 }
 
-bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+static bool ggml_cuda_flash_attn_ext_mma_f16_sparse_supported(
+        const int device, const ggml_tensor * dst) {
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
-    GGML_UNUSED_VARS(ctx, dst);
+    GGML_UNUSED_VARS(device, dst);
     return false;
 #else
-    const ggml_tensor * Q    = dst->src[0];
-    const ggml_tensor * K    = dst->src[1];
-    const ggml_tensor * mask = dst->src[3];
-    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    const ggml_tensor * Q       = dst->src[0];
+    const ggml_tensor * K       = dst->src[1];
+    const ggml_tensor * V       = dst->src[2];
+    const ggml_tensor * mask    = dst->src[3];
+    const ggml_tensor * indices = dst->src[5];
+    const int cc = ggml_cuda_info().devices[device].cc;
 
     float max_bias = 0.0f;
     float logit_softcap = 0.0f;
     memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
     memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
 
+    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || !turing_mma_available(cc) ||
+            max_bias != 0.0f || logit_softcap != 0.0f) {
+        return false;
+    }
+
+    if (indices != nullptr) {
+        const int64_t gqa_ratio = Q->ne[2] / K->ne[2];
+        // Fused GLM pool expansion encodes invalid entries as negative indices,
+        // so no mask is needed. Mask-backed sparse MMA remains handled by the
+        // generic compaction path below.
+        return mask == nullptr && K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16 &&
+            Q->ne[0] == 512 && V->ne[0] == 512 && Q->ne[2] % K->ne[2] == 0 && gqa_ratio > 4 &&
+            indices->type == GGML_TYPE_I32 && indices->ne[1] == Q->ne[1] && indices->ne[2] == Q->ne[3] &&
+            K->ne[1] >= std::max<int64_t>(4096, 2LL*indices->ne[0]);
+    }
+
     const int32_t n_kv_max = ggml_get_op_params_i32(dst, 4);
-    return GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) &&
-        mask != nullptr && n_kv_max > 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
+    return mask != nullptr && n_kv_max > 0 &&
         mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1 &&
         K->ne[1] >= std::max<int64_t>(4096, 2LL*n_kv_max);
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+}
+
+bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    return ggml_cuda_flash_attn_ext_mma_f16_sparse_supported(ctx.device, dst);
 }
 
 template <int DKQ, int DV, int ncols2>
@@ -178,9 +201,11 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
     float max_bias = 0.0f;
     memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
 
-    // Edge cases like no mask, ALiBi, unpadded K/V, or misaligned addresses for large data transfers
-    //     are put into the template specialization without GQA optimizations.
-    bool use_gqa_opt = mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    // Sparse indices provide the bounds information normally carried by the
+    // mask, so a mask-less sparse launch can still use the GQA specialization.
+    // Other edge cases are put into the specialization without GQA optimizations.
+    bool use_gqa_opt = (mask != nullptr || KQV->src[5] != nullptr) &&
+        max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
     for (const ggml_tensor * t : {Q, K, V, mask}) {
         if (t == nullptr || ggml_is_quantized(t->type)) {
             continue;
@@ -690,6 +715,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * dst) {
     GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
 
+    if (dst->src[5] != nullptr) {
+        return ggml_nbytes(dst);
+    }
+
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
@@ -725,6 +754,14 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+    if (dst->src[5] != nullptr) {
+        if (ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ctx, dst)) {
+            ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
+            return;
+        }
+        ggml_cuda_flash_attn_ext_indexed(ctx, dst);
+        return;
+    }
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
@@ -741,5 +778,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 }
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
+    if (dst->src[5] != nullptr) {
+        return ggml_cuda_flash_attn_ext_indexed_supported(dst) ||
+            ggml_cuda_flash_attn_ext_mma_f16_sparse_supported(device, dst);
+    }
     return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
 }

@@ -44,6 +44,10 @@ struct llama_ubatch {
     //                          // size               | idx | val
     llama_token  *  token;      // [n_tokens]         | i   | id, token
     float        *  embd;       // [n_embd, n_tokens] | i   | embd
+    float        *  embd_h;       // [n_embd_h, n_tokens] | i | hidden state
+    ggml_tensor  *  embd_tensor;  // [n_embd, n_tokens] | i   | backend-resident embd
+    ggml_tensor  *  embd_h_tensor;// [n_embd_h, n_tokens] | i | backend-resident hidden state
+    int32_t      *  embd_h_tensor_rows; // [n_tokens] | i | source row, NULL for a contiguous view
     llama_pos    *  pos;        // [n_tokens*n_pos]   | i   | pos
     int32_t      *  n_seq_id;   // [n_tokens]         | i   | -
     llama_seq_id ** seq_id;     // [n_tokens]         | s   | s0, s1, seq_id
@@ -54,6 +58,12 @@ struct llama_ubatch {
     struct data_t {
         std::vector<llama_token>    token;
         std::vector<float>          embd;
+        std::vector<float>          embd_h;
+        ggml_tensor                 embd_tensor = {};
+        bool                        has_embd_tensor = false;
+        ggml_tensor                 embd_h_tensor = {};
+        bool                        has_embd_h_tensor = false;
+        std::vector<int32_t>        embd_h_tensor_rows;
         std::vector<llama_pos>      pos;
         std::vector<int32_t>        n_seq_id;
         std::vector<llama_seq_id *> seq_id;      // these point into the seq_id_data below
@@ -80,8 +90,19 @@ public:
             const llama_vocab & vocab,
             const llama_memory_i * memory,
             uint32_t n_embd,
+            uint32_t n_embd_h,
             uint32_t n_seq_max,
             bool output_all);
+
+    bool init(
+            const llama_batch & batch_inp,
+            const llama_vocab & vocab,
+            const llama_memory_i * memory,
+            uint32_t n_embd,
+            uint32_t n_seq_max,
+            bool output_all) {
+        return init(batch_inp, vocab, memory, n_embd, n_embd, n_seq_max, output_all);
+    }
 
     const llama_batch & get_batch() const;
 
@@ -134,6 +155,7 @@ private:
     const uint32_t n_pos_per_embd;
 
     uint32_t n_embd;
+    uint32_t n_embd_h;
     uint32_t n_seq_max;
     uint32_t n_outputs;
 

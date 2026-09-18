@@ -596,6 +596,7 @@ extern "C" {
         GGML_OP_SOLVE_TRI,
         GGML_OP_GATED_DELTA_NET,
         GGML_OP_LIGHTNING_INDEXER,
+        GGML_OP_KPOOL_EXPAND,
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
@@ -2484,6 +2485,13 @@ extern "C" {
             struct ggml_tensor  * a,
             int                   k);
 
+    // hint contains Top-K indices from an earlier, correlated row
+    GGML_API struct ggml_tensor * ggml_top_k_hint(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * hint,
+            int                   k);
+
     GGML_API struct ggml_tensor * ggml_arange(
             struct ggml_context * ctx,
             float                 start,
@@ -2528,6 +2536,14 @@ extern "C" {
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
+
+    // Optional indirect KV addressing for sparse attention.
+    // indices: I32 [n_selected, n_queries, n_stream]
+    // When set, mask's first dimension is n_selected and each logical KV
+    // column is read from the physical cache row in indices.
+    GGML_API void ggml_flash_attn_ext_set_indices(
+            struct ggml_tensor * a,
+            struct ggml_tensor * indices);
 
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
@@ -2693,6 +2709,17 @@ extern "C" {
         struct ggml_tensor  * k,
         struct ggml_tensor  * weights,
         struct ggml_tensor  * mask);
+
+    // Expand selected pool ordinals into cache cell indices and append the tail.
+    // Invalid pools and tail entries are emitted as -1 for indexed attention.
+    GGML_API struct ggml_tensor * ggml_kpool_expand(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * selected,
+            struct ggml_tensor  * pool_cells,
+            struct ggml_tensor  * pool_bias,
+            struct ggml_tensor  * tail_cells,
+            struct ggml_tensor  * tail_mask,
+            int32_t               kpool);
 
     // DeepSeek V4 hyper-connections (ref. https://arxiv.org/pdf/2512.24880)
     // In short these operations are replacements for the original residual connection (x = transformer(x) + x)

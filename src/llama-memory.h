@@ -93,12 +93,29 @@ struct llama_memory_i {
     // simulate full cache, used for allocating worst-case compute buffers
     virtual llama_memory_context_ptr init_full() = 0;
 
+    // Simulate a full cache while exposing only n_seq active cache streams.
+    // Memory implementations whose graph shape is independent of the active
+    // sequence count can use the regular full-cache context.
+    virtual llama_memory_context_ptr init_full_n_seq(
+            uint32_t n_seq,
+            uint32_t n_kv = 0,
+                bool kpool_rebuild = true) {
+        (void) n_seq;
+        (void) n_kv;
+        (void) kpool_rebuild;
+        return init_full();
+    }
+
     // prepare for any pending memory updates, such as shifts, copies, etc.
     // status == LLAMA_MEMORY_STATUS_NO_UPDATE if there is nothing to update
     virtual llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) = 0;
 
     // getters
     virtual bool get_can_shift() const = 0;
+
+    // GLM-style sparse MTP can retain the first draft iteration's selected
+    // indexer cells. Other memory implementations intentionally ignore this.
+    virtual void set_mtp_index_reuse(bool /* reuse */) {}
 
     //
     // ops
