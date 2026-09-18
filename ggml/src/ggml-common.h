@@ -459,6 +459,101 @@ typedef struct {
 } block_iq4_xs;
 static_assert(sizeof(block_iq4_xs) == sizeof(ggml_half) + sizeof(uint16_t) + QK_K/64 + QK_K/2, "wrong iq4_xs block size/padding");
 
+// ============================== IQ*_K quantization types
+// Ported from ik_llama.cpp - https://github.com/ikawrakow/ik_llama.cpp
+// MIT license - Copyright (C) 2024 Iwan Kawrakow
+// The layouts below are byte-for-byte identical to ik_llama.cpp so that GGUFs
+// written by either project can be read by the other.
+
+// 2.375 bpw: d(2) + extra(2) + scales[8] + qs[64] = 76 bytes / 256 weights
+typedef struct {
+    ggml_half d;
+    uint16_t  extra;
+    uint8_t   scales[QK_K/32];
+    uint8_t   qs[QK_K/4];
+} block_iq2_k;
+static_assert(sizeof(block_iq2_k) == sizeof(ggml_half) + sizeof(uint16_t) + QK_K/32 + QK_K/4, "wrong iq2_k block size/padding");
+
+// 3.4375 bpw: d(2) + extra(2) + scales_h(2) + scales_l[8] + qs[64] + qh[32] = 110 bytes / 256 weights
+typedef struct {
+    ggml_half d;
+    uint16_t  extra;
+    uint16_t  scales_h;
+    uint8_t   scales_l[QK_K/32];
+    uint8_t   qs[QK_K/4];
+    uint8_t   qh[QK_K/8];
+} block_iq3_k;
+static_assert(sizeof(block_iq3_k) == sizeof(ggml_half) + 2*sizeof(uint16_t) + QK_K/32 + QK_K/4 + QK_K/8, "wrong iq3_k block size/padding");
+
+// 4.5 bpw: d(2) + extra(2) + scales_h[4] + scales_l[8] + qs[128] = 144 bytes / 256 weights
+typedef struct {
+    ggml_half d;
+    uint16_t  extra;
+    uint8_t   scales_h[QK_K/64];
+    uint8_t   scales_l[QK_K/32];
+    uint8_t   qs[QK_K/2];
+} block_iq4_k;
+static_assert(sizeof(block_iq4_k) == sizeof(ggml_half) + sizeof(uint16_t) + QK_K/2 + 3*QK_K/64, "wrong iq4_k block size/padding");
+
+// 5.5 bpw: d(2) + extra(2) + scales_h[4] + scales_l[8] + qs[128] + qh[32] = 176 bytes / 256 weights
+typedef struct {
+    ggml_half d;
+    uint16_t  extra;
+    uint8_t   scales_h[QK_K/64];
+    uint8_t   scales_l[QK_K/32];
+    uint8_t   qs[QK_K/2];
+    uint8_t   qh[QK_K/8];
+} block_iq5_k;
+static_assert(sizeof(block_iq5_k) == sizeof(ggml_half) + sizeof(uint16_t) + QK_K/2 + QK_K/8 + 3*QK_K/64, "wrong iq5_k block size/padding");
+
+// 6.625 bpw: d(2) + extra(2) + scales[16] + qs[128] + qh[64] = 212 bytes / 256 weights
+typedef struct {
+    ggml_half d;
+    uint16_t  extra;
+    int8_t    scales[QK_K/16];
+    uint8_t   qs[QK_K/2];
+    uint8_t   qh[QK_K/4];
+} block_iq6_k;
+static_assert(sizeof(block_iq6_k) == sizeof(ggml_half) + sizeof(uint16_t) + QK_K/2 + QK_K/4 + QK_K/16, "wrong iq6_k block size/padding");
+
+// ============================== IQ*_KS quantization types
+// Same 256-weight super-block as IQ*_K, but the float/half scale that IQ*_K
+// stores in every block is stored once per row instead, in front of the first
+// block (see ggml_row_meta_size()). A row of n weights is therefore
+// row_meta_size + n/QK_K * sizeof(block_iq*_ks) bytes.
+
+// 2.1875 bpw: row d(2) + extra(2) + scales[4] + qs[64] = 2 + 70/256 weights
+typedef struct {
+    uint16_t  extra;
+    uint8_t   scales[QK_K/64];
+    uint8_t   qs[QK_K/4];
+} block_iq2_ks;
+static_assert(sizeof(block_iq2_ks) == sizeof(uint16_t) + QK_K/64 + QK_K/4, "wrong iq2_ks block size/padding");
+
+// 3.1875 bpw: row d(2) + extra(2) + scales[4] + qs[64] + qh[32] = 2 + 102/256 weights
+typedef struct {
+    uint16_t  extra;
+    uint8_t   scales[QK_K/64];
+    uint8_t   qs[QK_K/4];
+    uint8_t   qh[QK_K/8];
+} block_iq3_ks;
+static_assert(sizeof(block_iq3_ks) == sizeof(uint16_t) + QK_K/64 + QK_K/4 + QK_K/8, "wrong iq3_ks block size/padding");
+
+// 4.25 bpw: row d(4) + scales[8] + qs[128] = 4 + 136/256 weights
+typedef struct {
+    uint8_t   scales[QK_K/32];
+    uint8_t   qs[QK_K/2];
+} block_iq4_ks;
+static_assert(sizeof(block_iq4_ks) == QK_K/32 + QK_K/2, "wrong iq4_ks block size/padding");
+
+// 5.25 bpw: row d(4) + scales[8] + qs[128] + qh[32] = 4 + 168/256 weights
+typedef struct {
+    uint8_t   scales[QK_K/32];
+    uint8_t   qs[QK_K/2];
+    uint8_t   qh[QK_K/8];
+} block_iq5_ks;
+static_assert(sizeof(block_iq5_ks) == QK_K/32 + QK_K/2 + QK_K/8, "wrong iq5_ks block size/padding");
+
 #endif // GGML_COMMON_DECL
 #endif // GGML_COMMON_DECL
 
@@ -1119,6 +1214,41 @@ GGML_TABLE_END()
 // TODO: fix name to kvalues_iq4_nl
 GGML_TABLE_BEGIN(int8_t, kvalues_iq4nl, 16)
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+GGML_TABLE_END()
+
+// ============================== IQ*_K non-linear value tables
+// Ported from ik_llama.cpp - MIT license - Copyright (C) 2024 Iwan Kawrakow
+// Each table holds two interleaved grids: the second half is the "shifted"
+// variant selected per sub-block through the block's `extra` bit field.
+
+GGML_TABLE_BEGIN(int8_t, iq2nl_values, 8)
+    -31, -13, 1, 17,   -26, -8, 6, 22
+GGML_TABLE_END()
+
+GGML_TABLE_BEGIN(int8_t, iq3nl_values, 16)
+    -63, -40, -23, -10, 1, 13, 28,  47,
+    -59, -36, -19,  -6, 5, 17, 32,  51,
+GGML_TABLE_END()
+
+GGML_TABLE_BEGIN(int8_t, iq4k_values, 32)
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+    -123, -100, -79, -61, -45, -31, -18,  -6, 5, 17, 29, 42, 57, 73, 93, 117
+GGML_TABLE_END()
+
+GGML_TABLE_BEGIN(int8_t, iq5nl_values, 64)
+    -126, -114, -103, -92, -83, -74, -65, -57, -50, -43, -36, -30, -24, -18, -12, -6, -1, 5, 11, 17, 23, 29, 36, 43, 51, 59, 68, 77, 87, 97, 109, 121,
+    -124, -112, -101, -90, -81, -72, -63, -55, -48, -41, -34, -28, -22, -16, -10, -4,  1, 7, 13, 19, 25, 31, 38, 45, 53, 61, 70, 79, 89, 99, 111, 123,
+GGML_TABLE_END()
+
+GGML_TABLE_BEGIN(int8_t, iq6nl_values, 128)
+    -127, -121, -115, -109, -104,  -98,  -93,  -88,  -84,  -79,  -74,  -70,  -66,  -62,  -58,  -54,
+     -51,  -47,  -44,  -40,  -37,  -34,  -31,  -28,  -25,  -22,  -19,  -16,  -13,  -11,   -8,   -5,
+      -2,    0,    3,    6,    9,   12,   14,   17,   20,   23,   27,   30,   33,   36,   40,   44,
+      47,   51,   55,   59,   63,   68,   72,   77,   82,   87,   92,   98,  103,  109,  115,  121,
+    -126, -120, -114, -108, -103,  -97,  -92,  -87,  -83,  -78,  -73,  -69,  -65,  -61,  -57,  -53,
+     -50,  -46,  -43,  -39,  -36,  -33,  -30,  -27,  -24,  -21,  -18,  -15,  -12,  -10,   -7,   -4,
+      -1,    1,    4,    7,   10,   13,   15,   18,   21,   24,   28,   31,   34,   37,   41,   45,
+      48,   52,   56,   60,   64,   69,   73,   78,   83,   88,   93,   99,  104,  110,  116,  122,
 GGML_TABLE_END()
 
 // e2m1 values (doubled), shared by MXFP4 and NVFP4

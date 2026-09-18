@@ -5711,6 +5711,16 @@ class GGMLQuantizationType(IntEnum):
     NVFP4   = 40
     Q1_0    = 41
     Q2_0    = 42
+    # IQ*_K quants ported from ik_llama.cpp; the IDs must match ik_llama.cpp
+    IQ2_K   = 137
+    IQ3_K   = 138
+    IQ4_K   = 139
+    IQ5_K   = 140
+    IQ6_K   = 141
+    IQ4_KS  = 144
+    IQ2_KS  = 145
+    IQ5_KS  = 152
+    IQ3_KS  = 156
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -5767,6 +5777,16 @@ class LlamaFileType(IntEnum):
     MOSTLY_NVFP4         = 39  # except 1d tensors
     MOSTLY_Q1_0          = 40  # except 1d tensors
     MOSTLY_Q2_0          = 41  # except 1d tensors
+    # IQ*_K file types ported from ik_llama.cpp; the IDs must match ik_llama.cpp
+    MOSTLY_IQ2_K         = 138  # except 1d tensors
+    MOSTLY_IQ3_K         = 139  # except 1d tensors
+    MOSTLY_IQ4_K         = 140  # except 1d tensors
+    MOSTLY_IQ5_K         = 141  # except 1d tensors
+    MOSTLY_IQ6_K         = 142  # except 1d tensors
+    MOSTLY_IQ4_KS        = 145  # except 1d tensors
+    MOSTLY_IQ2_KS        = 147  # except 1d tensors
+    MOSTLY_IQ5_KS        = 150  # except 1d tensors
+    MOSTLY_IQ3_KS        = 154  # except 1d tensors
 
     GUESSED              = 1024  # not specified in the model file
 
@@ -5904,6 +5924,26 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.NVFP4:   (64, 4 + 32),
     GGMLQuantizationType.Q1_0:    (128, 2 + 16),
     GGMLQuantizationType.Q2_0:    (64, 2 + 16),
+    # IQ*_K (ik_llama.cpp)
+    GGMLQuantizationType.IQ2_K:   (256, 2 + 2 + QK_K // 32 + QK_K // 4),                           # d + extra + scales[8]   + qs[64]              =  76
+    GGMLQuantizationType.IQ3_K:   (256, 2 + 2 + 2 + QK_K // 32 + QK_K // 4 + QK_K // 8),           # d + extra + scales_h    + scales_l[8] + qs[64] + qh[32] = 110
+    GGMLQuantizationType.IQ4_K:   (256, 2 + 2 + QK_K // 64 + QK_K // 32 + QK_K // 2),              # d + extra + scales_h[4] + scales_l[8] + qs[128]         = 144
+    GGMLQuantizationType.IQ5_K:   (256, 2 + 2 + QK_K // 64 + QK_K // 32 + QK_K // 2 + QK_K // 8),  # ... + qh[32]                                            = 176
+    GGMLQuantizationType.IQ6_K:   (256, 2 + 2 + QK_K // 16 + QK_K // 2 + QK_K // 4),               # d + extra + scales[16]  + qs[128] + qh[64]              = 212
+    # IQ*_KS (ik_llama.cpp): the scale is stored once per row, see GGML_ROW_META_SIZES
+    GGMLQuantizationType.IQ2_KS:  (256, 2 + QK_K // 64 + QK_K // 4),                               # extra + scales[4] + qs[64]                              =  70
+    GGMLQuantizationType.IQ3_KS:  (256, 2 + QK_K // 64 + QK_K // 4 + QK_K // 8),                   # extra + scales[4] + qs[64] + qh[32]                     = 102
+    GGMLQuantizationType.IQ4_KS:  (256, QK_K // 32 + QK_K // 2),                                   # scales[8] + qs[128]                                     = 136
+    GGMLQuantizationType.IQ5_KS:  (256, QK_K // 32 + QK_K // 2 + QK_K // 8),                       # scales[8] + qs[128] + qh[32]                            = 168
+}
+
+# Bytes of per-row metadata stored ahead of the blocks of every row. Mirrors
+# ggml_row_meta_size(); 0 for every type not listed here.
+GGML_ROW_META_SIZES: dict[GGMLQuantizationType, int] = {
+    GGMLQuantizationType.IQ2_KS:  2,  # ggml_half
+    GGMLQuantizationType.IQ3_KS:  2,  # ggml_half
+    GGMLQuantizationType.IQ4_KS:  4,  # float
+    GGMLQuantizationType.IQ5_KS:  4,  # float
 }
 
 

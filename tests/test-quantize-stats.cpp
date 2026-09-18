@@ -139,7 +139,7 @@ static bool tensor_is_contiguous(const struct ggml_tensor * tensor) {
 
     return
         tensor->nb[0] == ggml_type_size(tensor->type) &&
-        tensor->nb[1] == (tensor->nb[0]*tensor->ne[0])/ggml_blck_size(tensor->type) &&
+        tensor->nb[1] == ggml_row_size(tensor->type, tensor->ne[0]) &&
         tensor->nb[2] == tensor->nb[1]*tensor->ne[1] &&
         tensor->nb[3] == tensor->nb[2]*tensor->ne[2];
 }

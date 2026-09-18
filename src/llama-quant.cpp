@@ -215,7 +215,7 @@ struct tensor_metadata {
 
 static void llama_tensor_dequantize_impl(
     ggml_type type, const void * data, float * f32_output, std::vector<std::thread> & workers,
-    const size_t nelements, const int nthread
+    const size_t nelements, const size_t n_per_row, const int nthread
 ) {
     const ggml_type_traits * qtype = ggml_get_type_traits(type);
     if (ggml_is_quantized(type)) {
@@ -225,6 +225,41 @@ static void llama_tensor_dequantize_impl(
     } else if (type != GGML_TYPE_F16 &&
                type != GGML_TYPE_BF16) {
         throw std::runtime_error(format("cannot dequantize/convert tensor type %s", ggml_type_name(type)));
+    }
+
+    // This helper receives a raw pointer and an element count rather than a tensor, so it has to use the
+    // type's registered dequantizer and be told the row length separately.
+
+    // A type with per-row metadata stores its scale once, in front of the row's first block, and its
+    // to_float() takes that row start. Converting the whole slab in one call would apply the first row's
+    // scale to every row and read the other rows' metadata as block data; splitting the slab by block, as
+    // the threaded path below does, is wrong the same way. Convert one row at a time instead.
+    if (ggml_row_meta_size(type) != 0) {
+        GGML_ASSERT(n_per_row > 0 && nelements % n_per_row == 0);
+
+        const size_t nrows = nelements / n_per_row;
+        const size_t rs    = ggml_row_size(type, n_per_row);
+
+        auto convert = [qtype, rs, n_per_row](const uint8_t * in, float * out, size_t nr) {
+            for (size_t r = 0; r < nr; r++) {
+                qtype->to_float(in + r*rs, out + r*n_per_row, n_per_row);
+            }
+        };
+
+        const size_t nthread_use = std::max<size_t>(1, std::min<size_t>(nthread, nrows));
+        if (nthread_use < 2) {
+            convert((const uint8_t *) data, f32_output, nrows);
+            return;
+        }
+
+        const size_t rows_per_thread = (nrows + nthread_use - 1)/nthread_use;
+        for (size_t r0 = 0; r0 < nrows; r0 += rows_per_thread) {
+            const size_t nr = std::min(rows_per_thread, nrows - r0);
+            workers.emplace_back(convert, (const uint8_t *) data + r0*rs, f32_output + r0*n_per_row, nr);
+        }
+        for (auto & w : workers) { w.join(); }
+        workers.clear();
+        return;
     }
 
     if (nthread < 2) {
@@ -394,9 +429,18 @@ static ggml_type tensor_type_fallback(quantize_state_impl & qs, const ggml_tenso
             case GGML_TYPE_Q2_K:
             case GGML_TYPE_Q3_K:
             case GGML_TYPE_TQ1_0:
+            case GGML_TYPE_IQ2_K:   // the IQ*_K fallbacks below follow ik_llama.cpp
+            case GGML_TYPE_IQ3_K:
+            case GGML_TYPE_IQ2_KS:
+            case GGML_TYPE_IQ3_KS:
             case GGML_TYPE_TQ2_0:   return_type = GGML_TYPE_Q4_0;   break;
+            case GGML_TYPE_IQ4_K:
+            case GGML_TYPE_IQ4_KS:
+            case GGML_TYPE_IQ5_KS:  // ik_llama.cpp also falls IQ5_KS (not IQ5_K) back to Q5_0
             case GGML_TYPE_Q4_K:    return_type = GGML_TYPE_Q5_0;   break;
+            case GGML_TYPE_IQ5_K:   // ik_llama.cpp falls back to Q6_0, which mainline does not have
             case GGML_TYPE_Q5_K:    return_type = GGML_TYPE_Q5_1;   break;
+            case GGML_TYPE_IQ6_K:
             case GGML_TYPE_Q6_K:    return_type = GGML_TYPE_Q8_0;   break;
             default:
                 if (qk_k <= 32) {
@@ -471,6 +515,19 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
                      ftype == LLAMA_FTYPE_MOSTLY_IQ1_M) {
                 new_type = GGML_TYPE_Q5_K;
             }
+            // IQ*_K / IQ*_KS: mirrors ik_llama.cpp. Leaving the low-bpw types on the
+            // output tensor costs a lot of quality, so bump it the way ik does.
+            // (ik_llama.cpp spells the tied-embedding case `!qs.has_output`, and
+            // groups IQ2_KS/IQ3_KS with IQ2_K/IQ3_K and IQ4_KS with IQ4_XS/IQ3_S.
+            // IQ5_K and IQ5_KS keep the default, Q6_K.)
+            else if (ftype == LLAMA_FTYPE_MOSTLY_IQ2_K  || ftype == LLAMA_FTYPE_MOSTLY_IQ3_K ||
+                     ftype == LLAMA_FTYPE_MOSTLY_IQ2_KS || ftype == LLAMA_FTYPE_MOSTLY_IQ3_KS) {
+                new_type = qs.has_tied_embeddings ? GGML_TYPE_IQ4_K : GGML_TYPE_Q5_K;
+            }
+            else if ((ftype == LLAMA_FTYPE_MOSTLY_IQ4_K || ftype == LLAMA_FTYPE_MOSTLY_IQ4_KS) &&
+                     qs.has_tied_embeddings) {
+                new_type = GGML_TYPE_IQ5_K;
+            }
             else if (new_type != GGML_TYPE_Q8_0) {
                 new_type = GGML_TYPE_Q6_K;
             }
@@ -536,6 +593,28 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
         }
         else if (ftype == LLAMA_FTYPE_MOSTLY_Q2_K_S && qs.model.hparams.n_gqa() >= 4) {
             new_type = GGML_TYPE_Q4_K;
+        }
+        // IQ*_K: mirrors ik_llama.cpp
+        else if (ftype == LLAMA_FTYPE_MOSTLY_IQ2_K) {
+            new_type = qs.model.hparams.n_gqa() >= 2 ? GGML_TYPE_IQ4_K : GGML_TYPE_IQ3_K;
+        }
+        else if (ftype == LLAMA_FTYPE_MOSTLY_IQ3_K && qs.model.hparams.n_gqa() >= 2) {
+            new_type = GGML_TYPE_IQ4_K;
+        }
+        else if (ftype == LLAMA_FTYPE_MOSTLY_IQ4_K && qs.model.hparams.n_gqa() >= 2) {
+            new_type = GGML_TYPE_IQ5_K;
+        }
+        // IQ*_KS: mirrors ik_llama.cpp
+        else if (ftype == LLAMA_FTYPE_MOSTLY_IQ2_KS) {
+            if      (qs.model.hparams.n_gqa() >= 4 || qs.model.hparams.n_expert >= 4) new_type = GGML_TYPE_IQ4_K;
+            else if (qs.model.hparams.n_gqa() >= 2 || qs.model.hparams.n_expert >= 2) new_type = GGML_TYPE_IQ3_K;
+            else new_type = GGML_TYPE_Q2_K;
+        }
+        else if (ftype == LLAMA_FTYPE_MOSTLY_IQ3_KS && qs.model.hparams.n_gqa() >= 2) {
+            new_type = GGML_TYPE_IQ4_KS;
+        }
+        else if (ftype == LLAMA_FTYPE_MOSTLY_IQ4_KS && qs.model.hparams.n_gqa() >= 2) {
+            new_type = GGML_TYPE_IQ5_K;
         }
         else if (ftype == LLAMA_FTYPE_MOSTLY_IQ3_XXS) {
             new_type = qs.model.hparams.n_gqa() >= 4 ? GGML_TYPE_Q4_K : !qs.has_imatrix ? GGML_TYPE_IQ3_S : GGML_TYPE_IQ3_XXS;
@@ -638,7 +717,11 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
                 if (ftype == LLAMA_FTYPE_MOSTLY_Q2_K   || ftype == LLAMA_FTYPE_MOSTLY_IQ3_XS || ftype == LLAMA_FTYPE_MOSTLY_IQ3_XXS ||
                     ftype == LLAMA_FTYPE_MOSTLY_Q3_K_S || ftype == LLAMA_FTYPE_MOSTLY_Q3_K_M  || ftype == LLAMA_FTYPE_MOSTLY_IQ4_NL  ||
                     ftype == LLAMA_FTYPE_MOSTLY_Q4_K_S || ftype == LLAMA_FTYPE_MOSTLY_Q4_K_M  || ftype == LLAMA_FTYPE_MOSTLY_IQ3_S  ||
-                    ftype == LLAMA_FTYPE_MOSTLY_IQ3_M  || ftype == LLAMA_FTYPE_MOSTLY_IQ4_XS) {
+                    ftype == LLAMA_FTYPE_MOSTLY_IQ3_M  || ftype == LLAMA_FTYPE_MOSTLY_IQ4_XS  ||
+                    ftype == LLAMA_FTYPE_MOSTLY_IQ2_K  || ftype == LLAMA_FTYPE_MOSTLY_IQ3_K   ||
+                    ftype == LLAMA_FTYPE_MOSTLY_IQ4_K  ||
+                    ftype == LLAMA_FTYPE_MOSTLY_IQ3_KS || ftype == LLAMA_FTYPE_MOSTLY_IQ4_KS  ||
+                    ftype == LLAMA_FTYPE_MOSTLY_IQ5_KS) {
                     new_type = GGML_TYPE_Q5_K;
                 }
             } else {
@@ -647,6 +730,7 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
                 else if (ftype == LLAMA_FTYPE_MOSTLY_Q3_K_M ) new_type = GGML_TYPE_Q4_K;
                 else if (ftype == LLAMA_FTYPE_MOSTLY_Q3_K_L ) new_type = GGML_TYPE_Q5_K;
                 else if (ftype == LLAMA_FTYPE_MOSTLY_IQ3_M  ) new_type = GGML_TYPE_Q4_K;
+                else if (ftype == LLAMA_FTYPE_MOSTLY_IQ2_K  ) new_type = GGML_TYPE_IQ3_K;
             }
         } else {
             if (ftype == LLAMA_FTYPE_MOSTLY_Q3_K_L) new_type = GGML_TYPE_Q4_K;
@@ -884,6 +968,15 @@ ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_IQ4_XS:  return GGML_TYPE_IQ4_XS;
         case LLAMA_FTYPE_MOSTLY_IQ3_S:
         case LLAMA_FTYPE_MOSTLY_IQ3_M:   return GGML_TYPE_IQ3_S;
+        case LLAMA_FTYPE_MOSTLY_IQ2_K:   return GGML_TYPE_IQ2_K;
+        case LLAMA_FTYPE_MOSTLY_IQ3_K:   return GGML_TYPE_IQ3_K;
+        case LLAMA_FTYPE_MOSTLY_IQ4_K:   return GGML_TYPE_IQ4_K;
+        case LLAMA_FTYPE_MOSTLY_IQ5_K:   return GGML_TYPE_IQ5_K;
+        case LLAMA_FTYPE_MOSTLY_IQ6_K:   return GGML_TYPE_IQ6_K;
+        case LLAMA_FTYPE_MOSTLY_IQ2_KS:  return GGML_TYPE_IQ2_KS;
+        case LLAMA_FTYPE_MOSTLY_IQ3_KS:  return GGML_TYPE_IQ3_KS;
+        case LLAMA_FTYPE_MOSTLY_IQ4_KS:  return GGML_TYPE_IQ4_KS;
+        case LLAMA_FTYPE_MOSTLY_IQ5_KS:  return GGML_TYPE_IQ5_KS;
 
         default: return GGML_TYPE_COUNT;
     }
@@ -1305,7 +1398,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                         if (f32_conv_buf.size() < (size_t) nelements_cur) {
                             f32_conv_buf.resize(nelements_cur);
                         }
-                        llama_tensor_dequantize_impl(tensor->type, src, (float *) f32_conv_buf.data(), workers, nelements_cur, nthread);
+                        llama_tensor_dequantize_impl(tensor->type, src, (float *) f32_conv_buf.data(), workers, nelements_cur, n_per_row, nthread);
                         f32_data = (const float *) f32_conv_buf.data();
                     }
 

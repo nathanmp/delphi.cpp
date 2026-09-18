@@ -15,6 +15,8 @@
 #include "ops.h"
 #include "ggml.h"
 #include "common.h"
+#include "iqk/iqk_mul_mat.h"
+#include "moe-prof.h"
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h> // using malloc.h with MSC/MINGW
@@ -78,6 +80,11 @@
 
 #define UNUSED GGML_UNUSED
 #define SWAP(x, y, T) do { T SWAP = x; (x) = y; (y) = SWAP; } while (0)
+
+static bool ggml_cpu_iqk_mul_mat_enabled(void) {
+    const char * value = getenv("GGML_CPU_IQK_MUL_MAT");
+    return value == NULL || strcmp(value, "0") != 0;
+}
 
 // precomputed f32 table for f16 (256 KB) (simd-mappings.h)
 float ggml_table_f32_f16[1 << 16];
@@ -414,6 +421,60 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     },
     [GGML_TYPE_I32] = {
         .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_i32,
+    },
+    [GGML_TYPE_IQ2_K] = {
+        .from_float               = quantize_row_iq2_k,
+        .vec_dot                  = ggml_vec_dot_iq2_k_q8_K,
+        .vec_dot_type             = GGML_TYPE_Q8_K,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_IQ3_K] = {
+        .from_float               = quantize_row_iq3_k,
+        .vec_dot                  = ggml_vec_dot_iq3_k_q8_K,
+        .vec_dot_type             = GGML_TYPE_Q8_K,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_IQ4_K] = {
+        .from_float               = quantize_row_iq4_k,
+        .vec_dot                  = ggml_vec_dot_iq4_k_q8_K,
+        .vec_dot_type             = GGML_TYPE_Q8_K,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_IQ5_K] = {
+        .from_float               = quantize_row_iq5_k,
+        .vec_dot                  = ggml_vec_dot_iq5_k_q8_K,
+        .vec_dot_type             = GGML_TYPE_Q8_K,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_IQ6_K] = {
+        .from_float               = quantize_row_iq6_k,
+        .vec_dot                  = ggml_vec_dot_iq6_k_q8_K,
+        .vec_dot_type             = GGML_TYPE_Q8_K,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_IQ2_KS] = {
+        .from_float               = quantize_row_iq2_ks,
+        .vec_dot                  = ggml_vec_dot_iq2_ks_q8_K,
+        .vec_dot_type             = GGML_TYPE_Q8_K,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_IQ3_KS] = {
+        .from_float               = quantize_row_iq3_ks,
+        .vec_dot                  = ggml_vec_dot_iq3_ks_q8_K,
+        .vec_dot_type             = GGML_TYPE_Q8_K,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_IQ4_KS] = {
+        .from_float               = quantize_row_iq4_ks,
+        .vec_dot                  = ggml_vec_dot_iq4_ks_q8_K,
+        .vec_dot_type             = GGML_TYPE_Q8_K,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_IQ5_KS] = {
+        .from_float               = quantize_row_iq5_ks,
+        .vec_dot                  = ggml_vec_dot_iq5_ks_q8_K,
+        .vec_dot_type             = GGML_TYPE_Q8_K,
+        .nrows                    = 1,
     },
 };
 
@@ -1546,6 +1607,27 @@ UseGgmlGemm1:;
 
     ggml_barrier(params->threadpool);
 
+    // Try the optional IQK implementation before falling back to the stock CPU matmul. Unsupported
+    // layouts/types return false and continue below. Like the IQ panel gemm underneath, this must come after
+    // the barrier above: when src1 needs conversion it reads the q8_K rows from the work buffer, which the
+    // loop above fills cooperatively.
+    if (!params->use_ref && ggml_cpu_iqk_mul_mat_enabled() && dst->type == GGML_TYPE_F32) {
+        const void * iqk_src1 = src1->type == vec_dot_type ? src1->data : params->wdata;
+        const size_t iqk_nb11 = src1->type == vec_dot_type ? nb11 : ggml_row_size(vec_dot_type, ne10);
+        const size_t iqk_nb12 = src1->type == vec_dot_type ? nb12 : iqk_nb11 * ne11;
+        const size_t iqk_nb13 = src1->type == vec_dot_type ? nb13 : iqk_nb12 * ne12;
+
+        if (iqk_mul_mat_4d(ne01, ne11, ne00,
+                ne02, ne03, ne12, ne13,
+                nb02, nb03, iqk_nb12, iqk_nb13,
+                nb2 / sizeof(float), nb3 / sizeof(float),
+                src0->type, src0->data, nb01,
+                vec_dot_type, iqk_src1, iqk_nb11,
+                dst->data, nb1 / sizeof(float), ith, nth)) {
+            return;
+        }
+    }
+
     // IQ panel gemm (see iqp.h) - must come after the barrier above, it consumes the q8_K rows
     // of src1 from the work buffer
     if (ggml_cpu_iqp_supports_mul_mat(dst) && !params->use_ref) {
@@ -1721,15 +1803,25 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
     return ptr;
 }
 
-static void ggml_compute_forward_mul_mat_id(
+// `fuse_up` and `fuse_dst` are the up-projection MUL_MAT_ID node and the GLU node of a
+// fused MoE up+gate subgraph, or NULL for a plain MUL_MAT_ID. When set, `dst` supplies the
+// gate weights and every other shape, and the routed rows are written to `fuse_dst`
+// combined by swiglu_clamp; `dst` itself is never written.
+static void ggml_compute_forward_mul_mat_id_impl(
         const struct ggml_compute_params * params,
-              struct ggml_tensor * dst) {
+              struct ggml_tensor * dst,
+        const struct ggml_tensor * fuse_up,
+              struct ggml_tensor * fuse_dst,
+        float fuse_limit) {
 
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
     const struct ggml_tensor * ids = dst->src[2];
 
     GGML_TENSOR_BINARY_OP_LOCALS
+
+    const bool prof = ggml_moe_prof_enabled();
+    const int64_t prof_t_op = prof ? ggml_time_us() : 0;
 
     const int ith = params->ith;
     const int nth = params->nth;
@@ -1793,6 +1885,8 @@ static void ggml_compute_forward_mul_mat_id(
 
     GGML_ASSERT(params->wsize >= (size_t)((char *) wdata_cur - (char *) params->wdata));
 
+    const int64_t prof_t_quant = prof ? ggml_time_us() : 0;
+
     if (src1->type != vec_dot_type) {
         char * wdata = (char *) params->wdata + numa_node * src1_scratch_stride;
 
@@ -1830,6 +1924,12 @@ static void ggml_compute_forward_mul_mat_id(
 #endif
     }
 
+    if (prof) {
+        ggml_moe_prof_add(GGML_MOE_PROF_QUANT_SRC1, ggml_time_us() - prof_t_quant);
+    }
+
+    const int64_t prof_t_rows = prof ? ggml_time_us() : 0;
+
     if (ith == 0) {
         // initialize matrix_row_counts
         memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
@@ -1853,7 +1953,17 @@ static void ggml_compute_forward_mul_mat_id(
         *current_chunk_ctr = work_nth;
     }
 
+    if (prof) {
+        ggml_moe_prof_add(GGML_MOE_PROF_ROW_MAP, ggml_time_us() - prof_t_rows);
+    }
+
+    const int64_t prof_t_barrier = prof ? ggml_time_us() : 0;
+
     ggml_barrier(params->threadpool);
+
+    if (prof) {
+        ggml_moe_prof_add(GGML_MOE_PROF_BARRIER, ggml_time_us() - prof_t_barrier);
+    }
 
     // column split: this node owns rows [numa_row0_start, numa_row0_end) of every expert, and its workers share that range
     int64_t numa_row0_start = 0;
@@ -1868,6 +1978,10 @@ static void ggml_compute_forward_mul_mat_id(
 
         if (cne1 == 0) {
             continue;
+        }
+
+        if (prof && work_ith == 0) {
+            ggml_moe_prof_add_expert_rows(cne1);
         }
 
         const char * src0_cur = (const char *) src0->data + cur_a * nb02;
@@ -1886,6 +2000,40 @@ static void ggml_compute_forward_mul_mat_id(
 
         const int64_t nr0 = numa_row0_end - numa_row0_start;
         const int64_t nr1 = cne1;
+
+        if (fuse_up) {
+            // Both weight shards are offset by numa_row0_start exactly like the unfused
+            // call, so a socket still reads only its own output-row range of gate and up.
+            const struct ggml_tensor * up0 = fuse_up->src[0];
+            const char * up0_cur = (const char *) up0->data + cur_a * up0->nb[2];
+            const bool fused = iqk_moe_fused_up_gate(nr0, nr1, ne00, ne11,
+                src0->type,
+                src0_cur + numa_row0_start * nb01,
+                up0_cur  + numa_row0_start * nb01, nb01,
+                vec_dot_type, wdata, row_size,
+                (float *) fuse_dst->data + numa_row0_start, fuse_dst->nb[1], fuse_dst->nb[2],
+                matrix_rows + cur_a * ids->ne[0] * ids->ne[1],
+                fuse_limit, cur_a, work_ith, work_nth);
+            // There is no fallback: the eligibility test in ggml_cpu_try_fuse_ops already
+            // ran the same kernel checks, so a refusal here means they disagree.
+            GGML_ASSERT(fused);
+            continue;
+        }
+
+        // The IQK MoE kernel always computes rows [0, nr0) of the pointers it is
+        // given, so the `--numa tensors` column split is expressed by offsetting
+        // src0 and dst rather than by an explicit row range. Under --numa tensors
+        // the remaining split must be over this node's own workers.
+        if (!params->use_ref && ggml_cpu_iqk_mul_mat_enabled() &&
+            ne13 == 1 && dst->type == GGML_TYPE_F32 &&
+            (src1_cont || src1->type != vec_dot_type) &&
+            iqk_mul_mat_moe(nr0, nr1, ne00, ne11,
+                src0->type, src0_cur + numa_row0_start * nb01, nb01,
+                vec_dot_type, wdata, row_size,
+                (float *) dst->data + numa_row0_start, nb1, nb2,
+                matrix_rows + cur_a * ids->ne[0] * ids->ne[1], cur_a, work_ith, work_nth)) {
+            continue;
+        }
 
         int chunk_size = 16;
         if (nr0 == 1 || nr1 == 1) {
@@ -1933,6 +2081,16 @@ static void ggml_compute_forward_mul_mat_id(
             current_chunk = atomic_fetch_add_explicit(current_chunk_ctr, 1, memory_order_relaxed);
         }
     }
+
+    if (prof) {
+        ggml_moe_prof_add(GGML_MOE_PROF_TOTAL, ggml_time_us() - prof_t_op);
+    }
+}
+
+static void ggml_compute_forward_mul_mat_id(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst) {
+    ggml_compute_forward_mul_mat_id_impl(params, dst, NULL, NULL, 0.0f);
 }
 
 /////////////////////////////////
@@ -3359,6 +3517,85 @@ struct ggml_cplan ggml_graph_plan(
 // Returns the number of nodes skipped by fusion (>=1), or 0 if no fusion was applied.
 static bool ggml_cpu_disable_fusion = false;  // initialized once in ggml_cpu_init(), read-only afterwards
 
+bool ggml_backend_cpu_is_repack_tensor(const struct ggml_tensor * tensor);
+
+// Whether the three nodes at `node_n` are a routed MoE gate+up+SwiGLU triple that the fused
+// IQK kernel can compute in one pass. The two matmuls are told apart by identity from the
+// GLU sources rather than by graph order, which the builder is free to choose.
+static bool ggml_cpu_moe_fuse_up_gate_match(
+        const struct ggml_cgraph * cgraph,
+        const int node_n,
+        struct ggml_tensor ** gate_out,
+        struct ggml_tensor ** up_out,
+        struct ggml_tensor ** glu_out,
+        float * limit_out) {
+
+    const char * disable = getenv("GGML_CPU_MOE_FUSE_UP_GATE");
+    if ((disable && strcmp(disable, "0") == 0) || !ggml_cpu_iqk_mul_mat_enabled()) {
+        return false;
+    }
+
+    const enum ggml_op fuse_ops[] = { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU };
+    const int outputs[] = { node_n + 2 };
+    // ggml_can_fuse cannot be used: the two matmuls are siblings, not a chain.
+    if (!ggml_can_fuse_subgraph(cgraph, node_n, 3, fuse_ops, outputs, 1)) {
+        return false;
+    }
+
+    struct ggml_tensor * mm0 = cgraph->nodes[node_n + 0];
+    struct ggml_tensor * mm1 = cgraph->nodes[node_n + 1];
+    struct ggml_tensor * glu = cgraph->nodes[node_n + 2];
+
+    if (ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU_CLAMP ||
+        ggml_get_op_params_i32(glu, 1) != 0 || !glu->src[1]) {
+        return false;
+    }
+
+    struct ggml_tensor * gate = glu->src[0];
+    struct ggml_tensor * up   = glu->src[1];
+    if (!((gate == mm0 && up == mm1) || (gate == mm1 && up == mm0))) {
+        return false;
+    }
+
+    const struct ggml_tensor * gate0 = gate->src[0];
+    const struct ggml_tensor * up0   = up->src[0];
+
+    // MXFP4 experts live in the repack extra buffer, which has its own NUMA-aware
+    // MUL_MAT_ID and runs from ggml_cpu_extra_compute_forward. Fusing would bypass it.
+    if (ggml_backend_cpu_is_repack_tensor(gate0) || ggml_backend_cpu_is_repack_tensor(up0)) {
+        return false;
+    }
+
+    if (gate->src[1] != up->src[1] || gate->src[2] != up->src[2] ||
+        gate0->type != up0->type ||
+        !ggml_are_same_shape(gate0, up0) ||
+        gate0->nb[1] != up0->nb[1] || gate0->nb[2] != up0->nb[2] ||
+        (gate0->flags & GGML_TENSOR_FLAG_NUMA_EXPERT) != (up0->flags & GGML_TENSOR_FLAG_NUMA_EXPERT)) {
+        return false;
+    }
+
+    if (gate->type != GGML_TYPE_F32 || glu->type != GGML_TYPE_F32 ||
+        !ggml_are_same_shape(gate, glu) || glu->nb[0] != sizeof(float) ||
+        gate->src[1]->ne[3] != 1) {
+        return false;
+    }
+
+    const enum ggml_type vec_dot_type = type_traits_cpu[gate0->type].vec_dot_type;
+    if (!ggml_is_contiguous(gate->src[1]) && gate->src[1]->type == vec_dot_type) {
+        return false;
+    }
+    if (!iqk_mul_mat_moe_supported(gate0->ne[0], gate0->type, vec_dot_type)) {
+        return false;
+    }
+
+    *gate_out  = gate;
+    *up_out    = up;
+    *glu_out   = glu;
+    *limit_out = ggml_get_op_params_f32(glu, 3);
+    return true;
+}
+
+
 static int ggml_cpu_try_fuse_ops(
         const struct ggml_cgraph * cgraph,
         const int node_n,
@@ -3370,6 +3607,18 @@ static int ggml_cpu_try_fuse_ops(
     }
 
     struct ggml_tensor * node = cgraph->nodes[node_n];
+
+    if (node->op == GGML_OP_MUL_MAT_ID) {
+        // MUL_MAT_ID + MUL_MAT_ID + GLU fusion for CPU-routed MoE experts
+        struct ggml_tensor * gate = NULL;
+        struct ggml_tensor * up   = NULL;
+        struct ggml_tensor * glu  = NULL;
+        float limit = 0.0f;
+        if (ggml_cpu_moe_fuse_up_gate_match(cgraph, node_n, &gate, &up, &glu, &limit)) {
+            ggml_compute_forward_mul_mat_id_impl(params, gate, up, glu, limit);
+            return 2;
+        }
+    }
 
     if (node->op == GGML_OP_RMS_NORM) {
         // RMS_NORM + MUL fusion

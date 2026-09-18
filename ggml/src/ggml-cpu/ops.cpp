@@ -30,6 +30,30 @@ static void ggml_compute_forward_dup_same_cont(
     const int ith = params->ith; // thread index
     const int nth = params->nth; // number of threads
 
+    // A type with per-row metadata (IQ*_KS) is not a flat array of blocks: every row carries
+    // ggml_row_meta_size() bytes in front of its blocks. Splitting the copy by block index would skip those
+    // bytes and mis-address the blocks, which leaves the destination's per-row scales uninitialized. Split by
+    // row instead, which is what ggml_row_size() already accounts for.
+    if (ggml_row_meta_size(src0->type) != 0) {
+        // Per-row metadata cannot survive a reshape, so the rows have to line up.
+        GGML_ASSERT(src0->ne[0] == dst->ne[0]);
+
+        const int64_t nr = ggml_nrows(src0);
+        const size_t  rs = ggml_row_size(src0->type, src0->ne[0]);
+
+        const int64_t dr_row = (nr + nth - 1)/nth;
+        const int64_t r0     = dr_row*ith;
+        const int64_t r1     = MIN(r0 + dr_row, nr);
+
+        if (r0 < r1) {
+            memcpy(
+                ((char *)  dst->data + r0*rs),
+                ((char *) src0->data + r0*rs),
+                (r1 - r0)*rs);
+        }
+        return;
+    }
+
     // parallelize by blocks
     const int nk = ggml_nelements(src0)/ggml_blck_size(src0->type);
     const int dr = (nk + nth - 1) / nth;
@@ -298,7 +322,7 @@ static void ggml_compute_forward_dup_to_q(
         float * src0_f32 = (float *) params->wdata + (ne00 + CACHE_LINE_SIZE_F32) * ith;
 
         size_t id = 0;
-        size_t rs = nb0 * (ne00 / ggml_blck_size(dst->type));
+        size_t rs = ggml_row_size(dst->type, ne00);
         char * dst_ptr = (char *) dst->data;
 
         for (int i03 = 0; i03 < ne03; i03++) {
@@ -410,6 +434,38 @@ static void ggml_compute_forward_dup_bytes(
         return;
     }
 
+    // The loop further down flattens both tensors into a stream of blocks and re-splits it by the destination
+    // row length, which drops (or misplaces) per-row metadata. A type that carries metadata can still be
+    // permuted, because a permutation of dimensions 1..3 only reshuffles whole rows: the metadata travels
+    // with its blocks as long as the row length is unchanged, so copy row by row instead.
+    if (ggml_row_meta_size(src0->type) != 0 || ggml_row_meta_size(dst->type) != 0) {
+        GGML_ASSERT(src0->type == dst->type && ne0 == ne00 &&
+                    "ggml_compute_forward_dup: a type with per-row metadata cannot be reshaped or converted");
+        GGML_ASSERT(nb00 == type_size && nb0 == type_size &&
+                    "ggml_compute_forward_dup: a type with per-row metadata cannot be transposed");
+
+        const size_t rs = ggml_row_size(src0->type, ne00);
+
+        for (int64_t i03 = 0; i03 < ne03; i03++) {
+            for (int64_t i02 = 0; i02 < ne02; i02++) {
+                for (int64_t i01 = ir0; i01 < ir1; i01++) {
+                    // rows are consumed in source order and produced in destination order
+                    const int64_t ir = (i03*ne02 + i02)*ne01 + i01;
+
+                    const int64_t i1 = ir % ne1;
+                    const int64_t i2 = (ir / ne1) % ne2;
+                    const int64_t i3 = (ir / ne1 / ne2) % ne3;
+
+                    memcpy(
+                        ((char *)  dst->data + i1 *nb1  + i2 *nb2  + i3 *nb3),
+                        ((char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03),
+                        rs);
+                }
+            }
+        }
+        return;
+    }
+
     // dst counters
     int64_t k10 = 0;
     int64_t i11 = 0;
@@ -495,6 +551,36 @@ static void ggml_compute_forward_dup_from_q(
 
     const int ith = params->ith;
     const int nth = params->nth;
+
+    // A type with per-row metadata keeps its scale in front of the row's first block, and its to_float()
+    // takes that row start rather than a block. Dequantizing block by block below would hand every block
+    // after the first ggml_row_meta_size() bytes of the preceding block as its scale, so walk whole rows.
+    // Rows line up one to one because such a type cannot be reshaped.
+    if (ggml_row_meta_size(type) != 0) {
+        GGML_ASSERT(ne00 == ne10);
+
+        const int64_t nrows = ggml_nelements(src0)/ne00;
+
+        const int64_t dr_row = (nrows + nth - 1)/nth;
+        const int64_t rr0    = dr_row*ith;
+        const int64_t rr1    = MIN(rr0 + dr_row, nrows);
+
+        for (int64_t ir = rr0; ir < rr1; ++ir) {
+            const int64_t i01 = ir % ne01;
+            const int64_t i02 = (ir / ne01) % ne02;
+            const int64_t i03 = (ir / ne01 / ne02) % ne03;
+
+            const int64_t i11 = ir % ne11;
+            const int64_t i12 = (ir / ne11) % ne12;
+            const int64_t i13 = (ir / ne11 / ne12) % ne13;
+
+            dequantize_row_q(
+                    (const void *) ((char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03),
+                         (float *) ((char *)  dst->data + i11*nb11 + i12*nb12 + i13*nb13), ne00);
+        }
+
+        return;
+    }
 
     const int dr = (nr + nth - 1)/nth;
 
@@ -1904,6 +1990,9 @@ static void ggml_compute_forward_concat_any(
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
+    // concatenating block by block would drop the per-row metadata
+    GGML_ASSERT(ggml_row_meta_size(src0->type) == 0 && ggml_row_meta_size(dst->type) == 0 &&
+                "ggml_compute_forward_concat: types with per-row metadata are not supported");
     const int ith = params->ith;
     const int nth = params->nth;
 
@@ -5221,6 +5310,15 @@ void ggml_compute_forward_get_rows(
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ3_S:
         case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ2_K:
+        case GGML_TYPE_IQ3_K:
+        case GGML_TYPE_IQ4_K:
+        case GGML_TYPE_IQ5_K:
+        case GGML_TYPE_IQ6_K:
+        case GGML_TYPE_IQ2_KS:
+        case GGML_TYPE_IQ3_KS:
+        case GGML_TYPE_IQ4_KS:
+        case GGML_TYPE_IQ5_KS:
             {
                 ggml_compute_forward_get_rows_q(params, dst);
             } break;
@@ -5978,6 +6076,15 @@ void ggml_compute_forward_clamp(
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ3_S:
         case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ2_K:
+        case GGML_TYPE_IQ3_K:
+        case GGML_TYPE_IQ4_K:
+        case GGML_TYPE_IQ5_K:
+        case GGML_TYPE_IQ6_K:
+        case GGML_TYPE_IQ2_KS:
+        case GGML_TYPE_IQ3_KS:
+        case GGML_TYPE_IQ4_KS:
+        case GGML_TYPE_IQ5_KS:
         case GGML_TYPE_Q8_K:
         case GGML_TYPE_I8:
         case GGML_TYPE_I16:

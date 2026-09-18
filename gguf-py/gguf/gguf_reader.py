@@ -24,6 +24,7 @@ if __name__ == "__main__":
 from gguf.constants import (
     GGML_MAX_DIMS,
     GGML_QUANT_SIZES,
+    GGML_ROW_META_SIZES,
     GGUF_DEFAULT_ALIGNMENT,
     GGUF_MAGIC,
     GGUF_VERSION,
@@ -349,7 +350,10 @@ class GGUFReader:
                 n_elems *= int(dim)
             np_dims = tuple(reversed(dims.tolist()))
             block_size, type_size = GGML_QUANT_SIZES[ggml_type]
-            n_bytes = n_elems * type_size // block_size
+            # types with per-row metadata (IQ*_KS) carry a few extra bytes per row
+            row_meta_size = GGML_ROW_META_SIZES.get(ggml_type, 0)
+            n_rows = n_elems // int(dims.tolist()[0]) if len(dims) > 0 and int(dims.tolist()[0]) else 0
+            n_bytes = n_elems * type_size // block_size + n_rows * row_meta_size
             data_offs = int(start_offs + offset_tensor[0])
             item_type: npt.DTypeLike
             if ggml_type == GGMLQuantizationType.F16:

@@ -98,6 +98,16 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
             }
         }
 
+        if (ggml_row_meta_size(tensor->type) > 0) {
+            // types with per-row metadata must be quantized a whole row at a time: the
+            // per-row scale lives in front of the blocks, so the tensor cannot be treated
+            // as one long row of blck_size-sized rows the way the generic path below does
+            std::vector<uint8_t> dataq(ggml_nbytes(tensor));
+            ggml_quantize_chunk(tensor->type, data.data(), dataq.data(), 0, ggml_nrows(tensor), tensor->ne[0], im);
+            ggml_backend_tensor_set(tensor, dataq.data(), 0, dataq.size());
+            return;
+        }
+
         std::vector<uint8_t> dataq(ggml_row_size(tensor->type, nels));
         {
             // parallel quantization by block
@@ -260,10 +270,22 @@ static std::vector<float> tensor_to_float(const ggml_tensor * t) {
     std::vector<float> vq(ggml_blck_size(t->type));
     bool quantized = ggml_is_quantized(t->type);
 
+    // A type with per-row metadata (IQ*_KS) keeps its scale once per row, in front of the row's first block,
+    // and its to_float() takes that row start rather than a block. Stepping block by block would hand it
+    // ggml_row_meta_size() bytes of the preceding block as the scale, so convert a whole row in one call.
+    const size_t row_meta_size = ggml_row_meta_size(t->type);
+    std::vector<float> vr(row_meta_size != 0 ? t->ne[0] : 0);
+
     // access elements by index to avoid gaps in views
     for (int64_t i3 = 0; i3 < t->ne[3]; i3++) {
         for (int64_t i2 = 0; i2 < t->ne[2]; i2++) {
             for (int64_t i1 = 0; i1 < t->ne[1]; i1++) {
+                if (row_meta_size != 0) {
+                    size_t i = i3*t->nb[3] + i2*t->nb[2] + i1*t->nb[1];
+                    tt->to_float(&buf[i], vr.data(), t->ne[0]);
+                    tv.insert(tv.end(), vr.begin(), vr.end());
+                    continue;
+                }
                 for (int64_t i0 = 0; i0 < t->ne[0]; i0 += bs) {
                     size_t i = i3*t->nb[3] + i2*t->nb[2] + i1*t->nb[1] + i0/bs*t->nb[0];
                     if (t->type == GGML_TYPE_F16) {
@@ -5126,6 +5148,173 @@ struct test_mul_mat_id : public test_case {
     }
 };
 
+// GGML_OP_MUL_MAT_ID with the routed rows concentrated on a small pool of the
+// experts, so that a single expert receives enough rows to reach the batched
+// repack/GEMM thresholds of the CPU IQK and repack paths.
+struct test_mul_mat_id_pool : public test_case {
+    const ggml_type type_a;
+    const ggml_type type_b;
+    const int n_mats;
+    const int n_used;
+    const int n_pool; // experts the ids are drawn from
+    const bool b; // broadcast b matrix
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+
+    std::string vars() override {
+        return VARS_TO_STR9(type_a, type_b, n_mats, n_used, n_pool, b, m, n, k);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * m * k * n * n_used;
+    }
+
+    test_mul_mat_id_pool(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
+            int n_mats = 8, int n_used = 2, int n_pool = 4, bool b = false,
+            int64_t m = 32, int64_t n = 32, int64_t k = 32)
+        : type_a(type_a), type_b(type_b), n_mats(n_mats), n_used(n_used), n_pool(n_pool), b(b),
+            m(m), n(n), k(k) {
+            GGML_ASSERT(n_used <= n_pool && n_pool <= n_mats);
+        }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        // C^T = A * B^T: (k, m) * (k, n) => (m, n)
+        ggml_tensor * as = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_set_name(as, "as");
+
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+        ggml_set_name(ids, "ids");
+        if (n_used != n_mats) {
+            ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+            ggml_set_name(ids, "view_of_ids");
+        }
+
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, type_b, k, this->b ? 1 : n_used, n);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out = ggml_mul_mat_id(ctx, as, b, ids);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::random_device rd;
+        std::default_random_engine rng(rd());
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                if (ggml_is_view_op(t->op)) { continue; }
+                std::vector<int32_t> pool(n_pool);
+                std::iota(pool.begin(), pool.end(), 0);
+                for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                    // a fresh permutation per row keeps the first n_used ids distinct
+                    std::shuffle(pool.begin(), pool.end(), rng);
+                    std::vector<int32_t> data(t->ne[0]);
+                    for (int i = 0; i < t->ne[0]; i++) {
+                        data[i] = pool[i % n_pool];
+                    }
+                    ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
+                }
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// GGML_OP_MUL_MAT_ID + GGML_OP_MUL_MAT_ID + GGML_OP_GLU (fused MoE gate+up)
+struct test_moe_up_gate : public test_case {
+    const ggml_type type_a;
+    const ggml_type type_b;
+    const int n_mats;
+    const int n_used;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const float limit;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MOE_UP_GATE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR8(type_a, type_b, n_mats, n_used, m, n, k, limit);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 4 * m * k * n * n_used;
+    }
+
+    test_moe_up_gate(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
+            int n_mats = 4, int n_used = 2,
+            int64_t m = 64, int64_t n = 32, int64_t k = 256, float limit = 10.0f)
+        : type_a(type_a), type_b(type_b), n_mats(n_mats), n_used(n_used),
+            m(m), n(n), k(k), limit(limit) {
+            GGML_ASSERT(n_used <= n_mats);
+        }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * as_up = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_set_name(as_up, "as_up");
+
+        ggml_tensor * as_gate = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_set_name(as_gate, "as_gate");
+
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+        ggml_set_name(ids, "ids");
+        if (n_used != n_mats) {
+            ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+            ggml_set_name(ids, "view_of_ids");
+        }
+
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, type_b, k, n_used, n);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * up = ggml_mul_mat_id(ctx, as_up, b, ids);
+        ggml_set_name(up, "up");
+
+        ggml_tensor * gate = ggml_mul_mat_id(ctx, as_gate, b, ids);
+        ggml_set_name(gate, "gate");
+
+        ggml_tensor * out = ggml_swiglu_clamp(ctx, gate, up, limit);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::random_device rd;
+        std::default_random_engine rng(rd());
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                if (ggml_is_view_op(t->op)) { continue; }
+                std::vector<int32_t> pool(n_mats);
+                std::iota(pool.begin(), pool.end(), 0);
+                for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                    std::shuffle(pool.begin(), pool.end(), rng);
+                    ggml_backend_tensor_set(t, pool.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
+                }
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_MUL_MAT_ID + GGML_OP_ADD or GGML_OP_MUL
 struct test_mul_mat_id_fusion : public test_case {
     const ggml_type type_a;
@@ -8238,7 +8427,7 @@ static bool is_non_contiguous(const input_tensor & src) {
         return false;
     }
     const size_t default_nb0 = ggml_type_size(src.type);
-    const size_t default_nb1 = default_nb0 * (src.ne[0] / ggml_blck_size(src.type));
+    const size_t default_nb1 = ggml_row_size(src.type, src.ne[0]);
     const size_t default_nb2 = default_nb1 * src.ne[1];
     const size_t default_nb3 = default_nb2 * src.ne[2];
     return src.nb[0] != default_nb0 ||
@@ -8866,6 +9055,10 @@ static const ggml_type all_types[] = {
     GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S,
     GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M,
     GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS,
+    GGML_TYPE_IQ2_K, GGML_TYPE_IQ3_K, GGML_TYPE_IQ4_K,
+    GGML_TYPE_IQ5_K, GGML_TYPE_IQ6_K,
+    GGML_TYPE_IQ2_KS, GGML_TYPE_IQ3_KS,
+    GGML_TYPE_IQ4_KS, GGML_TYPE_IQ5_KS,
 };
 
 static const ggml_type base_types[] = {
@@ -8894,6 +9087,10 @@ static const ggml_type other_types[] = {
     GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S,
     GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M,
     GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS,
+    GGML_TYPE_IQ2_K, GGML_TYPE_IQ3_K, GGML_TYPE_IQ4_K,
+    GGML_TYPE_IQ5_K, GGML_TYPE_IQ6_K,
+    GGML_TYPE_IQ2_KS, GGML_TYPE_IQ3_KS,
+    GGML_TYPE_IQ4_KS, GGML_TYPE_IQ5_KS,
     GGML_TYPE_BF16,
 };
 
@@ -10133,6 +10330,64 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // IQ*_K / IQ*_KS CPU kernels: cover a large ordinary batch and MoE layouts whose
+    // per-expert row counts cross the transient Q8_K_R8 repack threshold.
+    for (ggml_type type_a : {GGML_TYPE_IQ2_K, GGML_TYPE_IQ3_K, GGML_TYPE_IQ4_K,
+                             GGML_TYPE_IQ5_K, GGML_TYPE_IQ6_K,
+                             GGML_TYPE_IQ2_KS, GGML_TYPE_IQ3_KS,
+                             GGML_TYPE_IQ4_KS, GGML_TYPE_IQ5_KS}) {
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 16, 4, 512, {3, 2}, {2, 2}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 128, 64, 512, {1, 1}, {1, 1}));
+        // enough weight rows per worker (>= 32 with 64 threads) and a wide enough
+        // batch that the ordinary MUL_MAT path repacks into the transient Q8_K_R8
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 2048, 64, 256, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, true, 64, 16, 512));
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 64, 64, 512));
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 8, 4, false, 64, 64, 512));
+    }
+
+    // MMQ must only select tile widths J that have a config entry (fewer with the m % 128 != 0 fallback):
+    // a Q8_1-layout type, a Q8_0_16-layout type and a type that borrows another type's config.
+    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q3_K, GGML_TYPE_IQ2_K}) {
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false,  64, 32, 256));
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 128, 64, 256));
+    }
+
+    // IQ*_K / IQ*_KS routed-expert coverage at the expert counts and top-k of the MoE
+    // models this fork targets on the CPU, with the projections scaled down.
+    // gate/up broadcasts one activation row to every selected expert; down
+    // does not, which is how llama.cpp builds the two MUL_MAT_ID operations.
+    for (ggml_type type_a : {GGML_TYPE_IQ2_K, GGML_TYPE_IQ3_K, GGML_TYPE_IQ4_K,
+                             GGML_TYPE_IQ5_K, GGML_TYPE_IQ6_K,
+                             GGML_TYPE_IQ2_KS, GGML_TYPE_IQ3_KS,
+                             GGML_TYPE_IQ4_KS, GGML_TYPE_IQ5_KS}) {
+        // MiniMax M3: 128 experts, top-4, 2:1 gate/up and 1:2 down.
+        // Every k is a multiple of the 256-element IQ*_K block.
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 128, 4, true,   384, 32,  768));
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 128, 4, false, 1024, 32,  512));
+        // concentrated routing: 128 rows * 4 experts over a pool of 8 is well
+        // past the per-expert row count at which the weights are repacked
+        test_cases.emplace_back(new test_mul_mat_id_pool(type_a, GGML_TYPE_F32, 128, 4, 8, false, 256, 128, 256));
+    }
+    for (ggml_type type_a : {GGML_TYPE_IQ3_K, GGML_TYPE_IQ4_K,
+                             GGML_TYPE_IQ3_KS, GGML_TYPE_IQ4_KS}) {
+        // DeepSeek V4 Flash: 256 experts, top-6
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 6, true,  256, 32, 512));
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 6, false, 512, 32, 256));
+
+        // fused up+gate+swiglu_clamp. n_used == n_mats concentrates every token on the
+        // same few experts, so the second case is above the weight repack threshold and
+        // the first is below it.
+        test_cases.emplace_back(new test_moe_up_gate(type_a, GGML_TYPE_F32, 8, 8,  512,  16, 256, 10.0f));
+        test_cases.emplace_back(new test_moe_up_gate(type_a, GGML_TYPE_F32, 8, 8,  512, 128, 256, 10.0f));
+        test_cases.emplace_back(new test_moe_up_gate(type_a, GGML_TYPE_F32, 8, 4, 1024,  64, 512, 10.0f));
+
+        // Qwen3.8-Flash-Next: 512 very narrow experts, top-10. Only gate/up is
+        // representable: its down projection has 640-element rows, which is not
+        // a multiple of the 256-element IQ*_K block.
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, true, 128, 16, 512));
+    }
+
     for (int bs : {1, 4, 512}) {
         for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K}) {
             for (ggml_type type_b : {GGML_TYPE_F32}) {
@@ -11172,7 +11427,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     // qwen3-30b-a3b
     for (int bs : {1, 4, 8, 32, 64, 128, 256, 512}) {
-        for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XS}) {
+        for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ4_K}) {
             for (ggml_type type_b : {GGML_TYPE_F32}) {
                 test_cases.emplace_back(new test_mul_mat_id(type_a, type_b, 128, 8, false, 768, bs, 2048));
                 test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, type_b, 128, 8, false, 768, bs, 2048, 1));
@@ -11181,7 +11436,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
 
     for (int bs : {1, 4, 8, 32, 64, 128, 256, 512}) {
-        for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XS}) {
+        for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ4_K}) {
             for (ggml_type type_b : {GGML_TYPE_F32}) {
                 test_cases.emplace_back(new test_mul_mat_id(type_a, type_b, 32, 4, false, 1792, bs, 2048));
                 test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, type_b, 32, 4, false, 1792, bs, 2048, 1));

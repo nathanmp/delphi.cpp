@@ -430,7 +430,21 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
-        GGML_TYPE_COUNT   = 43,
+        // IQ*_K quants ported from ik_llama.cpp (Iwan Kawrakow, MIT).
+        // The numeric IDs MUST match ik_llama.cpp so that GGUFs stay interoperable.
+        // IDs 43-136, 142-143, 146-151 and 153-155 are unused here but are (or may become)
+        // used by ik_llama.cpp.
+        GGML_TYPE_IQ2_K   = 137, // 2.375 bpw
+        GGML_TYPE_IQ3_K   = 138, // 3.4375 bpw
+        GGML_TYPE_IQ4_K   = 139, // 4.5 bpw
+        GGML_TYPE_IQ5_K   = 140, // 5.5 bpw
+        GGML_TYPE_IQ6_K   = 141, // 6.625 bpw
+        // IQ*_KS: per-row scale (see ggml_row_meta_size()); ids match ik_llama.cpp
+        GGML_TYPE_IQ4_KS  = 144, // 4.25 bpw
+        GGML_TYPE_IQ2_KS  = 145, // 2.1875 bpw
+        GGML_TYPE_IQ5_KS  = 152, // 5.25 bpw
+        GGML_TYPE_IQ3_KS  = 156, // 3.1875 bpw
+        GGML_TYPE_COUNT   = 157,
     };
 
     // [TAG_GGML_PREC]
@@ -691,7 +705,7 @@ extern "C" {
         int64_t ne[GGML_MAX_DIMS]; // number of elements
         size_t  nb[GGML_MAX_DIMS]; // stride in bytes:
                                    // nb[0] = ggml_type_size(type)
-                                   // nb[1] = nb[0]   * (ne[0] / ggml_blck_size(type)) + padding
+                                   // nb[1] = ggml_row_meta_size(type) + nb[0] * (ne[0] / ggml_blck_size(type)) + padding
                                    // nb[i] = nb[i-1] * ne[i-1]
 
         // compute data
@@ -760,6 +774,8 @@ extern "C" {
     GGML_API int64_t ggml_blck_size(enum ggml_type type);
     GGML_API size_t  ggml_type_size(enum ggml_type type);             // size in bytes for all elements in a block
     GGML_API size_t  ggml_row_size (enum ggml_type type, int64_t ne); // size in bytes for all elements in a row
+    // bytes of per-row metadata that precede the blocks of a row (0 for every type except IQ*_KS)
+    GGML_API size_t  ggml_row_meta_size(enum ggml_type type);
 
     GGML_DEPRECATED(
     GGML_API double ggml_type_sizef(enum ggml_type type), // ggml_type_size()/ggml_blck_size() as float
@@ -2982,6 +2998,9 @@ extern "C" {
         bool                     is_quantized;
         ggml_to_float_t          to_float;
         ggml_from_float_t        from_float_ref;
+        // extra bytes stored once at the beginning of every row, before the blocks.
+        // 0 for all types except the IQ*_KS family, whose scale is per row rather than per block.
+        size_t                   row_meta_size;
     };
 
     GGML_API const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type);

@@ -4839,3 +4839,7 @@ ggml_backend_buffer_type_t ggml_backend_cpu_repack_buffer_type(void) {
 
     return &ggml_backend_cpu_buffer_type_repack;
 }
+
+extern "C" bool ggml_backend_cpu_is_repack_tensor(const struct ggml_tensor * tensor) {
+    return tensor && tensor->buffer && tensor->buffer->buft == ggml_backend_cpu_repack_buffer_type();
+}

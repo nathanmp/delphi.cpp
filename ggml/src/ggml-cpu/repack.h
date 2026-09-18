@@ -10,6 +10,8 @@
 
 ggml_backend_buffer_type_t ggml_backend_cpu_repack_buffer_type(void);
 
+extern "C" bool ggml_backend_cpu_is_repack_tensor(const struct ggml_tensor * tensor);
+
 template <int K> constexpr int QK_0() {
     if constexpr (K == 4) {
         return QK4_0;

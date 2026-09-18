@@ -33,6 +33,8 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/repack.h
         ggml-cpu/iqp.cpp
         ggml-cpu/iqp.h
+        ggml-cpu/moe-prof.cpp
+        ggml-cpu/moe-prof.h
         ggml-cpu/hbm.cpp
         ggml-cpu/hbm.h
         ggml-cpu/quants.c
@@ -54,10 +56,25 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/vec.cpp
         ggml-cpu/ops.h
         ggml-cpu/ops.cpp
+        ggml-cpu/iqk/iqk_config.h
+        ggml-cpu/iqk/iqk_common.h
+        ggml-cpu/iqk/iqk_gemm_iqk_quants.h
+        ggml-cpu/iqk/iqk_mul_mat.h
+        ggml-cpu/iqk/iqk_mul_mat.cpp
+        ggml-cpu/iqk/iqk_gemm_iqk_quants.cpp
         )
 
     target_compile_features(${GGML_CPU_NAME} PRIVATE c_std_11 cxx_std_17)
     target_include_directories(${GGML_CPU_NAME} PRIVATE . ggml-cpu)
+
+    # The IQK GEMM unit holds one kernel instantiation per (quantization type, activation row
+    # count). Past GCC's large-unit-insns threshold the inliner stops folding the dequantizer into
+    # the kernels, and the ones that already existed lose about 8% before any new one runs. Raise
+    # the threshold for this file only, so adding a row count cannot slow down the other row counts.
+    if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        set_source_files_properties(ggml-cpu/iqk/iqk_gemm_iqk_quants.cpp
+            PROPERTIES COMPILE_OPTIONS "--param;large-unit-insns=100000")
+    endif()
 
     if (APPLE AND GGML_ACCELERATE)
         find_library(ACCELERATE_FRAMEWORK Accelerate)
