@@ -5329,6 +5329,118 @@ struct test_moe_up_gate : public test_case {
     }
 };
 
+// GGML_OP_MUL_MAT_ID with a fixed routing pattern
+//
+// init_mul_mat_id_tensors spreads the tokens evenly over the experts, so it never produces an empty
+// expert, a heavily skewed expert group, or a group at the end of the expert axis. Those are the
+// cases the device-side expert grouping in moe-devsort.cu has to get right (histogram, prefix sum,
+// and scatter bounds), so they are covered here with fixed patterns instead of random ids.
+//
+// The shapes force the synchronized sorted fallback in ggml_cuda_mul_mat_id: F32 experts are not
+// quantized (no MMQ/MMVQ), k is not a multiple of any warp size (no MMF), and n is above
+// MMVF_MAX_BATCH_SIZE. Run with GGML_CUDA_MOE_ROUTE_VERIFY=1 to also check the grouping itself
+// against the host reference, and with GGML_CUDA_MOE_ROUTE_DEBUG=1 to confirm the path is reached.
+enum mmid_routing {
+    MMID_ROUTING_UNIFORM, // round robin over all experts
+    MMID_ROUTING_SINGLE,  // one expert takes every token, the rest stay empty
+    MMID_ROUTING_SKEWED,  // one expert takes most tokens, the rest share a thin tail
+    MMID_ROUTING_LAST,    // only the highest expert index is used
+    MMID_ROUTING_SPARSE,  // two distant experts, so the used ranges have empty experts between them
+};
+
+static const char * mmid_routing_name(mmid_routing r) {
+    switch (r) {
+        case MMID_ROUTING_UNIFORM: return "uniform";
+        case MMID_ROUTING_SINGLE:  return "single";
+        case MMID_ROUTING_SKEWED:  return "skewed";
+        case MMID_ROUTING_LAST:    return "last";
+        case MMID_ROUTING_SPARSE:  return "sparse";
+    }
+    GGML_ABORT("fatal error");
+}
+
+struct test_mul_mat_id_routing : public test_case {
+    const int          n_mats;
+    const int          n_used;
+    const bool         b; // broadcast b matrix
+    const int64_t      m;
+    const int64_t      n;
+    const int64_t      k;
+    const mmid_routing routing;
+
+    std::string vars() override {
+        std::string r = mmid_routing_name(routing);
+        return VARS_TO_STR7(n_mats, n_used, b, m, n, k, r);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * m * k * n * n_used;
+    }
+
+    test_mul_mat_id_routing(int n_mats, int n_used, bool b, int64_t m, int64_t n, int64_t k, mmid_routing routing)
+        : n_mats(n_mats), n_used(n_used), b(b), m(m), n(n), k(k), routing(routing) {
+            GGML_ASSERT(n_used <= n_mats);
+        }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * as = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, m, n_mats);
+        ggml_set_name(as, "as");
+
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+        ggml_set_name(ids, "ids");
+        if (n_used != n_mats) {
+            ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+            ggml_set_name(ids, "view_of_ids");
+        }
+
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, this->b ? 1 : n_used, n);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out = ggml_mul_mat_id(ctx, as, b, ids);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    // The experts of one token must stay distinct: the host routing arm assigns each token at most
+    // one slot per expert and asserts on the total.
+    void token_experts(int64_t token, std::vector<int32_t> & dst) const {
+        int32_t first = 0;
+        switch (routing) {
+            case MMID_ROUTING_UNIFORM: first = (int32_t) (token * n_used) % n_mats;        break;
+            case MMID_ROUTING_SINGLE:  first = 0;                                          break;
+            case MMID_ROUTING_SKEWED:  first = token % 8 == 0 ? (int32_t) (token % n_mats) : 3; break;
+            case MMID_ROUTING_LAST:    first = n_mats - 1;                                 break;
+            case MMID_ROUTING_SPARSE:  first = token % 2 ? n_mats - 1 : 0;                 break;
+        }
+        for (int i = 0; i < n_used; i++) {
+            dst[i] = (first + i) % n_mats;
+        }
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_I32) {
+                init_tensor_uniform(t);
+                continue;
+            }
+            if (ggml_is_view_op(t->op)) {
+                continue;
+            }
+            std::vector<int32_t> data(t->ne[0], 0);
+            for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                token_experts(r, data);
+                ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
+            }
+        }
+    }
+};
+
 // GGML_OP_MUL_MAT_ID + GGML_OP_ADD or GGML_OP_MUL
 struct test_mul_mat_id_fusion : public test_case {
     const ggml_type type_a;
@@ -10658,6 +10770,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         // representable: its down projection has 640-element rows, which is not
         // a multiple of the 256-element IQ*_K block.
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, true, 128, 16, 512));
+    }
+    // sorted MUL_MAT_ID fallback: fixed routing patterns and MoE-shaped expert counts, see
+    // test_mul_mat_id_routing. k = 68 is deliberately not a multiple of any warp size.
+    for (bool b : {false, true}) {
+        for (mmid_routing r : {MMID_ROUTING_UNIFORM, MMID_ROUTING_SINGLE, MMID_ROUTING_SKEWED,
+                               MMID_ROUTING_LAST, MMID_ROUTING_SPARSE}) {
+            test_cases.emplace_back(new test_mul_mat_id_routing(  8, 1, b,  32,   64, 68, r));
+            test_cases.emplace_back(new test_mul_mat_id_routing( 64, 8, b,  32,  257, 68, r));
+            test_cases.emplace_back(new test_mul_mat_id_routing(256, 8, b,  16,  512, 68, r));
+        }
+        test_cases.emplace_back(new test_mul_mat_id_routing(  1,  1, b, 32,   16, 68, MMID_ROUTING_SINGLE));
+        test_cases.emplace_back(new test_mul_mat_id_routing( 16, 16, b, 32,   32, 68, MMID_ROUTING_UNIFORM));
+        test_cases.emplace_back(new test_mul_mat_id_routing(128,  4, b, 32, 1023, 68, MMID_ROUTING_SKEWED));
+        test_cases.emplace_back(new test_mul_mat_id_routing(256,  8, b, 16, 2048, 68, MMID_ROUTING_UNIFORM));
     }
 
     for (int bs : {1, 4, 512}) {
