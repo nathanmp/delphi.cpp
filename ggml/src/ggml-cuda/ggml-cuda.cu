@@ -1,6 +1,7 @@
 #include "ggml-cuda.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
+#include "ggml-exec-trace.h"
 
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
@@ -24,6 +25,7 @@
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/diagmask.cuh"
 #include "ggml-cuda/diag.cuh"
+#include "ggml-cuda/exec-trace-timing.cuh"
 #include "ggml-cuda/fattn.cuh"
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
@@ -92,6 +94,20 @@
 #include <vector>
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
+
+#if defined(GGML_USE_HIP)
+static constexpr enum ggml_exec_trace_dispatch_impl GGML_CUDA_TRACE_BLAS = GGML_EXEC_TRACE_DISPATCH_GPU_HIPBLAS;
+#else
+static constexpr enum ggml_exec_trace_dispatch_impl GGML_CUDA_TRACE_BLAS = GGML_EXEC_TRACE_DISPATCH_GPU_CUBLAS;
+#endif
+
+static uint32_t ggml_cuda_trace_mmq_config(const ggml_tensor * src0, int64_t ncols_max, int device) {
+    const auto & info = ggml_cuda_info().devices[device];
+    const bool fallback = src0->ne[1] % 128 != 0;
+    const int J = ggml_cuda_mmq_get_J_best(src0->type, fallback, info.cc, info.smpbo, ncols_max);
+    const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(src0->type, J, fallback, info.cc);
+    return ((uint32_t) config.nthreads << 16) | ((uint32_t) config.I << 8) | (uint32_t) J;
+}
 
 #define GGML_LOG_WARN_ONCE(str) \
     { static std::once_flag warn_flag; std::call_once(warn_flag, []() { GGML_LOG_WARN(str); }); }
@@ -702,6 +718,7 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
+    delete exec_trace_timer;
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
@@ -1825,6 +1842,8 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 
     const int32_t hint = ggml_get_op_params_i32(dst, 1);
     if (hint == GGML_HINT_SRC0_IS_HADAMARD && ggml_cuda_op_fwht(ctx, src1, dst)) {
+        ggml_exec_trace_dispatch(dst->op, GGML_EXEC_TRACE_DISPATCH_GPU_FWHT,
+                GGML_EXEC_TRACE_DISPATCH_VARIANT_DEFAULT, 0, 0);
         return;
     }
 
@@ -1834,6 +1853,8 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
         && ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
     if (bad_padding_clear || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        ggml_exec_trace_dispatch(dst->op, GGML_CUDA_TRACE_BLAS,
+                GGML_EXEC_TRACE_DISPATCH_VARIANT_BAD_PADDING_OR_TYPE, 0, 0);
         ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
         return;
     }
@@ -1844,6 +1865,8 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11)) {
         // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
         // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
+        ggml_exec_trace_dispatch(dst->op, GGML_EXEC_TRACE_DISPATCH_GPU_MMVF,
+                GGML_EXEC_TRACE_DISPATCH_VARIANT_DEFAULT, cc, warp_size);
         ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
         return;
     }
@@ -1858,21 +1881,33 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         dst_vec.nb[1] = dst_vec.nb[0]*ne11;
         dst_vec.nb[2] = dst_vec.nb[1];
         dst_vec.nb[3] = dst_vec.nb[1];
+        ggml_exec_trace_dispatch(dst->op, GGML_EXEC_TRACE_DISPATCH_GPU_MMVF,
+                GGML_EXEC_TRACE_DISPATCH_VARIANT_TRANSPOSED, cc, warp_size);
         ggml_cuda_mul_mat_vec_f(ctx, src1, src0, nullptr, &dst_vec);
         return;
     }
     if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
+        ggml_exec_trace_dispatch(dst->op, GGML_EXEC_TRACE_DISPATCH_GPU_MMF,
+                GGML_EXEC_TRACE_DISPATCH_VARIANT_DEFAULT, cc, warp_size);
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
         return;
     }
     if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
+        ggml_exec_trace_dispatch(dst->op, GGML_EXEC_TRACE_DISPATCH_GPU_MMVQ,
+                GGML_EXEC_TRACE_DISPATCH_VARIANT_DEFAULT, cc, warp_size);
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
         return;
     }
     if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
+        if (ggml_exec_trace_observing()) {
+            ggml_exec_trace_dispatch(dst->op, GGML_EXEC_TRACE_DISPATCH_GPU_MMQ,
+                    GGML_EXEC_TRACE_DISPATCH_VARIANT_DEFAULT, cc, ggml_cuda_trace_mmq_config(src0, ne11, ctx.device));
+        }
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
         return;
     }
+    ggml_exec_trace_dispatch(dst->op, GGML_CUDA_TRACE_BLAS,
+            GGML_EXEC_TRACE_DISPATCH_VARIANT_DEFAULT, cc, warp_size);
     ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
 }
 
@@ -1926,11 +1961,15 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             if (ggml_is_quantized(src0->type)) {
                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
                 if (ne2 <= mmvq_mmid_max) {
+                    ggml_exec_trace_dispatch(dst->op, GGML_EXEC_TRACE_DISPATCH_GPU_MMVQ,
+                            GGML_EXEC_TRACE_DISPATCH_VARIANT_DEFAULT, cc, mmvq_mmid_max);
                     ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
                     return;
                 }
             } else {
                 if (GGML_CUDA_CC_IS_AMD(cc)) {
+                    ggml_exec_trace_dispatch(dst->op, GGML_EXEC_TRACE_DISPATCH_GPU_MMVF,
+                            GGML_EXEC_TRACE_DISPATCH_VARIANT_DEFAULT, cc, WARP_SIZE);
                     ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
                     return;
                 }
@@ -1938,11 +1977,18 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         }
 
         if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
+            if (ggml_exec_trace_observing()) {
+                ggml_exec_trace_dispatch(dst->op, GGML_EXEC_TRACE_DISPATCH_GPU_MMQ,
+                        GGML_EXEC_TRACE_DISPATCH_VARIANT_DEFAULT, cc,
+                        ggml_cuda_trace_mmq_config(src0, ggml_cuda_mmq_moe_ncols_opt(cc, ne12, ids->ne[0], ne02), ctx.device));
+            }
             ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
             return;
         }
 
         if (ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
+            ggml_exec_trace_dispatch(dst->op, GGML_EXEC_TRACE_DISPATCH_GPU_MMF,
+                    GGML_EXEC_TRACE_DISPATCH_VARIANT_DEFAULT, cc, WARP_SIZE);
             ggml_cuda_mul_mat_f(ctx, src0, src1, ids, dst);
             return;
         }
@@ -1950,6 +1996,8 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     // note: this path should not be reached when recording CUDA graphs, because it requires stream synchronization
     GGML_ASSERT(ggml_cuda_mul_mat_id_needs_sync(dst, cc));
+    ggml_exec_trace_dispatch(dst->op, GGML_EXEC_TRACE_DISPATCH_GPU_MUL_MAT_ID_FALLBACK,
+            GGML_EXEC_TRACE_DISPATCH_VARIANT_SORTED_FALLBACK, cc, (uint32_t) ne02);
     cudaStream_t stream = ctx.stream();
 
     GGML_ASSERT(nb12 % nb11 == 0);
@@ -2546,6 +2594,11 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
 
     CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
 
+    // Timing events are recorded on stream 0; this existing synchronization completes all of them.
+    if (cuda_ctx->exec_trace_timer && cuda_ctx->curr_stream_no == 0) {
+        cuda_ctx->exec_trace_timer->resolve(GGML_EXEC_TRACE_GPU_TIMING_COMPLETION_SYNCHRONIZE);
+    }
+
     GGML_UNUSED(backend);
 }
 
@@ -2657,8 +2710,13 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
         CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
         graph->instance = nullptr;
         CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+        graph->trace_id = ggml_exec_trace_next_gpu_graph_id();
+        ggml_exec_trace_gpu_graph(GGML_EXEC_TRACE_GPU_GRAPH_UPDATE, graph->trace_id, graph->num_nodes,
+                GGML_EXEC_TRACE_GPU_GRAPH_REASON_UPDATE_REINSTANTIATED);
     } else {
         GGML_ASSERT(stat == cudaSuccess);
+        ggml_exec_trace_gpu_graph(GGML_EXEC_TRACE_GPU_GRAPH_UPDATE, graph->trace_id, graph->num_nodes,
+                GGML_EXEC_TRACE_GPU_GRAPH_REASON_NONE);
     }
 }
 #endif // USE_CUDA_GRAPH
@@ -3438,6 +3496,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
+    const auto trace_fused_mul_mat = [&](int node_index, ggml_op op, enum ggml_exec_trace_dispatch_impl implementation) {
+        if (!ggml_exec_trace_observing()) {
+            return;
+        }
+        const auto & device = ggml_cuda_info().devices[cuda_ctx->device];
+        ggml_exec_trace_set_node(node_index);
+        ggml_exec_trace_dispatch(op, implementation, GGML_EXEC_TRACE_DISPATCH_VARIANT_FUSED, device.cc, device.warp_size);
+    };
+
     if (node->op == GGML_OP_MUL) {
         ggml_cuda_moe_weighted_reduction_match match;
         if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
@@ -3765,6 +3832,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.glu_limit  = ggml_get_op_params_f32(glu, 3);
 
                 if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n)) {
+                    trace_fused_mul_mat(gate_idx, op, GGML_EXEC_TRACE_DISPATCH_GPU_MMVQ);
+                    trace_fused_mul_mat(up_idx, op, GGML_EXEC_TRACE_DISPATCH_GPU_MMVQ);
                     ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, cgraph->nodes[glu_idx], &fusion_data);
                     fused_mul_mat_vec = true;
                     fused_node_count  = n_ops;
@@ -3859,6 +3928,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.glu_limit  = ggml_get_op_params_f32(glu, 3);
 
                 if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n)) {
+                    trace_fused_mul_mat(gate_idx, op, GGML_EXEC_TRACE_DISPATCH_GPU_MMVQ);
+                    trace_fused_mul_mat(up_idx, op, GGML_EXEC_TRACE_DISPATCH_GPU_MMVQ);
                     ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, cgraph->nodes[glu_idx], &fusion_data);
                     fused_mul_mat_vec = true;
                     fused_node_count  = n_ops;
@@ -3915,6 +3986,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.glu_op    = ggml_get_glu_op(glu);
                 fusion_data.glu_limit = ggml_get_op_params_f32(glu, 3);
 
+                trace_fused_mul_mat(gate_n == cgraph->nodes[i] ? i : i + 2, op, GGML_EXEC_TRACE_DISPATCH_GPU_MMVF);
+                trace_fused_mul_mat(up_n == cgraph->nodes[i] ? i : i + 2, op, GGML_EXEC_TRACE_DISPATCH_GPU_MMVF);
                 ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
                 fused_mul_mat_vec = true;
                 fused_node_count  = 5;
@@ -3929,6 +4002,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.glu_op    = ggml_get_glu_op(glu);
                 fusion_data.glu_limit = ggml_get_op_params_f32(glu, 3);
 
+                trace_fused_mul_mat(gate_n == cgraph->nodes[i] ? i : i + 2, op, GGML_EXEC_TRACE_DISPATCH_GPU_MMVQ);
+                trace_fused_mul_mat(up_n == cgraph->nodes[i] ? i : i + 2, op, GGML_EXEC_TRACE_DISPATCH_GPU_MMVQ);
                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
                 fused_mul_mat_vec = true;
                 fused_node_count  = 5;
@@ -3956,6 +4031,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.glu_op    = ggml_get_glu_op(glu);
                 fusion_data.glu_limit = ggml_get_op_params_f32(glu, 3);
 
+                trace_fused_mul_mat(i, op, GGML_EXEC_TRACE_DISPATCH_GPU_MMVF);
+                trace_fused_mul_mat(i + 1, op, GGML_EXEC_TRACE_DISPATCH_GPU_MMVF);
                 ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
                 fused_mul_mat_vec = true;
                 fused_node_count  = 3;
@@ -3968,6 +4045,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.glu_op    = ggml_get_glu_op(glu);
                 fusion_data.glu_limit = ggml_get_op_params_f32(glu, 3);
 
+                trace_fused_mul_mat(i, op, GGML_EXEC_TRACE_DISPATCH_GPU_MMVQ);
+                trace_fused_mul_mat(i + 1, op, GGML_EXEC_TRACE_DISPATCH_GPU_MMVQ);
                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
                 fused_mul_mat_vec = true;
                 fused_node_count  = 3;
@@ -4056,6 +4135,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             fusion_data.x_scale = scale;
 
             if (ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
+                trace_fused_mul_mat(i, op, GGML_EXEC_TRACE_DISPATCH_GPU_MMVQ);
                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, out_node, &fusion_data);
                 fused_mul_mat_vec = true;
                 fused_node_count  = n_ops;
@@ -4114,6 +4194,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         fusion_data.x_bias = bias_tensor;
 
         if (ggml_cuda_should_fuse_mul_mat_vec_f(mm_node)) {
+            trace_fused_mul_mat(i, op, GGML_EXEC_TRACE_DISPATCH_GPU_MMVF);
             ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, bias_node, &fusion_data);
             fused_mul_mat_vec = true;
             fused_node_count  = 2;
@@ -4121,6 +4202,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
 
         if (ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
+            trace_fused_mul_mat(i, op, GGML_EXEC_TRACE_DISPATCH_GPU_MMVQ);
             ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, bias_node, &fusion_data);
             fused_mul_mat_vec = true;
             fused_node_count  = 2;
@@ -4212,6 +4294,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         }
     };
 
+    ggml_cuda_exec_trace_timer * trace_timer = cuda_ctx->exec_trace_timer;
+    cudaStream_t trace_timer_stream = trace_timer ? cuda_ctx->stream(cuda_ctx->device, 0) : nullptr;
+
     while (!graph_evaluated_or_captured) {
         // Only perform the graph execution if CUDA graphs are not enabled, or we are capturing the graph.
         // With the use of CUDA graphs, the execution will be performed by the graph launch.
@@ -4280,8 +4365,17 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 stream_ctx.concurrent_events.clear();
             }
 
+            const bool trace_nodes = ggml_exec_trace_observing();
+            // Timing events recorded during stream capture would become graph nodes, so only eager execution is timed here.
+            const bool trace_eager = trace_timer && !use_cuda_graph;
+            const bool trace_ops = trace_eager && trace_timer->op_spans();
+            const int trace_submit_span = trace_eager ?
+                    trace_timer->begin(trace_timer_stream, GGML_EXEC_TRACE_GPU_TIMING_SCOPE_EAGER_SUBMIT, 0, cgraph->n_nodes) : -1;
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
+                if (trace_nodes) {
+                    ggml_exec_trace_set_node(i);
+                }
                 if (is_concurrent_event_active) {
                     GGML_ASSERT(concurrent_event);
 
@@ -4322,9 +4416,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                // Nodes on forked streams are not timed one by one; the submission span covers them after the join.
+                const int trace_op_span = trace_ops && !is_concurrent_event_active && cuda_ctx->curr_stream_no == 0 ?
+                        trace_timer->begin(trace_timer_stream, GGML_EXEC_TRACE_GPU_TIMING_SCOPE_EAGER_OP, i, 1) : -1;
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
+                    if (trace_op_span >= 0) {
+                        trace_timer->end(trace_timer_stream, trace_op_span, nodes_to_skip + 1);
+                    }
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
                     GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",
@@ -4356,10 +4456,16 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
                 GGML_ASSERT(ok);
+                if (trace_op_span >= 0) {
+                    trace_timer->end(trace_timer_stream, trace_op_span, 0);
+                }
 
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
                }
+            }
+            if (trace_submit_span >= 0) {
+                trace_timer->end(trace_timer_stream, trace_submit_span, 0);
             }
         }
 
@@ -4372,6 +4478,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             }
 
             CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
+            graph->num_nodes = cgraph->n_nodes;
+            if (graph->trace_id == 0) {
+                graph->trace_id = ggml_exec_trace_next_gpu_graph_id();
+            }
+            ggml_exec_trace_gpu_graph(GGML_EXEC_TRACE_GPU_GRAPH_CAPTURE, graph->trace_id, cgraph->n_nodes,
+                    GGML_EXEC_TRACE_GPU_GRAPH_REASON_NONE);
             graph_evaluated_or_captured = true; // CUDA graph has been captured
 
             std::lock_guard<std::mutex> lock(ggml_cuda_lock);
@@ -4387,12 +4499,25 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         if (graph->instance == nullptr) { // Create executable graph from captured graph.
             CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+            if (graph->trace_id == 0) {
+                graph->trace_id = ggml_exec_trace_next_gpu_graph_id();
+            }
         }
         if (cuda_graph_update_required) { // Update graph executable
             ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
+        } else {
+            ggml_exec_trace_dispatch_replay(graph->trace_dispatches.data(), graph->trace_dispatches.size());
         }
         // Launch graph
+        ggml_exec_trace_gpu_graph(GGML_EXEC_TRACE_GPU_GRAPH_REPLAY, graph->trace_id, cgraph->n_nodes,
+                GGML_EXEC_TRACE_GPU_GRAPH_REASON_NONE);
+        // Time the launch as a whole from outside the graph. Events inside the graph would change its topology.
+        const int trace_launch_span = trace_timer ?
+                trace_timer->begin(trace_timer_stream, GGML_EXEC_TRACE_GPU_TIMING_SCOPE_GRAPH_LAUNCH, 0, graph->trace_id) : -1;
         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+        if (trace_launch_span >= 0) {
+            trace_timer->end(trace_timer_stream, trace_launch_span, 0);
+        }
 #else
         GGML_UNUSED(graph_key);
         graph_evaluated_or_captured = true;
@@ -4424,6 +4549,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
+    enum ggml_exec_trace_gpu_graph_reason fallback_reason = GGML_EXEC_TRACE_GPU_GRAPH_REASON_DISABLED;
+    uint32_t trace_dispatch_count = 0;
     const void * graph_key = nullptr;
 
 #ifdef USE_CUDA_GRAPH
@@ -4444,6 +4571,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     GGML_LOG_DEBUG("%s: CUDA graph warmup complete\n", __func__);
                     use_cuda_graph = true;
                     cuda_graph_update_required = true;
+                } else {
+                    fallback_reason = GGML_EXEC_TRACE_GPU_GRAPH_REASON_WARMUP;
                 }
                 // else: properties changed or first call - execute directly (use_cuda_graph stays false)
             } else {
@@ -4451,17 +4580,38 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 if (properties_changed) {
                     // Properties changed - reset warmup, execute directly until stable again
                     graph->warmup_complete = false;
+                    fallback_reason = GGML_EXEC_TRACE_GPU_GRAPH_REASON_PROPERTIES_CHANGED;
                     GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
                 } else {
                     use_cuda_graph = true;
                     cuda_graph_update_required = graph->instance == nullptr;
                 }
             }
+        } else {
+            fallback_reason = GGML_EXEC_TRACE_GPU_GRAPH_REASON_INCOMPATIBLE_MUL_MAT_ID;
         }
     }
 #endif // USE_CUDA_GRAPH
 
+    if (!use_cuda_graph) {
+#ifdef USE_CUDA_GRAPH
+        ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+        ggml_exec_trace_gpu_graph(GGML_EXEC_TRACE_GPU_GRAPH_FALLBACK, graph->trace_id, cgraph->n_nodes, fallback_reason);
+#else
+        ggml_exec_trace_gpu_graph(GGML_EXEC_TRACE_GPU_GRAPH_FALLBACK, 0, cgraph->n_nodes,
+                GGML_EXEC_TRACE_GPU_GRAPH_REASON_DISABLED);
+#endif
+    }
+
     if (use_cuda_graph && cuda_graph_update_required) {
+#ifdef USE_CUDA_GRAPH
+        if (ggml_exec_trace_observing()) {
+            ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+            graph->trace_dispatches.resize((size_t) cgraph->n_nodes * 2);
+            ggml_exec_trace_dispatch_capture_begin(
+                    graph->trace_dispatches.data(), graph->trace_dispatches.size(), &trace_dispatch_count);
+        }
+#endif
         // Start CUDA graph capture
         {
             std::lock_guard<std::mutex> lock(ggml_cuda_lock);
@@ -4472,6 +4622,14 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+
+#ifdef USE_CUDA_GRAPH
+    if (use_cuda_graph && cuda_graph_update_required && ggml_exec_trace_observing()) {
+        ggml_exec_trace_dispatch_capture_end();
+        ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+        graph->trace_dispatches.resize(trace_dispatch_count);
+    }
+#endif
 
     return GGML_STATUS_SUCCESS;
 }
@@ -5798,6 +5956,10 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
     if (ctx == nullptr) {
         GGML_LOG_ERROR("%s: failed to allocate context\n", __func__);
         return nullptr;
+    }
+    if (ggml_exec_trace_gpu_timing_get_mode() != GGML_EXEC_TRACE_GPU_TIMING_OFF) {
+        ctx->exec_trace_timer = new ggml_cuda_exec_trace_timer(
+                device, ggml_exec_trace_gpu_timing_event_capacity(), ggml_exec_trace_gpu_timing_get_mode());
     }
 
     ggml_backend_t cuda_backend = new ggml_backend {

@@ -1637,12 +1637,16 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
          ntx_fd);
 }
 
-template <ggml_type type, bool fallback>
-void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
-    const int    id    = ggml_cuda_get_device();
-    const int    cc    = ggml_cuda_info().devices[id].cc;
-    const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
+// Each expert only sees ncols*n_expert_used/n_experts tokens on average.
+// On RDNA3 and RDNA4 it is faster to pick the tile size against this value instead of ncols.
+static int64_t ggml_cuda_mmq_moe_ncols_opt(const int cc, const int64_t ncols, const int64_t n_expert_used, const int64_t n_experts) {
+    if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
+        return (ncols*n_expert_used + n_experts - 1) / n_experts;
+    }
+    return ncols;
+}
 
+static int ggml_cuda_mmq_get_J_best(ggml_type type, bool fallback, int cc, size_t smpbo, int64_t ncols_opt) {
     int J_best        = 0;
     int ntiles_J_best = INT_MAX;
 
@@ -1656,13 +1660,24 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
             continue;
         }
 
-        const int ntiles_x = (args.ncols_opt + config.J - 1) / config.J;
+        const int ntiles_x = (ncols_opt + config.J - 1) / config.J;
 
         if (ntiles_x < ntiles_J_best) {
             J_best = J;
             ntiles_J_best = ntiles_x;
         }
     }
+
+    return J_best;
+}
+
+template <ggml_type type, bool fallback>
+void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
+    const int    id    = ggml_cuda_get_device();
+    const int    cc    = ggml_cuda_info().devices[id].cc;
+    const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
+
+    const int J_best = ggml_cuda_mmq_get_J_best(type, fallback, cc, smpbo, args.ncols_opt);
 
     switch (J_best) {
         case   8:

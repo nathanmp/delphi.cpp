@@ -6,6 +6,7 @@
 #include "ggml-impl.h"
 #include "ggml-cpu.h"
 #include "ggml-cpu-impl.h"
+#include "ggml-exec-trace.h"
 #include "simd-mappings.h"
 #include "traits.h"
 
@@ -4260,6 +4261,14 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         const int ith = params->ith;
         const int nth = params->nth;
 
+        if (ith == 0) {
+            const enum ggml_exec_trace_dispatch_impl implementation = ne11 <= 3 ?
+                    GGML_EXEC_TRACE_DISPATCH_CPU_REPACK_GEMV : ne11 % 4 == 0 ?
+                    GGML_EXEC_TRACE_DISPATCH_CPU_REPACK_GEMM : GGML_EXEC_TRACE_DISPATCH_CPU_REPACK_GEMM_GEMV;
+            ggml_exec_trace_dispatch(op->op, implementation, GGML_EXEC_TRACE_DISPATCH_VARIANT_DEFAULT,
+                    nth, ((uint32_t) INTER_SIZE << 16) | (uint32_t) NB_COLS);
+        }
+
         GGML_ASSERT(ne0 == ne01);
         GGML_ASSERT(ne1 == ne11);
         GGML_ASSERT(ne2 == ne12);
@@ -4393,6 +4402,12 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
         const int ith = params->ith;
         const int nth = params->nth;
+
+        if (ith == 0) {
+            ggml_exec_trace_dispatch(op->op, GGML_EXEC_TRACE_DISPATCH_CPU_REPACK_GEMV,
+                    GGML_EXEC_TRACE_DISPATCH_VARIANT_PER_EXPERT, nth,
+                    ((uint32_t) INTER_SIZE << 16) | (uint32_t) NB_COLS);
+        }
 
         const ggml_from_float_t from_float = ggml_get_type_traits_cpu(PARAM_TYPE)->from_float;
 

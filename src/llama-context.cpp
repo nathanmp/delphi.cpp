@@ -1,5 +1,6 @@
 #include "llama-context.h"
 
+#include "ggml-exec-trace.h"
 #include "ggml.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
@@ -87,6 +88,8 @@ llama_context::llama_context(
     cvec(std::make_unique<llama_adapter_cvec>()),
     loras(std::make_unique<llama_adapter_loras>()),
     balloc(std::make_unique<llama_batch_allocr>(model.hparams.n_pos_per_embd())) {
+    ggml_exec_trace_init();
+
     // TODO warning when creating llama_context with awkward ctx size that is not a power of 2,
     //     may need to be backend-dependent
     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
@@ -1341,9 +1344,13 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    const uint32_t trace_ubatch_id = ggml_exec_trace_enabled() ? ggml_exec_trace_ubatch_begin(
+            ubatch.n_tokens, ubatch.n_seqs, ubatch.n_seqs_unq, n_outputs) : 0;
+
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
+        ggml_exec_trace_ubatch_end(trace_ubatch_id, ret);
         return nullptr;
     }
 
@@ -1381,12 +1388,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
             ret = GGML_STATUS_FAILED;
+            ggml_exec_trace_ubatch_end(trace_ubatch_id, ret);
             return nullptr;
         }
 
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
+            ggml_exec_trace_ubatch_end(trace_ubatch_id, ret);
             return nullptr;
         }
 
@@ -1407,10 +1416,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
+        ggml_exec_trace_ubatch_end(trace_ubatch_id, ret);
         return nullptr;
     }
 
     ret = GGML_STATUS_SUCCESS;
+    if (trace_ubatch_id) {
+        ggml_exec_trace_ubatch_end(trace_ubatch_id, ret);
+    }
 
     return res;
 }
@@ -4266,7 +4279,20 @@ size_t llama_state_seq_load_file(llama_context * ctx, const char * filepath, lla
 int32_t llama_encode(
         llama_context * ctx,
           llama_batch   batch) {
+    uint32_t trace_execution_id = 0;
+    if (ggml_exec_trace_enabled()) {
+        trace_execution_id = ggml_exec_trace_execution_begin(
+                GGML_EXEC_TRACE_EXECUTION_ENCODE,
+                batch.n_tokens,
+                ctx->n_batch(),
+                ctx->n_ubatch(),
+                ctx->n_threads(),
+                ctx->n_threads_batch());
+    }
     const int ret = ctx->encode(batch);
+    if (trace_execution_id) {
+        ggml_exec_trace_execution_end(trace_execution_id, ret);
+    }
     if (ret != 0) {
         LLAMA_LOG_ERROR("%s: failed to encode, ret = %d\n", __func__, ret);
     }
@@ -4277,7 +4303,22 @@ int32_t llama_encode(
 int32_t llama_decode(
         llama_context * ctx,
           llama_batch   batch) {
+    uint32_t trace_execution_id = 0;
+    if (ggml_exec_trace_enabled()) {
+        const enum ggml_exec_trace_execution_kind trace_kind = batch.n_tokens > 1 ?
+                GGML_EXEC_TRACE_EXECUTION_PREFILL : GGML_EXEC_TRACE_EXECUTION_DECODE;
+        trace_execution_id = ggml_exec_trace_execution_begin(
+                trace_kind,
+                batch.n_tokens,
+                ctx->n_batch(),
+                ctx->n_ubatch(),
+                ctx->n_threads(),
+                ctx->n_threads_batch());
+    }
     const int ret = ctx->decode(batch);
+    if (trace_execution_id) {
+        ggml_exec_trace_execution_end(trace_execution_id, ret);
+    }
     if (ret != 0 && ret != 1) {
         LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);
     }

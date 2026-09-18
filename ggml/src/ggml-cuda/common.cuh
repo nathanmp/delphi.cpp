@@ -3,6 +3,7 @@
 #include "ggml.h"
 #include "ggml-impl.h"
 #include "ggml-cuda.h"
+#include "ggml-exec-trace.h"
 
 #include <cstdint>
 #include <cstdlib>
@@ -1344,6 +1345,10 @@ struct ggml_cuda_graph {
     }
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t instance = nullptr;
+    // The trace ID follows this executable across replays. Reinstantiation and cache eviction produce a new ID.
+    uint32_t trace_id = 0;
+    // Dispatch is chosen during capture; graph replay re-emits this fixed decision sequence without redispatching.
+    std::vector<ggml_exec_trace_dispatch_record> trace_dispatches;
     size_t num_nodes = 0;
     std::vector<cudaGraphNode_t> nodes;
     bool disable_due_to_gpu_arch = false;
@@ -1516,10 +1521,14 @@ struct ggml_cuda_stream_context {
     }
 };
 
+struct ggml_cuda_exec_trace_timer;
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;
+    // null unless GGML_EXEC_TRACE_GPU_TIMING is active; owned by this context
+    ggml_cuda_exec_trace_timer * exec_trace_timer = nullptr;
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};

@@ -11,6 +11,7 @@
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
 #include "ggml-alloc.h"
+#include "ggml-exec-trace.h"
 #include "ggml-impl.h"
 
 #include <assert.h>
@@ -838,6 +839,16 @@ struct ggml_backend_sched {
     int debug_realloc;
     int debug_graph_size;
     int debug_prev_graph_size;
+
+    uint64_t trace_graph_uid;
+    uint32_t trace_graph_id;
+    uint32_t trace_topology_graph_id;
+    uint32_t * trace_tensor_ids;
+    uint32_t * trace_backend_node_ids;
+    uint64_t trace_ops_shapes_hash;
+    uint64_t trace_backend_hash;
+    uint64_t trace_split_hash;
+    uint64_t trace_cross_backend_edges;
 };
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
@@ -1032,6 +1043,450 @@ static void ggml_backend_sched_print_assignments(ggml_backend_sched_t sched, str
             GGML_LOG_DEBUG("\n");
         }
     }
+}
+
+static uint32_t ggml_backend_sched_trace_device_id(ggml_backend_sched_t sched, int backend_id) {
+    if (backend_id < 0 || backend_id >= sched->n_backends) {
+        return GGML_EXEC_TRACE_ID_NONE;
+    }
+
+    const ggml_backend_dev_t device = ggml_backend_get_device(sched->backends[backend_id]);
+    for (int candidate = 0; candidate < backend_id; ++candidate) {
+        if (ggml_backend_get_device(sched->backends[candidate]) == device) {
+            return candidate + 1;
+        }
+    }
+    return backend_id + 1;
+}
+
+static int ggml_backend_sched_trace_tensor_backend_id(ggml_backend_sched_t sched, const ggml_tensor * tensor) {
+    const size_t tensor_id = ggml_hash_find(&sched->hash_set, tensor);
+    return tensor_id == GGML_HASHSET_FULL ? -1 : sched->hv_tensor_backend_ids[tensor_id];
+}
+
+static uint32_t ggml_backend_sched_trace_tensor_id(ggml_backend_sched_t sched, const ggml_tensor * tensor) {
+    if (!sched->trace_tensor_ids) {
+        return GGML_EXEC_TRACE_ID_NONE;
+    }
+    const size_t tensor_id = ggml_hash_find(&sched->hash_set, tensor);
+    return tensor_id == GGML_HASHSET_FULL ? GGML_EXEC_TRACE_ID_NONE : sched->trace_tensor_ids[tensor_id];
+}
+
+static uint64_t ggml_backend_sched_trace_backend_ref(ggml_backend_sched_t sched, int backend_id) {
+    if (backend_id < 0 || backend_id >= sched->n_backends) {
+        return GGML_EXEC_TRACE_ID_NONE;
+    }
+    return ((uint64_t) ggml_backend_sched_trace_device_id(sched, backend_id) << 32) | (uint32_t) (backend_id + 1);
+}
+
+static uint64_t ggml_backend_sched_trace_span_begin() {
+    return ggml_exec_trace_enabled() ? ggml_exec_trace_now_ns() : 0;
+}
+
+static uint64_t ggml_backend_sched_trace_detail_span_begin() {
+    return ggml_exec_trace_detailed() ? ggml_exec_trace_now_ns() : 0;
+}
+
+static void ggml_backend_sched_trace_span_end(
+        ggml_backend_sched_t sched,
+        uint64_t start_ns,
+        enum ggml_exec_trace_event_kind kind,
+        uint32_t flags,
+        int split_id,
+        int backend_id,
+        uint32_t node_id,
+        uint64_t arg1 = 0,
+        uint64_t arg2 = 0,
+        uint64_t arg3 = 0) {
+    if (start_ns == 0) {
+        return;
+    }
+
+    ggml_exec_trace_event event = {};
+    event.timestamp_ns = start_ns;
+    event.args[0] = ggml_exec_trace_now_ns();
+    event.args[1] = arg1;
+    event.args[2] = arg2;
+    event.args[3] = arg3;
+    event.kind = kind;
+    event.flags = flags;
+    event.graph_id = sched->trace_graph_id;
+    event.node_id = node_id;
+    event.split_id = split_id >= 0 ? split_id + 1 : GGML_EXEC_TRACE_ID_NONE;
+    event.backend_id = backend_id >= 0 ? backend_id + 1 : GGML_EXEC_TRACE_ID_NONE;
+    event.device_id = ggml_backend_sched_trace_device_id(sched, backend_id);
+    ggml_exec_trace_record(event);
+}
+
+static void ggml_backend_sched_trace_copy_end(
+        ggml_backend_sched_t sched,
+        uint64_t start_ns,
+        enum ggml_exec_trace_event_kind kind,
+        enum ggml_exec_trace_copy_path path,
+        int split_id,
+        int src_backend_id,
+        int dst_backend_id,
+        uint32_t src_node_id,
+        uint32_t dst_node_id,
+        uint64_t bytes) {
+    if (kind == GGML_EXEC_TRACE_EVENT_COPY_HANDLING) {
+        ggml_exec_trace_integrity_copy(path, split_id + 1, src_backend_id + 1, dst_backend_id + 1, bytes);
+    }
+    if (start_ns == 0) {
+        return;
+    }
+    ggml_backend_sched_trace_span_end(
+            sched, start_ns, kind, path, split_id, dst_backend_id, src_node_id,
+            dst_node_id, bytes, ggml_backend_sched_trace_backend_ref(sched, src_backend_id));
+}
+
+static void ggml_backend_sched_trace_copy_wait_end(
+        ggml_backend_sched_t sched,
+        uint64_t start_ns,
+        enum ggml_exec_trace_event_kind kind,
+        enum ggml_exec_trace_copy_path path,
+        int split_id,
+        int waited_backend_id,
+        int other_backend_id,
+        uint32_t node_id,
+        enum ggml_exec_trace_wait_api wait_api,
+        uint64_t bytes = 0) {
+    if (start_ns == 0) {
+        return;
+    }
+    ggml_backend_sched_trace_span_end(
+            sched, start_ns, kind, path, split_id, waited_backend_id, node_id,
+            wait_api, ggml_backend_sched_trace_backend_ref(sched, other_backend_id), bytes);
+}
+
+static void ggml_backend_sched_integrity_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+    const uint32_t graph_id = ggml_exec_trace_next_graph_id();
+    sched->trace_graph_id = graph_id;
+
+    if (sched->trace_graph_uid == graph->uid && sched->trace_topology_graph_id != 0) {
+        ggml_exec_trace_integrity_graph(
+                sched->trace_ops_shapes_hash, sched->trace_backend_hash, sched->trace_split_hash,
+                graph->n_nodes, sched->n_splits, sched->trace_cross_backend_edges);
+        return;
+    }
+
+    uint64_t ops_shapes_hash = ggml_exec_trace_hash_init();
+    uint64_t backend_hash = ggml_exec_trace_hash_init();
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        const ggml_tensor * node = graph->nodes[i];
+        const int backend_id = ggml_backend_sched_trace_tensor_backend_id(sched, node);
+        ops_shapes_hash = ggml_exec_trace_hash_u64(ops_shapes_hash, (uint64_t) node->op);
+        ops_shapes_hash = ggml_exec_trace_hash_u64(ops_shapes_hash, (uint64_t) node->type);
+        backend_hash = ggml_exec_trace_hash_u64(backend_hash, (uint64_t) i);
+        backend_hash = ggml_exec_trace_hash_u64(backend_hash, (uint64_t) (backend_id + 1));
+        for (int dim = 0; dim < GGML_MAX_DIMS; ++dim) {
+            ops_shapes_hash = ggml_exec_trace_hash_u64(ops_shapes_hash, (uint64_t) node->ne[dim]);
+        }
+    }
+
+    uint64_t split_hash = ggml_exec_trace_hash_init();
+    uint64_t cross_backend_edges = 0;
+    for (int split_id = 0; split_id < sched->n_splits; ++split_id) {
+        const ggml_backend_sched_split & split = sched->splits[split_id];
+        const ggml_backend_dev_t device = ggml_backend_get_device(sched->backends[split.backend_id]);
+        const char * device_name = ggml_backend_dev_name(device);
+        split_hash = ggml_exec_trace_hash_bytes(split_hash, device_name, strlen(device_name));
+        split_hash = ggml_exec_trace_hash_u64(split_hash, split.backend_id + 1);
+        cross_backend_edges += split.n_inputs;
+    }
+
+    sched->trace_graph_uid = graph->uid;
+    sched->trace_topology_graph_id = graph_id;
+    sched->trace_ops_shapes_hash = ops_shapes_hash;
+    sched->trace_backend_hash = backend_hash;
+    sched->trace_split_hash = split_hash;
+    sched->trace_cross_backend_edges = cross_backend_edges;
+    ggml_exec_trace_integrity_graph(
+            ops_shapes_hash, backend_hash, split_hash, graph->n_nodes, sched->n_splits, cross_backend_edges);
+}
+
+static void ggml_backend_sched_trace_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+    if (!sched->trace_tensor_ids) {
+        sched->trace_tensor_ids = (uint32_t *) calloc(sched->hash_set.size, sizeof(sched->trace_tensor_ids[0]));
+        if (!sched->trace_tensor_ids) {
+            ggml_exec_trace_disable("failed to allocate scheduler trace tensor IDs");
+            return;
+        }
+    }
+
+    const uint64_t timestamp = ggml_exec_trace_now_ns();
+    const uint32_t graph_id = ggml_exec_trace_next_graph_id();
+    const bool topology_reused = sched->trace_graph_uid == graph->uid && sched->trace_topology_graph_id != 0;
+    sched->trace_graph_id = graph_id;
+
+    ggml_exec_trace_event graph_event = {};
+    graph_event.timestamp_ns = timestamp;
+    graph_event.kind = GGML_EXEC_TRACE_EVENT_GRAPH;
+    graph_event.flags = topology_reused ? 1 : 0;
+    graph_event.graph_id = graph_id;
+    graph_event.args[0] = topology_reused ? sched->trace_topology_graph_id : graph_id;
+    graph_event.args[1] = graph->n_nodes;
+    graph_event.args[2] = graph->n_leafs;
+    graph_event.args[3] = sched->n_splits;
+    ggml_exec_trace_record(graph_event);
+
+    if (topology_reused) {
+        ggml_exec_trace_event fingerprint = {};
+        fingerprint.timestamp_ns = timestamp;
+        fingerprint.kind = GGML_EXEC_TRACE_EVENT_FINGERPRINT;
+        fingerprint.graph_id = graph_id;
+        fingerprint.args[0] = sched->trace_ops_shapes_hash;
+        fingerprint.args[1] = sched->trace_backend_hash;
+        fingerprint.args[2] = sched->trace_split_hash;
+        fingerprint.args[3] = sched->trace_cross_backend_edges;
+        ggml_exec_trace_record(fingerprint);
+        ggml_exec_trace_integrity_graph(
+                sched->trace_ops_shapes_hash, sched->trace_backend_hash, sched->trace_split_hash,
+                graph->n_nodes, sched->n_splits, sched->trace_cross_backend_edges);
+        return;
+    }
+
+    std::vector<uint32_t> node_ids(graph->n_nodes);
+    std::unordered_map<const ggml_tensor *, uint32_t> tensor_ids;
+    std::unordered_map<const ggml_tensor *, int> tensor_indices;
+    tensor_ids.reserve((graph->n_nodes + graph->n_leafs) * 2);
+    tensor_indices.reserve(graph->n_nodes * 2);
+    memset(sched->trace_tensor_ids, 0, sched->hash_set.size * sizeof(sched->trace_tensor_ids[0]));
+
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        node_ids[i] = ggml_exec_trace_next_node_id();
+        tensor_ids.emplace(graph->nodes[i], node_ids[i]);
+        tensor_indices.emplace(graph->nodes[i], i);
+        const size_t tensor_id = ggml_hash_find(&sched->hash_set, graph->nodes[i]);
+        if (tensor_id != GGML_HASHSET_FULL) {
+            sched->trace_tensor_ids[tensor_id] = node_ids[i];
+        }
+    }
+    for (int i = 0; i < graph->n_leafs; ++i) {
+        tensor_ids.emplace(graph->leafs[i], ggml_exec_trace_next_node_id());
+        const size_t tensor_id = ggml_hash_find(&sched->hash_set, graph->leafs[i]);
+        if (tensor_id != GGML_HASHSET_FULL) {
+            sched->trace_tensor_ids[tensor_id] = tensor_ids.at(graph->leafs[i]);
+        }
+    }
+
+    // Scheduler copy tensors replace cross-backend sources in-place. Relate them to the original graph node when possible.
+    auto map_tensor_copies = [&](ggml_tensor * tensor, uint32_t trace_id, int node_index) {
+        const size_t tensor_id = ggml_hash_find(&sched->hash_set, tensor);
+        if (tensor_id == GGML_HASHSET_FULL) {
+            return;
+        }
+        for (int backend_id = 0; backend_id < sched->n_backends; ++backend_id) {
+            for (int copy_id = 0; copy_id < sched->n_copies; ++copy_id) {
+                ggml_tensor * copy = tensor_id_copy(tensor_id, backend_id, copy_id);
+                if (copy) {
+                    tensor_ids.emplace(copy, trace_id);
+                    const size_t copy_tensor_id = ggml_hash_find(&sched->hash_set, copy);
+                    if (copy_tensor_id != GGML_HASHSET_FULL) {
+                        sched->trace_tensor_ids[copy_tensor_id] = trace_id;
+                    }
+                    if (node_index >= 0) {
+                        tensor_indices.emplace(copy, node_index);
+                    }
+                }
+            }
+        }
+    };
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        map_tensor_copies(graph->nodes[i], node_ids[i], i);
+    }
+    for (int i = 0; i < graph->n_leafs; ++i) {
+        map_tensor_copies(graph->leafs[i], tensor_ids.at(graph->leafs[i]), -1);
+    }
+
+    for (int backend_id = 0; backend_id < sched->n_backends; ++backend_id) {
+        ggml_backend_t backend = sched->backends[backend_id];
+        ggml_backend_dev_t device = ggml_backend_get_device(backend);
+
+        ggml_exec_trace_event event = {};
+        event.timestamp_ns = timestamp;
+        event.kind = GGML_EXEC_TRACE_EVENT_BACKEND;
+        event.graph_id = graph_id;
+        event.backend_id = backend_id + 1;
+        event.device_id = ggml_backend_sched_trace_device_id(sched, backend_id);
+        event.flags = (uint32_t) ggml_backend_dev_type(device);
+        event.args[0] = ggml_exec_trace_intern(ggml_backend_name(backend));
+        event.args[1] = ggml_exec_trace_intern(ggml_backend_buft_name(sched->bufts[backend_id]));
+        event.args[2] = ggml_exec_trace_intern(ggml_backend_dev_name(device));
+        event.args[3] = ggml_exec_trace_intern(ggml_backend_dev_description(device));
+        ggml_exec_trace_record(event);
+    }
+
+    uint64_t ops_shapes_hash = ggml_exec_trace_hash_init();
+    uint64_t backend_hash = ggml_exec_trace_hash_init();
+
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        ggml_tensor * node = graph->nodes[i];
+        const int backend_id = ggml_backend_sched_trace_tensor_backend_id(sched, node);
+
+        ops_shapes_hash = ggml_exec_trace_hash_u64(ops_shapes_hash, (uint64_t) node->op);
+        ops_shapes_hash = ggml_exec_trace_hash_u64(ops_shapes_hash, (uint64_t) node->type);
+        backend_hash = ggml_exec_trace_hash_u64(backend_hash, (uint64_t) i);
+        backend_hash = ggml_exec_trace_hash_u64(backend_hash, (uint64_t) (backend_id + 1));
+        for (int dim = 0; dim < GGML_MAX_DIMS; ++dim) {
+            ops_shapes_hash = ggml_exec_trace_hash_u64(ops_shapes_hash, (uint64_t) node->ne[dim]);
+        }
+
+        ggml_exec_trace_event event = {};
+        event.timestamp_ns = timestamp;
+        event.kind = GGML_EXEC_TRACE_EVENT_NODE;
+        event.flags = (uint32_t) node->op;
+        event.graph_id = graph_id;
+        event.node_id = node_ids[i];
+        event.backend_id = backend_id + 1;
+        event.device_id = ggml_backend_sched_trace_device_id(sched, backend_id);
+        event.args[0] = i;
+        event.args[1] = ggml_exec_trace_intern(node->name);
+        event.args[2] = ggml_exec_trace_intern(ggml_op_name(node->op));
+        event.args[3] = ggml_exec_trace_intern(ggml_type_name(node->type));
+        ggml_exec_trace_record(event);
+
+        event = {};
+        event.timestamp_ns = timestamp;
+        event.kind = GGML_EXEC_TRACE_EVENT_NODE_DIMS;
+        event.graph_id = graph_id;
+        event.node_id = node_ids[i];
+        for (int dim = 0; dim < GGML_MAX_DIMS; ++dim) {
+            event.args[dim] = node->ne[dim];
+        }
+        ggml_exec_trace_record(event);
+
+        for (int src_index = 0; src_index < GGML_MAX_SRC; ++src_index) {
+            const ggml_tensor * src = node->src[src_index];
+            if (!src) {
+                continue;
+            }
+
+            const auto src_id = tensor_ids.find(src);
+            event = {};
+            event.timestamp_ns = timestamp;
+            event.kind = GGML_EXEC_TRACE_EVENT_NODE_SOURCE;
+            event.flags = ggml_exec_trace_intern(ggml_type_name(src->type));
+            event.graph_id = graph_id;
+            event.node_id = node_ids[i];
+            event.args[0] = src_index;
+            event.args[1] = src_id == tensor_ids.end() ? 0 : src_id->second;
+            event.args[2] = (uint64_t) src->type;
+            event.args[3] = ggml_exec_trace_intern(src->name);
+            ggml_exec_trace_record(event);
+
+            event = {};
+            event.timestamp_ns = timestamp;
+            event.kind = GGML_EXEC_TRACE_EVENT_NODE_SOURCE_DIMS;
+            event.graph_id = graph_id;
+            event.node_id = node_ids[i];
+            event.flags = (uint32_t) src_index;
+            for (int dim = 0; dim < GGML_MAX_DIMS; ++dim) {
+                event.args[dim] = src->ne[dim];
+            }
+            ggml_exec_trace_record(event);
+        }
+
+        if (node->view_src) {
+            const auto view_id = tensor_ids.find(node->view_src);
+            event = {};
+            event.timestamp_ns = timestamp;
+            event.kind = GGML_EXEC_TRACE_EVENT_NODE_VIEW;
+            event.graph_id = graph_id;
+            event.node_id = node_ids[i];
+            event.args[0] = view_id == tensor_ids.end() ? 0 : view_id->second;
+            event.args[1] = node->view_offs;
+            event.args[2] = ggml_exec_trace_intern(node->view_src->name);
+            ggml_exec_trace_record(event);
+        }
+
+        if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) && node->src[0] && node->src[1]) {
+            event = {};
+            event.timestamp_ns = timestamp;
+            event.kind = GGML_EXEC_TRACE_EVENT_NODE_MATMUL;
+            event.graph_id = graph_id;
+            event.node_id = node_ids[i];
+            event.flags = (uint32_t) node->op;
+            event.args[0] = node->src[0]->ne[1];
+            event.args[1] = node->op == GGML_OP_MUL_MAT_ID ? node->src[1]->ne[2] : node->src[1]->ne[1];
+            event.args[2] = node->src[0]->ne[0];
+            event.args[3] = node->op == GGML_OP_MUL_MAT_ID && node->src[2] ? node->src[2]->ne[0] : 0;
+            ggml_exec_trace_record(event);
+        }
+    }
+
+    uint64_t split_hash = ggml_exec_trace_hash_init();
+    uint64_t cross_backend_edges = 0;
+    for (int split_id = 0; split_id < sched->n_splits; ++split_id) {
+        const ggml_backend_sched_split & split = sched->splits[split_id];
+        const ggml_backend_t backend = sched->backends[split.backend_id];
+        const ggml_backend_dev_t device = ggml_backend_get_device(backend);
+        const char * device_name = ggml_backend_dev_name(device);
+        split_hash = ggml_exec_trace_hash_bytes(split_hash, device_name, strlen(device_name));
+        split_hash = ggml_exec_trace_hash_u64(split_hash, split.backend_id + 1);
+        cross_backend_edges += split.n_inputs;
+
+        ggml_exec_trace_event event = {};
+        event.timestamp_ns = timestamp;
+        event.kind = GGML_EXEC_TRACE_EVENT_SCHED_SPLIT;
+        event.graph_id = graph_id;
+        event.split_id = split_id + 1;
+        event.backend_id = split.backend_id + 1;
+        event.device_id = ggml_backend_sched_trace_device_id(sched, split.backend_id);
+        event.args[0] = split.i_start;
+        event.args[1] = split.i_end;
+        event.args[2] = split.i_end - split.i_start;
+        event.args[3] = split.n_inputs;
+        ggml_exec_trace_record(event);
+
+        for (int input_id = 0; input_id < split.n_inputs; ++input_id) {
+            ggml_tensor * input = split.inputs[input_id];
+            const auto node_id = tensor_ids.find(input);
+            const auto node_index = tensor_indices.find(input);
+            uint32_t source_split_id = 0;
+            if (node_index != tensor_indices.end()) {
+                for (int candidate = 0; candidate < sched->n_splits; ++candidate) {
+                    if (node_index->second >= sched->splits[candidate].i_start && node_index->second < sched->splits[candidate].i_end) {
+                        source_split_id = candidate + 1;
+                        break;
+                    }
+                }
+            }
+
+            event = {};
+            event.timestamp_ns = timestamp;
+            event.kind = GGML_EXEC_TRACE_EVENT_SCHED_SPLIT_INPUT;
+            event.graph_id = graph_id;
+            event.split_id = split_id + 1;
+            event.backend_id = split.backend_id + 1;
+            event.device_id = ggml_backend_sched_trace_device_id(sched, split.backend_id);
+            event.flags = ggml_backend_sched_trace_tensor_backend_id(sched, input) + 1;
+            event.args[0] = input_id;
+            event.args[1] = node_id == tensor_ids.end() ? 0 : node_id->second;
+            event.args[2] = source_split_id;
+            event.args[3] = ggml_exec_trace_intern(input->name);
+            ggml_exec_trace_record(event);
+        }
+    }
+
+    ggml_exec_trace_event fingerprint = {};
+    fingerprint.timestamp_ns = timestamp;
+    fingerprint.kind = GGML_EXEC_TRACE_EVENT_FINGERPRINT;
+    fingerprint.graph_id = graph_id;
+    fingerprint.args[0] = ops_shapes_hash;
+    fingerprint.args[1] = backend_hash;
+    fingerprint.args[2] = split_hash;
+    fingerprint.args[3] = cross_backend_edges;
+    ggml_exec_trace_record(fingerprint);
+
+    sched->trace_graph_uid = graph->uid;
+    sched->trace_topology_graph_id = graph_id;
+    sched->trace_ops_shapes_hash = ops_shapes_hash;
+    sched->trace_backend_hash = backend_hash;
+    sched->trace_split_hash = split_hash;
+    sched->trace_cross_backend_edges = cross_backend_edges;
+    ggml_exec_trace_integrity_graph(
+            ops_shapes_hash, backend_hash, split_hash, graph->n_nodes, sched->n_splits, cross_backend_edges);
 }
 
 static bool ggml_backend_sched_buffer_supported(ggml_backend_sched_t sched, struct ggml_tensor * t, int backend_id) {
@@ -1627,7 +2082,12 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
         // the re-allocation may cause the split inputs to be moved to a different address
         // synchronize without ggml_backend_sched_synchronize to avoid changing cur_copy
         for (int i = 0; i < sched->n_backends; i++) {
+            const uint64_t wait_start = ggml_backend_sched_trace_span_begin();
             ggml_backend_synchronize(sched->backends[i]);
+            ggml_backend_sched_trace_span_end(
+                    sched, wait_start, GGML_EXEC_TRACE_EVENT_BACKEND_WAIT,
+                    GGML_EXEC_TRACE_WAIT_GRAPH_REALLOCATION, -1, i, GGML_EXEC_TRACE_ID_NONE,
+                    GGML_EXEC_TRACE_WAIT_API_BACKEND_SYNCHRONIZE);
         }
 
         ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids);
@@ -1658,10 +2118,19 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
         if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
+            const uint64_t wait_start = ggml_backend_sched_trace_span_begin();
             if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
                 ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
+                ggml_backend_sched_trace_span_end(
+                        sched, wait_start, GGML_EXEC_TRACE_EVENT_BACKEND_WAIT,
+                        GGML_EXEC_TRACE_WAIT_PREVIOUS_SPLIT, split_id, prev_backend_id, GGML_EXEC_TRACE_ID_NONE,
+                        GGML_EXEC_TRACE_WAIT_API_EVENT_SYNCHRONIZE);
             } else {
                 ggml_backend_synchronize(sched->backends[prev_backend_id]);
+                ggml_backend_sched_trace_span_end(
+                        sched, wait_start, GGML_EXEC_TRACE_EVENT_BACKEND_WAIT,
+                        GGML_EXEC_TRACE_WAIT_PREVIOUS_SPLIT, split_id, prev_backend_id, GGML_EXEC_TRACE_ID_NONE,
+                        GGML_EXEC_TRACE_WAIT_API_BACKEND_SYNCHRONIZE);
             }
         }
 
@@ -1670,21 +2139,49 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+            const uint64_t copy_start = ggml_backend_sched_trace_span_begin();
+            const bool observe_copy = copy_start || ggml_exec_trace_integrity_enabled();
+            const int input_backend_id = observe_copy ? ggml_backend_sched_backend_id(sched, input_backend) : -1;
+            const uint32_t input_node_id = copy_start ? ggml_backend_sched_trace_tensor_id(sched, input) : GGML_EXEC_TRACE_ID_NONE;
+            // Scheduler copies keep the source tensor ID; the backend fields identify the storage endpoints.
+            const uint32_t input_cpy_node_id = input_node_id;
+            enum ggml_exec_trace_copy_path copy_path = GGML_EXEC_TRACE_COPY_BACKEND_ASYNC;
+            uint64_t copy_bytes = observe_copy ? ggml_nbytes(input) : 0;
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
+                copy_path = GGML_EXEC_TRACE_COPY_USER_INPUT_SYNC;
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
+                const uint64_t wait_start = ggml_backend_sched_trace_detail_span_begin();
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+                    ggml_backend_sched_trace_copy_wait_end(
+                            sched, wait_start, GGML_EXEC_TRACE_EVENT_COPY_WAIT_DST, copy_path,
+                            split_id, split_backend_id, input_backend_id, input_node_id,
+                            GGML_EXEC_TRACE_WAIT_API_EVENT_SYNCHRONIZE, copy_bytes);
                 } else {
                     ggml_backend_synchronize(split_backend);
+                    ggml_backend_sched_trace_copy_wait_end(
+                            sched, wait_start, GGML_EXEC_TRACE_EVENT_COPY_WAIT_DST, copy_path,
+                            split_id, split_backend_id, input_backend_id, input_node_id,
+                            GGML_EXEC_TRACE_WAIT_API_BACKEND_SYNCHRONIZE, copy_bytes);
                 }
+                const uint64_t body_start = ggml_backend_sched_trace_detail_span_begin();
                 ggml_backend_tensor_copy(input, input_cpy);
+                ggml_backend_sched_trace_copy_end(
+                        sched, body_start, GGML_EXEC_TRACE_EVENT_COPY_BODY, copy_path,
+                        split_id, input_backend_id, split_backend_id,
+                        input_node_id, input_cpy_node_id, copy_bytes);
             } else {
                 // wait for the split backend to finish using the input before overwriting it
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
                 } else {
+                    const uint64_t wait_start = ggml_backend_sched_trace_detail_span_begin();
                     ggml_backend_synchronize(split_backend);
+                    ggml_backend_sched_trace_span_end(
+                            sched, wait_start, GGML_EXEC_TRACE_EVENT_BACKEND_WAIT,
+                            GGML_EXEC_TRACE_WAIT_COPY_DST_REUSE, split_id, split_backend_id,
+                            input_node_id, GGML_EXEC_TRACE_WAIT_API_BACKEND_SYNCHRONIZE);
                 }
 
                 // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
@@ -1695,11 +2192,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     (node->src[0] == input_cpy && node->op == GGML_OP_MUL_MAT_ID)
                     //|| (node->src[1] == input_cpy && node->op == GGML_OP_ADD_ID) /* GGML_OP_ADD_ID weights are small and not worth splitting */
                     )) {
+                    copy_path = GGML_EXEC_TRACE_COPY_MOE_EXPERT_ASYNC;
+                    copy_bytes = 0;
 
                     const int64_t n_expert   = node->op == GGML_OP_MUL_MAT_ID ? input->ne[2] : input->ne[1];
                     const size_t expert_size = node->op == GGML_OP_MUL_MAT_ID ? input->nb[2] : input->nb[1];
 
+                    const uint64_t wait_start = ggml_backend_sched_trace_detail_span_begin();
                     ggml_backend_synchronize(input_backend);
+                    ggml_backend_sched_trace_copy_wait_end(
+                            sched, wait_start, GGML_EXEC_TRACE_EVENT_COPY_WAIT_SRC, copy_path,
+                            split_id, input_backend_id, split_backend_id, input_node_id,
+                            GGML_EXEC_TRACE_WAIT_API_BACKEND_SYNCHRONIZE);
 
                     // get the ids
                     ggml_tensor * ids_tensor = node->src[2];
@@ -1722,7 +2226,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     if (ids_tensor != prev_ids_tensor) {
                         ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
                         ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
+                        const uint64_t ids_wait_start = ggml_backend_sched_trace_detail_span_begin();
+                        const int ids_backend_id = ids_wait_start ? ggml_backend_sched_backend_id(sched, ids_backend) : -1;
+                        const uint32_t ids_node_id = ids_wait_start ? ggml_backend_sched_trace_tensor_id(sched, ids_tensor) : GGML_EXEC_TRACE_ID_NONE;
                         ggml_backend_synchronize(ids_backend);
+                        ggml_backend_sched_trace_span_end(
+                                sched, ids_wait_start, GGML_EXEC_TRACE_EVENT_BACKEND_WAIT,
+                                GGML_EXEC_TRACE_WAIT_MOE_IDS, split_id, ids_backend_id,
+                                ids_node_id,
+                                GGML_EXEC_TRACE_WAIT_API_BACKEND_SYNCHRONIZE);
 
                         // find the used experts
                         used_ids.clear();
@@ -1751,6 +2263,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
                             // this is necessary for MMQ in the CUDA backend
                             expert_size_copy + padding_end);
+                        if (observe_copy) {
+                            copy_bytes += expert_size_copy + padding_end;
+                        }
                     };
 
                     int id = 0;
@@ -1780,24 +2295,68 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
                     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
+                        copy_path = GGML_EXEC_TRACE_COPY_FALLBACK_SYNC;
+                        const uint64_t src_wait_start = ggml_backend_sched_trace_detail_span_begin();
                         ggml_backend_synchronize(input_backend);
+                        ggml_backend_sched_trace_copy_wait_end(
+                                sched, src_wait_start, GGML_EXEC_TRACE_EVENT_COPY_WAIT_SRC, copy_path,
+                                split_id, input_backend_id, split_backend_id, input_node_id,
+                                GGML_EXEC_TRACE_WAIT_API_BACKEND_SYNCHRONIZE, copy_bytes);
+                        const uint64_t dst_wait_start = ggml_backend_sched_trace_detail_span_begin();
                         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+                            ggml_backend_sched_trace_copy_wait_end(
+                                    sched, dst_wait_start, GGML_EXEC_TRACE_EVENT_COPY_WAIT_DST, copy_path,
+                                    split_id, split_backend_id, input_backend_id, input_node_id,
+                                    GGML_EXEC_TRACE_WAIT_API_EVENT_SYNCHRONIZE, copy_bytes);
                         } else {
                             ggml_backend_synchronize(split_backend);
+                            ggml_backend_sched_trace_copy_wait_end(
+                                    sched, dst_wait_start, GGML_EXEC_TRACE_EVENT_COPY_WAIT_DST, copy_path,
+                                    split_id, split_backend_id, input_backend_id, input_node_id,
+                                    GGML_EXEC_TRACE_WAIT_API_BACKEND_SYNCHRONIZE, copy_bytes);
                         }
+                        const uint64_t body_start = ggml_backend_sched_trace_detail_span_begin();
                         ggml_backend_tensor_copy(input, input_cpy);
+                        ggml_backend_sched_trace_copy_end(
+                                sched, body_start, GGML_EXEC_TRACE_EVENT_COPY_BODY, copy_path,
+                                split_id, input_backend_id, split_backend_id,
+                                input_node_id, input_cpy_node_id, copy_bytes);
                     }
                 }
             }
+
+            ggml_backend_sched_trace_copy_end(
+                    sched, copy_start, GGML_EXEC_TRACE_EVENT_COPY_HANDLING, copy_path,
+                    split_id, input_backend_id, split_backend_id,
+                    input_node_id, input_cpy_node_id, copy_bytes);
         }
 
         if (!sched->callback_eval) {
+            const uint64_t compute_start = ggml_backend_sched_trace_span_begin();
+            const enum ggml_exec_trace_event_kind compute_kind = compute_start &&
+                    ggml_backend_dev_type(ggml_backend_get_device(split_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU ?
+                    GGML_EXEC_TRACE_EVENT_CPU_COMPUTE : GGML_EXEC_TRACE_EVENT_BACKEND_SUBMIT;
+            if (ggml_exec_trace_observing()) {
+                for (int j = 0; j < split->graph.n_nodes; ++j) {
+                    sched->trace_backend_node_ids[j] = compute_start ?
+                            ggml_backend_sched_trace_tensor_id(sched, split->graph.nodes[j]) : GGML_EXEC_TRACE_ID_NONE;
+                }
+                ggml_exec_trace_backend_begin(
+                        sched->trace_graph_id, split_id + 1, split_backend_id + 1,
+                        ggml_backend_sched_trace_device_id(sched, split_backend_id),
+                        sched->trace_backend_node_ids, split->graph.n_nodes);
+            }
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+            ggml_exec_trace_backend_end();
+            ggml_backend_sched_trace_span_end(
+                    sched, compute_start, compute_kind, 0, split_id, split_backend_id,
+                    GGML_EXEC_TRACE_ID_NONE, (uint32_t) ec, split->i_start, split->i_end);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
             }
         } else {
+            ggml_exec_trace_integrity_eval_callback();
             // similar to ggml_backend_compare_graph_backend
             for (int j0 = 0; j0 < split->graph.n_nodes; j0++) {
                 struct ggml_tensor * t = split->graph.nodes[j0];
@@ -1815,13 +2374,37 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 struct ggml_cgraph gv = ggml_graph_view(&split->graph, j0, j1 + 1);
 
+                const uint64_t compute_start = ggml_backend_sched_trace_span_begin();
+                const enum ggml_exec_trace_event_kind compute_kind = compute_start &&
+                        ggml_backend_dev_type(ggml_backend_get_device(split_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU ?
+                        GGML_EXEC_TRACE_EVENT_CPU_COMPUTE : GGML_EXEC_TRACE_EVENT_BACKEND_SUBMIT;
+                if (ggml_exec_trace_observing()) {
+                    for (int j = 0; j < gv.n_nodes; ++j) {
+                        sched->trace_backend_node_ids[j] = compute_start ?
+                                ggml_backend_sched_trace_tensor_id(sched, gv.nodes[j]) : GGML_EXEC_TRACE_ID_NONE;
+                    }
+                    ggml_exec_trace_backend_begin(
+                            sched->trace_graph_id, split_id + 1, split_backend_id + 1,
+                            ggml_backend_sched_trace_device_id(sched, split_backend_id),
+                            sched->trace_backend_node_ids, gv.n_nodes);
+                }
                 enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv);
+                ggml_exec_trace_backend_end();
+                ggml_backend_sched_trace_span_end(
+                        sched, compute_start, compute_kind, 0, split_id, split_backend_id,
+                        GGML_EXEC_TRACE_ID_NONE, (uint32_t) ec,
+                        split->i_start + j0, split->i_start + j1 + 1);
                 if (ec != GGML_STATUS_SUCCESS) {
                     return ec;
                 }
 
                 // TODO: pass backend to the callback, then the user can decide if they want to synchronize
+                const uint64_t wait_start = ggml_backend_sched_trace_span_begin();
                 ggml_backend_synchronize(split_backend);
+                ggml_backend_sched_trace_span_end(
+                        sched, wait_start, GGML_EXEC_TRACE_EVENT_BACKEND_WAIT,
+                        GGML_EXEC_TRACE_WAIT_EVAL_CALLBACK, split_id, split_backend_id,
+                        GGML_EXEC_TRACE_ID_NONE, GGML_EXEC_TRACE_WAIT_API_BACKEND_SYNCHRONIZE);
 
                 if (need && !sched->callback_eval(t, false, sched->callback_eval_user_data)) {
                     break;
@@ -1880,6 +2463,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->leaf_backend_ids = (int *) calloc(nodes_size, sizeof(sched->leaf_backend_ids[0]));
     sched->prev_node_backend_ids = (int *) calloc(nodes_size, sizeof(sched->prev_node_backend_ids[0]));
     sched->prev_leaf_backend_ids = (int *) calloc(nodes_size, sizeof(sched->prev_leaf_backend_ids[0]));
+    sched->trace_backend_node_ids = (uint32_t *) calloc(nodes_size, sizeof(sched->trace_backend_node_ids[0]));
 
     sched->debug_graph_size = 0;
     sched->debug_prev_graph_size = 0;
@@ -1933,6 +2517,8 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     free(sched->graph_inputs);
     free(sched->hv_tensor_backend_ids);
     free(sched->hv_tensor_copies);
+    free(sched->trace_tensor_ids);
+    free(sched->trace_backend_node_ids);
     free(sched->node_backend_ids);
     free(sched->leaf_backend_ids);
     free(sched->prev_node_backend_ids);
@@ -1945,6 +2531,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
 
 void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
+    sched->trace_graph_id = GGML_EXEC_TRACE_ID_NONE;
     // reset state for the next run
     if (!sched->is_reset) {
         ggml_hash_set_reset(&sched->hash_set);
@@ -2023,13 +2610,28 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
         }
     }
 
+    if (ggml_exec_trace_enabled()) {
+        try {
+            ggml_backend_sched_trace_graph(sched, graph);
+        } catch (...) {
+            ggml_exec_trace_disable("failed to record scheduler topology");
+        }
+    } else if (ggml_exec_trace_integrity_enabled()) {
+        ggml_backend_sched_integrity_graph(sched, graph);
+    }
+
     return ggml_backend_sched_compute_splits(sched);
 }
 
 void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     for (int i = 0; i < sched->n_backends; i++) {
+        const uint64_t wait_start = ggml_backend_sched_trace_span_begin();
         ggml_backend_synchronize(sched->backends[i]);
+        ggml_backend_sched_trace_span_end(
+                sched, wait_start, GGML_EXEC_TRACE_EVENT_BACKEND_WAIT,
+                GGML_EXEC_TRACE_WAIT_SCHEDULER_SYNCHRONIZE, -1, i,
+                GGML_EXEC_TRACE_ID_NONE, GGML_EXEC_TRACE_WAIT_API_BACKEND_SYNCHRONIZE);
     }
     if (!sched->is_alloc) {
         // if the graph is not already allocated, always use copy 0 after a synchronization

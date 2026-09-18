@@ -1,5 +1,7 @@
 #include "llama.h"
 
+#include "ggml-exec-trace.h"
+
 #include "llama-impl.h"
 #include "llama-version.h"
 
@@ -121,6 +123,7 @@ const char * llama_version(void) {
 
 void llama_backend_init(void) {
     ggml_time_init();
+    ggml_exec_trace_init();
 
     // needed to initialize f16 tables
     {
@@ -132,9 +135,29 @@ void llama_backend_init(void) {
     if (!ggml_backend_reg_count()) {
         ggml_backend_load_all();
     }
+
+    if (ggml_exec_trace_enabled()) {
+        try {
+            ggml_exec_trace_metadata("system_info", llama_print_system_info());
+        } catch (...) {
+            ggml_exec_trace_disable("failed to collect system metadata");
+        }
+    }
 }
 
 void llama_numa_init(enum ggml_numa_strategy numa) {
+    const char * numa_name = "disabled";
+    switch (numa) {
+        case GGML_NUMA_STRATEGY_DISABLED:   numa_name = "disabled";   break;
+        case GGML_NUMA_STRATEGY_DISTRIBUTE: numa_name = "distribute"; break;
+        case GGML_NUMA_STRATEGY_ISOLATE:    numa_name = "isolate";    break;
+        case GGML_NUMA_STRATEGY_NUMACTL:     numa_name = "numactl";    break;
+        case GGML_NUMA_STRATEGY_MIRROR:     numa_name = "mirror";     break;
+        case GGML_NUMA_STRATEGY_TENSORS:    numa_name = "tensors";    break;
+        case GGML_NUMA_STRATEGY_COUNT:      numa_name = "invalid";    break;
+    }
+    ggml_exec_trace_metadata("numa_mode", numa_name);
+
     if (numa != GGML_NUMA_STRATEGY_DISABLED) {
         auto * dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
         GGML_ASSERT(dev && "CPU backend is not loaded");
@@ -148,6 +171,7 @@ void llama_numa_init(enum ggml_numa_strategy numa) {
 
 void llama_backend_free(void) {
     ggml_quantize_free();
+    ggml_exec_trace_flush();
 }
 
 int64_t llama_time_us(void) {

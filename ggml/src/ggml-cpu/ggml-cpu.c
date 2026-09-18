@@ -9,6 +9,7 @@
 #include "ggml-impl.h"
 #include "quants.h"
 #include "ggml-threading.h"
+#include "ggml-exec-trace.h"
 #include "unary-ops.h"
 #include "binary-ops.h"
 #include "vec.h"
@@ -1504,6 +1505,10 @@ void ggml_compute_forward_mul_mat(
 
     const int32_t hint = ggml_get_op_params_i32(dst, 1);
     if (hint == GGML_HINT_SRC0_IS_HADAMARD && !params->use_ref) {
+        if (params->ith == 0) {
+            ggml_exec_trace_dispatch(dst->op, GGML_EXEC_TRACE_DISPATCH_CPU_FWHT,
+                    GGML_EXEC_TRACE_DISPATCH_VARIANT_DEFAULT, params->nth, 0);
+        }
         ggml_compute_forward_fwht(params, dst);
         return;
     }
@@ -1558,6 +1563,10 @@ void ggml_compute_forward_mul_mat(
                                      src1->type,
                                      dst->type))
                     goto UseGgmlGemm1;
+        if (ith == 0) {
+            ggml_exec_trace_dispatch(dst->op, GGML_EXEC_TRACE_DISPATCH_CPU_LLAMAFILE,
+                    GGML_EXEC_TRACE_DISPATCH_VARIANT_DEFAULT, nth, 0);
+        }
         return;
     }
 UseGgmlGemm1:;
@@ -1631,6 +1640,10 @@ UseGgmlGemm1:;
     // IQ panel gemm (see iqp.h) - must come after the barrier above, it consumes the q8_K rows
     // of src1 from the work buffer
     if (ggml_cpu_iqp_supports_mul_mat(dst) && !params->use_ref) {
+        if (ith == 0) {
+            ggml_exec_trace_dispatch(dst->op, GGML_EXEC_TRACE_DISPATCH_CPU_IQP,
+                    GGML_EXEC_TRACE_DISPATCH_VARIANT_DEFAULT, nth, 0);
+        }
         ggml_compute_forward_mul_mat_iqp(params, dst);
         return;
     }
@@ -1654,6 +1667,10 @@ UseGgmlGemm1:;
                                      vec_dot_type,
                                      dst->type))
                     goto UseGgmlGemm2;
+        if (ith == 0) {
+            ggml_exec_trace_dispatch(dst->op, GGML_EXEC_TRACE_DISPATCH_CPU_LLAMAFILE,
+                    GGML_EXEC_TRACE_DISPATCH_VARIANT_DEFAULT, nth, 0);
+        }
         return;
     }
 UseGgmlGemm2:;
@@ -1691,6 +1708,12 @@ UseGgmlGemm2:;
     // The number of elements in each chunk
     const int64_t dr0 = (nr0 + nchunk0 - 1) / nchunk0;
     const int64_t dr1 = (nr1 + nchunk1 - 1) / nchunk1;
+
+    if (ith == 0) {
+        ggml_exec_trace_dispatch(dst->op, GGML_EXEC_TRACE_DISPATCH_CPU_VEC_DOT,
+                GGML_EXEC_TRACE_DISPATCH_VARIANT_DEFAULT, nth,
+                ((uint32_t) MIN(nchunk1, UINT16_MAX) << 16) | (uint32_t) MIN(nchunk0, UINT16_MAX));
+    }
 
     // The first chunk comes from our thread_id, the rest will get auto-assigned.
     int current_chunk = ith;
@@ -1971,6 +1994,31 @@ static void ggml_compute_forward_mul_mat_id_impl(
     if (numa_tensors) {
         ggml_numa_tp_row_range_for_node(
                 numa_node, ne01, GGML_NUMA_TP_PLAIN_ALIGN, &numa_row0_start, &numa_row0_end);
+    }
+
+    if (ith == 0 && ggml_exec_trace_observing()) {
+        int active_experts = 0;
+        int iqp_experts = 0;
+        for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+            const int64_t cne1 = matrix_row_counts[cur_a];
+            if (cne1 > 0) {
+                active_experts++;
+                iqp_experts += iqp && ggml_cpu_iqp_mul_mat_id_min_batch(cne1);
+            }
+        }
+        // IQP and IQK cover disjoint src0 types, so a node either runs IQP (possibly
+        // mixed with vec_dot when an expert is below the batch threshold) or IQK.
+        const bool iqk_node = !params->use_ref && ggml_cpu_iqk_mul_mat_enabled() &&
+                ne13 == 1 && dst->type == GGML_TYPE_F32 &&
+                (src1_cont || src1->type != vec_dot_type) &&
+                iqk_mul_mat_moe_supported(ne00, src0->type, vec_dot_type);
+        const enum ggml_exec_trace_dispatch_impl implementation = iqp_experts == 0 ?
+                (iqk_node ? GGML_EXEC_TRACE_DISPATCH_CPU_IQK : GGML_EXEC_TRACE_DISPATCH_CPU_VEC_DOT) :
+                iqp_experts == active_experts ?
+                GGML_EXEC_TRACE_DISPATCH_CPU_IQP : GGML_EXEC_TRACE_DISPATCH_CPU_IQP_VEC_DOT;
+        ggml_exec_trace_dispatch(dst->op, implementation,
+                fuse_up ? GGML_EXEC_TRACE_DISPATCH_VARIANT_FUSED : GGML_EXEC_TRACE_DISPATCH_VARIANT_PER_EXPERT,
+                nth, ((uint32_t) MIN(iqp_experts, UINT16_MAX) << 16) | (uint32_t) MIN(active_experts, UINT16_MAX));
     }
 
     for (int cur_a = 0; cur_a < n_as && numa_row0_start < numa_row0_end; ++cur_a) {
@@ -3674,8 +3722,14 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
 #endif
 
+    const bool trace_nodes = state->ith == 0 && ggml_exec_trace_observing();
+
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
+
+        if (trace_nodes) {
+            ggml_exec_trace_set_node(node_n);
+        }
 
         if (ggml_op_is_empty(node->op)) {
             // skip NOPs
