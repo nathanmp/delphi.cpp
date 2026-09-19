@@ -1391,6 +1391,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // llama_batch_init allocates only one of token/embd; MTP needs both.
         // TODO: fix, how to call without malloc
         batch.token = (llama_token *) malloc(sizeof(llama_token) * n_b);
+        // the hidden state is n_embd_out wide, which can exceed the input embedding width, and the batch
+        // allocator copies embd rows at the input width. Only embd_h rows use n_embd_out, so carry the
+        // hidden state there and leave embd unset. Give the buffer back before llama_batch_free.
+        batch.embd_h = batch.embd;
+        batch.embd   = nullptr;
 
         smpls.resize(n_seq);
         for (auto & s : smpls) {
@@ -1460,6 +1465,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             free(batch.token);
             batch.token = nullptr;
         }
+        batch.embd   = batch.embd_h;
+        batch.embd_h = nullptr;
         llama_batch_free(batch);
     }
 
@@ -1530,12 +1537,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // TODO:this is generally true, but would be nice to assert it
             {
                 const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
-                std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
+                std::memcpy(batch.embd_h + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
             }
 
             // fill the pending embeddings from a previous run
             auto set_h = [&](int idx, const float * h_row) {
-                std::memcpy(batch.embd + (size_t) idx * n_embd, h_row, row_bytes);
+                std::memcpy(batch.embd_h + (size_t) idx * n_embd, h_row, row_bytes);
             };
 
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
@@ -1622,7 +1629,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             common_sampler_reset(smpls[seq_id].get());
 
             common_batch_add(batch, dp.id_last, dp.pos0, { seq_id }, true);
-            std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[seq_id].data(), row_bytes);
+            std::memcpy(batch.embd_h + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[seq_id].data(), row_bytes);
 
             i_last[seq_id] = batch.n_tokens - 1;
 
@@ -1711,17 +1718,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     for (int t = 0; t < n_rows; ++t) {
                         const llama_token tok = (t == 0) ? dp.id_last : result[t - 1];
                         common_batch_add(batch, tok, dp.pos0 + t, { seq_id }, t == n_rows - 1);
-                        std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd,
+                        std::memcpy(batch.embd_h + (size_t) (batch.n_tokens - 1) * n_embd,
                                     chain_h[seq_id].data() + (size_t) t * n_embd, row_bytes);
                     }
                 } else if (is_mem_shared) {
                     // note: with shared memory (e.g. Gemma4 assistants) we use the same position for all draft tokens
                     // ref: https://github.com/huggingface/transformers/blob/effde20942e3f82a1b97449f60b3a48c5ff96145/docs/source/en/model_doc/gemma4_assistant.md?plain=1#L36-L37
                     common_batch_add(batch, id, dp.pos0, { seq_id }, true);
-                    std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, h_row, row_bytes);
+                    std::memcpy(batch.embd_h + (size_t) (batch.n_tokens - 1) * n_embd, h_row, row_bytes);
                 } else {
                     common_batch_add(batch, id, dp.pos0 + i + 1, { seq_id }, true);
-                    std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, h_row, row_bytes);
+                    std::memcpy(batch.embd_h + (size_t) (batch.n_tokens - 1) * n_embd, h_row, row_bytes);
                 }
 
                 i_last[seq_id] = batch.n_tokens - 1;
