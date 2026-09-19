@@ -539,7 +539,22 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
     }
 }
 
+static best_fattn_kernel ggml_cuda_get_best_fattn_kernel_impl(const int device, const ggml_tensor * dst);
+
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
+    const ggml_tensor * Q = dst->src[0];
+    if (ggml_cuda_spec_invariant() && Q->ne[1] >= 2 && Q->ne[1] <= 4) {
+        // pick what a single query would get
+        ggml_tensor q1 = *Q;
+        q1.ne[1] = 1;
+        ggml_tensor d1 = *dst;
+        d1.src[0] = &q1;
+        return ggml_cuda_get_best_fattn_kernel_impl(device, &d1);
+    }
+    return ggml_cuda_get_best_fattn_kernel_impl(device, dst);
+}
+
+static best_fattn_kernel ggml_cuda_get_best_fattn_kernel_impl(const int device, const ggml_tensor * dst) {
 #ifndef FLASH_ATTN_AVAILABLE
     GGML_UNUSED(device); GGML_UNUSED(dst);
     return BEST_FATTN_KERNEL_NONE;

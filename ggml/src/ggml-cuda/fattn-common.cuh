@@ -1203,6 +1203,11 @@ void launch_fattn(
             }
         }
 
+        if (ggml_cuda_spec_invariant() && ncols1 == 1 && ncols2 == 1 && Q->ne[1] <= 4) {
+            // fixed KV split, independent of the query count and n_kv; empty or masked blocks add exact zeros
+            parallel_blocks = std::max(1, blocks_per_wave / (ntiles_dst / ntiles_x));
+        }
+
         blocks_num.x = ntiles_x;
         blocks_num.y = parallel_blocks;
         blocks_num.z = ntiles_z_gqa*K->ne[2]*Q->ne[3];
