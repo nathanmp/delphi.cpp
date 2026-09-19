@@ -1550,22 +1550,8 @@ struct ggml_backend_cuda_context {
 #ifdef USE_CUDA_GRAPH
     std::unordered_map<uint64_t, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
 
-    int64_t last_graph_eviction_sweep = 0;
-
     ggml_cuda_graph * cuda_graph(uint64_t graph_key) {
         const int64_t time_now = ggml_time_us();
-
-        // sweep every 5s, evicting cuda graphs unused for >=10s
-        if (time_now - last_graph_eviction_sweep >= 5'000'000) {
-            last_graph_eviction_sweep = time_now;
-            for (auto it = cuda_graphs.begin(); it != cuda_graphs.end(); ) {
-                if (time_now - it->second->last_used_time >= 10'000'000) {
-                    it = cuda_graphs.erase(it);
-                } else {
-                    ++it;
-                }
-            }
-        }
 
         auto it = cuda_graphs.find(graph_key);
         if (it == cuda_graphs.end()) {
