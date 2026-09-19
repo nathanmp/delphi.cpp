@@ -2,6 +2,7 @@
 // tokens are decoded beside it (the verify widths used by speculative decoding).
 #include "llama.h"
 #include "ggml-backend.h"
+#include "../../src/llama-ext.h"
 
 #include <cmath>
 #include <cstdio>
@@ -91,7 +92,7 @@ int main(int argc, char ** argv) {
     std::string model_path, dev = "none", widths_s = "1,2,3,4,5,6,7,8";
     std::vector<std::string> ot; // tensor-name regexes kept on the CPU
     int  n_prefix = 64, n_tail = 12, n_threads = 32;
-    bool trace = false, fa_off = false;
+    bool trace = false, fa_off = false, nextn = false;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if      (a == "-m" && i + 1 < argc) model_path = argv[++i];
@@ -101,9 +102,10 @@ int main(int argc, char ** argv) {
         else if (a == "-nt" && i + 1 < argc) n_tail = atoi(argv[++i]);
         else if (a == "--trace") trace = true;
         else if (a == "--fa-off") fa_off = true;
+        else if (a == "--nextn") nextn = true; // target graph as in draft-mtp
         else if (a == "-ot" && i + 1 < argc) ot.push_back(argv[++i]);
         else if (a == "-t" && i + 1 < argc) n_threads = atoi(argv[++i]);
-        else { fprintf(stderr, "usage: %s -m model [-dev ROCm1,ROCm2|none] [-ot regex]... [-t 32] [-w 1,2,...,8] [-np 64] [-nt 12] [--trace] [--fa-off]\n", argv[0]); return 1; }
+        else { fprintf(stderr, "usage: %s -m model [-dev ROCm1,ROCm2|none] [-ot regex]... [-t 32] [-w 1,2,...,8] [-np 64] [-nt 12] [--trace] [--fa-off] [--nextn]\n", argv[0]); return 1; }
     }
     std::vector<int> widths;
     for (size_t p = 0; p < widths_s.size();) {
@@ -157,6 +159,7 @@ int main(int argc, char ** argv) {
         if (fa_off) cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
         if (trace) { cp.cb_eval = trace_cb; cp.cb_eval_user_data = &r.trace; }
         llama_context * ctx = llama_init_from_model(model, cp);
+        if (ctx && nextn) llama_set_embeddings_nextn(ctx, true, false);
         if (!ctx) { return 1; }
 
         llama_batch b = llama_batch_init(std::max(512, n_prefix), 0, 1);
