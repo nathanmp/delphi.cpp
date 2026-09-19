@@ -1523,12 +1523,22 @@ struct ggml_cuda_stream_context {
 
 struct ggml_cuda_exec_trace_timer;
 
+struct ggml_cuda_offload_calibration {
+    double h2d_bytes_per_second = 0.0;
+    double d2h_bytes_per_second = 0.0;
+    double device_bytes_per_second = 0.0;
+    int numa_node = -1;
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;
     // null unless GGML_EXEC_TRACE_GPU_TIMING is active; owned by this context
     ggml_cuda_exec_trace_timer * exec_trace_timer = nullptr;
+
+    std::mutex offload_calibration_mutex;
+    std::unordered_map<int, ggml_cuda_offload_calibration> offload_calibrations;
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};

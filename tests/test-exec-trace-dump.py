@@ -120,6 +120,31 @@ class TestExecTraceDump(unittest.TestCase):
         self.assertIn("graph_exec 4 / ROCm1: nodes=20 capture=1 update=0 replay=2 fallback=0", text)
         self.assertIn("uncaptured / ROCm2: nodes=10 capture=0 update=0 replay=0 fallback=1", text)
 
+    def test_offload_decision_terms(self):
+        strings = {1: "ROCm1", 2: "ffn_moe_up", 3: "MUL_MAT_ID", 4: "F32"}
+        events = [
+            event(exec_trace_dump.K_GRAPH, graph_id=1, args=(1, 1, 0, 1)),
+            event(exec_trace_dump.K_BACKEND, graph_id=1, backend_id=1, device_id=1, args=(1,)),
+            event(exec_trace_dump.K_NODE, graph_id=1, node_id=9, backend_id=2, device_id=2,
+                  flags=30, args=(0, 2, 3, 4)),
+            event(exec_trace_dump.K_OFFLOAD_DECISION, graph_id=1, node_id=9, backend_id=1, device_id=1,
+                  flags=1, args=(3_000_000, 100_000, 200_000, 5_000_000)),
+            event(exec_trace_dump.K_OFFLOAD_BYTES, graph_id=1, node_id=9, backend_id=1, device_id=1,
+                  args=(98_535_000_000, 4_000_000, 8_000_000, 2_000_000_000)),
+            event(exec_trace_dump.K_OFFLOAD_CALIBRATION, graph_id=1, node_id=9, backend_id=1, device_id=1,
+                  flags=1, args=(1_000_000_000_000, 10_000_000_000_000, 20_000_000_000, 18_000_000_000)),
+        ]
+        trace = {"version": 4, "flags": 0, "start_ns": 0, "events": events, "strings": strings, "trace_stats": {}}
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            exec_trace_dump.dump(trace, offload_decisions=True)
+        text = output.getvalue()
+        self.assertIn("choice=CPU", text)
+        self.assertIn("cpu_ms=3.100", text)
+        self.assertIn("candidate_ms=5.200", text)
+        self.assertIn("weight_h2d_bytes=98535000000", text)
+        self.assertIn("numa_node=0", text)
+
     def test_gpu_timing_placement_and_summary(self):
         strings = {1: "ROCm1", 2: "gpu_timing", 3: "op", 4: "blk.0.ffn_up", 5: "MUL_MAT", 6: "F32",
                    7: "gpu_timing_spans_started", 8: "3", 9: "gpu_timing_spans_released"}

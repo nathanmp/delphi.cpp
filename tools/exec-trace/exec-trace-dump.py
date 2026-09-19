@@ -41,6 +41,9 @@ K_GPU_GRAPH = 25
 K_CLOCK_SYNC = 26
 K_GPU_TIMING = 27
 K_GPU_TIMING_EPOCH = 28
+K_OFFLOAD_DECISION = 29
+K_OFFLOAD_BYTES = 30
+K_OFFLOAD_CALIBRATION = 31
 
 DISPATCH_NAMES = {
     0: "unknown",
@@ -113,6 +116,7 @@ TIMING_PROVENANCE = {1: "HOST_SAFE", 2: "DEVICE_EVENT", 3: "VENDOR_EXTERNAL"}
 GPU_TIMING_SCOPES = {1: "eager_submit", 2: "graph_launch", 3: "eager_op"}
 GPU_TIMING_STATUSES = {1: "resolved", 2: "unresolved", 3: "not_recorded", 4: "failed"}
 GPU_TIMING_COMPLETIONS = {1: "synchronize", 2: "query", 3: "none"}
+OFFLOAD_CHOICES = {1: "CPU", 2: "candidate"}
 
 
 class TraceError(Exception):
@@ -313,6 +317,58 @@ def dispatch_fingerprints(events, strings):
         hash_value = fnv1a_u64(hash_value, config_1)
         hashes[event["graph_id"]] = hash_value
     return hashes
+
+
+def dump_offload_decisions(events, strings, backend_name):
+    node_metadata = build_node_metadata(events, strings)
+    bytes_by_node = {}
+    calibration_by_node = {}
+    for event in events:
+        key = (event["graph_id"], event["node_id"], event["backend_id"])
+        if event["kind"] == K_OFFLOAD_BYTES:
+            bytes_by_node[key] = event
+        elif event["kind"] == K_OFFLOAD_CALIBRATION:
+            calibration_by_node[key] = event
+
+    decisions = [event for event in events if event["kind"] == K_OFFLOAD_DECISION]
+    print(f"offload_decision_count: {len(decisions)}")
+    for event in decisions:
+        key = (event["graph_id"], event["node_id"], event["backend_id"])
+        node = node_metadata(event) or {}
+        byte_event = bytes_by_node.get(key)
+        calibration = calibration_by_node.get(key)
+        cpu_compute, cpu_transfer, gpu_compute, gpu_transfer = event["args"]
+        fields = [
+            f"graph={event['graph_id']}",
+            f"node={event['node_id']}",
+            f"name={node.get('name', '')}",
+            f"op={node.get('op', '')}",
+            f"candidate={backend_name(event)}",
+            f"choice={OFFLOAD_CHOICES.get(event['flags'], event['flags'])}",
+            f"cpu_ms={(cpu_compute + cpu_transfer)/1e6:.3f}",
+            f"cpu_compute_ms={cpu_compute/1e6:.3f}",
+            f"cpu_transfer_ms={cpu_transfer/1e6:.3f}",
+            f"candidate_ms={(gpu_compute + gpu_transfer)/1e6:.3f}",
+            f"candidate_compute_ms={gpu_compute/1e6:.3f}",
+            f"candidate_transfer_ms={gpu_transfer/1e6:.3f}",
+        ]
+        if byte_event:
+            fields.extend([
+                f"weight_h2d_bytes={byte_event['args'][0]}",
+                f"cpu_input_d2h_bytes={byte_event['args'][1]}",
+                f"cpu_output_h2d_bytes={byte_event['args'][2]}",
+                f"operations={byte_event['args'][3]}",
+            ])
+        if calibration:
+            numa_node = calibration["flags"] - 1 if calibration["flags"] else "unknown"
+            fields.extend([
+                f"numa_node={numa_node}",
+                f"cpu_ops_s={calibration['args'][0]}",
+                f"candidate_ops_s={calibration['args'][1]}",
+                f"h2d_bytes_s={calibration['args'][2]}",
+                f"d2h_bytes_s={calibration['args'][3]}",
+            ])
+        print("  " + " ".join(fields))
 
 
 def dispatch_config(implementation, variant, config_0, config_1):
@@ -708,7 +764,7 @@ def dump_timeline(trace, backend_name):
         print(f"  {offset_ms:12.3f} ms  {' '.join(fields)}")
 
 
-def dump(trace, scheduler_summary=False, timeline=False, dispatches=False, gpu_timing=False):
+def dump(trace, scheduler_summary=False, timeline=False, dispatches=False, gpu_timing=False, offload_decisions=False):
     events = trace["events"]
     strings = trace["strings"]
     backend_name = build_backend_names(events, strings)
@@ -809,6 +865,10 @@ def dump(trace, scheduler_summary=False, timeline=False, dispatches=False, gpu_t
         dump_dispatches(events, strings, backend_name)
     else:
         print(f"dispatch_count: {sum(event['kind'] == K_DISPATCH for event in events)}")
+    if offload_decisions:
+        dump_offload_decisions(events, strings, backend_name)
+    else:
+        print(f"offload_decision_count: {sum(event['kind'] == K_OFFLOAD_DECISION for event in events)}")
     dump_gpu_graphs(events, backend_name)
 
     gpu_timing_count = sum(event["kind"] == K_GPU_TIMING for event in events)
@@ -826,6 +886,7 @@ def dump(trace, scheduler_summary=False, timeline=False, dispatches=False, gpu_t
 def main():
     parser = argparse.ArgumentParser(description="Print a summary of a GGML execution trace")
     parser.add_argument("--dispatches", action="store_true", help="print every backend dispatch decision")
+    parser.add_argument("--offload-decisions", action="store_true", help="print every transfer-aware offload decision")
     parser.add_argument("--scheduler-summary", action="store_true", help="aggregate host scheduler spans")
     parser.add_argument("--timeline", action="store_true", help="print chronological host span endpoints")
     parser.add_argument("--gpu-timing", action="store_true", help="summarize DEVICE_EVENT GPU timing spans")
@@ -835,7 +896,7 @@ def main():
     try:
         trace = read_trace(args.trace)
         dump(trace, scheduler_summary=args.scheduler_summary, timeline=args.timeline, dispatches=args.dispatches,
-             gpu_timing=args.gpu_timing)
+             gpu_timing=args.gpu_timing, offload_decisions=args.offload_decisions)
         if args.gpu_timing_json:
             args.gpu_timing_json.write_text(json.dumps(gpu_timing_summary(trace), indent=2) + "\n")
     except (OSError, TraceError) as error:

@@ -8,7 +8,13 @@
 #include "amx/amx.h"
 
 #include <cctype>
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstring>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #ifdef GGML_USE_CPU_HBM
@@ -224,6 +230,11 @@ struct ggml_backend_cpu_context {
     void *              abort_callback_data;
 
     bool                use_ref;  // use reference implementation
+
+    std::mutex          offload_cost_mutex;
+    int                 offload_cost_threads = 0;
+    double              offload_memory_bytes_per_second = 0.0;
+    double              offload_dot_operations_per_second[GGML_TYPE_COUNT] = {};
 };
 
 static const char * ggml_backend_cpu_get_name(ggml_backend_t backend) {
@@ -305,6 +316,128 @@ static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, s
     cplan.use_ref             = cpu_ctx->use_ref;
 
     return ggml_graph_compute(cgraph, &cplan);
+}
+
+static double ggml_backend_cpu_measure_memory_bandwidth(int n_threads) {
+    const size_t size = 128u*1024u*1024u;
+    std::vector<uint8_t> src(size, 0x5a);
+    std::vector<uint8_t> dst(size, 0);
+    n_threads = std::max(1, std::min<int>(n_threads, 64));
+
+    double best = 0.0;
+    for (int repetition = 0; repetition < 2; ++repetition) {
+        std::atomic<int> ready(0);
+        std::atomic<bool> start(false);
+        std::vector<std::thread> workers;
+        workers.reserve(n_threads);
+        for (int thread = 0; thread < n_threads; ++thread) {
+            workers.emplace_back([&, thread] {
+                const size_t begin = size*(size_t) thread/n_threads;
+                const size_t end   = size*(size_t) (thread + 1)/n_threads;
+                ready.fetch_add(1, std::memory_order_release);
+                while (!start.load(std::memory_order_acquire)) {
+                    std::this_thread::yield();
+                }
+                std::memcpy(dst.data() + begin, src.data() + begin, end - begin);
+            });
+        }
+        while (ready.load(std::memory_order_acquire) != n_threads) {
+            std::this_thread::yield();
+        }
+        const auto before = std::chrono::steady_clock::now();
+        start.store(true, std::memory_order_release);
+        for (std::thread & worker : workers) {
+            worker.join();
+        }
+        const auto after = std::chrono::steady_clock::now();
+        const double seconds = std::chrono::duration<double>(after - before).count();
+        best = std::max(best, size/seconds);
+        std::swap(src, dst);
+    }
+    return best;
+}
+
+static double ggml_backend_cpu_measure_dot_throughput(enum ggml_type type) {
+    const ggml_type_traits_cpu * weight_traits = ggml_get_type_traits_cpu(type);
+    if (!weight_traits->from_float || !weight_traits->vec_dot) {
+        return 0.0;
+    }
+
+    const int64_t n = 4096;
+    const ggml_type activation_type = weight_traits->vec_dot_type;
+    const ggml_type_traits_cpu * activation_traits = ggml_get_type_traits_cpu(activation_type);
+    if (!activation_traits->from_float) {
+        return 0.0;
+    }
+
+    std::vector<float> source(n, 0.125f);
+    std::vector<uint8_t> weight(ggml_row_size(type, n));
+    std::vector<uint8_t> activation(ggml_row_size(activation_type, n));
+    weight_traits->from_float(source.data(), weight.data(), n);
+    activation_traits->from_float(source.data(), activation.data(), n);
+
+    float result = 0.0f;
+    weight_traits->vec_dot(n, &result, 0, weight.data(), 0, activation.data(), 0, 1);
+
+    uint64_t iterations = 1;
+    double seconds = 0.0;
+    do {
+        iterations *= 2;
+        const auto before = std::chrono::steady_clock::now();
+        for (uint64_t i = 0; i < iterations; ++i) {
+            weight_traits->vec_dot(n, &result, 0, weight.data(), 0, activation.data(), 0, 1);
+        }
+        const auto after = std::chrono::steady_clock::now();
+        seconds = std::chrono::duration<double>(after - before).count();
+    } while (seconds < 0.01 && iterations < (1u << 20));
+
+    return 2.0*n*iterations/seconds;
+}
+
+static bool ggml_backend_cpu_get_op_cost(
+        ggml_backend_t backend, const struct ggml_tensor * op, const struct ggml_tensor * weight,
+        uint64_t operations, uint64_t active_weight_bytes, struct ggml_backend_op_cost * cost) {
+    GGML_UNUSED(op);
+    if (operations == 0 || active_weight_bytes == 0) {
+        return false;
+    }
+
+    struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *) backend->context;
+    const int n_threads = std::max(1, cpu_ctx->n_threads);
+    double dot_operations_per_second = 0.0;
+    {
+        std::lock_guard<std::mutex> lock(cpu_ctx->offload_cost_mutex);
+        if (cpu_ctx->offload_cost_threads != n_threads || cpu_ctx->offload_memory_bytes_per_second <= 0.0) {
+            cpu_ctx->offload_memory_bytes_per_second = ggml_backend_cpu_measure_memory_bandwidth(n_threads);
+            cpu_ctx->offload_cost_threads = n_threads;
+            GGML_LOG_INFO("CPU offload calibration: threads = %d, memory = %.2f GB/s\n",
+                    n_threads, cpu_ctx->offload_memory_bytes_per_second/1.0e9);
+        }
+        if (cpu_ctx->offload_dot_operations_per_second[weight->type] <= 0.0) {
+            cpu_ctx->offload_dot_operations_per_second[weight->type] =
+                    ggml_backend_cpu_measure_dot_throughput(weight->type);
+            GGML_LOG_INFO("CPU offload calibration: type = %s, vector dot = %.2f GOPS/thread\n",
+                    ggml_type_name(weight->type),
+                    cpu_ctx->offload_dot_operations_per_second[weight->type]/1.0e9);
+        }
+        dot_operations_per_second = cpu_ctx->offload_dot_operations_per_second[weight->type];
+    }
+
+    if (dot_operations_per_second <= 0.0) {
+        return false;
+    }
+
+    // The two measured limits make this a roofline estimate. The dot benchmark is cache-hot;
+    // the memory calibration limits it when the full expert working set must come from RAM.
+    const double arithmetic_intensity = (double) operations/active_weight_bytes;
+    const double memory_limit = cpu_ctx->offload_memory_bytes_per_second*arithmetic_intensity;
+    const double compute_limit = n_threads*dot_operations_per_second;
+
+    *cost = {};
+    cost->operations_per_second = std::min(memory_limit, compute_limit);
+    cost->numa_node = -1;
+    cost->calibrated = 1;
+    return cost->operations_per_second > 0.0;
 }
 
 static const struct ggml_backend_i ggml_backend_cpu_i = {
@@ -766,6 +899,9 @@ static ggml_backend_feature * ggml_backend_cpu_get_features(ggml_backend_reg_t r
 }
 
 static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    if (strcmp(name, "ggml_backend_get_op_cost") == 0) {
+        return (void *) ggml_backend_cpu_get_op_cost;
+    }
     if (strcmp(name, "ggml_backend_set_n_threads") == 0) {
         ggml_backend_set_n_threads_t fct = ggml_backend_cpu_set_n_threads;
         return (void *)fct;
