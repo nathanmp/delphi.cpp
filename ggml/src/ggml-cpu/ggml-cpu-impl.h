@@ -11,6 +11,15 @@
 #include <string.h> // memcpy
 #include <math.h>   // fabsf
 
+// GGML_SPEC_INVARIANT: batches of up to 8 tokens reproduce the per-token results of a 1-token decode
+static inline bool ggml_cpu_spec_inv(int64_t n_tokens) {
+    static int v = -1; // C: no dynamic static init; a racy first read writes the same value
+    if (v < 0) {
+        v = getenv("GGML_SPEC_INVARIANT") != NULL;
+    }
+    return v && n_tokens <= 8;
+}
+
 #ifdef __cplusplus
 extern "C" {
 #endif

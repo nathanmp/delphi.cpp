@@ -43,9 +43,9 @@
 
 #include <cstdlib>
 
-// GGML_CUDA_SPEC_INVARIANT: small batches (speculative verify) reproduce the per-token results of a 1-token decode.
+// GGML_SPEC_INVARIANT: small batches (speculative verify) reproduce the per-token results of a 1-token decode.
 static bool ggml_cuda_spec_invariant() {
-    static const bool v = getenv("GGML_CUDA_SPEC_INVARIANT") != nullptr;
+    static const bool v = getenv("GGML_SPEC_INVARIANT") != nullptr;
     return v;
 }
 

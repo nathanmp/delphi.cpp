@@ -1513,6 +1513,22 @@ void ggml_compute_forward_mul_mat(
         return;
     }
 
+    // spec-invariant: 2-8 columns as separate 1-column products, so each takes the 1-token path
+    if (src1->ne[1] >= 2 && src1->ne[2] == 1 && src1->ne[3] == 1 && ggml_cpu_spec_inv(src1->ne[1])) {
+        for (int64_t j = 0; j < src1->ne[1]; j++) {
+            struct ggml_tensor s1 = *src1;
+            s1.ne[1] = 1;
+            s1.data  = (char *) src1->data + j*src1->nb[1];
+            struct ggml_tensor d1 = *dst;
+            d1.ne[1]  = 1;
+            d1.data   = (char *) dst->data + j*dst->nb[1];
+            d1.src[1] = &s1;
+            ggml_compute_forward_mul_mat(params, &d1);
+            ggml_barrier(params->threadpool);
+        }
+        return;
+    }
+
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int ith = params->ith;
