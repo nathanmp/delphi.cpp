@@ -1266,6 +1266,18 @@ static void mul_mat_vec_q_switch_ncols_dst(
         return idle * 8 <= iters_wide * 2;
     };
 
+    if (has_ids && ncols_dst > 1 && ncols_dst <= 4 && ggml_cuda_spec_invariant()) {
+        // one single-token launch per token, so each matches a 1-token decode
+        for (int t = 0; t < ncols_dst; ++t) {
+            mul_mat_vec_q_switch_ncols_dst<type>(
+                vx, (const block_q8_1 *) vy + t*stride_col_y, ids + t*ids_stride, fusion, dst + t*stride_col_dst,
+                ncols_x, nrows_x, 1, stride_row_x, stride_col_y, stride_col_dst,
+                nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+        }
+        return;
+    }
+
     if (has_ids && ncols_dst > 1) {
         // Multi-token MUL_MAT_ID path - dedicated MoE kernel
         mul_mat_vec_q_moe_launch<type>(

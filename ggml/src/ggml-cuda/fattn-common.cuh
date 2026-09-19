@@ -1203,7 +1203,7 @@ void launch_fattn(
             }
         }
 
-        if (ggml_cuda_spec_invariant() && ncols1 == 1 && ncols2 == 1 && Q->ne[1] <= 4) {
+        if (ggml_cuda_spec_invariant() && Q->ne[1] <= 4) {
             // fixed KV split, independent of the query count and n_kv; empty or masked blocks add exact zeros
             parallel_blocks = std::max(1, blocks_per_wave / (ntiles_dst / ntiles_x));
         }
