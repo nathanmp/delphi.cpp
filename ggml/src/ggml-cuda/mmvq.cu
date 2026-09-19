@@ -2274,7 +2274,7 @@ bool ggml_cuda_moe_down_q_reduction_supported(
         const char * value = std::getenv("GGML_CUDA_MOE_DOWN_REDUCE");
         return value != nullptr && std::atoi(value) == 0;
     }();
-    if (disabled) {
+    if (disabled || ggml_cuda_spec_invariant()) { // single-token only, so it cannot match a verify batch
         return false;
     }
     if (src0 == nullptr || src1 == nullptr || ids == nullptr || weights == nullptr || dst == nullptr) {

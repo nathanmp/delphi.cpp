@@ -539,22 +539,7 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
     }
 }
 
-static best_fattn_kernel ggml_cuda_get_best_fattn_kernel_impl(const int device, const ggml_tensor * dst);
-
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
-    const ggml_tensor * Q = dst->src[0];
-    if (Q->ne[1] >= 2 && ggml_cuda_spec_inv(Q->ne[1])) {
-        // pick what a single query would get
-        ggml_tensor q1 = *Q;
-        q1.ne[1] = 1;
-        ggml_tensor d1 = *dst;
-        d1.src[0] = &q1;
-        return ggml_cuda_get_best_fattn_kernel_impl(device, &d1);
-    }
-    return ggml_cuda_get_best_fattn_kernel_impl(device, dst);
-}
-
-static best_fattn_kernel ggml_cuda_get_best_fattn_kernel_impl(const int device, const ggml_tensor * dst) {
 #ifndef FLASH_ATTN_AVAILABLE
     GGML_UNUSED(device); GGML_UNUSED(dst);
     return BEST_FATTN_KERNEL_NONE;
@@ -769,6 +754,37 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+
+    // spec-invariant: one single-query call per query, so kernel choice, tiling and KV split match a 1-token decode
+    const ggml_tensor * Q = dst->src[0];
+    if (Q->ne[1] >= 2 && Q->ne[3] == 1 && ggml_cuda_spec_inv(Q->ne[1])) {
+        const ggml_tensor * mask = dst->src[3];
+        const ggml_tensor * idx  = dst->src[5];
+        for (int64_t j = 0; j < Q->ne[1]; ++j) {
+            ggml_tensor q1 = *Q;
+            q1.ne[1] = 1;
+            q1.data  = (char *) Q->data + j*Q->nb[1];
+            ggml_tensor m1, i1;
+            ggml_tensor d1 = *dst;
+            d1.ne[2]  = 1;
+            d1.data   = (char *) dst->data + j*dst->nb[2];
+            d1.src[0] = &q1;
+            if (mask) {
+                m1 = *mask;
+                m1.ne[1] = 1;
+                m1.data  = (char *) mask->data + j*mask->nb[1];
+                d1.src[3] = &m1;
+            }
+            if (idx) {
+                i1 = *idx;
+                i1.ne[1] = 1;
+                i1.data  = (char *) idx->data + j*idx->nb[1];
+                d1.src[5] = &i1;
+            }
+            ggml_cuda_flash_attn_ext(ctx, &d1);
+        }
+        return;
+    }
     if (dst->src[5] != nullptr) {
         if (ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ctx, dst)) {
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);

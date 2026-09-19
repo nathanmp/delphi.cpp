@@ -51,7 +51,7 @@ static bool trace_cb(ggml_tensor * t, bool ask, void * ud) {
     if (!gather(t, all)) {
         return true;
     }
-    const std::string key = std::string(t->name) + "#" + std::to_string(s->occ[t->name]++);
+    const std::string key = std::string(t->name) + "#" + std::to_string(s->occ[t->name]++) + " " + ggml_op_desc(t);
     if (s->ntok == 1) {
         s->tok[s->base].push_back({ key, t->type, std::move(all) });
         return true;
@@ -90,7 +90,7 @@ static const char * k_text =
 int main(int argc, char ** argv) {
     std::string model_path, dev = "none", widths_s = "1,2,3,4,5,6,7,8";
     std::vector<std::string> ot; // tensor-name regexes kept on the CPU
-    int  n_prefix = 64, n_tail = 12;
+    int  n_prefix = 64, n_tail = 12, n_threads = 32;
     bool trace = false, fa_off = false;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -102,7 +102,8 @@ int main(int argc, char ** argv) {
         else if (a == "--trace") trace = true;
         else if (a == "--fa-off") fa_off = true;
         else if (a == "-ot" && i + 1 < argc) ot.push_back(argv[++i]);
-        else { fprintf(stderr, "usage: %s -m model [-dev ROCm1,ROCm2|none] [-ot regex]... [-w 1,2,...,8] [-np 64] [-nt 12] [--trace] [--fa-off]\n", argv[0]); return 1; }
+        else if (a == "-t" && i + 1 < argc) n_threads = atoi(argv[++i]);
+        else { fprintf(stderr, "usage: %s -m model [-dev ROCm1,ROCm2|none] [-ot regex]... [-t 32] [-w 1,2,...,8] [-np 64] [-nt 12] [--trace] [--fa-off]\n", argv[0]); return 1; }
     }
     std::vector<int> widths;
     for (size_t p = 0; p < widths_s.size();) {
@@ -152,7 +153,7 @@ int main(int argc, char ** argv) {
         r.trace.tok.resize(n_tail);
         auto cp = llama_context_default_params();
         cp.n_ctx = std::max(1024, n_prefix + n_tail + 256); cp.n_batch = std::max(512, n_prefix); cp.n_ubatch = 512; cp.n_seq_max = 1;
-        cp.n_threads = cp.n_threads_batch = 32;
+        cp.n_threads = cp.n_threads_batch = n_threads;
         if (fa_off) cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
         if (trace) { cp.cb_eval = trace_cb; cp.cb_eval_user_data = &r.trace; }
         llama_context * ctx = llama_init_from_model(model, cp);
