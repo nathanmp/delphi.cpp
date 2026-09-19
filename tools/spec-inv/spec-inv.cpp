@@ -94,6 +94,7 @@ int main(int argc, char ** argv) {
     int  n_prefix = 64, n_tail = 12, n_threads = 32;
     bool trace = false, fa_off = false, nextn = false;
     int n_rs = 0;
+    bool ref_plain = false;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if      (a == "-m" && i + 1 < argc) model_path = argv[++i];
@@ -104,10 +105,11 @@ int main(int argc, char ** argv) {
         else if (a == "--trace") trace = true;
         else if (a == "--fa-off") fa_off = true;
         else if (a == "--rs" && i + 1 < argc) n_rs = atoi(argv[++i]); // n_rs_seq as in draft-mtp (= n_max)
+        else if (a == "--ref-plain") ref_plain = true; // first width without --nextn/--rs, as plain decode
         else if (a == "--nextn") nextn = true; // target graph as in draft-mtp
         else if (a == "-ot" && i + 1 < argc) ot.push_back(argv[++i]);
         else if (a == "-t" && i + 1 < argc) n_threads = atoi(argv[++i]);
-        else { fprintf(stderr, "usage: %s -m model [-dev ROCm1,ROCm2|none] [-ot regex]... [-t 32] [-w 1,2,...,8] [-np 64] [-nt 12] [--trace] [--fa-off] [--nextn] [--rs N]\n", argv[0]); return 1; }
+        else { fprintf(stderr, "usage: %s -m model [-dev ROCm1,ROCm2|none] [-ot regex]... [-t 32] [-w 1,2,...,8] [-np 64] [-nt 12] [--trace] [--fa-off] [--nextn] [--rs N] [--ref-plain]\n", argv[0]); return 1; }
     }
     std::vector<int> widths;
     for (size_t p = 0; p < widths_s.size();) {
@@ -158,11 +160,12 @@ int main(int argc, char ** argv) {
         auto cp = llama_context_default_params();
         cp.n_ctx = std::max(1024, n_prefix + n_tail + 256); cp.n_batch = std::max(512, n_prefix); cp.n_ubatch = 512; cp.n_seq_max = 1;
         cp.n_threads = cp.n_threads_batch = n_threads;
-        cp.n_rs_seq = n_rs;
+        const bool spec_cfg = !(ref_plain && wi == 0);
+        cp.n_rs_seq = spec_cfg ? n_rs : 0;
         if (fa_off) cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
         if (trace) { cp.cb_eval = trace_cb; cp.cb_eval_user_data = &r.trace; }
         llama_context * ctx = llama_init_from_model(model, cp);
-        if (ctx && nextn) llama_set_embeddings_nextn(ctx, true, false);
+        if (ctx && nextn && spec_cfg) llama_set_embeddings_nextn(ctx, true, false);
         if (!ctx) { return 1; }
 
         llama_batch b = llama_batch_init(std::max(512, n_prefix), 0, 1);
