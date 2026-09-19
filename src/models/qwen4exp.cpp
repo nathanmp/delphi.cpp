@@ -304,7 +304,9 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
 
         // the head's own output mixer, mirroring the trunk's hc_head_*: it collapses the
         // hc streams and stands in for the output norm, of which qwen4exp has none
-        layer.nextn.hc_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_NORM, "weight", il), { hc_dim }, flags);
+        // build_hc_mix scales the streams with an [n_embd, hc] gamma, the same as the trunk's
+        // hc_attn_norm and hc_ffn_norm. The file stores it flat, so reshape on load.
+        layer.nextn.hc_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_NORM, "weight", il), { n_embd, hc }, TENSOR_ALLOW_RESHAPE | flags);
         layer.nextn.hc_head_down = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_DOWN, "weight", il), { hc_dim, hc_lr }, flags);
         layer.nextn.hc_head_up   = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_UP,   "weight", il), { hc_lr, hc_dim }, flags);
 
