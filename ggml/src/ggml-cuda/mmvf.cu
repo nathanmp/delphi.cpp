@@ -806,6 +806,9 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
         }
     }
 
+    if (ggml_cuda_spec_invariant() && (type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16)) {
+        return ne11 <= MMVF_MAX_BATCH_SIZE; // per-column sums do not depend on ne11
+    }
     switch (type) {
         case GGML_TYPE_F32:
             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {

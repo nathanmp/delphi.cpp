@@ -139,7 +139,7 @@ int main(int argc, char ** argv) {
     const llama_vocab * vocab = llama_model_get_vocab(model);
     const int n_vocab = llama_vocab_n_tokens(vocab);
 
-    std::vector<llama_token> toks(4096);
+    std::vector<llama_token> toks(n_prefix + n_tail + 4096);
     std::string text;
     while ((int) text.size() < 8 * (n_prefix + n_tail)) text += k_text;
     const int n = llama_tokenize(vocab, text.c_str(), text.size(), toks.data(), toks.size(), true, false);
@@ -151,14 +151,14 @@ int main(int argc, char ** argv) {
         run_result & r = res[wi];
         r.trace.tok.resize(n_tail);
         auto cp = llama_context_default_params();
-        cp.n_ctx = 1024; cp.n_batch = 512; cp.n_ubatch = 512; cp.n_seq_max = 1;
+        cp.n_ctx = std::max(1024, n_prefix + n_tail + 256); cp.n_batch = std::max(512, n_prefix); cp.n_ubatch = 512; cp.n_seq_max = 1;
         cp.n_threads = cp.n_threads_batch = 32;
         if (fa_off) cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
         if (trace) { cp.cb_eval = trace_cb; cp.cb_eval_user_data = &r.trace; }
         llama_context * ctx = llama_init_from_model(model, cp);
         if (!ctx) { return 1; }
 
-        llama_batch b = llama_batch_init(512, 0, 1);
+        llama_batch b = llama_batch_init(std::max(512, n_prefix), 0, 1);
         auto add = [&](int pos, bool logits) {
             b.token[b.n_tokens] = toks[pos]; b.pos[b.n_tokens] = pos; b.n_seq_id[b.n_tokens] = 1;
             b.seq_id[b.n_tokens][0] = 0; b.logits[b.n_tokens] = logits; b.n_tokens++;
