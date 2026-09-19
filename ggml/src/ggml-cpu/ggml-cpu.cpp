@@ -1,5 +1,6 @@
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
+#include "ggml-alloc.h"
 #include "ggml-cpu.h"
 #include "ggml-cpu-impl.h"
 #include "repack.h"
@@ -235,6 +236,11 @@ struct ggml_backend_cpu_context {
     int                 offload_cost_threads = 0;
     double              offload_memory_bytes_per_second = 0.0;
     double              offload_dot_operations_per_second[GGML_TYPE_COUNT] = {};
+    double              offload_mul_mat_id_operations_per_second[GGML_TYPE_COUNT] = {};
+    int64_t             offload_mul_mat_id_rows[GGML_TYPE_COUNT] = {};
+    int64_t             offload_mul_mat_id_cols[GGML_TYPE_COUNT] = {};
+    int64_t             offload_mul_mat_id_top_k[GGML_TYPE_COUNT] = {};
+    int64_t             offload_mul_mat_id_tokens[GGML_TYPE_COUNT] = {};
 };
 
 static const char * ggml_backend_cpu_get_name(ggml_backend_t backend) {
@@ -394,10 +400,87 @@ static double ggml_backend_cpu_measure_dot_throughput(enum ggml_type type) {
     return 2.0*n*iterations/seconds;
 }
 
+// Measure the actual routed-expert kernel using the already loaded weight tensor.
+// This preserves any CPU-specific packed layout and does not retain model data.
+static double ggml_backend_cpu_measure_mul_mat_id_throughput(
+        ggml_backend_t backend, const struct ggml_backend_cpu_context * cpu_ctx,
+        const struct ggml_tensor * op, const struct ggml_tensor * weight) {
+    if (op->op != GGML_OP_MUL_MAT_ID || !op->src[1] || !op->src[2] || weight->ne[2] <= 0) {
+        return 0.0;
+    }
+
+    const int64_t n_tokens = op->src[1]->ne[2];
+    const int64_t top_k = op->src[2]->ne[0];
+    if (n_tokens <= 0 || top_k <= 0) {
+        return 0.0;
+    }
+
+    const struct ggml_init_params params = {
+        /*.mem_size   =*/ 3*ggml_tensor_overhead() + ggml_graph_overhead_custom(8, false),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    struct ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        return 0.0;
+    }
+
+    struct ggml_tensor * b = ggml_new_tensor_3d(ctx, op->src[1]->type,
+            weight->ne[0], top_k, n_tokens);
+    struct ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, top_k, n_tokens);
+    struct ggml_tensor * result = ggml_mul_mat_id(ctx, const_cast<struct ggml_tensor *>(weight), b, ids);
+    struct ggml_cgraph * graph = ggml_new_graph_custom(ctx, 8, false);
+    ggml_build_forward_expand(graph, result);
+
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buffer) {
+        ggml_free(ctx);
+        return 0.0;
+    }
+
+    std::vector<uint8_t> zeros(std::max(ggml_nbytes(b), ggml_nbytes(result)), 0);
+    std::vector<int32_t> selected((size_t) top_k*n_tokens);
+    for (size_t i = 0; i < selected.size(); ++i) {
+        selected[i] = i % weight->ne[2];
+    }
+    ggml_backend_tensor_set(b, zeros.data(), 0, ggml_nbytes(b));
+    ggml_backend_tensor_set(ids, selected.data(), 0, ggml_nbytes(ids));
+
+    struct ggml_cplan plan = ggml_graph_plan(graph, cpu_ctx->n_threads, cpu_ctx->threadpool);
+    std::vector<uint8_t> work(plan.work_size);
+    plan.work_data = work.data();
+    plan.abort_callback = cpu_ctx->abort_callback;
+    plan.abort_callback_data = cpu_ctx->abort_callback_data;
+    plan.use_ref = cpu_ctx->use_ref;
+    if (ggml_graph_compute(graph, &plan) != GGML_STATUS_SUCCESS) {
+        ggml_backend_buffer_free(buffer);
+        ggml_free(ctx);
+        return 0.0;
+    }
+
+    const uint64_t operations = 2*(uint64_t) weight->ne[0]*weight->ne[1]*top_k*n_tokens;
+    double longest_seconds = 0.0;
+    for (int repetition = 0; repetition < 2; ++repetition) {
+        const auto before = std::chrono::steady_clock::now();
+        const enum ggml_status status = ggml_graph_compute(graph, &plan);
+        const auto after = std::chrono::steady_clock::now();
+        if (status != GGML_STATUS_SUCCESS) {
+            ggml_backend_buffer_free(buffer);
+            ggml_free(ctx);
+            return 0.0;
+        }
+        longest_seconds = std::max(longest_seconds, std::chrono::duration<double>(after - before).count());
+    }
+
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    const double throughput = longest_seconds > 0.0 ? operations/longest_seconds : 0.0;
+    return throughput;
+}
+
 static bool ggml_backend_cpu_get_op_cost(
         ggml_backend_t backend, const struct ggml_tensor * op, const struct ggml_tensor * weight,
         uint64_t operations, uint64_t active_weight_bytes, struct ggml_backend_op_cost * cost) {
-    GGML_UNUSED(op);
     if (operations == 0 || active_weight_bytes == 0) {
         return false;
     }
@@ -410,6 +493,12 @@ static bool ggml_backend_cpu_get_op_cost(
         if (cpu_ctx->offload_cost_threads != n_threads || cpu_ctx->offload_memory_bytes_per_second <= 0.0) {
             cpu_ctx->offload_memory_bytes_per_second = ggml_backend_cpu_measure_memory_bandwidth(n_threads);
             cpu_ctx->offload_cost_threads = n_threads;
+            std::memset(cpu_ctx->offload_mul_mat_id_operations_per_second, 0,
+                    sizeof(cpu_ctx->offload_mul_mat_id_operations_per_second));
+            std::memset(cpu_ctx->offload_mul_mat_id_rows, 0, sizeof(cpu_ctx->offload_mul_mat_id_rows));
+            std::memset(cpu_ctx->offload_mul_mat_id_cols, 0, sizeof(cpu_ctx->offload_mul_mat_id_cols));
+            std::memset(cpu_ctx->offload_mul_mat_id_top_k, 0, sizeof(cpu_ctx->offload_mul_mat_id_top_k));
+            std::memset(cpu_ctx->offload_mul_mat_id_tokens, 0, sizeof(cpu_ctx->offload_mul_mat_id_tokens));
             GGML_LOG_INFO("CPU offload calibration: threads = %d, memory = %.2f GB/s\n",
                     n_threads, cpu_ctx->offload_memory_bytes_per_second/1.0e9);
         }
@@ -421,9 +510,27 @@ static bool ggml_backend_cpu_get_op_cost(
                     cpu_ctx->offload_dot_operations_per_second[weight->type]/1.0e9);
         }
         dot_operations_per_second = cpu_ctx->offload_dot_operations_per_second[weight->type];
+        if (op->op == GGML_OP_MUL_MAT_ID &&
+                (cpu_ctx->offload_mul_mat_id_operations_per_second[weight->type] <= 0.0 ||
+                 cpu_ctx->offload_mul_mat_id_rows[weight->type] != weight->ne[0] ||
+                 cpu_ctx->offload_mul_mat_id_cols[weight->type] != weight->ne[1] ||
+                 cpu_ctx->offload_mul_mat_id_top_k[weight->type] != op->src[2]->ne[0] ||
+                 cpu_ctx->offload_mul_mat_id_tokens[weight->type] != op->src[1]->ne[2])) {
+            cpu_ctx->offload_mul_mat_id_operations_per_second[weight->type] =
+                    ggml_backend_cpu_measure_mul_mat_id_throughput(backend, cpu_ctx, op, weight);
+            cpu_ctx->offload_mul_mat_id_rows[weight->type] = weight->ne[0];
+            cpu_ctx->offload_mul_mat_id_cols[weight->type] = weight->ne[1];
+            cpu_ctx->offload_mul_mat_id_top_k[weight->type] = op->src[2]->ne[0];
+            cpu_ctx->offload_mul_mat_id_tokens[weight->type] = op->src[1]->ne[2];
+            GGML_LOG_INFO("CPU offload calibration: type = %s, MUL_MAT_ID = %.2f GOPS\n",
+                    ggml_type_name(weight->type),
+                    cpu_ctx->offload_mul_mat_id_operations_per_second[weight->type]/1.0e9);
+        }
     }
 
-    if (dot_operations_per_second <= 0.0) {
+    if (dot_operations_per_second <= 0.0 &&
+            !(op->op == GGML_OP_MUL_MAT_ID &&
+              cpu_ctx->offload_mul_mat_id_operations_per_second[weight->type] > 0.0)) {
         return false;
     }
 
@@ -431,10 +538,16 @@ static bool ggml_backend_cpu_get_op_cost(
     // the memory calibration limits it when the full expert working set must come from RAM.
     const double arithmetic_intensity = (double) operations/active_weight_bytes;
     const double memory_limit = cpu_ctx->offload_memory_bytes_per_second*arithmetic_intensity;
-    const double compute_limit = n_threads*dot_operations_per_second;
+    const double mul_mat_id_operations_per_second = op->op == GGML_OP_MUL_MAT_ID ?
+            cpu_ctx->offload_mul_mat_id_operations_per_second[weight->type] : 0.0;
+    const double compute_limit = mul_mat_id_operations_per_second > 0.0 ?
+            mul_mat_id_operations_per_second : n_threads*dot_operations_per_second;
 
     *cost = {};
-    cost->operations_per_second = std::min(memory_limit, compute_limit);
+    // MUL_MAT_ID has an operation-family calibration with its routed tile shape.
+    // Do not replace that measurement with the generic memcpy roofline.
+    cost->operations_per_second = mul_mat_id_operations_per_second > 0.0 ?
+            compute_limit : std::min(memory_limit, compute_limit);
     cost->numa_node = -1;
     cost->calibrated = 1;
     return cost->operations_per_second > 0.0;
