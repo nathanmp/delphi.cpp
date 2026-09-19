@@ -88,7 +88,8 @@ static const char * k_text =
     "market. The plans were redrawn twice before the first contract was signed.";
 
 int main(int argc, char ** argv) {
-    std::string model_path, dev = "none", widths_s = "1,2,3,4";
+    std::string model_path, dev = "none", widths_s = "1,2,3,4,5,6,7,8";
+    std::vector<std::string> ot; // tensor-name regexes kept on the CPU
     int  n_prefix = 64, n_tail = 12;
     bool trace = false, fa_off = false;
     for (int i = 1; i < argc; i++) {
@@ -100,7 +101,8 @@ int main(int argc, char ** argv) {
         else if (a == "-nt" && i + 1 < argc) n_tail = atoi(argv[++i]);
         else if (a == "--trace") trace = true;
         else if (a == "--fa-off") fa_off = true;
-        else { fprintf(stderr, "usage: %s -m model [-dev ROCm1|none] [-w 1,2,3,4] [-np 64] [-nt 12] [--trace] [--fa-off]\n", argv[0]); return 1; }
+        else if (a == "-ot" && i + 1 < argc) ot.push_back(argv[++i]);
+        else { fprintf(stderr, "usage: %s -m model [-dev ROCm1,ROCm2|none] [-ot regex]... [-w 1,2,...,8] [-np 64] [-nt 12] [--trace] [--fa-off]\n", argv[0]); return 1; }
     }
     std::vector<int> widths;
     for (size_t p = 0; p < widths_s.size();) {
@@ -112,15 +114,26 @@ int main(int argc, char ** argv) {
     llama_log_set([](ggml_log_level l, const char * t, void *) { if (l >= GGML_LOG_LEVEL_ERROR) fputs(t, stderr); }, nullptr);
     llama_backend_init();
     auto mp = llama_model_default_params();
-    ggml_backend_dev_t devs[2] = { nullptr, nullptr };
+    std::vector<ggml_backend_dev_t> devs;
     if (dev != "none") {
-        devs[0] = ggml_backend_dev_by_name(dev.c_str());
-        if (!devs[0]) { fprintf(stderr, "no device %s\n", dev.c_str()); return 1; }
+        for (size_t p = 0; p < dev.size();) {
+            size_t e = dev.find(',', p);
+            e = e == std::string::npos ? dev.size() : e;
+            const std::string name = dev.substr(p, e - p);
+            devs.push_back(ggml_backend_dev_by_name(name.c_str()));
+            if (!devs.back()) { fprintf(stderr, "no device %s\n", name.c_str()); return 1; }
+            p = e + 1;
+        }
         mp.n_gpu_layers = 999;
     } else {
         mp.n_gpu_layers = 0;
     }
-    mp.devices = devs;
+    devs.push_back(nullptr);
+    mp.devices = devs.data();
+    std::vector<llama_model_tensor_buft_override> ovr;
+    for (auto & o : ot) ovr.push_back({ o.c_str(), ggml_backend_dev_buffer_type(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) });
+    ovr.push_back({ nullptr, nullptr });
+    if (!ot.empty()) mp.tensor_buft_overrides = ovr.data();
     llama_model * model = llama_model_load_from_file(model_path.c_str(), mp);
     if (!model) { return 1; }
     const llama_vocab * vocab = llama_model_get_vocab(model);

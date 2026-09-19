@@ -1149,7 +1149,7 @@ template <int DKQ, int DV, int ncols2, bool use_logit_softcap>
 static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
     // spec-invariant: tile as for one query
-    const int64_t ne1_sel = ggml_cuda_spec_invariant() && Q->ne[1] <= 4 ? 1 : Q->ne[1];
+    const int64_t ne1_sel = ggml_cuda_spec_inv(Q->ne[1]) ? 1 : Q->ne[1];
 
     const int id        = ggml_cuda_get_device();
     const int cc        = ggml_cuda_info().devices[id].cc;

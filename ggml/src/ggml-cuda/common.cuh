@@ -49,6 +49,11 @@ static bool ggml_cuda_spec_invariant() {
     return v;
 }
 
+// covers verify batches up to 8 tokens (draft n_max <= 7)
+static bool ggml_cuda_spec_inv(int64_t n_tokens) {
+    return n_tokens <= 8 && ggml_cuda_spec_invariant();
+}
+
 #define STRINGIZE_IMPL(...) #__VA_ARGS__
 #define STRINGIZE(...) STRINGIZE_IMPL(__VA_ARGS__)
 

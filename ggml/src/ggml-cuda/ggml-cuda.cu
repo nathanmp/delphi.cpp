@@ -3208,7 +3208,7 @@ static bool ggml_cuda_match_moe_weighted_reduction(
     // existing chain of vector operations. Keep the fusion for multi-token
     // prefill and speculative verification batches.
     if (n_expert_used < 2 || n_expert_used > MOE_WEIGHTED_REDUCTION_MAX_EXPERTS ||
-            (n_tokens <= 1 && !allow_single_token) || (n_tokens <= 4 && ggml_cuda_spec_invariant())) {
+            (n_tokens <= 1 && !allow_single_token) || ggml_cuda_spec_inv(n_tokens)) {
         return false;
     }
 

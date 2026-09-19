@@ -543,7 +543,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel_impl(const int device, 
 
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
-    if (ggml_cuda_spec_invariant() && Q->ne[1] >= 2 && Q->ne[1] <= 4) {
+    if (Q->ne[1] >= 2 && ggml_cuda_spec_inv(Q->ne[1])) {
         // pick what a single query would get
         ggml_tensor q1 = *Q;
         q1.ne[1] = 1;
