@@ -4794,6 +4794,19 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 }
             }
 
+            // keep the router logits live through the topk-moe chain: whether it fuses must not depend on the allocation
+            if (cgraph->nodes[i]->op == GGML_OP_UNARY || cgraph->nodes[i]->op == GGML_OP_SOFT_MAX ||
+                    cgraph->nodes[i]->op == GGML_OP_ARGSORT) {
+                ggml_cuda_topk_moe_args args;
+                if (ggml_cuda_topk_moe_fusion(cgraph, i, args)) {
+                    const int n = args.delayed_softmax ? 6 :
+                        (args.sqrt_softplus ? 2 : 1) + (args.prob_bias ? 5 : 4) + (args.norm ? 5 : 0) + (args.scale ? 1 : 0);
+                    if (i + n <= cgraph->n_nodes && cgraph->nodes[i]->src[0]->op != GGML_OP_NONE) {
+                        params->add_alloc_dep(params->user_data, cgraph->nodes[i]->src[0], cgraph->nodes[i + n - 1]);
+                    }
+                }
+            }
+
             if (cgraph->nodes[i]->op != GGML_OP_MUL) {
                 continue;
             }
