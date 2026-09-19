@@ -41,6 +41,14 @@
 #include "vendors/cuda.h"
 #endif // defined(GGML_USE_HIP)
 
+#include <cstdlib>
+
+// GGML_CUDA_SPEC_INVARIANT: small batches (speculative verify) reproduce the per-token results of a 1-token decode.
+static bool ggml_cuda_spec_invariant() {
+    static const bool v = getenv("GGML_CUDA_SPEC_INVARIANT") != nullptr;
+    return v;
+}
+
 #define STRINGIZE_IMPL(...) #__VA_ARGS__
 #define STRINGIZE(...) STRINGIZE_IMPL(__VA_ARGS__)
 
