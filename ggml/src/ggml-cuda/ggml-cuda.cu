@@ -2647,16 +2647,19 @@ static void ggml_cuda_graph_hash(uint64_t & hash, const void * data, size_t size
 
 static uint64_t ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
     uint64_t hash = 14695981039346656037ULL;
-    const uintptr_t anchor = reinterpret_cast<uintptr_t>(cgraph->nodes[0]);
-    ggml_cuda_graph_hash(hash, &anchor, sizeof(anchor));
 
     static const bool shape_cache = [] {
         const char * env = std::getenv("GGML_CUDA_GRAPH_SHAPE_CACHE");
         return env == nullptr || std::atoi(env) != 0;
     }();
     if (!shape_cache) {
+        const uintptr_t anchor = reinterpret_cast<uintptr_t>(cgraph->nodes[0]);
+        ggml_cuda_graph_hash(hash, &anchor, sizeof(anchor));
         return hash;
     }
+
+    // Shape-cache reuse validates all tensor properties before replay. A graph-object
+    // address only fragments that cache when tracing changes allocation timing.
 
     ggml_cuda_graph_hash(hash, &cgraph->n_nodes, sizeof(cgraph->n_nodes));
     for (int i = 0; i < cgraph->n_nodes; ++i) {
