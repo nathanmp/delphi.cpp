@@ -1600,7 +1600,14 @@ common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
     tmp.push_back(0);
     tmp.push_back(0);
 
-    int ret = llama_decode(ctx, llama_batch_get_one(tmp.data(), tmp.size()));
+    // an MTP draft context reads a hidden state per token as well, and its graph asserts without one.
+    // every other context ignores embd_h, and only the removal result is used here, so zeros are enough.
+    std::vector<float> tmp_h((size_t) tmp.size() * llama_model_n_embd_out(llama_get_model(ctx)), 0.0f);
+
+    llama_batch tmp_batch = llama_batch_get_one(tmp.data(), tmp.size());
+    tmp_batch.embd_h = tmp_h.data();
+
+    int ret = llama_decode(ctx, tmp_batch);
     if (ret != 0) {
         COM_ERR("llama_decode() failed: %d\n", ret);
         res = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
