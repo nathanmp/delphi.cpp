@@ -1780,7 +1780,11 @@ struct clip_model_loader {
                         hparams.image_resize_algo = RESIZE_ALGO_BILINEAR;
                         get_u32(KEY_SPATIAL_MERGE_SIZE, hparams.n_merge, false);
                         // drives the clamp in both the per-block MLP and the merger
-                        get_f32(KEY_VISION_SWIGLU_LIMIT, hparams.swiglu_limit);
+                        get_f32(KEY_VISION_SWIGLU_LIMIT, hparams.swiglu_limit, false);
+                        get_f32(KEY_VISION_SWIGLU_CLAMP, hparams.swiglu_limit, false);
+                        if (hparams.swiglu_limit <= 0.0f) {
+                            throw std::runtime_error("GLM5Next vision model has no valid SwiGLU clamp");
+                        }
                         hparams.ffn_op = FFN_SILU_CLAMP;
                         log_ffn_op = "silu_clamp";
                         // min_pixels/max_pixels of the GLM-5.3-Flash preprocessor, in tokens
