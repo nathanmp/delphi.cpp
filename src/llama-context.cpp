@@ -603,6 +603,12 @@ void llama_context::sched_reserve() {
 
     synchronize();
 
+    // Backend placement can depend on CPU throughput. Configure the batch thread
+    // count before the scheduler assigns the reserve graphs, not only before it
+    // executes them. Otherwise the first graph uses the backend default and its
+    // placement can be cached for the whole context.
+    set_backend_n_threads(cparams.n_threads_batch);
+
     const int64_t t_start_us = ggml_time_us();
 
     const uint32_t n_seqs = cparams.n_seq_max;
@@ -1671,6 +1677,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     auto * res = get_gf_res_prev();
     auto * gf  = res->get_gf();
+
+    set_backend_n_threads(ubatch.n_tokens > 1 ? cparams.n_threads_batch : cparams.n_threads);
 
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
@@ -2930,10 +2938,7 @@ ggml_status llama_context::graph_compute(
         }
     }
 
-    // set the number of threads for all the backends
-    for (const auto & set_n_threads_fn : set_n_threads_fns) {
-        set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
-    }
+    set_backend_n_threads(n_threads);
 
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
@@ -2943,6 +2948,21 @@ ggml_status llama_context::graph_compute(
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
 
     return status;
+}
+
+void llama_context::set_backend_n_threads(int n_threads) {
+    if (backend_n_threads == n_threads) {
+        return;
+    }
+
+    for (const auto & set_n_threads_fn : set_n_threads_fns) {
+        set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
+    }
+    backend_n_threads = n_threads;
+
+    // A graph assigned with a different CPU thread count has stale placement
+    // costs. Make the next evaluation rebuild it with the new calibration.
+    gf_res_prev_active = nullptr;
 }
 
 llm_graph_cb llama_context::graph_get_cb() const {

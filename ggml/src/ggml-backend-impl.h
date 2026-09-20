@@ -118,6 +118,19 @@ extern "C" {
         void * user_data;
     };
 
+    struct ggml_backend_op_cost {
+        double operations_per_second;
+        double h2d_bytes_per_second;
+        double d2h_bytes_per_second;
+        uint64_t fixed_ns;
+        int32_t numa_node;
+        uint32_t calibrated;
+    };
+
+    typedef bool (*ggml_backend_get_op_cost_t)(
+            ggml_backend_t backend, const struct ggml_tensor * op, const struct ggml_tensor * weight,
+            uint64_t operations, uint64_t active_weight_bytes, struct ggml_backend_op_cost * cost);
+
     struct ggml_backend_i {
         const char * (*get_name)(ggml_backend_t backend);
 

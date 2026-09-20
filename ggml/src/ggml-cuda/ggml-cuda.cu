@@ -81,11 +81,13 @@
 #include <array>
 #include <atomic>
 #include <charconv>
+#include <chrono>
 #include <cinttypes>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cfloat>
+#include <cstring>
 #include <initializer_list>
 #include <limits>
 #include <map>
@@ -96,6 +98,13 @@
 #include <cstdlib>
 #include <string>
 #include <vector>
+
+#if defined(__linux__)
+#include <linux/mempolicy.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 
@@ -2638,16 +2647,19 @@ static void ggml_cuda_graph_hash(uint64_t & hash, const void * data, size_t size
 
 static uint64_t ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
     uint64_t hash = 14695981039346656037ULL;
-    const uintptr_t anchor = reinterpret_cast<uintptr_t>(cgraph->nodes[0]);
-    ggml_cuda_graph_hash(hash, &anchor, sizeof(anchor));
 
     static const bool shape_cache = [] {
         const char * env = std::getenv("GGML_CUDA_GRAPH_SHAPE_CACHE");
         return env == nullptr || std::atoi(env) != 0;
     }();
     if (!shape_cache) {
+        const uintptr_t anchor = reinterpret_cast<uintptr_t>(cgraph->nodes[0]);
+        ggml_cuda_graph_hash(hash, &anchor, sizeof(anchor));
         return hash;
     }
+
+    // Shape-cache reuse validates all tensor properties before replay. A graph-object
+    // address only fragments that cache when tracing changes allocation timing.
 
     ggml_cuda_graph_hash(hash, &cgraph->n_nodes, sizeof(cgraph->n_nodes));
     for (int i = 0; i < cgraph->n_nodes; ++i) {
@@ -5069,6 +5081,185 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     }
 }
 
+static int ggml_backend_cuda_pointer_numa_node(const void * pointer) {
+#if defined(__linux__)
+    int node = -1;
+    if (syscall(SYS_get_mempolicy, &node, nullptr, 0, pointer, MPOL_F_NODE | MPOL_F_ADDR) == 0) {
+        return node;
+    }
+#else
+    GGML_UNUSED(pointer);
+#endif
+    return -1;
+}
+
+static std::vector<std::pair<int, int>> ggml_backend_cuda_tensor_numa_nodes(const ggml_tensor * tensor) {
+    std::unordered_map<int, int> counts;
+    const size_t size = ggml_nbytes(tensor);
+    const int samples = size > 0 ? 64 : 1;
+    for (int sample = 0; sample < samples; ++sample) {
+        const size_t offset = size > 1 ? (size - 1)*(size_t) sample/(samples - 1) : 0;
+        const int node = ggml_backend_cuda_pointer_numa_node((const char *) tensor->data + offset);
+        counts[node]++;
+    }
+    return std::vector<std::pair<int, int>>(counts.begin(), counts.end());
+}
+
+static void * ggml_backend_cuda_numa_alloc(size_t size, int node, bool * bound) {
+    *bound = false;
+#if defined(__linux__)
+    void * pointer = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (pointer == MAP_FAILED) {
+        return nullptr;
+    }
+    if (node >= 0) {
+        const size_t bits = 8*sizeof(unsigned long);
+        std::vector<unsigned long> mask((node + bits)/bits, 0);
+        mask[node/bits] |= 1ul << (node % bits);
+        const unsigned long maxnode = mask.size()*bits;
+        *bound = syscall(SYS_mbind, pointer, size, MPOL_BIND, mask.data(), maxnode, 0) == 0;
+    }
+    return pointer;
+#else
+    GGML_UNUSED(node);
+    return std::malloc(size);
+#endif
+}
+
+static void ggml_backend_cuda_numa_free(void * pointer, size_t size) {
+#if defined(__linux__)
+    munmap(pointer, size);
+#else
+    GGML_UNUSED(size);
+    std::free(pointer);
+#endif
+}
+
+static double ggml_backend_cuda_measure_copy(
+        void * dst, const void * src, size_t size, enum cudaMemcpyKind kind, cudaStream_t stream) {
+    CUDA_CHECK(cudaMemcpyAsync(dst, src, size, kind, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    double best = 0.0;
+    for (int repetition = 0; repetition < 2; ++repetition) {
+        const auto before = std::chrono::steady_clock::now();
+        CUDA_CHECK(cudaMemcpyAsync(dst, src, size, kind, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        const auto after = std::chrono::steady_clock::now();
+        const double seconds = std::chrono::duration<double>(after - before).count();
+        best = std::max(best, size/seconds);
+    }
+    return best;
+}
+
+static bool ggml_backend_cuda_calibrate_offload(
+        ggml_backend_cuda_context * cuda_ctx, int numa_node, ggml_cuda_offload_calibration * calibration) {
+    const size_t size = 64u*1024u*1024u;
+    bool bound = false;
+    void * host = ggml_backend_cuda_numa_alloc(size, numa_node, &bound);
+    if (!host) {
+        return false;
+    }
+    std::memset(host, 0x5a, size);
+
+    bool registered = false;
+    if (getenv("GGML_CUDA_REGISTER_HOST") != nullptr) {
+        const cudaError_t error = cudaHostRegister(host, size, cudaHostRegisterPortable);
+        registered = error == cudaSuccess;
+        if (!registered) {
+            (void) cudaGetLastError();
+        }
+    }
+
+    ggml_cuda_set_device(cuda_ctx->device);
+    void * device_a = nullptr;
+    void * device_b = nullptr;
+    cudaError_t error_a = cudaMalloc(&device_a, size);
+    cudaError_t error_b = error_a == cudaSuccess ? cudaMalloc(&device_b, size) : error_a;
+    if (error_a != cudaSuccess || error_b != cudaSuccess) {
+        (void) cudaGetLastError();
+        if (device_a) {
+            (void) cudaFree(device_a);
+        }
+        if (registered) {
+            (void) cudaHostUnregister(host);
+        }
+        ggml_backend_cuda_numa_free(host, size);
+        return false;
+    }
+
+    cudaStream_t stream = cuda_ctx->stream();
+    calibration->h2d_bytes_per_second = ggml_backend_cuda_measure_copy(device_a, host, size, cudaMemcpyHostToDevice, stream);
+    calibration->d2h_bytes_per_second = ggml_backend_cuda_measure_copy(host, device_a, size, cudaMemcpyDeviceToHost, stream);
+    calibration->device_bytes_per_second = 2.0*ggml_backend_cuda_measure_copy(device_b, device_a, size, cudaMemcpyDeviceToDevice, stream);
+    calibration->numa_node = numa_node;
+
+    CUDA_CHECK(cudaFree(device_b));
+    CUDA_CHECK(cudaFree(device_a));
+    if (registered) {
+        CUDA_CHECK(cudaHostUnregister(host));
+    }
+    ggml_backend_cuda_numa_free(host, size);
+
+    GGML_LOG_INFO("%s offload calibration: NUMA node = %d%s, H2D = %.2f GB/s, D2H = %.2f GB/s, device = %.2f GB/s\n",
+            cuda_ctx->name.c_str(), numa_node, numa_node >= 0 && !bound ? " (binding unavailable)" : "",
+            calibration->h2d_bytes_per_second/1.0e9, calibration->d2h_bytes_per_second/1.0e9,
+            calibration->device_bytes_per_second/1.0e9);
+    return calibration->h2d_bytes_per_second > 0.0 && calibration->d2h_bytes_per_second > 0.0 &&
+            calibration->device_bytes_per_second > 0.0;
+}
+
+static bool ggml_backend_cuda_get_op_cost(
+        ggml_backend_t backend, const struct ggml_tensor * op, const struct ggml_tensor * weight,
+        uint64_t operations, uint64_t active_weight_bytes, struct ggml_backend_op_cost * cost) {
+    if (operations == 0 || active_weight_bytes == 0 ||
+            (op->op != GGML_OP_MUL_MAT && op->op != GGML_OP_MUL_MAT_ID)) {
+        return false;
+    }
+
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    const std::vector<std::pair<int, int>> numa_nodes = ggml_backend_cuda_tensor_numa_nodes(weight);
+    ggml_cuda_offload_calibration calibration = {};
+    int n_samples = 0;
+    double h2d_seconds_per_byte = 0.0;
+    double d2h_seconds_per_byte = 0.0;
+    {
+        std::lock_guard<std::mutex> lock(cuda_ctx->offload_calibration_mutex);
+        for (const auto & [numa_node, count] : numa_nodes) {
+            auto found = cuda_ctx->offload_calibrations.find(numa_node);
+            if (found == cuda_ctx->offload_calibrations.end()) {
+                ggml_cuda_offload_calibration node_calibration;
+                if (!ggml_backend_cuda_calibrate_offload(cuda_ctx, numa_node, &node_calibration)) {
+                    return false;
+                }
+                found = cuda_ctx->offload_calibrations.emplace(numa_node, node_calibration).first;
+            }
+            n_samples += count;
+            h2d_seconds_per_byte += count/found->second.h2d_bytes_per_second;
+            d2h_seconds_per_byte += count/found->second.d2h_bytes_per_second;
+            calibration.device_bytes_per_second = std::max(
+                    calibration.device_bytes_per_second, found->second.device_bytes_per_second);
+        }
+    }
+    calibration.h2d_bytes_per_second = n_samples/h2d_seconds_per_byte;
+    calibration.d2h_bytes_per_second = n_samples/d2h_seconds_per_byte;
+    calibration.numa_node = numa_nodes.size() == 1 ? numa_nodes[0].first : -1;
+
+    const double arithmetic_intensity = (double) operations/active_weight_bytes;
+    const double memory_limit = 0.45*calibration.device_bytes_per_second*arithmetic_intensity;
+    const double compute_limit = 300.0e9*ggml_cuda_info().devices[cuda_ctx->device].nsm;
+
+    *cost = {};
+    cost->operations_per_second = std::min(memory_limit, compute_limit);
+    // The selected-expert path uses several transfers. Keep headroom relative to the bulk calibration.
+    cost->h2d_bytes_per_second = 0.85*calibration.h2d_bytes_per_second;
+    cost->d2h_bytes_per_second = 0.85*calibration.d2h_bytes_per_second;
+    cost->fixed_ns = 20000;
+    cost->numa_node = calibration.numa_node;
+    cost->calibrated = 1;
+    return cost->operations_per_second > 0.0;
+}
+
 static const ggml_backend_i ggml_backend_cuda_interface = {
     /* .get_name                = */ ggml_backend_cuda_get_name,
     /* .free                    = */ ggml_backend_cuda_free,
@@ -6006,6 +6197,9 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_get_op_cost") == 0) {
+        return (void *) ggml_backend_cuda_get_op_cost;
+    }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }

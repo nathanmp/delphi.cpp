@@ -51,6 +51,20 @@ enum ggml_exec_trace_event_kind {
     // GPU_TIMING_EPOCH closes a group of GPU_TIMING spans that share one anchor event. timestamp_ns is the host enqueue time of the anchor, args[0] is the host time when
     // completion was known, args[1] is the epoch ID, args[2] is the span count, and args[3] is the completion source.
     GGML_EXEC_TRACE_EVENT_GPU_TIMING_EPOCH,
+    // OFFLOAD_DECISION stores CPU compute, CPU transfer, candidate compute, and candidate transfer
+    // nanoseconds in args[0..3].
+    // backend_id/device_id identify the candidate. flags is the selected side.
+    GGML_EXEC_TRACE_EVENT_OFFLOAD_DECISION,
+    // OFFLOAD_BYTES stores candidate weight H2D bytes, CPU input D2H bytes, CPU output H2D bytes, and operation count in args[0..3].
+    GGML_EXEC_TRACE_EVENT_OFFLOAD_BYTES,
+    // OFFLOAD_CALIBRATION stores CPU operations/s, candidate operations/s, H2D bytes/s, and D2H bytes/s
+    // in args[0..3]. flags is NUMA node + 1, or zero if unknown.
+    GGML_EXEC_TRACE_EVENT_OFFLOAD_CALIBRATION,
+};
+
+enum ggml_exec_trace_offload_choice {
+    GGML_EXEC_TRACE_OFFLOAD_CPU = 1,
+    GGML_EXEC_TRACE_OFFLOAD_CANDIDATE,
 };
 
 // Timing provenance. Host spans are HOST_SAFE. VENDOR_EXTERNAL marks offline profiler data and never appears in a raw trace.
