@@ -984,8 +984,8 @@ class DeepseekV4DSparkModel(DeepseekV4Model):
             return None
         return super().filter_tensors((cls._rekey_mtp_tensor_name(name), gen))
 
-    @staticmethod
-    def _rekey_mtp_tensor_name(name: str) -> str:
+    @classmethod
+    def _rekey_mtp_tensor_name(cls, name: str) -> str:
         match = re.match(r"mtp\.(\d+)\.(.+)$", name)
         if match is None:
             raise ValueError(f"Unexpected DSpark tensor {name!r}")
@@ -998,7 +998,7 @@ class DeepseekV4DSparkModel(DeepseekV4Model):
             "hc_head_base",
             "hc_head_scale",
         )
-        if rest in DeepseekV4DSparkModel._DSPARK_ROOT_MAP or rest in root_names:
+        if rest in cls._DSPARK_ROOT_MAP or rest in root_names:
             return rest
         return f"layers.{stage}.{rest}"
 
@@ -1513,3 +1513,49 @@ class DeepseekV41Model(DeepseekV4Model):
             if tensor_name in v41_only:
                 return v41_only[tensor_name]
         return super()._map_dsv4_tensor_name(name, bid)
+
+
+class DeepseekV41DSparkModel(DeepseekV4DSparkModel, DeepseekV41Model):
+    """The V4.1 DSpark draft: three full V4.1 blocks under mtp.*, exported as a DFLASH model.
+
+    Same layout as DeepseekV4DSparkModel with the V4.1 names for the two Markov head matrices.
+    The block has no hc_head weights, because V4.1 collapses the hyper-connection copies with
+    the mix the last ffn produced, and it has no per-head q norm. dsv41_semantics is what tells
+    the C++ side to run the draft the same way it runs the main V4.1 model.
+
+    Like every DSpark stage, only the first stage carries main_proj/main_norm and only the last
+    carries norm/markov_head/confidence_head; the reference builds them that way.
+    """
+
+    model_arch = gguf.MODEL_ARCH.DFLASH
+
+    _DSPARK_ROOT_MAP: dict[str, tuple[gguf.MODEL_TENSOR, str]] = {
+        "main_proj.weight": (gguf.MODEL_TENSOR.FC, ".weight"),
+        "main_norm.weight": (gguf.MODEL_TENSOR.ENC_OUTPUT_NORM, ".weight"),
+        "markov_head.embed.weight": (gguf.MODEL_TENSOR.DSPARK_MARKOV_W1, ".weight"),
+        "markov_head.head.weight": (gguf.MODEL_TENSOR.DSPARK_MARKOV_W2, ".weight"),
+        "confidence_head.proj.weight": (gguf.MODEL_TENSOR.DSPARK_CONF_PROJ, ".weight"),
+    }
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # the draft routes over its own, smaller pool (128 experts, 3 used); the expert count
+        # and the MXFP4 writer both read these two keys
+        self.hparams["n_routed_experts"] = self.hparams["dspark_n_routed_experts"]
+        self.hparams["num_experts_per_tok"] = self.hparams["dspark_num_experts_per_tok"]
+
+        # the draft has no engram tables: dropping the ids stops both the table writer and the
+        # engram metadata block, which would otherwise ask for keys the draft does not describe
+        self.hparams.pop("engram_layer_ids", None)
+
+    def set_gguf_parameters(self):
+        # the V4 keys only: the V4.1 additions (engram, indexer sources) describe the target
+        DeepseekV4Model.set_gguf_parameters(self)
+
+        self.gguf_writer.add_block_size(self.hparams["dspark_block_size"])
+        # the reference takes h.mean(dim=2) BEFORE running a target layer, and t_layer_inp[il]
+        # in deepseek4.cpp is the input of layer il, so the ids go through as they are. V4 takes
+        # the mean after the layer, which is why its exporter adds one.
+        self.gguf_writer.add_target_layers([int(v) for v in self.hparams["dspark_target_layer_ids"]])
+        self.gguf_writer.add_bool(f"{gguf.MODEL_ARCH_NAMES[self.model_arch]}.dsv41_semantics", True)
