@@ -415,6 +415,13 @@ static double ggml_backend_cpu_measure_mul_mat_id_throughput(
         return 0.0;
     }
 
+    // Calibration runs during graph reserve, before lazy weights are resident.
+    // Reading weight data here would fault on NULL and crash. Skip the direct
+    // measurement and fall back to the vector-dot estimate.
+    if (!weight->data) {
+        return 0.0;
+    }
+
     const struct ggml_init_params params = {
         /*.mem_size   =*/ 3*ggml_tensor_overhead() + ggml_graph_overhead_custom(8, false),
         /*.mem_buffer =*/ NULL,
