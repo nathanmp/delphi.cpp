@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cinttypes>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <memory>
 #include <stdexcept>
@@ -736,6 +737,30 @@ static bool dsv41_compact_attn_enabled(
     return mode >= 2 || (n_stream == 1 && n_comp >= 2*n_selected);
 }
 
+// DSpark verification issues a few queries per stream, and each query selects different
+// compressed rows, so one shared compact K/V tensor is not valid. The batch is tiny, so
+// materialize one compact K/V per query instead. Prefill has far too many queries for one
+// attention call per query; it stays on the dense fallback.
+//
+// Mode 3 forces this path wherever the query count fits. Unlike decode there is no
+// profitability heuristic: at short context the extra attention calls can cost more than
+// they save, while at long context they win by a wide margin. Compare mode 0 against
+// mode 3 at the target context length instead.
+static bool dsv41_verify_compact_enabled(
+        int64_t n_query,
+        int64_t n_stream) {
+    const char * env = std::getenv("LLAMA_DSV41_COMPACT_ATTN");
+    const int mode = env ? std::atoi(env) : 1;
+
+    if (mode < 3 || n_stream < 1 || n_query % n_stream != 0) {
+        return false;
+    }
+
+    const int64_t n_tps = n_query/n_stream;
+
+    return n_tps >= 2 && n_tps <= 16;
+}
+
 // DeepSeek-V4.1 attention: a sliding window of raw KV, plus, where the layer uses one, the
 // compressed positions the indexer picked, concatenated into a single masked attention.
 //
@@ -937,10 +962,13 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
     const int64_t n_stream = raw_k->ne[3];
     const bool use_compact = top_k != nullptr && cparams.flash_attn &&
             dsv41_compact_attn_enabled(n_comp, top_k->ne[0], nt, n_stream);
+    const bool use_verify_compact = !use_compact && top_k != nullptr && cparams.flash_attn &&
+            dsv41_verify_compact_enabled(nt, n_stream);
 
     if (use_compact) {
         const int64_t n_raw = raw_k->ne[2];
         const int64_t n_selected = top_k->ne[0];
+        const int64_t n_compact = n_raw + n_selected;
 
         GGML_ASSERT(raw_mask->ne[0] == n_raw && raw_mask->ne[1] == 1 &&
                 raw_mask->ne[2] == 1 && raw_mask->ne[3] == n_stream);
@@ -978,7 +1006,79 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
         cb(compact_mask, "kq_compact_mask", il);
 
         out = build_attn_mha(q, compact_k, compact_k, nullptr, compact_mask, layer.attn_sinks,
-                nullptr, 0, kq_scale, il);
+                nullptr, n_compact, kq_scale, il);
+    } else if (use_verify_compact) {
+        // Each query selects different compressed rows, so materialize one compact K/V
+        // per query with the decode gather pattern and run one ordinary attention per
+        // query. The raw window is shared per stream; only the selected rows differ.
+        // Per-query causality already lives in the per-query mask columns, and the
+        // fill-entry validity rule from the decode path applies unchanged.
+        const int64_t n_raw = raw_k->ne[2];
+        const int64_t n_selected = top_k->ne[0];
+        const int64_t n_tps = nt/n_stream;
+        const int64_t n_compact = n_raw + n_selected;
+
+        GGML_ASSERT(nt == n_tps*n_stream);
+        GGML_ASSERT(top_k->ne[1] == n_tps && top_k->ne[2] == 1 && top_k->ne[3] == n_stream);
+        GGML_ASSERT(raw_mask->ne[0] == n_raw && raw_mask->ne[1] == n_tps &&
+                raw_mask->ne[2] == 1 && raw_mask->ne[3] == n_stream);
+        GGML_ASSERT(inp_comp.kq_mask->ne[0] == n_comp && inp_comp.kq_mask->ne[1] == n_tps &&
+                inp_comp.kq_mask->ne[2] == 1 && inp_comp.kq_mask->ne[3] == n_stream);
+
+        ggml_tensor * top_k_flat = ggml_reshape_2d(ctx0, top_k, n_selected, nt);
+
+        out = nullptr;
+        for (int64_t t = 0; t < nt; ++t) {
+            const int64_t s  = t/n_tps;
+            const int64_t qi = t % n_tps;
+
+            ggml_tensor * q_t = ggml_view_3d(ctx0, q,
+                    q->ne[0], q->ne[1], 1, q->nb[1], q->nb[2], t*q->nb[2]);
+            ggml_tensor * raw_k_s = ggml_view_4d(ctx0, raw_k,
+                    raw_k->ne[0], raw_k->ne[1], n_raw, 1,
+                    raw_k->nb[1], raw_k->nb[2], raw_k->nb[3], s*raw_k->nb[3]);
+
+            ggml_tensor * top_k_col = ggml_view_2d(ctx0, top_k_flat,
+                    n_selected, 1, top_k_flat->nb[1], t*top_k_flat->nb[1]);
+
+            ggml_tensor * comp_rows = ggml_view_3d(ctx0, comp_k,
+                    comp_k->ne[0], n_comp, 1, comp_k->nb[2], comp_k->nb[3], s*comp_k->nb[3]);
+            ggml_tensor * comp_selected = ggml_get_rows(ctx0, comp_rows, top_k_col);
+            comp_selected = ggml_reshape_4d(ctx0, comp_selected,
+                    comp_k->ne[0], 1, n_selected, 1);
+            if (comp_selected->type != comp_k->type) {
+                comp_selected = ggml_cast(ctx0, comp_selected, comp_k->type);
+            }
+
+            ggml_tensor * compact_k = ggml_concat(ctx0, raw_k_s, comp_selected, 2);
+
+            ggml_tensor * raw_mask_qi = ggml_view_4d(ctx0, raw_mask,
+                    n_raw, 1, 1, 1,
+                    raw_mask->nb[1], raw_mask->nb[2], raw_mask->nb[3],
+                    qi*raw_mask->nb[1] + s*raw_mask->nb[3]);
+
+            // The selection addresses the compressed rows in mask dimension 0, so
+            // stride the view with nb[0] to gather them through dimension 1.
+            ggml_tensor * mask_col = ggml_view_4d(ctx0, inp_comp.kq_mask,
+                    1, n_comp, 1, 1,
+                    inp_comp.kq_mask->nb[0], inp_comp.kq_mask->nb[2], inp_comp.kq_mask->nb[3],
+                    qi*inp_comp.kq_mask->nb[1] + s*inp_comp.kq_mask->nb[3]);
+            ggml_tensor * comp_mask = ggml_get_rows(ctx0, mask_col, top_k_col);
+            comp_mask = ggml_reshape_4d(ctx0, comp_mask, n_selected, 1, 1, 1);
+            if (comp_mask->type != raw_mask->type) {
+                comp_mask = ggml_cast(ctx0, comp_mask, raw_mask->type);
+            }
+
+            ggml_tensor * compact_mask = ggml_concat(ctx0, raw_mask_qi, comp_mask, 0);
+
+            ggml_tensor * out_t = build_attn_mha(q_t, compact_k, compact_k, nullptr, compact_mask,
+                    layer.attn_sinks, nullptr, n_compact, kq_scale, il);
+            char out_name[64];
+            snprintf(out_name, sizeof(out_name), "attn_out_verify_q%" PRId64, t);
+            cb(out_t, out_name, il);
+
+            out = out == nullptr ? out_t : ggml_concat(ctx0, out, out_t, 1);
+        }
     } else {
         ggml_tensor * k_all = ggml_concat(ctx0, raw_k, comp_k, 2);
         cb(k_all, "k_all", il);
