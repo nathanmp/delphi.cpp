@@ -761,6 +761,39 @@ static bool dsv41_verify_compact_enabled(
     return n_tps >= 2 && n_tps <= 16;
 }
 
+// Prefill issues far too many queries for one attention call per query. Pass the
+// per-query selections as indices and let FlashAttention dereference the cache rows
+// inside the kernel, like build_attn_sparse does. Only the CUDA/HIP indexed kernel
+// honors indices (the CPU kernel does too); Metal and Vulkan ignore them, so this path
+// is opt-in (mode 4) and stays off by default.
+static bool dsv41_prefill_indexed_enabled(
+        const llama_hparams & hparams,
+        bool flash_attn,
+        int64_t n_comp,
+        int64_t n_selected,
+        int64_t n_query,
+        int64_t n_stream) {
+    const char * env = std::getenv("LLAMA_DSV41_COMPACT_ATTN");
+    const int mode = env ? std::atoi(env) : 1;
+
+    if (mode < 4 || !flash_attn || n_stream < 1 || n_query % n_stream != 0) {
+        return false;
+    }
+
+    // The indexed kernel takes no alibi bias or logit softcap.
+    if (hparams.f_max_alibi_bias != 0.0f || hparams.attn_soft_cap) {
+        return false;
+    }
+
+    const int64_t n_tps = n_query/n_stream;
+
+    // The indexed kernel is scalar per row while dense prefill uses the MMA tile
+    // kernel, so it needs a clear rows-ratio to win. Measured: break-even near
+    // n_comp == 2*top_k, clear wins from n_comp == 4*top_k. Compare mode 0 against
+    // mode 4 at the target context length instead of lowering this.
+    return n_tps > 16 && n_comp >= 4*n_selected;
+}
+
 // DeepSeek-V4.1 attention: a sliding window of raw KV, plus, where the layer uses one, the
 // compressed positions the indexer picked, concatenated into a single masked attention.
 //
@@ -964,6 +997,8 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
             dsv41_compact_attn_enabled(n_comp, top_k->ne[0], nt, n_stream);
     const bool use_verify_compact = !use_compact && top_k != nullptr && cparams.flash_attn &&
             dsv41_verify_compact_enabled(nt, n_stream);
+    const bool use_prefill_indexed = !use_compact && !use_verify_compact && top_k != nullptr &&
+            dsv41_prefill_indexed_enabled(hparams, cparams.flash_attn, n_comp, top_k->ne[0], nt, n_stream);
 
     if (use_compact) {
         const int64_t n_raw = raw_k->ne[2];
@@ -1079,6 +1114,54 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
 
             out = out == nullptr ? out_t : ggml_concat(ctx0, out, out_t, 1);
         }
+    } else if (use_prefill_indexed) {
+        // One kernel dereferences every query's rows through indices. The compressed
+        // rows come first so the per-query selections need no offset; the raw window
+        // follows, identical for every query, so build its indices once with arange
+        // and repeat. The validity mask carries the gathered compressed entries first,
+        // then the raw mask with its per-query causality.
+        const int64_t n_raw = raw_k->ne[2];
+        const int64_t n_selected = top_k->ne[0];
+        const int64_t n_tps = nt/n_stream;
+        const int64_t n_compact = n_raw + n_selected;
+
+        GGML_ASSERT(nt == n_tps*n_stream);
+        GGML_ASSERT(top_k->ne[1] == n_tps && top_k->ne[2] == 1 && top_k->ne[3] == n_stream);
+        GGML_ASSERT(raw_mask->ne[0] == n_raw && raw_mask->ne[1] == n_tps &&
+                raw_mask->ne[2] == 1 && raw_mask->ne[3] == n_stream);
+        GGML_ASSERT(inp_comp.kq_mask->ne[0] == n_comp && inp_comp.kq_mask->ne[1] == n_tps &&
+                inp_comp.kq_mask->ne[2] == 1 && inp_comp.kq_mask->ne[3] == n_stream);
+        GGML_ASSERT(comp_k->type == raw_k->type &&
+                (comp_k->type == GGML_TYPE_F16 || comp_k->type == GGML_TYPE_Q8_0));
+
+        ggml_tensor * k_all = ggml_concat(ctx0, comp_k, raw_k, 2);
+        cb(k_all, "k_all_indexed", il);
+
+        ggml_tensor * raw_idx = ggml_arange(ctx0, (float) n_comp, (float) (n_comp + n_raw), 1.0f);
+        raw_idx = ggml_cast(ctx0, raw_idx, GGML_TYPE_I32);
+        raw_idx = ggml_reshape_3d(ctx0, raw_idx, n_raw, 1, 1);
+        ggml_tensor * raw_idx_tpl = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, n_raw, n_tps, n_stream);
+        raw_idx = ggml_repeat(ctx0, raw_idx, raw_idx_tpl);
+        cb(raw_idx, "raw_idx", il);
+
+        ggml_tensor * comp_idx = ggml_reshape_3d(ctx0, top_k, n_selected, n_tps, n_stream);
+
+        ggml_tensor * kv_indices = ggml_concat(ctx0, comp_idx, raw_idx, 0);
+        cb(kv_indices, "kq_indices", il);
+
+        ggml_tensor * mask_rows = ggml_reshape_3d(ctx0, inp_comp.kq_mask, 1, n_comp, nt);
+        ggml_tensor * top_k_2d = ggml_reshape_2d(ctx0, top_k, n_selected, nt);
+        ggml_tensor * comp_valid = ggml_get_rows(ctx0, mask_rows, top_k_2d);
+        comp_valid = ggml_reshape_4d(ctx0, comp_valid, n_selected, n_tps, 1, n_stream);
+        if (comp_valid->type != raw_mask->type) {
+            comp_valid = ggml_cast(ctx0, comp_valid, raw_mask->type);
+        }
+
+        ggml_tensor * indexed_mask = ggml_concat(ctx0, comp_valid, raw_mask, 0);
+        cb(indexed_mask, "kq_indexed_mask", il);
+
+        out = build_attn_mha(q, k_all, k_all, nullptr, indexed_mask, layer.attn_sinks,
+                nullptr, n_compact, kq_scale, il, kv_indices);
     } else {
         ggml_tensor * k_all = ggml_concat(ctx0, raw_k, comp_k, 2);
         cb(k_all, "k_all", il);
