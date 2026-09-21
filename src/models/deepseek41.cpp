@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -716,6 +717,25 @@ ggml_tensor * llama_model_deepseek41::graph::build_indexer_top_k(
     return top_k;
 }
 
+// Sparse attention on HIP cannot compact a finite mask inside FlashAttention. Decode already has
+// the selected compressed rows, so gather them before attention instead. Keep the raw sliding
+// window in cache order, then append the selected compressed rows in top-k order. This preserves
+// the attention sinks and works with the ordinary FlashAttention kernels.
+static bool dsv41_compact_attn_enabled(
+        int64_t n_comp,
+        int64_t n_selected,
+        int64_t n_query,
+        int64_t n_stream) {
+    const char * env = std::getenv("LLAMA_DSV41_COMPACT_ATTN");
+    const int mode = env ? std::atoi(env) : 1;
+
+    if (mode == 0 || n_query != n_stream) {
+        return false;
+    }
+
+    return mode >= 2 || (n_stream == 1 && n_comp >= 2*n_selected);
+}
+
 // DeepSeek-V4.1 attention: a sliding window of raw KV, plus, where the layer uses one, the
 // compressed positions the indexer picked, concatenated into a single masked attention.
 //
@@ -913,23 +933,70 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
             comp_k->nb[1], comp_k->nb[2], comp_k->nb[3], 0);
     cb(comp_k, "comp_k", il);
 
-    ggml_tensor * k_all = ggml_concat(ctx0, raw_k, comp_k, 2);
-    cb(k_all, "k_all", il);
-
     ggml_tensor * raw_mask  = inp_attn->get_kq_mask();
-    ggml_tensor * comp_mask = top_k
-        ? build_top_k_mask(inp_comp.kq_mask, top_k, "comp_top_k_mask", il)
-        : inp_comp.kq_mask;
+    const int64_t n_stream = raw_k->ne[3];
+    const bool use_compact = top_k != nullptr && cparams.flash_attn &&
+            dsv41_compact_attn_enabled(n_comp, top_k->ne[0], nt, n_stream);
 
-    ggml_tensor * kq_mask = ggml_concat(ctx0, raw_mask, comp_mask, 0);
-    cb(kq_mask, "kq_mask", il);
+    if (use_compact) {
+        const int64_t n_raw = raw_k->ne[2];
+        const int64_t n_selected = top_k->ne[0];
 
-    const int64_t n_kv_max = top_k
-        ? std::min<int64_t>(raw_mask->ne[0], hparams.n_swa) + top_k->ne[0]
-        : 0;
+        GGML_ASSERT(raw_mask->ne[0] == n_raw && raw_mask->ne[1] == 1 &&
+                raw_mask->ne[2] == 1 && raw_mask->ne[3] == n_stream);
+        GGML_ASSERT(top_k->ne[1] == 1 && top_k->ne[2] == 1 && top_k->ne[3] == n_stream);
 
-    out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, layer.attn_sinks,
-            nullptr, n_kv_max, kq_scale, il);
+        // ggml_get_rows addresses dimension 1, while the KV cache stores rows in
+        // dimension 2. The selected compressed rows are query-specific in general;
+        // this decode path has one query per stream, so one compact K/V tensor is valid.
+        ggml_tensor * top_k_rows = ggml_reshape_2d(ctx0, top_k, n_selected, n_stream);
+        ggml_tensor * comp_rows = ggml_view_3d(ctx0, comp_k,
+                comp_k->ne[0], n_comp, n_stream, comp_k->nb[2], comp_k->nb[3], 0);
+        ggml_tensor * comp_selected = ggml_get_rows(ctx0, comp_rows, top_k_rows);
+        comp_selected = ggml_reshape_4d(ctx0, comp_selected,
+                comp_k->ne[0], 1, n_selected, n_stream);
+        if (comp_selected->type != comp_k->type) {
+            comp_selected = ggml_cast(ctx0, comp_selected, comp_k->type);
+        }
+        cb(comp_selected, "comp_k_selected", il);
+
+        ggml_tensor * compact_k = ggml_concat(ctx0, raw_k, comp_selected, 2);
+        cb(compact_k, "k_compact", il);
+
+        // Top-k can contain masked fill entries when a stream has fewer compressed
+        // positions than the configured width. Gather the original validity mask so
+        // those entries cannot contribute to the compact attention result.
+        ggml_tensor * mask_rows = ggml_reshape_4d(ctx0, inp_comp.kq_mask,
+                1, n_comp, 1, n_stream);
+        ggml_tensor * comp_mask = ggml_get_rows(ctx0, mask_rows, top_k_rows);
+        comp_mask = ggml_reshape_4d(ctx0, comp_mask, n_selected, 1, 1, n_stream);
+        if (comp_mask->type != raw_mask->type) {
+            comp_mask = ggml_cast(ctx0, comp_mask, raw_mask->type);
+        }
+
+        ggml_tensor * compact_mask = ggml_concat(ctx0, raw_mask, comp_mask, 0);
+        cb(compact_mask, "kq_compact_mask", il);
+
+        out = build_attn_mha(q, compact_k, compact_k, nullptr, compact_mask, layer.attn_sinks,
+                nullptr, 0, kq_scale, il);
+    } else {
+        ggml_tensor * k_all = ggml_concat(ctx0, raw_k, comp_k, 2);
+        cb(k_all, "k_all", il);
+
+        ggml_tensor * comp_mask = top_k
+            ? build_top_k_mask(inp_comp.kq_mask, top_k, "comp_top_k_mask", il)
+            : inp_comp.kq_mask;
+
+        ggml_tensor * kq_mask = ggml_concat(ctx0, raw_mask, comp_mask, 0);
+        cb(kq_mask, "kq_mask", il);
+
+        const int64_t n_kv_max = top_k
+            ? std::min<int64_t>(raw_mask->ne[0], hparams.n_swa) + top_k->ne[0]
+            : 0;
+
+        out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, layer.attn_sinks,
+                nullptr, n_kv_max, kq_scale, il);
+    }
     if (k_rot) {
         out = llama_mul_mat_hadamard(ctx0, out, k_rot);
     }
