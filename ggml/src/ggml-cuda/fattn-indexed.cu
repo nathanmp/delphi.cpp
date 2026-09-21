@@ -25,6 +25,7 @@ static __global__ void flash_attn_ext_indexed(
         const void  * __restrict__ k,
         const void  * __restrict__ v,
         const half  * __restrict__ mask,
+        const float * __restrict__ sinks,
         const int   * __restrict__ indices,
               float * __restrict__ dst,
         float scale,
@@ -143,6 +144,14 @@ static __global__ void flash_attn_ext_indexed(
                 total_sum += partial_sum[iw]*expf(partial_max[iw] - total_max);
             }
         }
+        // Attention sink: an extra zero-value logit per head. Fold it into the
+        // denominator exactly like the dense kernels do.
+        if (sinks != nullptr) {
+            const float sink = sinks[head];
+            const float max_new = fmaxf(total_max, sink);
+            total_sum = total_sum*expf(total_max - max_new) + expf(sink - max_new);
+            total_max = max_new;
+        }
     }
     total_max = __shfl_sync(0xffffffff, total_max, 0, WARP_SIZE);
     total_sum = __shfl_sync(0xffffffff, total_sum, 0, WARP_SIZE);
@@ -175,6 +184,7 @@ static void launch_flash_attn_ext_indexed(
         const ggml_tensor * k,
         const ggml_tensor * v,
         const ggml_tensor * mask,
+        const ggml_tensor * sinks,
         const ggml_tensor * indices,
         ggml_tensor * dst,
         float scale) {
@@ -185,6 +195,7 @@ static void launch_flash_attn_ext_indexed(
             k->data,
             v->data,
             mask ? (const half *) mask->data : nullptr,
+            sinks ? (const float *) sinks->data : nullptr,
             (const int   *) indices->data,
             (float       *) dst->data,
             scale, indices->ne[0], q->ne[1], q->ne[2], k->ne[1],
@@ -211,9 +222,14 @@ bool ggml_cuda_flash_attn_ext_indexed_supported(const ggml_tensor * dst) {
     const bool kv_type = (k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16) ||
                          (k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q8_0);
 
+    // Sinks are one F32 value per head, read as sinks[head] like the dense kernels do.
+    const bool sinks_ok = sinks == nullptr ||
+        (sinks->type == GGML_TYPE_F32 && ggml_is_contiguous(sinks) &&
+         sinks->ne[0] == q->ne[2] && sinks->ne[1] == 1 && sinks->ne[2] == 1 && sinks->ne[3] == 1);
+
     return indices != nullptr && dst->type == GGML_TYPE_F32 && q->type == GGML_TYPE_F32 && kv_type &&
         (mask == nullptr || mask->type == GGML_TYPE_F16) &&
-        indices->type == GGML_TYPE_I32 && sinks == nullptr &&
+        indices->type == GGML_TYPE_I32 && sinks_ok &&
         (mask == nullptr || ggml_is_contiguous(mask)) && ggml_is_contiguous(indices) &&
         q->ne[0] == 512 && k->ne[0] == 512 && v->ne[0] == 512 &&
         k->ne[2] == 1 && v->ne[2] == 1 &&
@@ -231,14 +247,15 @@ void ggml_cuda_flash_attn_ext_indexed(ggml_backend_cuda_context & ctx, ggml_tens
     const ggml_tensor * k       = dst->src[1];
     const ggml_tensor * v       = dst->src[2];
     const ggml_tensor * mask    = dst->src[3];
+    const ggml_tensor * sinks   = dst->src[4];
     const ggml_tensor * indices = dst->src[5];
 
     float scale = 1.0f;
     memcpy(&scale, (const float *) dst->op_params, sizeof(float));
 
     if (k->type == GGML_TYPE_Q8_0) {
-        launch_flash_attn_ext_indexed<16, true>(ctx, q, k, v, mask, indices, dst, scale);
+        launch_flash_attn_ext_indexed<16, true>(ctx, q, k, v, mask, sinks, indices, dst, scale);
     } else {
-        launch_flash_attn_ext_indexed<8, false>(ctx, q, k, v, mask, indices, dst, scale);
+        launch_flash_attn_ext_indexed<8, false>(ctx, q, k, v, mask, sinks, indices, dst, scale);
     }
 }
