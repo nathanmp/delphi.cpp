@@ -83,6 +83,13 @@ class TestBottleneckProfile(unittest.TestCase):
         self.assertIn("TG wall 50.000 ms/token", summary)
         self.assertIn("<=2.0%", summary)
 
+    def test_summary_includes_arm_notes(self):
+        result = {
+            "recipe": "example", "created_utc": "2026-09-22T00:00:00Z", "repository": {"commit": "abc", "tree": "clean"},
+            "arms": [{"name": "diagnostic", "type": "llama-bench", "notes": ["graphs are disabled"], "metrics": {"kind": "llama-bench", "tests": []}}],
+        }
+        self.assertIn("Note: graphs are disabled", profile.render_summary(result))
+
 
 if __name__ == "__main__":
     unittest.main()
