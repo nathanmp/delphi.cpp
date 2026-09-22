@@ -54,7 +54,7 @@ class TestBottleneckProfile(unittest.TestCase):
                 }}}}]
         }
         summary = profile.render_summary(result)
-        self.assertIn("diagnostic, non-additive", summary)
+        self.assertIn("Rows can overlap", summary)
         self.assertIn("instrumented window 10.000 ms/token", summary)
         self.assertIn("<=25.0%", summary)
 
@@ -87,6 +87,41 @@ class TestBottleneckProfile(unittest.TestCase):
             6: {"kind": "decode", "tokens": 1},
         }
         self.assertEqual(profile._prefill_execution_ids({3, 4, 5, 6}, info, 128, 4096), {3, 4, 5})
+
+    def test_prefill_trace_selection_uses_request_clock_for_dspark(self):
+        info = {
+            1: {"kind": "prefill", "tokens": 5, "start_ns": 50},
+            2: {"kind": "prefill", "tokens": 2048, "start_ns": 150},
+            3: {"kind": "prefill", "tokens": 512, "start_ns": 200},
+        }
+        self.assertEqual(profile._prefill_execution_ids({1, 2, 3}, info, 128, 4096, (100, 300)), {2, 3})
+
+    def test_diagnostic_discovers_groups_without_recipe_rules(self):
+        base = {"name": "plain", "type": "llama-server + speed-bench", "metrics": {"kind": "speed-bench", "prompt_t_s": 10.0, "predicted_t_s": 100.0, "latency_s": 1.0, "accept_rate": None}}
+        diagnostic = {
+            "name": "plain-op-diagnostic", "type": "llama-server + speed-bench", "metrics": {"kind": "speed-bench"},
+            "trace": {"mode": "op", "integrity": "not-run", "analysis": {
+                "decode": {"executions": 20, "diagnostic_by_op_ms": {"NEW_OP": {"median": 1.0}}, "diagnostic_by_node_role_ms": {"NEW_OP / custom-*": {"median": 1.0}}},
+                "prefill": {"executions": 2, "aggregate_per_client_token_ms": {"diagnostic_by_op_ms": {"NEW_OP": 2.0}, "diagnostic_by_node_role_ms": {"NEW_OP / custom-*": 2.0}}},
+                "gpu_timing_status_counts": {"resolved": 20},
+            }},
+        }
+        result = {"recipe": "example", "created_utc": "2026-09-22T00:00:00Z", "repository": {"commit": "abc", "tree": "clean"}, "arms": [base, diagnostic]}
+        summary = profile.render_summary(result)
+        self.assertIn("conditional max throughput gain", summary)
+        self.assertIn("| NEW_OP | 1.000 | <=11.1% |", summary)
+        self.assertIn("| NEW_OP / custom-* | 1.000 | <=11.1% |", summary)
+        self.assertIn("screening estimates, not proven production ceilings", summary)
+
+    def test_role_normalization_is_not_specific_to_known_ops(self):
+        self.assertEqual(profile._node_role({"op": "FUTURE_OP", "name": "future_mix-19"}), "FUTURE_OP / future_mix-*")
+        self.assertEqual(profile._node_role({"op": "MUL_MAT", "name": "node_7", "sources": {0: {"name": "blk.23.ffn_gate.weight"}}}), "MUL_MAT / src blk.*.ffn_gate.weight")
+        self.assertEqual(profile._node_role({"op": "ADD", "name": "node_7", "type": "f32", "dims": (48, 2, 1, 1), "sources": {0: {"name": " (view)"}, 1: {"name": " (view)"}}}), "ADD / unnamed f32 48x2 src:view+view")
+
+    def test_diagnostic_cutoff_bounds_each_omitted_group(self):
+        lines = []
+        profile._render_diagnostic_groups(lines, "By operation", {"A": 2.0, "B": 1.0, "C": 0.5}, 10.0, True, limit=2)
+        self.assertIn("The 1 omitted group is <= 0.500 diagnostic ms/token (<=5.3% conditional gain)", lines[-1])
 
     def test_speed_bench_summary_uses_end_to_end_wall_for_ceilings(self):
         result = {
@@ -122,6 +157,22 @@ class TestBottleneckProfile(unittest.TestCase):
         }
         summary = profile.render_summary(result)
         self.assertIn("insufficient steady decode executions", summary)
+        self.assertNotIn("| measured span |", summary)
+
+    def test_summary_withholds_partial_speculative_decode_trace(self):
+        result = {
+            "recipe": "example", "created_utc": "2026-09-22T00:00:00Z", "repository": {"commit": "abc", "tree": "clean"}, "arms": [{
+                "name": "mtp", "type": "llama-server + speed-bench", "server_command": ["llama-server", "--spec-type", "draft-mtp"],
+                "metrics": {"kind": "speed-bench", "prompt_t_s": 100.0, "predicted_t_s": 40.0, "latency_s": 3.0},
+                "trace": {"mode": "submit", "integrity": "not-run", "analysis": {"decode": {
+                    "executions": 100, "wall_ms_per_token": {"median": 0.4},
+                    "cpu_compute_ms": {"median": 0.1}, "copy_handling_ms": {"median": 0.2},
+                    "host_submit_ms": {"median": 0.3}, "device_submit_ms": {"median": 1.0},
+                }}},
+            }],
+        }
+        summary = profile.render_summary(result)
+        self.assertIn("speculative decode spans cover too little", summary)
         self.assertNotIn("| measured span |", summary)
 
     def test_summary_renders_prefill_when_decode_trace_is_short(self):

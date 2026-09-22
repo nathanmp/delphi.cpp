@@ -63,6 +63,7 @@ def _tokens(url: str, target_tokens: int, timeout_s: float) -> list[int]:
 def run(url: str, target_tokens: int, timeout_s: float) -> dict[str, Any]:
     input_tokens = _tokens(url, target_tokens, timeout_s)
     started = time.monotonic()
+    request_start_raw_ns = time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW)
     response = _post(url, "/completion", {
         "prompt": input_tokens,
         "n_predict": 1,
@@ -71,6 +72,7 @@ def run(url: str, target_tokens: int, timeout_s: float) -> dict[str, Any]:
         "cache_prompt": False,
         "stream": False,
     }, timeout_s)
+    request_end_raw_ns = time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW)
     latency_s = time.monotonic() - started
     timings = response.get("timings", {}) if isinstance(response, dict) else {}
     if not isinstance(timings, dict):
@@ -88,6 +90,8 @@ def run(url: str, target_tokens: int, timeout_s: float) -> dict[str, Any]:
         "prompt_ms": prompt_ms,
         "prompt_t_s": prompt_t_s,
         "latency_s": latency_s,
+        "request_start_raw_ns": request_start_raw_ns,
+        "request_end_raw_ns": request_end_raw_ns,
         "predicted_tokens": timings.get("predicted_n"),
     }
 

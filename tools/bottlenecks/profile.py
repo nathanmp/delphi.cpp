@@ -13,6 +13,7 @@ import argparse
 import importlib.util
 import json
 import os
+import re
 import shlex
 import signal
 import statistics
@@ -34,7 +35,7 @@ ENV_PREFIXES = ("GGML_", "LLAMA_", "CUDA_", "HIP_", "HSA_", "ROCR_", "OMP_")
 
 @dataclass(frozen=True)
 class FamilyRule:
-    """Assign an eager GPU operation span to a diagnostic family."""
+    """Optional user-defined tag for an eager GPU operation span."""
 
     name: str
     operations: tuple[str, ...] = ()
@@ -133,6 +134,31 @@ def _load_trace_dump():
 
 
 TRACE = _load_trace_dump()
+
+
+def _stable_node_name(name: str) -> str:
+    name = re.sub(r"\bblk\.\d+\.", "blk.*.", name)
+    name = re.sub(r"\b(?:layer|layers)\.\d+\.", lambda match: match.group(0).split(".")[0] + ".*.", name)
+    name = re.sub(r"([_-])\d+(?=$|[\s(])", r"\1*", name)
+    return name
+
+
+def _node_role(node: Mapping[str, Any]) -> str:
+    """Group repeated layer nodes by their trace names and source tensors."""
+    op = node.get("op") or "unknown op"
+    name = node.get("name") or ""
+    if re.fullmatch(r"node_\d+", name) or not name.strip() or name.startswith(" (view)"):
+        sources = [re.sub(r"#\d+$", "", re.sub(r"^[^#]+#", "", source.get("name", ""))) for source in node.get("sources", {}).values()]
+        named = next((source for source in sources if re.search(r"\bblk\.\d+\..*(?:weight|bias)", source)), None)
+        if named is None:
+            named = next((source for source in sources if source.strip() and not source.lstrip().startswith("(") and not re.fullmatch(r"node_\d+", source)), None)
+        if named is not None:
+            return f"{op} / src {_stable_node_name(named)}"
+        dims = node.get("dims") or ()
+        shape = "x".join(str(size) for size in dims if size != 1) or "scalar"
+        source_kinds = "+".join("view" if "view" in source else "generic" for source in sources) or "none"
+        return f"{op} / unnamed {node.get('type', '?')} {shape} src:{source_kinds}"
+    return f"{op} / {_stable_node_name(name)}"
 
 
 def _stats(values: Iterable[float]) -> dict[str, Any]:
@@ -283,6 +309,8 @@ def _prefill_metrics(payload: Any) -> dict[str, Any]:
         "prompt_t_s": payload.get("prompt_t_s"),
         "prompt_ms": payload.get("prompt_ms"),
         "latency_s": payload.get("latency_s"),
+        "request_start_raw_ns": payload.get("request_start_raw_ns"),
+        "request_end_raw_ns": payload.get("request_end_raw_ns"),
         "predicted_tokens": payload.get("predicted_tokens"),
     }
 
@@ -315,6 +343,7 @@ def _selected_execution_ids(events: Sequence[Mapping[str, Any]]) -> tuple[set[in
         info[execution_id] = {
             "kind": kind,
             "tokens": begin["args"][0],
+            "start_ns": begin["timestamp_ns"],
             "wall_ms": (end["timestamp_ns"] - begin["timestamp_ns"]) / 1e6,
         }
     selected = set()
@@ -323,7 +352,7 @@ def _selected_execution_ids(events: Sequence[Mapping[str, Any]]) -> tuple[set[in
     return selected, info
 
 
-def _prefill_execution_ids(selected: set[int], execution_info: Mapping[int, Mapping[str, Any]], min_tokens: int, target_tokens: int) -> set[int]:
+def _prefill_execution_ids(selected: set[int], execution_info: Mapping[int, Mapping[str, Any]], min_tokens: int, target_tokens: int, window_ns: tuple[int, int] | None = None) -> set[int]:
     pool = set(execution_info) if target_tokens else selected
     candidates = sorted(
         execution_id for execution_id in pool
@@ -331,31 +360,36 @@ def _prefill_execution_ids(selected: set[int], execution_info: Mapping[int, Mapp
     )
     if not target_tokens:
         return {execution_id for execution_id in candidates if execution_info[execution_id]["tokens"] >= min_tokens}
+    if window_ns:
+        return {execution_id for execution_id in candidates if window_ns[0] <= execution_info[execution_id]["start_ns"] <= window_ns[1]}
 
     # The exact-ID request is the final client action in an arm. Its logical
     # batches may include a small tail, so do not discard that tail merely
     # because it is below min_tokens. MTP/DSpark can evaluate the same prompt
     # in more than one context; retain the complete final run and record its
     # trace-token total rather than silently choosing one context.
-    sequences: list[list[int]] = []
-    for execution_id in candidates:
-        if not sequences or execution_id != sequences[-1][-1] + 1:
-            sequences.append([execution_id])
-        else:
-            sequences[-1].append(execution_id)
-    matching = [sequence for sequence in sequences if sum(execution_info[item]["tokens"] for item in sequence) >= target_tokens and max(execution_info[item]["tokens"] for item in sequence) >= min_tokens]
-    return set(matching[-1]) if matching else set()
+    large = [execution_id for execution_id in candidates if execution_info[execution_id]["tokens"] >= max(min_tokens, target_tokens // 2)]
+    if not large:
+        return set()
+    start = large[-1]
+    while start - 1 in large:
+        start -= 1
+    return {execution_id for execution_id in candidates if execution_id >= start}
 
 
-def _trace_summary(path: Path, family_rules: Sequence[FamilyRule], *, prefill_min_tokens: int = 0, prefill_target_tokens: int = 0) -> dict[str, Any]:
+def _trace_summary(path: Path, family_rules: Sequence[FamilyRule], *, prefill_min_tokens: int = 0, prefill_target_tokens: int = 0, prefill_window_ns: tuple[int, int] | None = None) -> dict[str, Any]:
     trace = TRACE.read_trace(path)
     if trace["flags"] & 1 or trace["trace_stats"].get("dropped_event_count", 0):
         raise ProfileError(f"trace is truncated or dropped events: {path}")
     events, strings = trace["events"], trace["strings"]
     selected, execution_info = _selected_execution_ids(events)
     decode_ids = {execution_id for execution_id in selected if execution_info[execution_id]["kind"] == "decode"}
-    prefill_ids = _prefill_execution_ids(selected, execution_info, prefill_min_tokens, prefill_target_tokens)
+    prefill_ids = _prefill_execution_ids(selected, execution_info, prefill_min_tokens, prefill_target_tokens, prefill_window_ns)
+    measured_ids = decode_ids | prefill_ids
     per_execution = defaultdict(lambda: Counter())
+    host_detail: dict[int, Counter[str]] = defaultdict(Counter)
+    copy_bytes: dict[int, Counter[str]] = defaultdict(Counter)
+    backend_name = TRACE.build_backend_names(events, strings)
     span_names = {
         TRACE.K_BACKEND_SUBMIT: "host_submit_ms",
         TRACE.K_CPU_COMPUTE: "cpu_compute_ms",
@@ -363,26 +397,67 @@ def _trace_summary(path: Path, family_rules: Sequence[FamilyRule], *, prefill_mi
     }
     for event in events:
         label = span_names.get(event["kind"])
-        if label and event["execution_id"] in decode_ids | prefill_ids:
+        if label and event["execution_id"] in measured_ids:
             per_execution[event["execution_id"]][label] += TRACE.span_duration_ns(event) / 1e6
+        execution_id = event["execution_id"]
+        if execution_id not in measured_ids:
+            continue
+        kind = event["kind"]
+        if kind == TRACE.K_BACKEND_SUBMIT:
+            detail = f"GPU submission on {backend_name(event)}"
+        elif kind == TRACE.K_CPU_COMPUTE:
+            detail = f"CPU split on {backend_name(event)}"
+        elif kind == TRACE.K_BACKEND_WAIT:
+            reason = TRACE.WAIT_REASONS.get(event["flags"], str(event["flags"]))
+            detail = f"wait {reason} on {backend_name(event)}"
+        elif kind in (TRACE.K_COPY_HANDLING, TRACE.K_COPY_BODY):
+            source_id = event["args"][3] & 0xffffffff
+            source = backend_name(event, source_id)
+            destination = backend_name(event)
+            path = TRACE.COPY_PATHS.get(event["flags"], str(event["flags"]))
+            phase = "handling" if kind == TRACE.K_COPY_HANDLING else "body"
+            detail = f"copy {phase} {path} {source} -> {destination}"
+            if kind == TRACE.K_COPY_HANDLING:
+                copy_bytes[execution_id][detail] += event["args"][2]
+        elif kind in (TRACE.K_COPY_WAIT_SRC, TRACE.K_COPY_WAIT_DST):
+            other_id = event["args"][2] & 0xffffffff
+            other = backend_name(event, other_id)
+            current = backend_name(event)
+            source, destination = (current, other) if kind == TRACE.K_COPY_WAIT_SRC else (other, current)
+            path = TRACE.COPY_PATHS.get(event["flags"], str(event["flags"]))
+            phase = "source wait" if kind == TRACE.K_COPY_WAIT_SRC else "destination wait"
+            detail = f"copy {phase} {path} {source} -> {destination}"
+        else:
+            continue
+        host_detail[execution_id][detail] += TRACE.span_duration_ns(event) / 1e6
 
     spans, _ = TRACE.gpu_timing_model(events)
     gpu_status_counts = Counter(span["status"] for span in spans)
     submit_per_execution = Counter()
+    submit_by_backend: dict[int, Counter[str]] = defaultdict(Counter)
     family_per_execution: dict[int, Counter[str]] = defaultdict(Counter)
+    op_per_execution: dict[int, Counter[str]] = defaultdict(Counter)
+    role_per_execution: dict[int, Counter[str]] = defaultdict(Counter)
+    backend_op_per_execution: dict[int, Counter[str]] = defaultdict(Counter)
     node_metadata = TRACE.build_node_metadata(events, strings)
     for span in spans:
         event = span["event"]
         execution_id = event["execution_id"]
-        if execution_id not in decode_ids | prefill_ids or span["status"] != "resolved":
+        if execution_id not in measured_ids or span["status"] != "resolved":
             continue
         duration_ms = span["device_duration_ns"] / 1e6
         if span["scope"] in ("eager_submit", "graph_launch"):
             submit_per_execution[execution_id] += duration_ms
+            submit_by_backend[execution_id][backend_name(event)] += duration_ms
         if span["scope"] == "eager_op":
             node = node_metadata(event) or {}
-            family = next((rule.name for rule in family_rules if rule.matches(node)), "everything else")
-            family_per_execution[execution_id][family] += duration_ms
+            op = node.get("op") or "unknown op"
+            op_per_execution[execution_id][op] += duration_ms
+            role_per_execution[execution_id][_node_role(node)] += duration_ms
+            backend_op_per_execution[execution_id][f"{backend_name(event)} / {op}"] += duration_ms
+            family = next((rule.name for rule in family_rules if rule.matches(node)), None)
+            if family:
+                family_per_execution[execution_id][family] += duration_ms
 
     def summarize(ids: set[int], client_tokens: int = 0) -> dict[str, Any]:
         summary = {
@@ -397,6 +472,31 @@ def _trace_summary(path: Path, family_rules: Sequence[FamilyRule], *, prefill_mi
         for label in span_names.values():
             summary[label] = _stats(per_execution[item][label] / max(1, execution_info[item]["tokens"]) for item in ids)
         summary["device_submit_ms"] = _stats(submit_per_execution[item] / max(1, execution_info[item]["tokens"]) for item in ids)
+        detail_names = sorted({name for item in ids for name in host_detail[item]})
+        summary["host_detail_ms"] = {
+            name: _stats(host_detail[item][name] / max(1, execution_info[item]["tokens"]) for item in ids)
+            for name in detail_names
+        }
+        summary["copy_bytes_per_token"] = {
+            name: sum(copy_bytes[item][name] for item in ids) / max(1, sum(execution_info[item]["tokens"] for item in ids))
+            for name in detail_names if any(copy_bytes[item][name] for item in ids)
+        }
+        backend_names = sorted({name for item in ids for name in submit_by_backend[item]})
+        summary["device_submit_by_backend_ms"] = {
+            name: _stats(submit_by_backend[item][name] / max(1, execution_info[item]["tokens"]) for item in ids)
+            for name in backend_names
+        }
+        for key, per_execution_data in (
+            ("diagnostic_by_op_ms", op_per_execution),
+            ("diagnostic_by_node_role_ms", role_per_execution),
+            ("diagnostic_by_backend_op_ms", backend_op_per_execution),
+        ):
+            names = sorted({name for item in ids for name in per_execution_data[item]})
+            if names:
+                summary[key] = {
+                    name: _stats(per_execution_data[item][name] / max(1, execution_info[item]["tokens"]) for item in ids)
+                    for name in names
+                }
         family_names = sorted({name for item in ids for name in family_per_execution[item]})
         if family_names:
             summary["diagnostic_op_family_ms"] = {
@@ -414,6 +514,28 @@ def _trace_summary(path: Path, family_rules: Sequence[FamilyRule], *, prefill_mi
                     name: sum(family_per_execution[item][name] for item in ids) / client_tokens
                     for name in family_names
                 }
+            for key, per_execution_data in (
+                ("diagnostic_by_op_ms", op_per_execution),
+                ("diagnostic_by_node_role_ms", role_per_execution),
+                ("diagnostic_by_backend_op_ms", backend_op_per_execution),
+            ):
+                if key in summary:
+                    aggregate[key] = {
+                        name: sum(per_execution_data[item][name] for item in ids) / client_tokens
+                        for name in summary[key]
+                    }
+            aggregate["host_detail_ms"] = {
+                name: sum(host_detail[item][name] for item in ids) / client_tokens
+                for name in detail_names
+            }
+            aggregate["copy_bytes_per_token"] = {
+                name: sum(copy_bytes[item][name] for item in ids) / client_tokens
+                for name in summary["copy_bytes_per_token"]
+            }
+            aggregate["device_submit_by_backend_ms"] = {
+                name: sum(submit_by_backend[item][name] for item in ids) / client_tokens
+                for name in backend_names
+            }
             summary["aggregate_per_client_token_ms"] = aggregate
         return summary
 
@@ -585,11 +707,15 @@ def _run_server_arm(arm: ServerArm, artifacts: Path, common_env: Mapping[str, st
     if arm.trace_mode != "off":
         if not trace_path.exists():
             raise ProfileError(f"{arm.name} did not produce {trace_path}")
+        prefill_metric = next((item["metrics"] for item in extra_measurements if item["metrics"]["kind"] == "prefill"), {})
+        start_ns = prefill_metric.get("request_start_raw_ns")
+        end_ns = prefill_metric.get("request_end_raw_ns")
+        prefill_window_ns = (start_ns, end_ns) if isinstance(start_ns, int) and isinstance(end_ns, int) and start_ns < end_ns else None
         result["trace"] = {
             "path": str(trace_path),
             "mode": arm.trace_mode,
             "integrity": "not-run",
-            "analysis": _trace_summary(trace_path, arm.family_rules, prefill_min_tokens=arm.trace_prefill_min_tokens, prefill_target_tokens=arm.trace_prefill_target_tokens),
+            "analysis": _trace_summary(trace_path, arm.family_rules, prefill_min_tokens=arm.trace_prefill_min_tokens, prefill_target_tokens=arm.trace_prefill_target_tokens, prefill_window_ns=prefill_window_ns),
         }
     return result
 
@@ -717,17 +843,45 @@ def _serial_gain_ceiling(component_ms: float | None, wall_ms: float | None) -> s
         return "n/a"
     share = component_ms / wall_ms
     if share >= 1:
-        return ">=100% (not useful)"
+        return "not bounded (<1x wall needed)"
     return f"<={100.0 * (1.0 / (1.0 - share) - 1.0):.1f}%"
+
+
+def _render_detail_rows(lines: list[str], values: Mapping[str, float], wall_ms: float | None, *, unit: str = "ms/token", limit: int = 10) -> None:
+    ordered = sorted(((name, duration) for name, duration in values.items() if duration >= 0.0005), key=lambda item: (-item[1], item[0]))
+    if not ordered:
+        return
+    lines.extend(("", f"| measured detail | {unit} | optimistic gain ceiling | evidence |", "| --- | ---: | ---: | --- |"))
+    for name, duration in ordered[:limit]:
+        evidence = "DEVICE_EVENT sum, non-additive" if name.startswith("device ") else "HOST_SAFE interval, non-additive"
+        lines.append(f"| {name} | {_fmt(duration)} | {_serial_gain_ceiling(duration, wall_ms)} | {evidence} |")
+
+
+def _render_diagnostic_groups(lines: list[str], title: str, values: Mapping[str, float], wall_ms: float | None, complete: bool, *, limit: int) -> None:
+    if not values:
+        return
+    ordered = sorted(values.items(), key=lambda item: (-item[1], item[0]))
+    lines.extend(("", f"{title}: {len(ordered)} observed groups (largest {min(limit, len(ordered))} shown; all groups in JSON).", "", "| observed group | diagnostic ms/token | conditional max throughput gain |", "| --- | ---: | ---: |"))
+    for name, duration in ordered[:limit]:
+        ceiling = _serial_gain_ceiling(duration, wall_ms) if complete else "n/a (incomplete events)"
+        lines.append(f"| {name} | {_fmt(duration)} | {ceiling} |")
+    if len(ordered) > limit:
+        next_duration = ordered[limit][1]
+        ceiling = _serial_gain_ceiling(next_duration, wall_ms) if complete else "n/a (incomplete events)"
+        omitted = len(ordered) - limit
+        subject = "The 1 omitted group" if omitted == 1 else f"Each of the {omitted} omitted groups"
+        lines.append(f"{subject} is <= {_fmt(next_duration)} diagnostic ms/token ({ceiling} conditional gain); see JSON for names.")
 
 
 def render_summary(result: Mapping[str, Any]) -> str:
     """Render the short, prompt-facing view of a normalized result."""
     lines = [f"# {result['recipe']} bottleneck measurement", "", f"Measured: {result['created_utc']}"]
     repository = result["repository"]
-    lines.append(f"Build: {repository.get('commit') or 'unknown'} ({repository.get('tree', 'unknown')} tree)")
-    lines.extend(("", "This is measured on this machine and configuration. It overrides prior assumptions. A device-op family is diagnostic and non-additive; use the end-to-end wall-time row for Amdahl estimates."))
+    lines.append(f"Checkout: {repository.get('commit') or 'unknown'} ({repository.get('tree', 'unknown')} tree); arm-level Binary lines identify the tested build.")
+    lines.extend(("", "This is measured on this machine and configuration. It overrides prior assumptions. Rows can overlap; do not add their times or ceilings. The ceiling assumes removing only that measured interval without changing other work."))
     for arm in result["arms"]:
+        if arm["name"].endswith("-op-diagnostic"):
+            continue
         lines.extend(("", f"## {arm['name']} ({arm['type']})"))
         for note in arm.get("notes", ()):
             lines.append(f"Note: {note}")
@@ -764,14 +918,17 @@ def render_summary(result: Mapping[str, Any]) -> str:
         lines.append(f"Trace ({trace['mode']}, integrity {trace['integrity']}): {decode['executions']} measured decode executions; instrumented window {_fmt(decode['wall_ms_per_token']['median'], ' ms/token')}")
         if decode["executions"] < 10:
             lines.append("Trace breakdown: insufficient steady decode executions; use the end-to-end measurement above.")
+        elif "--spec-type" in arm.get("server_command", ()) and end_to_end_wall_ms and sum(decode[key]["median"] for key in ("cpu_compute_ms", "copy_handling_ms", "host_submit_ms", "device_submit_ms")) < 0.5 * end_to_end_wall_ms:
+            lines.append("Trace breakdown: speculative decode spans cover too little of end-to-end wall time for an Amdahl screen; likely only a subset of target/draft contexts. Use the end-to-end measurement above.")
         else:
             lines.extend(("", "| measured span | median ms/token | optimistic gain ceiling | evidence |", "| --- | ---: | ---: | --- |"))
             for key, label in (("cpu_compute_ms", "CPU compute"), ("copy_handling_ms", "copy handling"), ("host_submit_ms", "host submit"), ("device_submit_ms", "device submit sum")):
                 evidence = "HOST interval, upper-bound only" if key != "device_submit_ms" else "DEVICE_EVENT, non-additive"
-                ceiling = _serial_gain_ceiling(decode[key]["median"], end_to_end_wall_ms or decode["wall_ms_per_token"]["median"]) if key != "device_submit_ms" else "n/a"
+                ceiling = _serial_gain_ceiling(decode[key]["median"], end_to_end_wall_ms or decode["wall_ms_per_token"]["median"])
                 lines.append(f"| {label} | {_fmt(decode[key]['median'])} | {ceiling} | {evidence} |")
-            for family, stats in decode.get("diagnostic_op_family_ms", {}).items():
-                lines.append(f"| {family} | {_fmt(stats['median'])} | n/a | DEVICE_EVENT diagnostic, non-additive |")
+            detail = {name: stats["median"] for name, stats in decode.get("host_detail_ms", {}).items()}
+            detail.update({f"device interval on {name}": stats["median"] for name, stats in decode.get("device_submit_by_backend_ms", {}).items()})
+            _render_detail_rows(lines, detail, end_to_end_wall_ms or decode["wall_ms_per_token"]["median"])
         prefill = trace["analysis"].get("prefill")
         if prefill and prefill["executions"]:
             prefill_metric = next((item["metrics"] for item in arm.get("extra_measurements", ()) if item["metrics"].get("kind") == "prefill"), None)
@@ -787,15 +944,55 @@ def render_summary(result: Mapping[str, Any]) -> str:
             lines.extend(("", f"| measured prefill span | {span_label} | optimistic gain ceiling | evidence |", "| --- | ---: | ---: | --- |"))
             for key, label in (("cpu_compute_ms", "CPU compute"), ("copy_handling_ms", "copy handling"), ("host_submit_ms", "host submit"), ("device_submit_ms", "device submit sum")):
                 evidence = f"HOST interval, upper-bound only{evidence_suffix}" if key != "device_submit_ms" else "DEVICE_EVENT, non-additive"
-                ceiling = _serial_gain_ceiling(span_values[key], prefill_wall_ms or wall_ms) if key != "device_submit_ms" else "n/a"
+                ceiling = _serial_gain_ceiling(span_values[key], prefill_wall_ms or wall_ms)
                 lines.append(f"| {label} | {_fmt(span_values[key])} | {ceiling} | {evidence} |")
             if aggregate:
-                families = aggregate.get("diagnostic_op_family_ms", {})
-                for family, value in families.items():
-                    lines.append(f"| {family} | {_fmt(value)} | n/a | DEVICE_EVENT diagnostic, non-additive |")
+                detail = dict(aggregate.get("host_detail_ms", {}))
+                detail.update({f"device interval on {name}": value for name, value in aggregate.get("device_submit_by_backend_ms", {}).items()})
             else:
-                for family, stats in prefill.get("diagnostic_op_family_ms", {}).items():
-                    lines.append(f"| {family} | {_fmt(stats['median'])} | n/a | DEVICE_EVENT diagnostic, non-additive |")
+                detail = {name: stats["median"] for name, stats in prefill.get("host_detail_ms", {}).items()}
+                detail.update({f"device interval on {name}": stats["median"] for name, stats in prefill.get("device_submit_by_backend_ms", {}).items()})
+            _render_detail_rows(lines, detail, prefill_wall_ms or wall_ms, unit="ms/client token" if aggregate else "ms/token")
+    production = {arm["name"]: arm for arm in result["arms"] if not arm["name"].endswith("-op-diagnostic")}
+    for arm in result["arms"]:
+        if not arm["name"].endswith("-op-diagnostic"):
+            continue
+        base_name = arm["name"].removesuffix("-op-diagnostic")
+        base = production.get(base_name)
+        lines.extend(("", f"## {arm['name']} operation diagnostic"))
+        lines.append("Graphs and fusion were disabled for per-op GPU timing. CPU split work is not decomposed by operation. The conditional gains below use production wall time as the denominator; they are screening estimates, not proven production ceilings.")
+        binary_version = arm.get("binary_version")
+        if binary_version:
+            lines.append(f"Binary: {binary_version.splitlines()[0]}")
+        if not base or not arm.get("trace"):
+            lines.append("No matched production arm or trace was collected.")
+            continue
+        base_decode_t_s = base["metrics"].get("predicted_t_s")
+        decode_wall_ms = 1000.0 / base_decode_t_s if base_decode_t_s and base_decode_t_s > 0 else None
+        base_prefill = next((item["metrics"] for item in base.get("extra_measurements", ()) if item["metrics"].get("kind") == "prefill"), {})
+        prefill_t_s = base_prefill.get("prompt_t_s")
+        prefill_wall_ms = 1000.0 / prefill_t_s if prefill_t_s and prefill_t_s > 0 else None
+        analysis = arm["trace"]["analysis"]
+        statuses = analysis.get("gpu_timing_status_counts", {})
+        if any(count for status, count in statuses.items() if status != "resolved"):
+            lines.append("Some device events were unresolved; per-op times are incomplete, so conditional ceilings are suppressed.")
+        complete = not any(count for status, count in statuses.items() if status != "resolved")
+        for workload, groups, wall_ms, count in (
+            ("decode", analysis["decode"], decode_wall_ms, analysis["decode"]["executions"]),
+            ("prefill", analysis.get("prefill", {}).get("aggregate_per_client_token_ms", {}), prefill_wall_ms, analysis.get("prefill", {}).get("executions", 0)),
+        ):
+            lines.extend(("", f"{workload.capitalize()} per-op timing: {count} trace executions; production wall {_fmt(wall_ms, ' ms/token')}."))
+            if not groups.get("diagnostic_by_op_ms"):
+                lines.append("No resolved per-op device events for this workload.")
+                continue
+            breakdowns = [("diagnostic_by_op_ms", "By GGML operation", 12), ("diagnostic_by_node_role_ms", "By recurring node role", 20)]
+            backend_ops = groups.get("diagnostic_by_backend_op_ms", {})
+            if len({name.split(" / ", 1)[0] for name in backend_ops}) > 1:
+                breakdowns.append(("diagnostic_by_backend_op_ms", "By backend and GGML operation", 12))
+            for key, title, limit in breakdowns:
+                raw = groups.get(key, {})
+                values = {name: value["median"] for name, value in raw.items()} if workload == "decode" else raw
+                _render_diagnostic_groups(lines, title, values, wall_ms, complete, limit=limit)
     return "\n".join(lines) + "\n"
 
 
