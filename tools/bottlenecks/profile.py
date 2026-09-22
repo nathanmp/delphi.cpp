@@ -88,6 +88,7 @@ class ServerArm:
     notes: tuple[str, ...] = ()
     extra_measurements: tuple["ServerMeasurement", ...] = ()
     trace_prefill_min_tokens: int = 0
+    trace_prefill_target_tokens: int = 0
 
 
 @dataclass(frozen=True)
@@ -322,18 +323,38 @@ def _selected_execution_ids(events: Sequence[Mapping[str, Any]]) -> tuple[set[in
     return selected, info
 
 
-def _trace_summary(path: Path, family_rules: Sequence[FamilyRule], *, prefill_min_tokens: int = 0) -> dict[str, Any]:
+def _prefill_execution_ids(selected: set[int], execution_info: Mapping[int, Mapping[str, Any]], min_tokens: int, target_tokens: int) -> set[int]:
+    pool = set(execution_info) if target_tokens else selected
+    candidates = sorted(
+        execution_id for execution_id in pool
+        if execution_info[execution_id]["kind"] == "prefill"
+        and execution_info[execution_id]["tokens"] >= min_tokens
+    )
+    if not target_tokens:
+        return set(candidates)
+
+    matches: list[set[int]] = []
+    for start in range(len(candidates)):
+        total = 0
+        match = set()
+        for execution_id in candidates[start:]:
+            total += execution_info[execution_id]["tokens"]
+            match.add(execution_id)
+            if total >= target_tokens:
+                if total == target_tokens:
+                    matches.append(match)
+                break
+    return matches[-1] if matches else set()
+
+
+def _trace_summary(path: Path, family_rules: Sequence[FamilyRule], *, prefill_min_tokens: int = 0, prefill_target_tokens: int = 0) -> dict[str, Any]:
     trace = TRACE.read_trace(path)
     if trace["flags"] & 1 or trace["trace_stats"].get("dropped_event_count", 0):
         raise ProfileError(f"trace is truncated or dropped events: {path}")
     events, strings = trace["events"], trace["strings"]
     selected, execution_info = _selected_execution_ids(events)
     decode_ids = {execution_id for execution_id in selected if execution_info[execution_id]["kind"] == "decode"}
-    prefill_ids = {
-        execution_id for execution_id in selected
-        if execution_info[execution_id]["kind"] == "prefill"
-        and execution_info[execution_id]["tokens"] >= prefill_min_tokens
-    }
+    prefill_ids = _prefill_execution_ids(selected, execution_info, prefill_min_tokens, prefill_target_tokens)
     per_execution = defaultdict(lambda: Counter())
     span_names = {
         TRACE.K_BACKEND_SUBMIT: "host_submit_ms",
@@ -400,6 +421,7 @@ def _trace_summary(path: Path, family_rules: Sequence[FamilyRule], *, prefill_mi
         "decode": decode,
         "prefill": prefill,
         "prefill_min_tokens": prefill_min_tokens,
+        "prefill_target_tokens": prefill_target_tokens,
         "prefill_excluded_below_min_tokens": sorted(
             execution_id for execution_id in selected
             if execution_info[execution_id]["kind"] == "prefill"
@@ -444,7 +466,7 @@ def _run_bench_arm(arm: BenchArm, artifacts: Path, common_env: Mapping[str, str]
             "path": str(trace_path),
             "mode": arm.trace_mode,
             "integrity": "not-run",
-            "analysis": _trace_summary(trace_path, arm.family_rules, prefill_min_tokens=arm.trace_prefill_min_tokens),
+            "analysis": _trace_summary(trace_path, arm.family_rules, prefill_min_tokens=arm.trace_prefill_min_tokens, prefill_target_tokens=arm.trace_prefill_target_tokens),
         }
     return result
 
@@ -555,7 +577,7 @@ def _run_server_arm(arm: ServerArm, artifacts: Path, common_env: Mapping[str, st
             "path": str(trace_path),
             "mode": arm.trace_mode,
             "integrity": "not-run",
-            "analysis": _trace_summary(trace_path, arm.family_rules, prefill_min_tokens=arm.trace_prefill_min_tokens),
+            "analysis": _trace_summary(trace_path, arm.family_rules, prefill_min_tokens=arm.trace_prefill_min_tokens, prefill_target_tokens=arm.trace_prefill_target_tokens),
         }
     return result
 

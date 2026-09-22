@@ -77,6 +77,16 @@ class TestBottleneckProfile(unittest.TestCase):
         self.assertEqual(metrics["prompt_tokens"], 4097)
         self.assertEqual(metrics["prompt_t_s"], 2048.5)
 
+    def test_prefill_trace_selection_uses_final_exact_sequence(self):
+        info = {
+            1: {"kind": "prefill", "tokens": 2},
+            2: {"kind": "prefill", "tokens": 256},
+            3: {"kind": "prefill", "tokens": 2048},
+            4: {"kind": "prefill", "tokens": 2048},
+            5: {"kind": "decode", "tokens": 1},
+        }
+        self.assertEqual(profile._prefill_execution_ids({2, 3, 4, 5}, info, 128, 4096), {3, 4})
+
     def test_speed_bench_summary_uses_end_to_end_wall_for_ceilings(self):
         result = {
             "recipe": "example", "created_utc": "2026-09-22T00:00:00Z", "repository": {"commit": "abc", "tree": "clean"}, "arms": [{
