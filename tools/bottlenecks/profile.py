@@ -286,6 +286,8 @@ def _speed_bench_metrics(payload: Any) -> dict[str, Any]:
     overall = summary.get("overall", {}) if isinstance(summary, dict) else {}
     if not overall and isinstance(summary, list):
         overall = next((item for item in summary if item.get("category") == "overall"), {})
+    results = [item for item in payload.get("results", ()) if isinstance(item, dict) and item.get("ok")]
+    windows = [window for item in results for window in item.get("request_windows_raw_ns", ()) if isinstance(window, list) and len(window) == 2]
     return {
         "kind": "speed-bench",
         "completed_samples": payload.get("completed_samples"),
@@ -294,6 +296,11 @@ def _speed_bench_metrics(payload: Any) -> dict[str, Any]:
         "predicted_t_s": overall.get("avg_pred_t_s"),
         "latency_s": overall.get("avg_latency"),
         "accept_rate": overall.get("accept_rate"),
+        "prompt_tokens": sum(item.get("prompt_tokens") or 0 for item in results),
+        "completion_tokens": sum(item.get("completion_tokens") or 0 for item in results),
+        "prompt_ms": sum(item.get("prompt_ms") or 0 for item in results),
+        "predicted_ms": sum(item.get("predicted_ms") or 0 for item in results),
+        "request_windows_raw_ns": windows,
         "overall": overall,
     }
 
@@ -335,13 +342,14 @@ def _selected_execution_ids(events: Sequence[Mapping[str, Any]]) -> tuple[set[in
     by_kind: dict[str, list[int]] = defaultdict(list)
     info: dict[int, dict[str, Any]] = {}
     for execution_id, begin in begins.items():
-        kind = TRACE.EXECUTION_NAMES.get(begin["flags"], str(begin["flags"]))
+        kind = TRACE.execution_kind(begin)
         end = ends.get(execution_id)
         if end is None:
             continue
         by_kind[kind].append(execution_id)
         info[execution_id] = {
             "kind": kind,
+            "phase": TRACE.execution_phase(begin),
             "tokens": begin["args"][0],
             "start_ns": begin["timestamp_ns"],
             "wall_ms": (end["timestamp_ns"] - begin["timestamp_ns"]) / 1e6,
@@ -377,13 +385,28 @@ def _prefill_execution_ids(selected: set[int], execution_info: Mapping[int, Mapp
     return {execution_id for execution_id in candidates if execution_id >= start}
 
 
-def _trace_summary(path: Path, family_rules: Sequence[FamilyRule], *, prefill_min_tokens: int = 0, prefill_target_tokens: int = 0, prefill_window_ns: tuple[int, int] | None = None) -> dict[str, Any]:
+def _in_windows(timestamp_ns: int, windows_ns: Sequence[Sequence[int]]) -> bool:
+    return any(len(window) == 2 and window[0] <= timestamp_ns <= window[1] for window in windows_ns)
+
+
+def _decode_execution_ids(selected: set[int], execution_info: Mapping[int, Mapping[str, Any]], windows_ns: Sequence[Sequence[int]]) -> tuple[set[int], bool]:
+    phased = {
+        execution_id for execution_id, info in execution_info.items()
+        if info["phase"] in ("generation_target", "generation_draft") and
+        (not windows_ns or _in_windows(info["start_ns"], windows_ns))
+    }
+    if phased:
+        return phased, True
+    return {execution_id for execution_id in selected if execution_info[execution_id]["kind"] == "decode"}, False
+
+
+def _trace_summary(path: Path, family_rules: Sequence[FamilyRule], *, decode_windows_ns: Sequence[Sequence[int]] = (), decode_client_tokens: int = 0, prefill_min_tokens: int = 0, prefill_target_tokens: int = 0, prefill_window_ns: tuple[int, int] | None = None) -> dict[str, Any]:
     trace = TRACE.read_trace(path)
     if trace["flags"] & 1 or trace["trace_stats"].get("dropped_event_count", 0):
         raise ProfileError(f"trace is truncated or dropped events: {path}")
     events, strings = trace["events"], trace["strings"]
     selected, execution_info = _selected_execution_ids(events)
-    decode_ids = {execution_id for execution_id in selected if execution_info[execution_id]["kind"] == "decode"}
+    decode_ids, phase_selected_decode = _decode_execution_ids(selected, execution_info, decode_windows_ns)
     prefill_ids = _prefill_execution_ids(selected, execution_info, prefill_min_tokens, prefill_target_tokens, prefill_window_ns)
     measured_ids = decode_ids | prefill_ids
     per_execution = defaultdict(lambda: Counter())
@@ -439,7 +462,18 @@ def _trace_summary(path: Path, family_rules: Sequence[FamilyRule], *, prefill_mi
     op_per_execution: dict[int, Counter[str]] = defaultdict(Counter)
     role_per_execution: dict[int, Counter[str]] = defaultdict(Counter)
     backend_op_per_execution: dict[int, Counter[str]] = defaultdict(Counter)
+    cpu_op_per_execution: dict[int, Counter[str]] = defaultdict(Counter)
+    cpu_role_per_execution: dict[int, Counter[str]] = defaultdict(Counter)
     node_metadata = TRACE.build_node_metadata(events, strings)
+    for event in events:
+        execution_id = event["execution_id"]
+        if event["kind"] != TRACE.K_CPU_NODE_TIMING or execution_id not in measured_ids:
+            continue
+        node = node_metadata(event) or {}
+        duration_ms = TRACE.span_duration_ns(event) / 1e6
+        op = node.get("op") or "unknown op"
+        cpu_op_per_execution[execution_id][op] += duration_ms
+        cpu_role_per_execution[execution_id][_node_role(node)] += duration_ms
     for span in spans:
         event = span["event"]
         execution_id = event["execution_id"]
@@ -462,6 +496,7 @@ def _trace_summary(path: Path, family_rules: Sequence[FamilyRule], *, prefill_mi
     def summarize(ids: set[int], client_tokens: int = 0) -> dict[str, Any]:
         summary = {
             "executions": len(ids),
+            "phase_counts": dict(sorted(Counter(execution_info[item]["phase"] for item in ids).items())),
             "tokens": {
                 "total": sum(execution_info[item]["tokens"] for item in ids),
                 "per_execution": _stats(execution_info[item]["tokens"] for item in ids),
@@ -490,6 +525,8 @@ def _trace_summary(path: Path, family_rules: Sequence[FamilyRule], *, prefill_mi
             ("diagnostic_by_op_ms", op_per_execution),
             ("diagnostic_by_node_role_ms", role_per_execution),
             ("diagnostic_by_backend_op_ms", backend_op_per_execution),
+            ("diagnostic_cpu_by_op_ms", cpu_op_per_execution),
+            ("diagnostic_cpu_by_node_role_ms", cpu_role_per_execution),
         ):
             names = sorted({name for item in ids for name in per_execution_data[item]})
             if names:
@@ -518,6 +555,8 @@ def _trace_summary(path: Path, family_rules: Sequence[FamilyRule], *, prefill_mi
                 ("diagnostic_by_op_ms", op_per_execution),
                 ("diagnostic_by_node_role_ms", role_per_execution),
                 ("diagnostic_by_backend_op_ms", backend_op_per_execution),
+                ("diagnostic_cpu_by_op_ms", cpu_op_per_execution),
+                ("diagnostic_cpu_by_node_role_ms", cpu_role_per_execution),
             ):
                 if key in summary:
                     aggregate[key] = {
@@ -539,7 +578,7 @@ def _trace_summary(path: Path, family_rules: Sequence[FamilyRule], *, prefill_mi
             summary["aggregate_per_client_token_ms"] = aggregate
         return summary
 
-    decode = summarize(decode_ids)
+    decode = summarize(decode_ids, decode_client_tokens if phase_selected_decode else 0)
     prefill = summarize(prefill_ids, prefill_target_tokens)
 
     graph_states = Counter()
@@ -711,11 +750,20 @@ def _run_server_arm(arm: ServerArm, artifacts: Path, common_env: Mapping[str, st
         start_ns = prefill_metric.get("request_start_raw_ns")
         end_ns = prefill_metric.get("request_end_raw_ns")
         prefill_window_ns = (start_ns, end_ns) if isinstance(start_ns, int) and isinstance(end_ns, int) and start_ns < end_ns else None
+        decode_metrics = result["metrics"]
         result["trace"] = {
             "path": str(trace_path),
             "mode": arm.trace_mode,
             "integrity": "not-run",
-            "analysis": _trace_summary(trace_path, arm.family_rules, prefill_min_tokens=arm.trace_prefill_min_tokens, prefill_target_tokens=arm.trace_prefill_target_tokens, prefill_window_ns=prefill_window_ns),
+            "analysis": _trace_summary(
+                trace_path,
+                arm.family_rules,
+                decode_windows_ns=decode_metrics.get("request_windows_raw_ns", ()),
+                decode_client_tokens=decode_metrics.get("completion_tokens") or 0,
+                prefill_min_tokens=arm.trace_prefill_min_tokens,
+                prefill_target_tokens=arm.trace_prefill_target_tokens,
+                prefill_window_ns=prefill_window_ns,
+            ),
         }
     return result
 
@@ -894,7 +942,8 @@ def render_summary(result: Mapping[str, Any]) -> str:
             predicted_t_s = metrics.get("predicted_t_s")
             if predicted_t_s is not None and predicted_t_s > 0:
                 end_to_end_wall_ms = 1000.0 / predicted_t_s
-            lines.append(f"End to end: PP {_fmt(metrics.get('prompt_t_s'), ' t/s')}; TG {_fmt(predicted_t_s, ' t/s')}; TG wall {_fmt(end_to_end_wall_ms, ' ms/token')}; latency {_fmt(metrics.get('latency_s'), ' s')}; acceptance {metrics.get('accept_rate', 'n/a')}")
+            lines.append(f"Decode workload: SPEED-Bench prompt {metrics.get('prompt_tokens', 'n/a')} tokens; output {metrics.get('completion_tokens', 'n/a')} tokens; TG {_fmt(predicted_t_s, ' t/s')}; TG wall {_fmt(end_to_end_wall_ms, ' ms/output token')}; request latency {_fmt(metrics.get('latency_s'), ' s')}; acceptance {metrics.get('accept_rate', 'n/a')}")
+            lines.append(f"Short-prompt setup: {_fmt(metrics.get('prompt_t_s'), ' prompt t/s')} over {_fmt(metrics.get('prompt_ms'), ' ms')}; this is not the bulk-prefill result.")
         else:
             for test in metrics["tests"]:
                 name = test["test"].get("model_type", "benchmark")
@@ -906,29 +955,44 @@ def render_summary(result: Mapping[str, Any]) -> str:
                 if extra_metrics.get("prompt_t_s"):
                     prefill_wall_ms = 1000.0 / extra_metrics["prompt_t_s"]
                 lines.append(
-                    f"Prefill ({measurement['name']}): target {extra_metrics.get('target_tokens', 'n/a')} tokens; "
-                    f"evaluated {extra_metrics.get('prompt_tokens', 'n/a')}; PP {_fmt(extra_metrics.get('prompt_t_s'), ' t/s')}; "
-                    f"PP wall {_fmt(prefill_wall_ms, ' ms/token')}; latency {_fmt(extra_metrics.get('latency_s'), ' s')}"
+                    f"Bulk prefill ({measurement['name']}): target {extra_metrics.get('target_tokens', 'n/a')} tokens; "
+                    f"evaluated {extra_metrics.get('prompt_tokens', 'n/a')}; {_fmt(extra_metrics.get('prompt_t_s'), ' t/s')}; "
+                    f"wall {_fmt(prefill_wall_ms, ' ms/input token')}; latency {_fmt(extra_metrics.get('latency_s'), ' s')}. Use this line for long-prompt prefill."
                 )
         trace = arm.get("trace")
         if not trace:
             lines.append("Trace: not collected")
             continue
         decode = trace["analysis"]["decode"]
-        lines.append(f"Trace ({trace['mode']}, integrity {trace['integrity']}): {decode['executions']} measured decode executions; instrumented window {_fmt(decode['wall_ms_per_token']['median'], ' ms/token')}")
+        decode_aggregate = decode.get("aggregate_per_client_token_ms")
+        decode_instrumented = decode_aggregate.get("wall_ms") if decode_aggregate else decode["wall_ms_per_token"]["median"]
+        decode_unit = "ms/output token across target/draft contexts" if decode_aggregate else "median ms/trace token"
+        phase_counts = decode.get("phase_counts", {})
+        phase_text = ", ".join(f"{name.replace('generation_', '')} {count}" for name, count in phase_counts.items())
+        phase_suffix = f" ({phase_text})" if phase_text else ""
+        coverage = ""
+        if decode_aggregate and end_to_end_wall_ms and decode_instrumented is not None:
+            coverage = f" ({100.0 * decode_instrumented / end_to_end_wall_ms:.1f}% of TG wall; asynchronous device rows can exceed this host span)"
+        lines.append(f"Decode trace ({trace['mode']}, integrity {trace['integrity']}): {decode['executions']} target/draft executions{phase_suffix}; traced llama_decode host wall {_fmt(decode_instrumented, ' ' + decode_unit)}{coverage}")
         if decode["executions"] < 10:
-            lines.append("Trace breakdown: insufficient steady decode executions; use the end-to-end measurement above.")
-        elif "--spec-type" in arm.get("server_command", ()) and end_to_end_wall_ms and sum(decode[key]["median"] for key in ("cpu_compute_ms", "copy_handling_ms", "host_submit_ms", "device_submit_ms")) < 0.5 * end_to_end_wall_ms:
-            lines.append("Trace breakdown: speculative decode spans cover too little of end-to-end wall time for an Amdahl screen; likely only a subset of target/draft contexts. Use the end-to-end measurement above.")
+            lines.append("Decode trace breakdown: insufficient steady executions; use the decode-workload TG measurement above.")
+        elif not decode_aggregate and "--spec-type" in arm.get("server_command", ()) and end_to_end_wall_ms and sum(decode[key]["median"] for key in ("cpu_compute_ms", "copy_handling_ms", "host_submit_ms", "device_submit_ms")) < 0.5 * end_to_end_wall_ms:
+            lines.append("Decode trace breakdown: this legacy trace lacks phase tags and covers too little speculative work; use the decode-workload TG measurement above.")
         else:
-            lines.extend(("", "| measured span | median ms/token | optimistic gain ceiling | evidence |", "| --- | ---: | ---: | --- |"))
+            span_values = decode_aggregate or {key: decode[key]["median"] for key in ("cpu_compute_ms", "copy_handling_ms", "host_submit_ms", "device_submit_ms")}
+            span_label = "aggregate ms/output token" if decode_aggregate else "median ms/trace token"
+            lines.extend(("", f"| measured decode span | {span_label} | optimistic gain ceiling | evidence |", "| --- | ---: | ---: | --- |"))
             for key, label in (("cpu_compute_ms", "CPU compute"), ("copy_handling_ms", "copy handling"), ("host_submit_ms", "host submit"), ("device_submit_ms", "device submit sum")):
                 evidence = "HOST interval, upper-bound only" if key != "device_submit_ms" else "DEVICE_EVENT, non-additive"
-                ceiling = _serial_gain_ceiling(decode[key]["median"], end_to_end_wall_ms or decode["wall_ms_per_token"]["median"])
-                lines.append(f"| {label} | {_fmt(decode[key]['median'])} | {ceiling} | {evidence} |")
-            detail = {name: stats["median"] for name, stats in decode.get("host_detail_ms", {}).items()}
-            detail.update({f"device interval on {name}": stats["median"] for name, stats in decode.get("device_submit_by_backend_ms", {}).items()})
-            _render_detail_rows(lines, detail, end_to_end_wall_ms or decode["wall_ms_per_token"]["median"])
+                ceiling = _serial_gain_ceiling(span_values[key], end_to_end_wall_ms or decode_instrumented)
+                lines.append(f"| {label} | {_fmt(span_values[key])} | {ceiling} | {evidence} |")
+            if decode_aggregate:
+                detail = dict(decode_aggregate.get("host_detail_ms", {}))
+                detail.update({f"device interval on {name}": value for name, value in decode_aggregate.get("device_submit_by_backend_ms", {}).items()})
+            else:
+                detail = {name: stats["median"] for name, stats in decode.get("host_detail_ms", {}).items()}
+                detail.update({f"device interval on {name}": stats["median"] for name, stats in decode.get("device_submit_by_backend_ms", {}).items()})
+            _render_detail_rows(lines, detail, end_to_end_wall_ms or decode_instrumented, unit="ms/output token" if decode_aggregate else "ms/trace token")
         prefill = trace["analysis"].get("prefill")
         if prefill and prefill["executions"]:
             prefill_metric = next((item["metrics"] for item in arm.get("extra_measurements", ()) if item["metrics"].get("kind") == "prefill"), None)
@@ -960,7 +1024,7 @@ def render_summary(result: Mapping[str, Any]) -> str:
         base_name = arm["name"].removesuffix("-op-diagnostic")
         base = production.get(base_name)
         lines.extend(("", f"## {arm['name']} operation diagnostic"))
-        lines.append("Graphs and fusion were disabled for per-op GPU timing. CPU split work is not decomposed by operation. The conditional gains below use production wall time as the denominator; they are screening estimates, not proven production ceilings.")
+        lines.append("GPU graphs and GPU/CPU fusion were disabled for per-operation timing. The conditional gains below use production wall time as the denominator; they are screening estimates, not proven production ceilings.")
         binary_version = arm.get("binary_version")
         if binary_version:
             lines.append(f"Binary: {binary_version.splitlines()[0]}")
@@ -977,12 +1041,13 @@ def render_summary(result: Mapping[str, Any]) -> str:
         if any(count for status, count in statuses.items() if status != "resolved"):
             lines.append("Some device events were unresolved; per-op times are incomplete, so conditional ceilings are suppressed.")
         complete = not any(count for status, count in statuses.items() if status != "resolved")
-        for workload, groups, wall_ms, count in (
+        for workload, summary, wall_ms, count in (
             ("decode", analysis["decode"], decode_wall_ms, analysis["decode"]["executions"]),
             ("prefill", analysis.get("prefill", {}).get("aggregate_per_client_token_ms", {}), prefill_wall_ms, analysis.get("prefill", {}).get("executions", 0)),
         ):
+            groups = summary.get("aggregate_per_client_token_ms", summary) if workload == "decode" else summary
             lines.extend(("", f"{workload.capitalize()} per-op timing: {count} trace executions; production wall {_fmt(wall_ms, ' ms/token')}."))
-            if not groups.get("diagnostic_by_op_ms"):
+            if not groups.get("diagnostic_by_op_ms") and not groups.get("diagnostic_cpu_by_op_ms"):
                 lines.append("No resolved per-op device events for this workload.")
                 continue
             breakdowns = [("diagnostic_by_op_ms", "By GGML operation", 12), ("diagnostic_by_node_role_ms", "By recurring node role", 20)]
@@ -991,8 +1056,12 @@ def render_summary(result: Mapping[str, Any]) -> str:
                 breakdowns.append(("diagnostic_by_backend_op_ms", "By backend and GGML operation", 12))
             for key, title, limit in breakdowns:
                 raw = groups.get(key, {})
-                values = {name: value["median"] for name, value in raw.items()} if workload == "decode" else raw
+                values = {name: value["median"] for name, value in raw.items()} if workload == "decode" and not summary.get("aggregate_per_client_token_ms") else raw
                 _render_diagnostic_groups(lines, title, values, wall_ms, complete, limit=limit)
+            for key, title, limit in (("diagnostic_cpu_by_op_ms", "CPU by GGML operation", 12), ("diagnostic_cpu_by_node_role_ms", "CPU by recurring node role", 20)):
+                raw = groups.get(key, {})
+                values = {name: value["median"] for name, value in raw.items()} if workload == "decode" and not summary.get("aggregate_per_client_token_ms") else raw
+                _render_diagnostic_groups(lines, title, values, wall_ms, True, limit=limit)
     return "\n".join(lines) + "\n"
 
 

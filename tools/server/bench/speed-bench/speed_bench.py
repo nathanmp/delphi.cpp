@@ -42,6 +42,7 @@ class RequestResult:
     predicted_ms: float | None
     prompt_per_second: float | None
     predicted_per_second: float | None
+    request_windows_raw_ns: list[list[int]]
     error: str | None
 
 
@@ -160,7 +161,7 @@ def run_request(
     osl: int,
     extra_inputs: dict[str, Any],
     timeout: float,
-) -> tuple[dict[str, Any], float]:
+) -> tuple[dict[str, Any], float, int, int]:
     payload: dict[str, Any] = {
         "messages": messages,
         "max_tokens": osl,
@@ -171,13 +172,15 @@ def run_request(
     payload.update(extra_inputs)
     payload["max_tokens"] = osl
 
+    start_raw_ns = time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW)
     start = time.perf_counter()
     response = requests.post(endpoint, json=payload, timeout=timeout)
     latency_s = time.perf_counter() - start
+    end_raw_ns = time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW)
     if response.status_code != 200:
         body = response.text[:500].replace("\n", "\\n")
         raise RuntimeError(f"HTTP {response.status_code}: {body}")
-    return response.json(), latency_s
+    return response.json(), latency_s, start_raw_ns, end_raw_ns
 
 
 def run_one(
@@ -201,10 +204,12 @@ def run_one(
     prompt_per_second = None
     predicted_per_second = None
     finish_reason: str | None = None
+    request_windows_raw_ns: list[list[int]] = []
     try:
         for turn in selected_turns:
             messages.append({"role": "user", "content": turn})
-            data, latency_s = run_request(endpoint, model, messages, osl, extra_inputs, timeout)
+            data, latency_s, start_raw_ns, end_raw_ns = run_request(endpoint, model, messages, osl, extra_inputs, timeout)
+            request_windows_raw_ns.append([start_raw_ns, end_raw_ns])
             total_latency_s += latency_s
             usage, timings, finish_reason, assistant_text = parse_completion_response(data)
 
@@ -247,6 +252,7 @@ def run_one(
             predicted_ms=predicted_ms if predicted_ms > 0 else None,
             prompt_per_second=prompt_per_second,
             predicted_per_second=predicted_per_second,
+            request_windows_raw_ns=request_windows_raw_ns,
             error=None,
         )
     except Exception as exc:
@@ -266,6 +272,7 @@ def run_one(
             predicted_ms=None,
             prompt_per_second=None,
             predicted_per_second=None,
+            request_windows_raw_ns=request_windows_raw_ns,
             error=str(exc),
         )
 

@@ -122,7 +122,8 @@ static void run_tiny_graph() {
     ggml_cgraph * graph = ggml_new_graph_custom(ctx.get(), 8, false);
     ggml_build_forward_expand(graph, result);
 
-    ggml_backend_ptr backend(ggml_backend_cpu_init());
+    ggml_backend_load_all();
+    ggml_backend_ptr backend(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr));
     GGML_ASSERT(backend);
     ggml_backend_t backend_raw = backend.get();
     ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend_raw);
@@ -154,6 +155,7 @@ static int test_disabled() {
 static int test_enabled(const char * path, bool detailed) {
     std::remove(path);
     set_env("GGML_EXEC_TRACE", path);
+    set_env("GGML_EXEC_TRACE_GPU_TIMING", "op");
     if (detailed) {
         set_env("GGML_EXEC_TRACE_DETAIL", "full");
     }
@@ -171,8 +173,10 @@ static int test_enabled(const char * path, bool detailed) {
     const uint64_t hash_c = ggml_exec_trace_hash_u64(ggml_exec_trace_hash_init(), 0x12345679);
     GGML_ASSERT(hash_a == hash_b && hash_a != hash_c);
 
+    const auto previous_phase = ggml_exec_trace_set_execution_phase(GGML_EXEC_TRACE_PHASE_GENERATION_DRAFT);
     const uint32_t execution_id = ggml_exec_trace_execution_begin(
             GGML_EXEC_TRACE_EXECUTION_DECODE, 1, 32, 16, 4, 8);
+    ggml_exec_trace_set_execution_phase(previous_phase);
     const uint32_t ubatch_id = ggml_exec_trace_ubatch_begin(1, 1, 1, 1);
 
     const uint64_t copy_start = ggml_exec_trace_now_ns();
@@ -268,6 +272,7 @@ static int test_enabled(const char * path, bool detailed) {
     GGML_ASSERT(has_kind(GGML_EXEC_TRACE_EVENT_SCHED_SPLIT));
     GGML_ASSERT(has_kind(GGML_EXEC_TRACE_EVENT_FINGERPRINT));
     GGML_ASSERT(has_kind(GGML_EXEC_TRACE_EVENT_CPU_COMPUTE));
+    GGML_ASSERT(has_kind(GGML_EXEC_TRACE_EVENT_CPU_NODE_TIMING));
     GGML_ASSERT(has_kind(GGML_EXEC_TRACE_EVENT_BACKEND_WAIT));
     GGML_ASSERT(has_kind(GGML_EXEC_TRACE_EVENT_COPY_HANDLING));
     GGML_ASSERT(has_kind(GGML_EXEC_TRACE_EVENT_DISPATCH));
@@ -277,14 +282,20 @@ static int test_enabled(const char * path, bool detailed) {
 #endif
 
     uint32_t cpu_compute_count = 0;
+    uint32_t cpu_node_timing_count = 0;
     uint32_t backend_wait_count = 0;
     bool found_copy_event = false;
     uint32_t manual_dispatch_count = 0;
     uint32_t gpu_graph_replay_count = 0;
     uint32_t clock_sync_count = 0;
     uint64_t dispatch_name_id = 0;
+    bool found_execution_phase = false;
     for (const ggml_exec_trace_event & event : events) {
-        if (event.kind == GGML_EXEC_TRACE_EVENT_NODE_SOURCE) {
+        if (event.kind == GGML_EXEC_TRACE_EVENT_EXECUTION_BEGIN && event.execution_id == execution_id) {
+            GGML_ASSERT((event.flags & 0xff) == GGML_EXEC_TRACE_EXECUTION_DECODE);
+            GGML_ASSERT(((event.flags >> 8) & 0xff) == GGML_EXEC_TRACE_PHASE_GENERATION_DRAFT);
+            found_execution_phase = true;
+        } else if (event.kind == GGML_EXEC_TRACE_EVENT_NODE_SOURCE) {
             GGML_ASSERT(event.args[1] != GGML_EXEC_TRACE_ID_NONE);
             GGML_ASSERT(event.flags != GGML_EXEC_TRACE_ID_NONE);
         } else if (event.kind == GGML_EXEC_TRACE_EVENT_NODE_MATMUL) {
@@ -306,6 +317,11 @@ static int test_enabled(const char * path, bool detailed) {
         }
         if (event.kind == GGML_EXEC_TRACE_EVENT_CPU_COMPUTE) {
             cpu_compute_count++;
+        } else if (event.kind == GGML_EXEC_TRACE_EVENT_CPU_NODE_TIMING) {
+            GGML_ASSERT(event.args[0] >= event.timestamp_ns);
+            GGML_ASSERT(event.args[1] >= 1);
+            GGML_ASSERT(event.node_id != GGML_EXEC_TRACE_ID_NONE);
+            cpu_node_timing_count++;
         } else if (event.kind == GGML_EXEC_TRACE_EVENT_BACKEND_WAIT) {
             backend_wait_count++;
         } else if (event.kind == GGML_EXEC_TRACE_EVENT_COPY_HANDLING && event.graph_id == 37) {
@@ -337,6 +353,8 @@ static int test_enabled(const char * path, bool detailed) {
             gpu_graph_replay_count++;
         }
     }
+    GGML_ASSERT(found_execution_phase);
+    GGML_ASSERT(cpu_node_timing_count > 0);
 #if defined(__linux__)
     GGML_ASSERT(clock_sync_count == 2);
 #endif

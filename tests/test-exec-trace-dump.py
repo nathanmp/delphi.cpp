@@ -33,6 +33,11 @@ def event(kind, start_ns=0, end_ns=0, graph_id=1, node_id=0, split_id=0, backend
 
 
 class TestExecTraceDump(unittest.TestCase):
+    def test_execution_flags_decode_kind_and_phase(self):
+        item = event(exec_trace_dump.K_EXECUTION_BEGIN, flags=2 | (3 << 8))
+        self.assertEqual(exec_trace_dump.execution_kind(item), "prefill")
+        self.assertEqual(exec_trace_dump.execution_phase(item), "generation_draft")
+
     def test_scheduler_summary_and_chronological_timeline(self):
         start_ns = 1_000_000_000
         events = [

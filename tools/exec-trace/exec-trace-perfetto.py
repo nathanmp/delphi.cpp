@@ -306,7 +306,8 @@ def add_raw_events(timeline, trace, catalog, merged):
         track = timeline.track(f"host:{begin['thread_id']}", "host", "Host", f"Host thread {begin['thread_id']}", process_sort_index=0)
         args = common_args(begin)
         args.update({
-            "kind": TRACE.EXECUTION_NAMES.get(begin["flags"], str(begin["flags"])),
+            "kind": TRACE.execution_kind(begin),
+            "phase": TRACE.execution_phase(begin),
             "token_count": begin["args"][0],
             "logical_batch_size": begin["args"][1],
             "ubatch_size": begin["args"][2],

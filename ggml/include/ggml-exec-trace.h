@@ -9,7 +9,7 @@
 extern "C" {
 #endif
 
-#define GGML_EXEC_TRACE_SCHEMA_VERSION 4
+#define GGML_EXEC_TRACE_SCHEMA_VERSION 5
 #define GGML_EXEC_TRACE_ID_NONE 0
 
 #define GGML_EXEC_TRACE_INTEGRITY_SCHEMA_VERSION 1
@@ -60,6 +60,16 @@ enum ggml_exec_trace_event_kind {
     // OFFLOAD_CALIBRATION stores CPU operations/s, candidate operations/s, H2D bytes/s, and D2H bytes/s
     // in args[0..3]. flags is NUMA node + 1, or zero if unknown.
     GGML_EXEC_TRACE_EVENT_OFFLOAD_CALIBRATION,
+    // CPU_NODE_TIMING is a host interval for one unfused CPU graph node. It is emitted only in op timing mode.
+    // node_id identifies the node; args[0] is the end timestamp and args[1] is the number of graph nodes covered.
+    GGML_EXEC_TRACE_EVENT_CPU_NODE_TIMING,
+};
+
+enum ggml_exec_trace_execution_phase {
+    GGML_EXEC_TRACE_PHASE_UNKNOWN = 0,
+    GGML_EXEC_TRACE_PHASE_PROMPT,
+    GGML_EXEC_TRACE_PHASE_GENERATION_TARGET,
+    GGML_EXEC_TRACE_PHASE_GENERATION_DRAFT,
 };
 
 enum ggml_exec_trace_offload_choice {
@@ -254,6 +264,10 @@ GGML_API uint32_t ggml_exec_trace_execution_begin(
         uint32_t n_threads_batch);
 GGML_API void ggml_exec_trace_execution_end(uint32_t execution_id, int32_t status);
 
+// The phase is thread-local and is copied into EXECUTION_BEGIN. Returns the previous phase for scoped use.
+GGML_API enum ggml_exec_trace_execution_phase ggml_exec_trace_set_execution_phase(
+        enum ggml_exec_trace_execution_phase phase);
+
 GGML_API uint32_t ggml_exec_trace_ubatch_begin(
         uint32_t n_tokens,
         uint32_t n_sequences,
@@ -275,6 +289,8 @@ GGML_API void ggml_exec_trace_backend_begin(
         uint32_t n_nodes);
 GGML_API void ggml_exec_trace_backend_end(void);
 GGML_API void ggml_exec_trace_set_node(uint32_t node_index);
+GGML_API uint64_t ggml_exec_trace_cpu_node_begin(void);
+GGML_API void ggml_exec_trace_cpu_node_end(uint64_t start_ns, uint32_t node_index, uint32_t node_count);
 GGML_API void ggml_exec_trace_dispatch(
         enum ggml_op op,
         enum ggml_exec_trace_dispatch_impl implementation,

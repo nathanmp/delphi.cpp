@@ -44,6 +44,7 @@ K_GPU_TIMING_EPOCH = 28
 K_OFFLOAD_DECISION = 29
 K_OFFLOAD_BYTES = 30
 K_OFFLOAD_CALIBRATION = 31
+K_CPU_NODE_TIMING = 32
 
 DISPATCH_NAMES = {
     0: "unknown",
@@ -85,9 +86,11 @@ GPU_GRAPH_REASONS = {
 }
 
 EXECUTION_NAMES = {1: "decode", 2: "prefill", 3: "encode"}
+EXECUTION_PHASES = {0: "unknown", 1: "prompt", 2: "generation_target", 3: "generation_draft"}
 SPAN_NAMES = {
     K_BACKEND_SUBMIT: "BACKEND_SUBMIT",
     K_CPU_COMPUTE: "CPU_COMPUTE",
+    K_CPU_NODE_TIMING: "CPU_NODE_TIMING",
     K_BACKEND_WAIT: "BACKEND_WAIT",
     K_COPY_HANDLING: "COPY_HANDLING",
     K_COPY_WAIT_SRC: "COPY_WAIT_SRC",
@@ -131,7 +134,7 @@ def read_trace(path):
     magic, version, header_size, event_size, flags, start_ns, event_count, string_count, string_bytes = HEADER.unpack_from(data)
     if magic.rstrip(b"\0") != b"GEXECTR":
         raise TraceError("invalid trace magic")
-    if version not in (1, 2, 3, 4):
+    if version not in (1, 2, 3, 4, 5):
         raise TraceError(f"unsupported schema version {version}")
     if header_size < HEADER.size or event_size < EVENT.size:
         raise TraceError("invalid record sizes")
@@ -201,6 +204,14 @@ def read_trace(path):
         "strings": strings,
         "trace_stats": trace_stats,
     }
+
+
+def execution_kind(event):
+    return EXECUTION_NAMES.get(event["flags"] & 0xff, str(event["flags"] & 0xff))
+
+
+def execution_phase(event):
+    return EXECUTION_PHASES.get((event["flags"] >> 8) & 0xff, f"phase-{(event['flags'] >> 8) & 0xff}")
 
 
 def string(strings, string_id):
@@ -512,6 +523,8 @@ def timeline_detail(event, backend_name):
     args = event["args"]
     if kind in (K_BACKEND_SUBMIT, K_CPU_COMPUTE):
         return f"status={signed_u32(args[1])} nodes=[{args[2]},{args[3]})"
+    if kind == K_CPU_NODE_TIMING:
+        return f"nodes={args[1]}"
     if kind == K_BACKEND_WAIT:
         reason = WAIT_REASONS.get(event["flags"], str(event["flags"]))
         wait_api = WAIT_APIS.get(args[1], str(args[1]))
@@ -826,7 +839,7 @@ def dump(trace, scheduler_summary=False, timeline=False, dispatches=False, gpu_t
         host_ms = f"{(end['timestamp_ns'] - event['timestamp_ns']) / 1e6:.3f}" if end else "missing"
         print(
             f"  execution {event['execution_id']}: "
-            f"kind={EXECUTION_NAMES.get(event['flags'], event['flags'])} "
+            f"kind={execution_kind(event)} phase={execution_phase(event)} "
             f"tokens={args[0]} batch={args[1]} ubatch={args[2]} "
             f"threads={n_threads}/{n_threads_batch} status={status} host_ms={host_ms}"
         )

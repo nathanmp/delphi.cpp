@@ -222,7 +222,8 @@ def trace_model(trace):
                     "execution_id": event["execution_id"],
                     "start_ns": begin["timestamp_ns"],
                     "end_ns": event["timestamp_ns"],
-                    "kind": TRACE.EXECUTION_NAMES.get(begin["flags"], str(begin["flags"])),
+                    "kind": TRACE.execution_kind(begin),
+                    "phase": TRACE.execution_phase(begin),
                 })
 
     submissions.sort(key=lambda item: (item["start_ns"], item["end_ns"], item["id"]))

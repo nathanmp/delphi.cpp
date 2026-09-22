@@ -3744,6 +3744,9 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 #endif
 
     const bool trace_nodes = state->ith == 0 && ggml_exec_trace_observing();
+    uint64_t trace_cpu_start = 0;
+    uint32_t trace_cpu_node = 0;
+    uint32_t trace_cpu_node_count = 0;
 
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
@@ -3761,10 +3764,19 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             continue;
         }
 
+        if (trace_nodes) {
+            trace_cpu_node = node_n;
+            trace_cpu_node_count = 1;
+            trace_cpu_start = ggml_exec_trace_cpu_node_begin();
+        }
+
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
         // Try fused ops, fall back to normal compute
         const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
         if (n_fused > 0) {
+            if (trace_nodes) {
+                trace_cpu_node_count += n_fused;
+            }
             node_n += n_fused;
         } else {
             ggml_compute_forward(&params, node);
@@ -3778,6 +3790,10 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
         if (node_n + 1 < cgraph->n_nodes) {
             ggml_barrier(state->threadpool);
+            if (trace_nodes) {
+                ggml_exec_trace_cpu_node_end(trace_cpu_start, trace_cpu_node, trace_cpu_node_count);
+                trace_cpu_start = 0;
+            }
         }
     }
 
@@ -3788,6 +3804,10 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 #endif
 
     ggml_barrier(state->threadpool);
+
+    if (trace_nodes && trace_cpu_start != 0) {
+        ggml_exec_trace_cpu_node_end(trace_cpu_start, trace_cpu_node, trace_cpu_node_count);
+    }
 
 #ifdef GGML_USE_CPU_RISCV64_SPACEMIT
     ggml_backend_cpu_riscv64_spacemit_clear_numa_thread_affinity_threaded(state->ith);

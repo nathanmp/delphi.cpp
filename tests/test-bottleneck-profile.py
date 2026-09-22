@@ -55,16 +55,19 @@ class TestBottleneckProfile(unittest.TestCase):
         }
         summary = profile.render_summary(result)
         self.assertIn("Rows can overlap", summary)
-        self.assertIn("instrumented window 10.000 ms/token", summary)
+        self.assertIn("traced llama_decode host wall 10.000 median ms/trace token", summary)
         self.assertIn("<=25.0%", summary)
 
     def test_speed_bench_parser_uses_saved_json_field_names(self):
         metrics = profile._speed_bench_metrics({"completed_samples": 1, "failed_samples": 0, "summary": [{
             "category": "overall", "avg_prompt_t_s": 100.0, "avg_pred_t_s": 20.0, "avg_latency": 3.0, "accept_rate": 0.75,
-        }]})
+        }], "results": [{"ok": True, "prompt_tokens": 56, "completion_tokens": 1024, "prompt_ms": 500.0, "predicted_ms": 2000.0, "request_windows_raw_ns": [[100, 200]]}]})
         self.assertEqual(metrics["prompt_t_s"], 100.0)
         self.assertEqual(metrics["predicted_t_s"], 20.0)
         self.assertEqual(metrics["accept_rate"], 0.75)
+        self.assertEqual(metrics["prompt_tokens"], 56)
+        self.assertEqual(metrics["completion_tokens"], 1024)
+        self.assertEqual(metrics["request_windows_raw_ns"], [[100, 200]])
 
     def test_prefill_parser_keeps_requested_and_realized_lengths(self):
         metrics = profile._prefill_metrics({
@@ -96,6 +99,17 @@ class TestBottleneckProfile(unittest.TestCase):
         }
         self.assertEqual(profile._prefill_execution_ids({1, 2, 3}, info, 128, 4096, (100, 300)), {2, 3})
 
+    def test_decode_selection_includes_multitoken_target_and_draft_batches(self):
+        info = {
+            1: {"kind": "decode", "phase": "generation_target", "tokens": 1, "start_ns": 50},
+            2: {"kind": "prefill", "phase": "generation_target", "tokens": 5, "start_ns": 150},
+            3: {"kind": "prefill", "phase": "generation_draft", "tokens": 4, "start_ns": 175},
+            4: {"kind": "prefill", "phase": "prompt", "tokens": 101, "start_ns": 180},
+        }
+        selected, phase_selected = profile._decode_execution_ids({1, 2, 3, 4}, info, ((100, 200),))
+        self.assertTrue(phase_selected)
+        self.assertEqual(selected, {2, 3})
+
     def test_diagnostic_discovers_groups_without_recipe_rules(self):
         base = {"name": "plain", "type": "llama-server + speed-bench", "metrics": {"kind": "speed-bench", "prompt_t_s": 10.0, "predicted_t_s": 100.0, "latency_s": 1.0, "accept_rate": None}}
         diagnostic = {
@@ -123,6 +137,22 @@ class TestBottleneckProfile(unittest.TestCase):
         profile._render_diagnostic_groups(lines, "By operation", {"A": 2.0, "B": 1.0, "C": 0.5}, 10.0, True, limit=2)
         self.assertIn("The 1 omitted group is <= 0.500 diagnostic ms/token (<=5.3% conditional gain)", lines[-1])
 
+    def test_speculative_diagnostic_renders_aggregate_gpu_and_cpu_groups(self):
+        base = {"name": "mtp-synthetic", "type": "llama-server + speed-bench", "metrics": {"kind": "speed-bench", "predicted_t_s": 100.0}}
+        aggregate = {
+            "diagnostic_by_op_ms": {"MUL_MAT": 2.0},
+            "diagnostic_cpu_by_op_ms": {"MUL_MAT_ID": 4.0},
+        }
+        diagnostic = {
+            "name": "mtp-synthetic-op-diagnostic", "type": "llama-server + speed-bench", "metrics": {"kind": "speed-bench"},
+            "trace": {"analysis": {"decode": {"executions": 400, "aggregate_per_client_token_ms": aggregate}, "prefill": {"executions": 0}, "gpu_timing_status_counts": {"resolved": 1}}},
+        }
+        result = {"recipe": "example", "created_utc": "2026-09-22T00:00:00Z", "repository": {"commit": "abc", "tree": "clean"}, "arms": [base, diagnostic]}
+        summary = profile.render_summary(result)
+        self.assertIn("| MUL_MAT | 2.000 | <=25.0% |", summary)
+        self.assertIn("CPU by GGML operation", summary)
+        self.assertIn("| MUL_MAT_ID | 4.000 | <=66.7% |", summary)
+
     def test_speed_bench_summary_uses_end_to_end_wall_for_ceilings(self):
         result = {
             "recipe": "example", "created_utc": "2026-09-22T00:00:00Z", "repository": {"commit": "abc", "tree": "clean"}, "arms": [{
@@ -137,7 +167,7 @@ class TestBottleneckProfile(unittest.TestCase):
                 }}}}]
         }
         summary = profile.render_summary(result)
-        self.assertIn("TG wall 50.000 ms/token", summary)
+        self.assertIn("TG wall 50.000 ms/output token", summary)
         self.assertIn("<=2.0%", summary)
 
     def test_summary_includes_arm_notes(self):
@@ -156,7 +186,7 @@ class TestBottleneckProfile(unittest.TestCase):
                 }}}}]
         }
         summary = profile.render_summary(result)
-        self.assertIn("insufficient steady decode executions", summary)
+        self.assertIn("insufficient steady executions", summary)
         self.assertNotIn("| measured span |", summary)
 
     def test_summary_withholds_partial_speculative_decode_trace(self):
@@ -172,7 +202,7 @@ class TestBottleneckProfile(unittest.TestCase):
             }],
         }
         summary = profile.render_summary(result)
-        self.assertIn("speculative decode spans cover too little", summary)
+        self.assertIn("legacy trace lacks phase tags", summary)
         self.assertNotIn("| measured span |", summary)
 
     def test_summary_renders_prefill_when_decode_trace_is_short(self):
@@ -190,7 +220,7 @@ class TestBottleneckProfile(unittest.TestCase):
             }],
         }
         summary = profile.render_summary(result)
-        self.assertIn("Prefill (prefill-4096): target 4096 tokens", summary)
+        self.assertIn("Bulk prefill (prefill-4096): target 4096 tokens", summary)
         self.assertIn("Prefill trace: 2 selected executions, 4096 trace-token executions", summary)
         self.assertIn("aggregate ms/client token", summary)
 

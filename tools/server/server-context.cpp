@@ -10,6 +10,7 @@
 #include "build-info.h"
 #include "common.h"
 #include "fit.h"
+#include "ggml-exec-trace.h"
 #include "llama.h"
 #include "log.h"
 #include "sampling.h"
@@ -37,6 +38,23 @@
 #endif
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+class server_exec_trace_phase_scope {
+public:
+    explicit server_exec_trace_phase_scope(enum ggml_exec_trace_execution_phase phase) :
+        previous(ggml_exec_trace_set_execution_phase(phase)) {
+    }
+
+    ~server_exec_trace_phase_scope() {
+        ggml_exec_trace_set_execution_phase(previous);
+    }
+
+    server_exec_trace_phase_scope(const server_exec_trace_phase_scope &) = delete;
+    server_exec_trace_phase_scope & operator=(const server_exec_trace_phase_scope &) = delete;
+
+private:
+    enum ggml_exec_trace_execution_phase previous;
+};
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
@@ -3043,6 +3061,7 @@ private:
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
             queue_tasks.yield_to_queue([&]() {
+                server_exec_trace_phase_scope trace_phase(GGML_EXEC_TRACE_PHASE_GENERATION_DRAFT);
                 common_speculative_draft(spec.get());
             });
         }
@@ -3671,14 +3690,18 @@ private:
         }
 
         bool has_output = false;
+        bool has_prompt = false;
         for (int i = off; i < off + batch_view.n_tokens; ++i) {
             has_output |= batch.tokens[i].output;
+            has_prompt |= batch.tokens[i].is_prompt;
         }
 
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
         queue_tasks.yield_to_queue([&]() {
+            const auto phase = has_prompt ? GGML_EXEC_TRACE_PHASE_PROMPT : GGML_EXEC_TRACE_PHASE_GENERATION_TARGET;
+            server_exec_trace_phase_scope trace_phase(phase);
             ret = llama_decode(ctx_tgt, batch_view);
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
@@ -3744,6 +3767,8 @@ private:
         if (spec) {
             bool ok = true;
             queue_tasks.yield_to_queue([&]() {
+                const auto phase = has_prompt ? GGML_EXEC_TRACE_PHASE_PROMPT : GGML_EXEC_TRACE_PHASE_GENERATION_DRAFT;
+                server_exec_trace_phase_scope trace_phase(phase);
                 ok = common_speculative_process(spec.get(), batch_view);
             });
 

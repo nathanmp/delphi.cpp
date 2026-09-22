@@ -161,6 +161,7 @@ struct trace_state {
 trace_state g_trace;
 integrity_state g_integrity;
 thread_local uint32_t t_execution_id = 0;
+thread_local enum ggml_exec_trace_execution_phase t_execution_phase = GGML_EXEC_TRACE_PHASE_UNKNOWN;
 thread_local uint32_t t_ubatch_id = 0;
 thread_local uint32_t t_thread_id = 0;
 thread_local integrity_thread_state * t_integrity = nullptr;
@@ -856,13 +857,20 @@ uint32_t ggml_exec_trace_execution_begin(
     ggml_exec_trace_event event = {};
     event.kind = GGML_EXEC_TRACE_EVENT_EXECUTION_BEGIN;
     event.execution_id = id;
-    event.flags = (uint32_t) kind;
+    event.flags = (uint32_t) kind | ((uint32_t) t_execution_phase << 8);
     event.args[0] = n_tokens;
     event.args[1] = n_batch;
     event.args[2] = n_ubatch;
     event.args[3] = ((uint64_t) n_threads_batch << 32) | n_threads;
     ggml_exec_trace_record(event);
     return id;
+}
+
+enum ggml_exec_trace_execution_phase ggml_exec_trace_set_execution_phase(
+        enum ggml_exec_trace_execution_phase phase) {
+    const enum ggml_exec_trace_execution_phase previous = t_execution_phase;
+    t_execution_phase = phase;
+    return previous;
 }
 
 void ggml_exec_trace_execution_end(uint32_t execution_id, int32_t status) {
@@ -954,6 +962,28 @@ void ggml_exec_trace_backend_end(void) {
 
 void ggml_exec_trace_set_node(uint32_t node_index) {
     t_backend.node_index = node_index;
+}
+
+uint64_t ggml_exec_trace_cpu_node_begin(void) {
+    return ggml_exec_trace_enabled() && g_trace.gpu_timing_mode == GGML_EXEC_TRACE_GPU_TIMING_OP &&
+            t_backend.node_ids && t_backend.node_index < t_backend.n_nodes ? ggml_exec_trace_now_ns() : 0;
+}
+
+void ggml_exec_trace_cpu_node_end(uint64_t start_ns, uint32_t node_index, uint32_t node_count) {
+    if (start_ns == 0 || !t_backend.node_ids || node_index >= t_backend.n_nodes) {
+        return;
+    }
+    ggml_exec_trace_event event = {};
+    event.timestamp_ns = start_ns;
+    event.kind = GGML_EXEC_TRACE_EVENT_CPU_NODE_TIMING;
+    event.graph_id = t_backend.graph_id;
+    event.node_id = t_backend.node_ids[node_index];
+    event.split_id = t_backend.split_id;
+    event.backend_id = t_backend.backend_id;
+    event.device_id = t_backend.device_id;
+    event.args[0] = ggml_exec_trace_now_ns();
+    event.args[1] = node_count;
+    ggml_exec_trace_record(event);
 }
 
 void ggml_exec_trace_dispatch(
