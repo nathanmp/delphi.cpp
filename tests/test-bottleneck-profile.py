@@ -55,7 +55,7 @@ class TestBottleneckProfile(unittest.TestCase):
         }
         summary = profile.render_summary(result)
         self.assertIn("diagnostic, non-additive", summary)
-        self.assertIn("wall 10.000 ms/token", summary)
+        self.assertIn("instrumented window 10.000 ms/token", summary)
         self.assertIn("<=25.0%", summary)
 
     def test_speed_bench_parser_uses_saved_json_field_names(self):
@@ -65,6 +65,23 @@ class TestBottleneckProfile(unittest.TestCase):
         self.assertEqual(metrics["prompt_t_s"], 100.0)
         self.assertEqual(metrics["predicted_t_s"], 20.0)
         self.assertEqual(metrics["accept_rate"], 0.75)
+
+    def test_speed_bench_summary_uses_end_to_end_wall_for_ceilings(self):
+        result = {
+            "recipe": "example", "created_utc": "2026-09-22T00:00:00Z", "repository": {"commit": "abc", "tree": "clean"}, "arms": [{
+                "name": "plain", "type": "llama-server + speed-bench",
+                "metrics": {"kind": "speed-bench", "prompt_t_s": 100.0, "predicted_t_s": 20.0, "latency_s": 3.0, "accept_rate": None},
+                "trace": {"mode": "submit", "integrity": "not-run", "analysis": {"decode": {
+                    "executions": 2,
+                    "wall_ms_per_token": {"median": 10.0},
+                    "cpu_compute_ms": {"median": 1.0}, "copy_handling_ms": {"median": 2.0},
+                    "host_submit_ms": {"median": 3.0}, "device_submit_ms": {"median": 4.0},
+                    "diagnostic_op_family_ms": {},
+                }}}}]
+        }
+        summary = profile.render_summary(result)
+        self.assertIn("TG wall 50.000 ms/token", summary)
+        self.assertIn("<=2.0%", summary)
 
 
 if __name__ == "__main__":

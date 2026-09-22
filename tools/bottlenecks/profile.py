@@ -616,8 +616,12 @@ def render_summary(result: Mapping[str, Any]) -> str:
     for arm in result["arms"]:
         lines.extend(("", f"## {arm['name']} ({arm['type']})"))
         metrics = arm["metrics"]
+        end_to_end_wall_ms = None
         if metrics["kind"] == "speed-bench":
-            lines.append(f"End to end: PP {_fmt(metrics.get('prompt_t_s'), ' t/s')}; TG {_fmt(metrics.get('predicted_t_s'), ' t/s')}; latency {_fmt(metrics.get('latency_s'), ' s')}; acceptance {metrics.get('accept_rate', 'n/a')}")
+            predicted_t_s = metrics.get("predicted_t_s")
+            if predicted_t_s is not None and predicted_t_s > 0:
+                end_to_end_wall_ms = 1000.0 / predicted_t_s
+            lines.append(f"End to end: PP {_fmt(metrics.get('prompt_t_s'), ' t/s')}; TG {_fmt(predicted_t_s, ' t/s')}; TG wall {_fmt(end_to_end_wall_ms, ' ms/token')}; latency {_fmt(metrics.get('latency_s'), ' s')}; acceptance {metrics.get('accept_rate', 'n/a')}")
         else:
             for test in metrics["tests"]:
                 name = test["test"].get("model_type", "benchmark")
@@ -627,11 +631,11 @@ def render_summary(result: Mapping[str, Any]) -> str:
             lines.append("Trace: not collected")
             continue
         decode = trace["analysis"]["decode"]
-        lines.append(f"Trace ({trace['mode']}, integrity {trace['integrity']}): {decode['executions']} measured decode executions; wall {_fmt(decode['wall_ms_per_token']['median'], ' ms/token')}")
+        lines.append(f"Trace ({trace['mode']}, integrity {trace['integrity']}): {decode['executions']} measured decode executions; instrumented window {_fmt(decode['wall_ms_per_token']['median'], ' ms/token')}")
         lines.extend(("", "| measured span | median ms/token | optimistic gain ceiling | evidence |", "| --- | ---: | ---: | --- |"))
         for key, label in (("cpu_compute_ms", "CPU compute"), ("copy_handling_ms", "copy handling"), ("host_submit_ms", "host submit"), ("device_submit_ms", "device submit sum")):
-            evidence = "HOST_SAFE, overlapping" if key != "device_submit_ms" else "DEVICE_EVENT, non-additive"
-            ceiling = _serial_gain_ceiling(decode[key]["median"], decode["wall_ms_per_token"]["median"]) if key != "device_submit_ms" else "n/a"
+            evidence = "HOST interval, upper-bound only" if key != "device_submit_ms" else "DEVICE_EVENT, non-additive"
+            ceiling = _serial_gain_ceiling(decode[key]["median"], end_to_end_wall_ms or decode["wall_ms_per_token"]["median"]) if key != "device_submit_ms" else "n/a"
             lines.append(f"| {label} | {_fmt(decode[key]['median'])} | {ceiling} | {evidence} |")
         for family, stats in decode.get("diagnostic_op_family_ms", {}).items():
             lines.append(f"| {family} | {_fmt(stats['median'])} | n/a | DEVICE_EVENT diagnostic, non-additive |")
