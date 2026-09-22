@@ -617,6 +617,9 @@ def render_summary(result: Mapping[str, Any]) -> str:
         lines.extend(("", f"## {arm['name']} ({arm['type']})"))
         for note in arm.get("notes", ()):
             lines.append(f"Note: {note}")
+        binary_version = arm.get("binary_version")
+        if binary_version:
+            lines.append(f"Binary: {binary_version.splitlines()[0]}")
         metrics = arm["metrics"]
         end_to_end_wall_ms = None
         if metrics["kind"] == "speed-bench":
