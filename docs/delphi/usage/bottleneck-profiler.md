@@ -71,7 +71,7 @@ extra_measurements=(
 )
 ```
 
-For a steady-state prefill measurement, use an input that crosses several logical batches and ubatches. The current private recipes use 4096 input tokens with `-b 2048 -ub 512`: two logical batches and eight ubatches. The summary records both the server-reported prefill throughput and a separate trace span table. Set `trace_prefill_min_tokens` to exclude the short prompt executions from a decode client; the private recipes use 128. Set `trace_prefill_target_tokens` to the exact client input size (4096 in the private recipes), so the trace table selects the final matching prefill sequence rather than any unrelated prompt work in the arm.
+For a steady-state prefill measurement, use an input that crosses several logical batches and ubatches. The current private recipes use 4096 input tokens with `-b 2048 -ub 512`: two logical batches and eight ubatches. The summary records both the server-reported prefill throughput and a separate trace span table. Set `trace_prefill_min_tokens` to reject an unrelated short sequence; the private recipes use 128. Set `trace_prefill_target_tokens` to the exact client input size (4096 in the private recipes), so the trace table selects the final complete prefill sequence, including a small batch tail. Speculative configurations can have more trace-token executions than client input tokens because target and draft contexts both do work.
 
 Use the same server workload for a plain arm and a speculative arm. For execution-cost comparisons, a fixed synthetic acceptance pattern removes prompt-dependent acceptance variance. Also collect a short normal-acceptance arm when a change can affect draft quality, logits, sampling, or acceptance.
 

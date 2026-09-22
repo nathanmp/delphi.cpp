@@ -328,23 +328,23 @@ def _prefill_execution_ids(selected: set[int], execution_info: Mapping[int, Mapp
     candidates = sorted(
         execution_id for execution_id in pool
         if execution_info[execution_id]["kind"] == "prefill"
-        and execution_info[execution_id]["tokens"] >= min_tokens
     )
     if not target_tokens:
-        return set(candidates)
+        return {execution_id for execution_id in candidates if execution_info[execution_id]["tokens"] >= min_tokens}
 
-    matches: list[set[int]] = []
-    for start in range(len(candidates)):
-        total = 0
-        match = set()
-        for execution_id in candidates[start:]:
-            total += execution_info[execution_id]["tokens"]
-            match.add(execution_id)
-            if total >= target_tokens:
-                if total == target_tokens:
-                    matches.append(match)
-                break
-    return matches[-1] if matches else set()
+    # The exact-ID request is the final client action in an arm. Its logical
+    # batches may include a small tail, so do not discard that tail merely
+    # because it is below min_tokens. MTP/DSpark can evaluate the same prompt
+    # in more than one context; retain the complete final run and record its
+    # trace-token total rather than silently choosing one context.
+    sequences: list[list[int]] = []
+    for execution_id in candidates:
+        if not sequences or execution_id != sequences[-1][-1] + 1:
+            sequences.append([execution_id])
+        else:
+            sequences[-1].append(execution_id)
+    matching = [sequence for sequence in sequences if sum(execution_info[item]["tokens"] for item in sequence) >= target_tokens and max(execution_info[item]["tokens"] for item in sequence) >= min_tokens]
+    return set(matching[-1]) if matching else set()
 
 
 def _trace_summary(path: Path, family_rules: Sequence[FamilyRule], *, prefill_min_tokens: int = 0, prefill_target_tokens: int = 0) -> dict[str, Any]:
@@ -766,7 +766,7 @@ def render_summary(result: Mapping[str, Any]) -> str:
             prefill_wall_ms = None
             if prefill_metric and prefill_metric.get("prompt_t_s"):
                 prefill_wall_ms = 1000.0 / prefill_metric["prompt_t_s"]
-            lines.extend(("", f"Prefill trace: {prefill['executions']} selected executions, {prefill['tokens']['total']} trace tokens; instrumented window {_fmt(prefill['wall_ms_per_token']['median'], ' ms/token')}"))
+            lines.extend(("", f"Prefill trace: {prefill['executions']} selected executions, {prefill['tokens']['total']} trace-token executions; instrumented window {_fmt(prefill['wall_ms_per_token']['median'], ' ms/token')}"))
             lines.extend(("", "| measured prefill span | median ms/token | optimistic gain ceiling | evidence |", "| --- | ---: | ---: | --- |"))
             for key, label in (("cpu_compute_ms", "CPU compute"), ("copy_handling_ms", "copy handling"), ("host_submit_ms", "host submit"), ("device_submit_ms", "device submit sum")):
                 evidence = "HOST interval, upper-bound only" if key != "device_submit_ms" else "DEVICE_EVENT, non-additive"

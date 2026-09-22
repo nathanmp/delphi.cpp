@@ -77,15 +77,16 @@ class TestBottleneckProfile(unittest.TestCase):
         self.assertEqual(metrics["prompt_tokens"], 4097)
         self.assertEqual(metrics["prompt_t_s"], 2048.5)
 
-    def test_prefill_trace_selection_uses_final_exact_sequence(self):
+    def test_prefill_trace_selection_uses_final_complete_sequence(self):
         info = {
             1: {"kind": "prefill", "tokens": 2},
-            2: {"kind": "prefill", "tokens": 256},
             3: {"kind": "prefill", "tokens": 2048},
             4: {"kind": "prefill", "tokens": 2048},
-            5: {"kind": "decode", "tokens": 1},
+            5: {"kind": "prefill", "tokens": 4},
+            2: {"kind": "decode", "tokens": 1},
+            6: {"kind": "decode", "tokens": 1},
         }
-        self.assertEqual(profile._prefill_execution_ids({2, 3, 4, 5}, info, 128, 4096), {3, 4})
+        self.assertEqual(profile._prefill_execution_ids({3, 4, 5, 6}, info, 128, 4096), {3, 4, 5})
 
     def test_speed_bench_summary_uses_end_to_end_wall_for_ceilings(self):
         result = {
@@ -139,7 +140,7 @@ class TestBottleneckProfile(unittest.TestCase):
         }
         summary = profile.render_summary(result)
         self.assertIn("Prefill (prefill-4096): target 4096 tokens", summary)
-        self.assertIn("Prefill trace: 2 selected executions, 4096 trace tokens", summary)
+        self.assertIn("Prefill trace: 2 selected executions, 4096 trace-token executions", summary)
         self.assertIn("measured prefill span", summary)
 
 
