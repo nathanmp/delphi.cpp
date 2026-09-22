@@ -615,6 +615,8 @@ def render_summary(result: Mapping[str, Any]) -> str:
     lines.extend(("", "This is measured on this machine and configuration. It overrides prior assumptions. A device-op family is diagnostic and non-additive; use the end-to-end wall-time row for Amdahl estimates."))
     for arm in result["arms"]:
         lines.extend(("", f"## {arm['name']} ({arm['type']})"))
+        for note in arm.get("notes", ()):
+            lines.append(f"Note: {note}")
         metrics = arm["metrics"]
         end_to_end_wall_ms = None
         if metrics["kind"] == "speed-bench":
