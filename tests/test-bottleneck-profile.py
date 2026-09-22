@@ -135,13 +135,13 @@ class TestBottleneckProfile(unittest.TestCase):
                 "name": "plain", "type": "llama-server + speed-bench",
                 "metrics": {"kind": "speed-bench", "prompt_t_s": 10.0, "predicted_t_s": 20.0, "latency_s": 3.0, "accept_rate": None},
                 "extra_measurements": [{"name": "prefill-4096", "metrics": {"kind": "prefill", "target_tokens": 4096, "prompt_tokens": 4097, "prompt_t_s": 250.0, "latency_s": 16.5}}],
-                "trace": {"mode": "submit", "integrity": "not-run", "analysis": {"decode": span, "prefill": {**span, "tokens": {"total": 4096}}}},
+                "trace": {"mode": "submit", "integrity": "not-run", "analysis": {"decode": span, "prefill": {**span, "tokens": {"total": 4096}, "aggregate_per_client_token_ms": {"wall_ms": 4.5, "cpu_compute_ms": 1.1, "copy_handling_ms": 0.6, "host_submit_ms": 0.3, "device_submit_ms": 2.2}}}},
             }],
         }
         summary = profile.render_summary(result)
         self.assertIn("Prefill (prefill-4096): target 4096 tokens", summary)
         self.assertIn("Prefill trace: 2 selected executions, 4096 trace-token executions", summary)
-        self.assertIn("measured prefill span", summary)
+        self.assertIn("aggregate ms/client token", summary)
 
 
 if __name__ == "__main__":

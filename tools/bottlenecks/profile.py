@@ -384,7 +384,7 @@ def _trace_summary(path: Path, family_rules: Sequence[FamilyRule], *, prefill_mi
             family = next((rule.name for rule in family_rules if rule.matches(node)), "everything else")
             family_per_execution[execution_id][family] += duration_ms
 
-    def summarize(ids: set[int]) -> dict[str, Any]:
+    def summarize(ids: set[int], client_tokens: int = 0) -> dict[str, Any]:
         summary = {
             "executions": len(ids),
             "tokens": {
@@ -403,10 +403,22 @@ def _trace_summary(path: Path, family_rules: Sequence[FamilyRule], *, prefill_mi
                 name: _stats(family_per_execution[item][name] / max(1, execution_info[item]["tokens"]) for item in ids)
                 for name in family_names
             }
+        if client_tokens:
+            aggregate = {
+                "wall_ms": sum(execution_info[item]["wall_ms"] for item in ids) / client_tokens,
+                **{label: sum(per_execution[item][label] for item in ids) / client_tokens for label in span_names.values()},
+                "device_submit_ms": sum(submit_per_execution[item] for item in ids) / client_tokens,
+            }
+            if family_names:
+                aggregate["diagnostic_op_family_ms"] = {
+                    name: sum(family_per_execution[item][name] for item in ids) / client_tokens
+                    for name in family_names
+                }
+            summary["aggregate_per_client_token_ms"] = aggregate
         return summary
 
     decode = summarize(decode_ids)
-    prefill = summarize(prefill_ids)
+    prefill = summarize(prefill_ids, prefill_target_tokens)
 
     graph_states = Counter()
     for event in events:
@@ -766,14 +778,24 @@ def render_summary(result: Mapping[str, Any]) -> str:
             prefill_wall_ms = None
             if prefill_metric and prefill_metric.get("prompt_t_s"):
                 prefill_wall_ms = 1000.0 / prefill_metric["prompt_t_s"]
-            lines.extend(("", f"Prefill trace: {prefill['executions']} selected executions, {prefill['tokens']['total']} trace-token executions; instrumented window {_fmt(prefill['wall_ms_per_token']['median'], ' ms/token')}"))
-            lines.extend(("", "| measured prefill span | median ms/token | optimistic gain ceiling | evidence |", "| --- | ---: | ---: | --- |"))
+            aggregate = prefill.get("aggregate_per_client_token_ms")
+            span_values = aggregate or {key: prefill[key]["median"] for key in ("cpu_compute_ms", "copy_handling_ms", "host_submit_ms", "device_submit_ms")}
+            wall_ms = span_values["wall_ms"] if aggregate else prefill["wall_ms_per_token"]["median"]
+            span_label = "aggregate ms/client token" if aggregate else "median ms/token"
+            evidence_suffix = " across trace contexts" if aggregate else ""
+            lines.extend(("", f"Prefill trace: {prefill['executions']} selected executions, {prefill['tokens']['total']} trace-token executions; instrumented window {_fmt(wall_ms, ' ms/client token' if aggregate else ' ms/token')}"))
+            lines.extend(("", f"| measured prefill span | {span_label} | optimistic gain ceiling | evidence |", "| --- | ---: | ---: | --- |"))
             for key, label in (("cpu_compute_ms", "CPU compute"), ("copy_handling_ms", "copy handling"), ("host_submit_ms", "host submit"), ("device_submit_ms", "device submit sum")):
-                evidence = "HOST interval, upper-bound only" if key != "device_submit_ms" else "DEVICE_EVENT, non-additive"
-                ceiling = _serial_gain_ceiling(prefill[key]["median"], prefill_wall_ms or prefill["wall_ms_per_token"]["median"]) if key != "device_submit_ms" else "n/a"
-                lines.append(f"| {label} | {_fmt(prefill[key]['median'])} | {ceiling} | {evidence} |")
-            for family, stats in prefill.get("diagnostic_op_family_ms", {}).items():
-                lines.append(f"| {family} | {_fmt(stats['median'])} | n/a | DEVICE_EVENT diagnostic, non-additive |")
+                evidence = f"HOST interval, upper-bound only{evidence_suffix}" if key != "device_submit_ms" else "DEVICE_EVENT, non-additive"
+                ceiling = _serial_gain_ceiling(span_values[key], prefill_wall_ms or wall_ms) if key != "device_submit_ms" else "n/a"
+                lines.append(f"| {label} | {_fmt(span_values[key])} | {ceiling} | {evidence} |")
+            if aggregate:
+                families = aggregate.get("diagnostic_op_family_ms", {})
+                for family, value in families.items():
+                    lines.append(f"| {family} | {_fmt(value)} | n/a | DEVICE_EVENT diagnostic, non-additive |")
+            else:
+                for family, stats in prefill.get("diagnostic_op_family_ms", {}).items():
+                    lines.append(f"| {family} | {_fmt(stats['median'])} | n/a | DEVICE_EVENT diagnostic, non-additive |")
     return "\n".join(lines) + "\n"
 
 
