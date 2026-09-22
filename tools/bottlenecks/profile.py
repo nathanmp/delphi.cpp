@@ -86,6 +86,22 @@ class ServerArm:
     trace_event_capacity: int = 16_384
     family_rules: tuple[FamilyRule, ...] = ()
     notes: tuple[str, ...] = ()
+    extra_measurements: tuple["ServerMeasurement", ...] = ()
+    trace_prefill_min_tokens: int = 0
+
+
+@dataclass(frozen=True)
+class ServerMeasurement:
+    """An additional client measurement made while a ServerArm is loaded.
+
+    The command can use the same placeholders as ServerArm.client_command.
+    Its {output} placeholder is an arm-local JSON file named after this
+    measurement. result_kind selects the small normalized metric parser.
+    """
+
+    name: str
+    command: tuple[str, ...]
+    result_kind: str = "speed-bench"
 
 
 Arm = BenchArm | ServerArm
@@ -255,6 +271,29 @@ def _speed_bench_metrics(payload: Any) -> dict[str, Any]:
     }
 
 
+def _prefill_metrics(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise ProfileError("prefill client result is not a JSON object")
+    return {
+        "kind": "prefill",
+        "target_tokens": payload.get("target_tokens"),
+        "input_tokens": payload.get("input_tokens"),
+        "prompt_tokens": payload.get("prompt_tokens"),
+        "prompt_t_s": payload.get("prompt_t_s"),
+        "prompt_ms": payload.get("prompt_ms"),
+        "latency_s": payload.get("latency_s"),
+        "predicted_tokens": payload.get("predicted_tokens"),
+    }
+
+
+def _server_metrics(kind: str, payload: Any) -> dict[str, Any]:
+    if kind == "speed-bench":
+        return _speed_bench_metrics(payload)
+    if kind == "prefill":
+        return _prefill_metrics(payload)
+    raise ProfileError(f"unknown server measurement kind: {kind}")
+
+
 def _selected_execution_ids(events: Sequence[Mapping[str, Any]]) -> tuple[set[int], dict[int, dict[str, Any]]]:
     begins: dict[int, Mapping[str, Any]] = {}
     ends: dict[int, Mapping[str, Any]] = {}
@@ -283,13 +322,18 @@ def _selected_execution_ids(events: Sequence[Mapping[str, Any]]) -> tuple[set[in
     return selected, info
 
 
-def _trace_summary(path: Path, family_rules: Sequence[FamilyRule]) -> dict[str, Any]:
+def _trace_summary(path: Path, family_rules: Sequence[FamilyRule], *, prefill_min_tokens: int = 0) -> dict[str, Any]:
     trace = TRACE.read_trace(path)
     if trace["flags"] & 1 or trace["trace_stats"].get("dropped_event_count", 0):
         raise ProfileError(f"trace is truncated or dropped events: {path}")
     events, strings = trace["events"], trace["strings"]
     selected, execution_info = _selected_execution_ids(events)
     decode_ids = {execution_id for execution_id in selected if execution_info[execution_id]["kind"] == "decode"}
+    prefill_ids = {
+        execution_id for execution_id in selected
+        if execution_info[execution_id]["kind"] == "prefill"
+        and execution_info[execution_id]["tokens"] >= prefill_min_tokens
+    }
     per_execution = defaultdict(lambda: Counter())
     span_names = {
         TRACE.K_BACKEND_SUBMIT: "host_submit_ms",
@@ -298,15 +342,8 @@ def _trace_summary(path: Path, family_rules: Sequence[FamilyRule]) -> dict[str, 
     }
     for event in events:
         label = span_names.get(event["kind"])
-        if label and event["execution_id"] in decode_ids:
+        if label and event["execution_id"] in decode_ids | prefill_ids:
             per_execution[event["execution_id"]][label] += TRACE.span_duration_ns(event) / 1e6
-
-    decode = {
-        "executions": len(decode_ids),
-        "wall_ms_per_token": _stats(execution_info[item]["wall_ms"] / max(1, execution_info[item]["tokens"]) for item in decode_ids),
-    }
-    for label in span_names.values():
-        decode[label] = _stats(per_execution[item][label] / max(1, execution_info[item]["tokens"]) for item in decode_ids)
 
     spans, _ = TRACE.gpu_timing_model(events)
     gpu_status_counts = Counter(span["status"] for span in spans)
@@ -316,7 +353,7 @@ def _trace_summary(path: Path, family_rules: Sequence[FamilyRule]) -> dict[str, 
     for span in spans:
         event = span["event"]
         execution_id = event["execution_id"]
-        if execution_id not in decode_ids or span["status"] != "resolved":
+        if execution_id not in decode_ids | prefill_ids or span["status"] != "resolved":
             continue
         duration_ms = span["device_duration_ns"] / 1e6
         if span["scope"] in ("eager_submit", "graph_launch"):
@@ -326,13 +363,29 @@ def _trace_summary(path: Path, family_rules: Sequence[FamilyRule]) -> dict[str, 
             family = next((rule.name for rule in family_rules if rule.matches(node)), "everything else")
             family_per_execution[execution_id][family] += duration_ms
 
-    decode["device_submit_ms"] = _stats(submit_per_execution[item] / max(1, execution_info[item]["tokens"]) for item in decode_ids)
-    if family_per_execution:
-        family_names = sorted({name for item in family_per_execution.values() for name in item})
-        decode["diagnostic_op_family_ms"] = {
-            name: _stats(family_per_execution[item][name] / max(1, execution_info[item]["tokens"]) for item in decode_ids)
-            for name in family_names
+    def summarize(ids: set[int]) -> dict[str, Any]:
+        summary = {
+            "executions": len(ids),
+            "tokens": {
+                "total": sum(execution_info[item]["tokens"] for item in ids),
+                "per_execution": _stats(execution_info[item]["tokens"] for item in ids),
+            },
+            "wall_ms": _stats(execution_info[item]["wall_ms"] for item in ids),
+            "wall_ms_per_token": _stats(execution_info[item]["wall_ms"] / max(1, execution_info[item]["tokens"]) for item in ids),
         }
+        for label in span_names.values():
+            summary[label] = _stats(per_execution[item][label] / max(1, execution_info[item]["tokens"]) for item in ids)
+        summary["device_submit_ms"] = _stats(submit_per_execution[item] / max(1, execution_info[item]["tokens"]) for item in ids)
+        family_names = sorted({name for item in ids for name in family_per_execution[item]})
+        if family_names:
+            summary["diagnostic_op_family_ms"] = {
+                name: _stats(family_per_execution[item][name] / max(1, execution_info[item]["tokens"]) for item in ids)
+                for name in family_names
+            }
+        return summary
+
+    decode = summarize(decode_ids)
+    prefill = summarize(prefill_ids)
 
     graph_states = Counter()
     for event in events:
@@ -345,6 +398,13 @@ def _trace_summary(path: Path, family_rules: Sequence[FamilyRule]) -> dict[str, 
         "gpu_timing_status_counts": dict(sorted(gpu_status_counts.items())),
         "warmups_excluded": sorted(set(execution_info) - selected),
         "decode": decode,
+        "prefill": prefill,
+        "prefill_min_tokens": prefill_min_tokens,
+        "prefill_excluded_below_min_tokens": sorted(
+            execution_id for execution_id in selected
+            if execution_info[execution_id]["kind"] == "prefill"
+            and execution_info[execution_id]["tokens"] < prefill_min_tokens
+        ),
         "gpu_graph_lifecycle": dict(sorted(graph_states.items())),
     }
 
@@ -384,7 +444,7 @@ def _run_bench_arm(arm: BenchArm, artifacts: Path, common_env: Mapping[str, str]
             "path": str(trace_path),
             "mode": arm.trace_mode,
             "integrity": "not-run",
-            "analysis": _trace_summary(trace_path, arm.family_rules),
+            "analysis": _trace_summary(trace_path, arm.family_rules, prefill_min_tokens=arm.trace_prefill_min_tokens),
         }
     return result
 
@@ -426,7 +486,7 @@ def _run_server_arm(arm: ServerArm, artifacts: Path, common_env: Mapping[str, st
     arm_dir = artifacts / arm.name
     arm_dir.mkdir(parents=True, exist_ok=True)
     trace_path = _arm_trace_path(artifacts, arm)
-    output_path = arm_dir / "speed-bench.json"
+    output_path = arm_dir / "client.json"
     url = f"http://127.0.0.1:{arm.port}"
     values = {"port": str(arm.port), "url": url, "output": str(output_path), "artifact_dir": str(arm_dir)}
     env = dict(common_env)
@@ -451,6 +511,25 @@ def _run_server_arm(arm: ServerArm, artifacts: Path, common_env: Mapping[str, st
             (arm_dir / "client.stderr.log").write_text(client.stderr)
             if client.returncode:
                 raise ProfileError(f"{arm.name} client failed with status {client.returncode}; see {arm_dir / 'client.stderr.log'}")
+            extra_measurements = []
+            for measurement in arm.extra_measurements:
+                measurement_output = arm_dir / f"{measurement.name}.json"
+                measurement_values = dict(values)
+                measurement_values["output"] = str(measurement_output)
+                command = _render(measurement.command, measurement_values)
+                completed = _run(command, env, timeout=arm.request_timeout_s)
+                (arm_dir / f"{measurement.name}.stdout.log").write_text(completed.stdout)
+                (arm_dir / f"{measurement.name}.stderr.log").write_text(completed.stderr)
+                if completed.returncode:
+                    raise ProfileError(f"{arm.name} {measurement.name} failed with status {completed.returncode}; see {arm_dir / f'{measurement.name}.stderr.log'}")
+                if not measurement_output.exists():
+                    raise ProfileError(f"{arm.name} {measurement.name} did not create {measurement_output}")
+                extra_measurements.append({
+                    "name": measurement.name,
+                    "command": list(command),
+                    "command_text": _command_text(command),
+                    "metrics": _server_metrics(measurement.result_kind, _parse_json_output(measurement_output.read_text(), f"{arm.name} {measurement.name}")),
+                })
         finally:
             _stop_server(process)
     if not output_path.exists():
@@ -466,6 +545,7 @@ def _run_server_arm(arm: ServerArm, artifacts: Path, common_env: Mapping[str, st
         "binary_version": _version(server_command[0], env),
         "models": _model_identity(arm.model_paths),
         "metrics": _speed_bench_metrics(_parse_json_output(output_path.read_text(), arm.name)),
+        "extra_measurements": extra_measurements,
         "notes": list(arm.notes),
     }
     if arm.trace_mode != "off":
@@ -475,7 +555,7 @@ def _run_server_arm(arm: ServerArm, artifacts: Path, common_env: Mapping[str, st
             "path": str(trace_path),
             "mode": arm.trace_mode,
             "integrity": "not-run",
-            "analysis": _trace_summary(trace_path, arm.family_rules),
+            "analysis": _trace_summary(trace_path, arm.family_rules, prefill_min_tokens=arm.trace_prefill_min_tokens),
         }
     return result
 
@@ -631,6 +711,17 @@ def render_summary(result: Mapping[str, Any]) -> str:
             for test in metrics["tests"]:
                 name = test["test"].get("model_type", "benchmark")
                 lines.append(f"{name}: {_fmt(test['throughput_t_s']['median'], ' t/s')} median ({test['throughput_t_s']['count']} samples)")
+        for measurement in arm.get("extra_measurements", ()):
+            extra_metrics = measurement["metrics"]
+            if extra_metrics["kind"] == "prefill":
+                prefill_wall_ms = None
+                if extra_metrics.get("prompt_t_s"):
+                    prefill_wall_ms = 1000.0 / extra_metrics["prompt_t_s"]
+                lines.append(
+                    f"Prefill ({measurement['name']}): target {extra_metrics.get('target_tokens', 'n/a')} tokens; "
+                    f"evaluated {extra_metrics.get('prompt_tokens', 'n/a')}; PP {_fmt(extra_metrics.get('prompt_t_s'), ' t/s')}; "
+                    f"PP wall {_fmt(prefill_wall_ms, ' ms/token')}; latency {_fmt(extra_metrics.get('latency_s'), ' s')}"
+                )
         trace = arm.get("trace")
         if not trace:
             lines.append("Trace: not collected")
@@ -639,14 +730,28 @@ def render_summary(result: Mapping[str, Any]) -> str:
         lines.append(f"Trace ({trace['mode']}, integrity {trace['integrity']}): {decode['executions']} measured decode executions; instrumented window {_fmt(decode['wall_ms_per_token']['median'], ' ms/token')}")
         if decode["executions"] < 10:
             lines.append("Trace breakdown: insufficient steady decode executions; use the end-to-end measurement above.")
-            continue
-        lines.extend(("", "| measured span | median ms/token | optimistic gain ceiling | evidence |", "| --- | ---: | ---: | --- |"))
-        for key, label in (("cpu_compute_ms", "CPU compute"), ("copy_handling_ms", "copy handling"), ("host_submit_ms", "host submit"), ("device_submit_ms", "device submit sum")):
-            evidence = "HOST interval, upper-bound only" if key != "device_submit_ms" else "DEVICE_EVENT, non-additive"
-            ceiling = _serial_gain_ceiling(decode[key]["median"], end_to_end_wall_ms or decode["wall_ms_per_token"]["median"]) if key != "device_submit_ms" else "n/a"
-            lines.append(f"| {label} | {_fmt(decode[key]['median'])} | {ceiling} | {evidence} |")
-        for family, stats in decode.get("diagnostic_op_family_ms", {}).items():
-            lines.append(f"| {family} | {_fmt(stats['median'])} | n/a | DEVICE_EVENT diagnostic, non-additive |")
+        else:
+            lines.extend(("", "| measured span | median ms/token | optimistic gain ceiling | evidence |", "| --- | ---: | ---: | --- |"))
+            for key, label in (("cpu_compute_ms", "CPU compute"), ("copy_handling_ms", "copy handling"), ("host_submit_ms", "host submit"), ("device_submit_ms", "device submit sum")):
+                evidence = "HOST interval, upper-bound only" if key != "device_submit_ms" else "DEVICE_EVENT, non-additive"
+                ceiling = _serial_gain_ceiling(decode[key]["median"], end_to_end_wall_ms or decode["wall_ms_per_token"]["median"]) if key != "device_submit_ms" else "n/a"
+                lines.append(f"| {label} | {_fmt(decode[key]['median'])} | {ceiling} | {evidence} |")
+            for family, stats in decode.get("diagnostic_op_family_ms", {}).items():
+                lines.append(f"| {family} | {_fmt(stats['median'])} | n/a | DEVICE_EVENT diagnostic, non-additive |")
+        prefill = trace["analysis"].get("prefill")
+        if prefill and prefill["executions"]:
+            prefill_metric = next((item["metrics"] for item in arm.get("extra_measurements", ()) if item["metrics"].get("kind") == "prefill"), None)
+            prefill_wall_ms = None
+            if prefill_metric and prefill_metric.get("prompt_t_s"):
+                prefill_wall_ms = 1000.0 / prefill_metric["prompt_t_s"]
+            lines.extend(("", f"Prefill trace: {prefill['executions']} selected executions, {prefill['tokens']['total']} trace tokens; instrumented window {_fmt(prefill['wall_ms_per_token']['median'], ' ms/token')}"))
+            lines.extend(("", "| measured prefill span | median ms/token | optimistic gain ceiling | evidence |", "| --- | ---: | ---: | --- |"))
+            for key, label in (("cpu_compute_ms", "CPU compute"), ("copy_handling_ms", "copy handling"), ("host_submit_ms", "host submit"), ("device_submit_ms", "device submit sum")):
+                evidence = "HOST interval, upper-bound only" if key != "device_submit_ms" else "DEVICE_EVENT, non-additive"
+                ceiling = _serial_gain_ceiling(prefill[key]["median"], prefill_wall_ms or prefill["wall_ms_per_token"]["median"]) if key != "device_submit_ms" else "n/a"
+                lines.append(f"| {label} | {_fmt(prefill[key]['median'])} | {ceiling} | {evidence} |")
+            for family, stats in prefill.get("diagnostic_op_family_ms", {}).items():
+                lines.append(f"| {family} | {_fmt(stats['median'])} | n/a | DEVICE_EVENT diagnostic, non-additive |")
     return "\n".join(lines) + "\n"
 
 

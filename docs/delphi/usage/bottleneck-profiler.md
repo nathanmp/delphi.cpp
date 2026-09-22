@@ -57,6 +57,22 @@ The JSON records the complete command, selected environment, binary version, mod
 
 Use `ServerArm` for one `llama-server` load and one SPEED-Bench client invocation. Its `server_command` and `client_command` can contain `{port}`, `{url}`, `{output}`, and `{artifact_dir}`. The runner waits for `/health`, runs the optional warmup command, invokes the client, and stops the server with `SIGINT` so the trace is finalized.
 
+Use `ServerMeasurement` in `ServerArm.extra_measurements` for an additional workload against that same loaded server. This is useful when a configuration must report both decode and prefill without paying another model load. The bundled `tools/bottlenecks/prefill-client.py` obtains token IDs from the server and sends an exact-length request to `/completion`; its JSON result uses `result_kind="prefill"`.
+
+```python
+from tools.bottlenecks.profile import ServerMeasurement
+
+extra_measurements=(
+    ServerMeasurement(
+        name="prefill-4096",
+        command=("python3", "tools/bottlenecks/prefill-client.py", "--url", "{url}", "--tokens", "4096", "--output", "{output}"),
+        result_kind="prefill",
+    ),
+)
+```
+
+For a steady-state prefill measurement, use an input that crosses several logical batches and ubatches. The current private recipes use 4096 input tokens with `-b 2048 -ub 512`: two logical batches and eight ubatches. The summary records both the server-reported prefill throughput and a separate trace span table. Set `trace_prefill_min_tokens` to exclude the short prompt executions from a decode client; the private recipes use 128.
+
 Use the same server workload for a plain arm and a speculative arm. For execution-cost comparisons, a fixed synthetic acceptance pattern removes prompt-dependent acceptance variance. Also collect a short normal-acceptance arm when a change can affect draft quality, logits, sampling, or acceptance.
 
 ## Interpretation

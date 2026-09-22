@@ -66,6 +66,17 @@ class TestBottleneckProfile(unittest.TestCase):
         self.assertEqual(metrics["predicted_t_s"], 20.0)
         self.assertEqual(metrics["accept_rate"], 0.75)
 
+    def test_prefill_parser_keeps_requested_and_realized_lengths(self):
+        metrics = profile._prefill_metrics({
+            "target_tokens": 4096, "input_tokens": 4096, "prompt_tokens": 4097,
+            "prompt_ms": 2000.0, "prompt_t_s": 2048.5, "latency_s": 2.1,
+            "predicted_tokens": 1,
+        })
+        self.assertEqual(metrics["kind"], "prefill")
+        self.assertEqual(metrics["target_tokens"], 4096)
+        self.assertEqual(metrics["prompt_tokens"], 4097)
+        self.assertEqual(metrics["prompt_t_s"], 2048.5)
+
     def test_speed_bench_summary_uses_end_to_end_wall_for_ceilings(self):
         result = {
             "recipe": "example", "created_utc": "2026-09-22T00:00:00Z", "repository": {"commit": "abc", "tree": "clean"}, "arms": [{
@@ -101,6 +112,25 @@ class TestBottleneckProfile(unittest.TestCase):
         summary = profile.render_summary(result)
         self.assertIn("insufficient steady decode executions", summary)
         self.assertNotIn("| measured span |", summary)
+
+    def test_summary_renders_prefill_when_decode_trace_is_short(self):
+        span = {
+            "executions": 2, "wall_ms_per_token": {"median": 4.0},
+            "cpu_compute_ms": {"median": 1.0}, "copy_handling_ms": {"median": 0.5},
+            "host_submit_ms": {"median": 0.25}, "device_submit_ms": {"median": 2.0},
+        }
+        result = {
+            "recipe": "example", "created_utc": "2026-09-22T00:00:00Z", "repository": {"commit": "abc", "tree": "clean"}, "arms": [{
+                "name": "plain", "type": "llama-server + speed-bench",
+                "metrics": {"kind": "speed-bench", "prompt_t_s": 10.0, "predicted_t_s": 20.0, "latency_s": 3.0, "accept_rate": None},
+                "extra_measurements": [{"name": "prefill-4096", "metrics": {"kind": "prefill", "target_tokens": 4096, "prompt_tokens": 4097, "prompt_t_s": 250.0, "latency_s": 16.5}}],
+                "trace": {"mode": "submit", "integrity": "not-run", "analysis": {"decode": span, "prefill": {**span, "tokens": {"total": 4096}}}},
+            }],
+        }
+        summary = profile.render_summary(result)
+        self.assertIn("Prefill (prefill-4096): target 4096 tokens", summary)
+        self.assertIn("Prefill trace: 2 selected executions, 4096 trace tokens", summary)
+        self.assertIn("measured prefill span", summary)
 
 
 if __name__ == "__main__":
