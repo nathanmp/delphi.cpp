@@ -634,6 +634,9 @@ def render_summary(result: Mapping[str, Any]) -> str:
             continue
         decode = trace["analysis"]["decode"]
         lines.append(f"Trace ({trace['mode']}, integrity {trace['integrity']}): {decode['executions']} measured decode executions; instrumented window {_fmt(decode['wall_ms_per_token']['median'], ' ms/token')}")
+        if decode["executions"] < 10:
+            lines.append("Trace breakdown: insufficient steady decode executions; use the end-to-end measurement above.")
+            continue
         lines.extend(("", "| measured span | median ms/token | optimistic gain ceiling | evidence |", "| --- | ---: | ---: | --- |"))
         for key, label in (("cpu_compute_ms", "CPU compute"), ("copy_handling_ms", "copy handling"), ("host_submit_ms", "host submit"), ("device_submit_ms", "device submit sum")):
             evidence = "HOST interval, upper-bound only" if key != "device_submit_ms" else "DEVICE_EVENT, non-additive"

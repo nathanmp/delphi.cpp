@@ -46,7 +46,7 @@ class TestBottleneckProfile(unittest.TestCase):
         result = {
             "recipe": "example", "created_utc": "2026-09-22T00:00:00Z", "repository": {"commit": "abc", "tree": "clean"}, "arms": [{
                 "name": "plain", "type": "llama-bench", "metrics": {"kind": "llama-bench", "tests": []}, "trace": {"mode": "op", "integrity": "not-run", "analysis": {"decode": {
-                    "executions": 2,
+                    "executions": 10,
                     "wall_ms_per_token": {"median": 10.0},
                     "cpu_compute_ms": {"median": 1.0}, "copy_handling_ms": {"median": 2.0},
                     "host_submit_ms": {"median": 3.0}, "device_submit_ms": {"median": 4.0},
@@ -72,7 +72,7 @@ class TestBottleneckProfile(unittest.TestCase):
                 "name": "plain", "type": "llama-server + speed-bench",
                 "metrics": {"kind": "speed-bench", "prompt_t_s": 100.0, "predicted_t_s": 20.0, "latency_s": 3.0, "accept_rate": None},
                 "trace": {"mode": "submit", "integrity": "not-run", "analysis": {"decode": {
-                    "executions": 2,
+                    "executions": 10,
                     "wall_ms_per_token": {"median": 10.0},
                     "cpu_compute_ms": {"median": 1.0}, "copy_handling_ms": {"median": 2.0},
                     "host_submit_ms": {"median": 3.0}, "device_submit_ms": {"median": 4.0},
@@ -89,6 +89,18 @@ class TestBottleneckProfile(unittest.TestCase):
             "arms": [{"name": "diagnostic", "type": "llama-bench", "notes": ["graphs are disabled"], "metrics": {"kind": "llama-bench", "tests": []}}],
         }
         self.assertIn("Note: graphs are disabled", profile.render_summary(result))
+
+    def test_summary_rejects_low_sample_trace_breakdown(self):
+        result = {
+            "recipe": "example", "created_utc": "2026-09-22T00:00:00Z", "repository": {"commit": "abc", "tree": "clean"}, "arms": [{
+                "name": "plain", "type": "llama-bench", "metrics": {"kind": "llama-bench", "tests": []}, "trace": {"mode": "submit", "integrity": "not-run", "analysis": {"decode": {
+                    "executions": 3, "wall_ms_per_token": {"median": 10.0},
+                    "cpu_compute_ms": {"median": 1.0}, "copy_handling_ms": {"median": 2.0}, "host_submit_ms": {"median": 3.0}, "device_submit_ms": {"median": 4.0},
+                }}}}]
+        }
+        summary = profile.render_summary(result)
+        self.assertIn("insufficient steady decode executions", summary)
+        self.assertNotIn("| measured span |", summary)
 
 
 if __name__ == "__main__":
