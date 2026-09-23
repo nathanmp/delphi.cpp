@@ -1066,11 +1066,23 @@ def _render_resource_table(lines: list[str], group: Mapping[str, Any], wall_ms: 
     device = group.get("device_busy_by_backend_ms") or {}
     if not resource and not device:
         return
+    # Idle is the complement of the combined busy union against the same wall
+    # used for utilization. The analysis wall is the traced host call, which can
+    # be shorter than the end-to-end wall when device work is asynchronous.
+    combined = _metric_value(resource.get("combined"))
+    idle = _metric_value(resource.get("idle"))
+    if wall_ms is not None and combined is not None:
+        idle = max(0.0, wall_ms - combined)
     rows: list[tuple[str, Any]] = [("CPU compute", resource.get("cpu"))]
     rows.extend((f"device {name}", value) for name, value in sorted(device.items()))
     rows.append(("all devices", resource.get("device")))
+    if len(device) > 1:
+        device_sum = _metric_value(resource.get("device"))
+        device_union = _metric_value(resource.get("device_union"))
+        if device_sum is not None and device_union is not None:
+            rows.append(("devices busy at the same time", device_sum - device_union))
     rows.append(("CPU and device both busy", resource.get("overlap")))
-    rows.append(("neither CPU nor device", resource.get("idle")))
+    rows.append(("neither CPU nor device", idle))
     lines.extend(("", f"| resource | busy {unit} | utilization |", "| --- | ---: | ---: |"))
     for label, item in rows:
         value = _metric_value(item)
@@ -1080,6 +1092,8 @@ def _render_resource_table(lines: list[str], group: Mapping[str, Any], wall_ms: 
         lines.append(f"| {label} | {_fmt(value)} | {_fmt(utilization, '%')} |")
     if device:
         lines.append(f"With {len(device)} device(s), all-device utilization can reach {len(device) * 100}% when every device is busy at once.")
+    if len(device) > 1:
+        lines.append("`devices busy at the same time` is the device-device overlap from the host-clock device placement; near zero means the device intervals do not overlap there. Per-device utilization is the more reliable figure.")
 
 
 def _render_counters(lines: list[str], group: Mapping[str, Any], *, unit: str) -> None:

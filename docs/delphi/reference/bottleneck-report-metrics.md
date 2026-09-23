@@ -98,8 +98,9 @@ After each workload's detail table, a resource table shows how busy the CPU and 
 | `CPU compute` | Union of the host CPU-compute spans divided by the wall. |
 | `device <name>` | Union of that device's coarse intervals divided by the wall. |
 | `all devices` | The per-device busy times summed and divided by the wall. With N devices the maximum is N x 100%, so a value near 100% on a multi-device host means only one device's worth of work is running. |
+| `devices busy at the same time` | The device-device overlap from the host-clock device placement, shown only on a multi-device host. Near zero means the device intervals do not overlap there. Cross-device placement is less certain than per-device utilization, so treat this row as a hint. |
 | `CPU and device both busy` | Time the CPU and at least one device are both busy. A value near zero means the host and device work are serialized. |
-| `neither CPU nor device` | Wall time with no CPU compute and no device work, such as copy waits, host submission, or allocator time. |
+| `neither CPU nor device` | Wall time with no CPU compute and no device work, such as copy waits, host submission, or allocator time. It is the end-to-end wall minus the combined busy union, so it is consistent with the utilization denominator. |
 
 The CPU and device rows are upper bounds: a host span can include blocked time and a device interval includes gaps. Use the table to separate a serial hybrid schedule from an overlapped one before optimizing either side.
 

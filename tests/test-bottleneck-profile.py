@@ -235,8 +235,8 @@ class TestBottleneckProfile(unittest.TestCase):
                     "aggregate_per_client_token_ms": {
                         "wall_ms": 50.0, "cpu_compute_ms": 10.0, "copy_handling_ms": 5.0,
                         "host_submit_ms": 2.0, "device_submit_ms": 30.0, "unaccounted_ms": 1.5,
-                        "resource_busy_ms": {"cpu": 10.0, "device": 30.0, "device_union": 30.0, "combined": 35.0, "overlap": 5.0, "idle": 15.0},
-                        "device_busy_by_backend_ms": {"ROCm3": 30.0},
+                        "resource_busy_ms": {"cpu": 10.0, "device": 35.0, "device_union": 32.0, "combined": 36.0, "overlap": 1.0, "idle": 99.0},
+                        "device_busy_by_backend_ms": {"ROCm0": 5.0, "ROCm3": 30.0},
                         "counters_per_client_token": {"offload_measurements": 0.0, "offload_decisions": 0.8, "copies": 45.0, "splits": 90.0, "graph_replay": 45.3},
                     },
                 }}},
@@ -247,6 +247,8 @@ class TestBottleneckProfile(unittest.TestCase):
         self.assertIn("| unaccounted host time | 1.500 |", summary)
         self.assertIn("| resource | busy ms/output token | utilization |", summary)
         self.assertIn("| device ROCm3 | 30.000 | 60.000% |", summary)
+        self.assertIn("| devices busy at the same time | 3.000 | 6.000% |", summary)
+        self.assertIn("| neither CPU nor device | 14.000 | 28.000% |", summary)
         self.assertIn("Recurring work per output token:", summary)
         self.assertIn("copies 45.000", summary)
 
