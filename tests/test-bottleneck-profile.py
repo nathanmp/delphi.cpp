@@ -2,6 +2,7 @@
 
 import importlib.util
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -54,7 +55,7 @@ class TestBottleneckProfile(unittest.TestCase):
                 }}}}]
         }
         summary = profile.render_summary(result)
-        self.assertIn("Rows can overlap", summary)
+        self.assertIn("Do not add rows or ceilings", summary)
         self.assertIn("traced llama_decode host wall 10.000 median ms/trace token", summary)
         self.assertIn("<=25.0%", summary)
 
@@ -204,6 +205,50 @@ class TestBottleneckProfile(unittest.TestCase):
         summary = profile.render_summary(result)
         self.assertIn("legacy trace lacks phase tags", summary)
         self.assertNotIn("| measured span |", summary)
+
+    def test_union_duration_counts_overlaps_once(self):
+        self.assertEqual(profile._union_duration_ns([(0, 10), (5, 15), (20, 30)]), 25)
+        self.assertEqual(profile._union_duration_ns([(0, 10), (10, 20)]), 20)
+        self.assertEqual(profile._union_duration_ns([]), 0)
+
+    def test_pipeline_parallelism_reads_enable_and_fallback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "server.stderr.log"
+            path.write_text("llama_context: pipeline parallelism enabled\n")
+            self.assertEqual(profile._pipeline_parallelism(path)["state"], "enabled")
+            path.write_text("pipeline parallelism enabled\ncompute buffer allocation failed, retrying without pipeline parallelism\n")
+            self.assertEqual(profile._pipeline_parallelism(path)["state"], "enabled_then_disabled")
+            path.write_text("nothing here\n")
+            self.assertEqual(profile._pipeline_parallelism(path)["state"], "not_enabled")
+
+    def test_summary_renders_unaccounted_resource_and_counters(self):
+        result = {
+            "recipe": "example", "created_utc": "2026-09-22T00:00:00Z", "repository": {"commit": "abc", "tree": "clean"}, "arms": [{
+                "name": "plain", "type": "llama-server + speed-bench",
+                "pipeline_parallelism": {"state": "enabled_then_disabled"},
+                "metrics": {"kind": "speed-bench", "prompt_t_s": 100.0, "predicted_t_s": 20.0, "latency_s": 3.0, "accept_rate": None},
+                "trace": {"mode": "submit", "integrity": "not-run", "analysis": {"decode": {
+                    "executions": 100,
+                    "wall_ms_per_token": {"median": 50.0},
+                    "cpu_compute_ms": {"median": 1.0}, "copy_handling_ms": {"median": 2.0},
+                    "host_submit_ms": {"median": 3.0}, "device_submit_ms": {"median": 4.0},
+                    "aggregate_per_client_token_ms": {
+                        "wall_ms": 50.0, "cpu_compute_ms": 10.0, "copy_handling_ms": 5.0,
+                        "host_submit_ms": 2.0, "device_submit_ms": 30.0, "unaccounted_ms": 1.5,
+                        "resource_busy_ms": {"cpu": 10.0, "device": 30.0, "device_union": 30.0, "combined": 35.0, "overlap": 5.0, "idle": 15.0},
+                        "device_busy_by_backend_ms": {"ROCm3": 30.0},
+                        "counters_per_client_token": {"offload_measurements": 0.0, "offload_decisions": 0.8, "copies": 45.0, "splits": 90.0, "graph_replay": 45.3},
+                    },
+                }}},
+            }],
+        }
+        summary = profile.render_summary(result)
+        self.assertIn("Pipeline parallelism: enabled, then disabled after a compute buffer allocation failure.", summary)
+        self.assertIn("| unaccounted host time | 1.500 |", summary)
+        self.assertIn("| resource | busy ms/output token | utilization |", summary)
+        self.assertIn("| device ROCm3 | 30.000 | 60.000% |", summary)
+        self.assertIn("Recurring work per output token:", summary)
+        self.assertIn("copies 45.000", summary)
 
     def test_summary_renders_prefill_when_decode_trace_is_short(self):
         span = {

@@ -177,6 +177,67 @@ def _stats(values: Iterable[float]) -> dict[str, Any]:
     }
 
 
+def _union_duration_ns(intervals: Iterable[tuple[int, int]]) -> int:
+    """Total time covered by at least one interval, so overlaps count once."""
+    ordered = sorted((start, end) for start, end in intervals if end > start)
+    if not ordered:
+        return 0
+    total = 0
+    start, end = ordered[0]
+    for next_start, next_end in ordered[1:]:
+        if next_start > end:
+            total += end - start
+            start, end = next_start, next_end
+        else:
+            end = max(end, next_end)
+    return total + (end - start)
+
+
+def _metric_value(item: Any) -> float | None:
+    """Read a scalar from either an aggregate float or a _stats() dictionary."""
+    if isinstance(item, dict):
+        value = item.get("mean")
+        return value if value is not None else item.get("median")
+    return item
+
+
+PP_ENABLED_MARKER = "pipeline parallelism enabled"
+PP_DISABLED_MARKER = "retrying without pipeline parallelism"
+
+
+def _pipeline_parallelism(log_path: Path) -> dict[str, Any]:
+    """Detect scheduler pipeline parallelism from a run log.
+
+    The scheduler logs one message when it enables pipeline parallelism and one
+    when it falls back after the larger compute buffers cannot be reserved. The
+    fallback is the interesting case: throughput silently changes without a
+    command-line change.
+    """
+    if not log_path.exists():
+        return {"state": "unknown"}
+    text = log_path.read_text(errors="replace")
+    enabled = text.count(PP_ENABLED_MARKER)
+    disabled = text.count(PP_DISABLED_MARKER)
+    if disabled:
+        state = "enabled_then_disabled"
+    elif enabled:
+        state = "enabled"
+    else:
+        state = "not_enabled"
+    return {"state": state, "enabled_count": enabled, "disabled_count": disabled}
+
+
+def _pipeline_parallelism_text(info: Mapping[str, Any] | None) -> str:
+    state = (info or {}).get("state")
+    if state == "enabled":
+        return "Pipeline parallelism: enabled and kept."
+    if state == "enabled_then_disabled":
+        return "Pipeline parallelism: enabled, then disabled after a compute buffer allocation failure."
+    if state == "not_enabled":
+        return "Pipeline parallelism: not enabled."
+    return "Pipeline parallelism: unknown."
+
+
 def _command_text(command: Sequence[str]) -> str:
     return shlex.join(command)
 
@@ -418,6 +479,16 @@ def _trace_summary(path: Path, family_rules: Sequence[FamilyRule], *, decode_win
         TRACE.K_CPU_COMPUTE: "cpu_compute_ms",
         TRACE.K_COPY_HANDLING: "copy_handling_ms",
     }
+    # Every host-clock span. The union of these intervals is the time the report
+    # can account for; the rest of the execution wall is reported as unaccounted.
+    host_span_kinds = (
+        TRACE.K_BACKEND_SUBMIT, TRACE.K_CPU_COMPUTE, TRACE.K_BACKEND_WAIT,
+        TRACE.K_COPY_HANDLING, TRACE.K_COPY_WAIT_SRC, TRACE.K_COPY_WAIT_DST, TRACE.K_COPY_BODY,
+    )
+    exec_host_spans: dict[int, list[tuple[int, int]]] = defaultdict(list)
+    exec_cpu_spans: dict[int, list[tuple[int, int]]] = defaultdict(list)
+    exec_counters: dict[int, Counter[str]] = defaultdict(Counter)
+    exec_offload_measurements: dict[int, set[tuple[int, ...]]] = defaultdict(set)
     for event in events:
         label = span_names.get(event["kind"])
         if label and event["execution_id"] in measured_ids:
@@ -426,6 +497,24 @@ def _trace_summary(path: Path, family_rules: Sequence[FamilyRule], *, decode_win
         if execution_id not in measured_ids:
             continue
         kind = event["kind"]
+        if kind in host_span_kinds:
+            interval = (event["timestamp_ns"], event["args"][0])
+            exec_host_spans[execution_id].append(interval)
+            if kind == TRACE.K_CPU_COMPUTE:
+                exec_cpu_spans[execution_id].append(interval)
+        if kind == TRACE.K_OFFLOAD_CALIBRATION:
+            # One event per offload decision. Repeated measurements of the same
+            # shape give distinct rate tuples, so the distinct count approximates
+            # how many real benchmark runs happened.
+            exec_counters[execution_id]["offload_decisions"] += 1
+            exec_offload_measurements[execution_id].add(tuple(event["args"]))
+        elif kind == TRACE.K_COPY_HANDLING:
+            exec_counters[execution_id]["copies"] += 1
+        elif kind in (TRACE.K_BACKEND_SUBMIT, TRACE.K_CPU_COMPUTE):
+            exec_counters[execution_id]["splits"] += 1
+        elif kind == TRACE.K_GPU_GRAPH:
+            state = TRACE.GPU_GRAPH_STATES.get(event["flags"], str(event["flags"]))
+            exec_counters[execution_id][f"graph_{state}"] += 1
         if kind == TRACE.K_BACKEND_SUBMIT:
             detail = f"GPU submission on {backend_name(event)}"
         elif kind == TRACE.K_CPU_COMPUTE:
@@ -453,11 +542,14 @@ def _trace_summary(path: Path, family_rules: Sequence[FamilyRule], *, decode_win
         else:
             continue
         host_detail[execution_id][detail] += TRACE.span_duration_ns(event) / 1e6
+    for execution_id, measurements in exec_offload_measurements.items():
+        exec_counters[execution_id]["offload_measurements"] = len(measurements)
 
     spans, _ = TRACE.gpu_timing_model(events)
     gpu_status_counts = Counter(span["status"] for span in spans)
     submit_per_execution = Counter()
     submit_by_backend: dict[int, Counter[str]] = defaultdict(Counter)
+    exec_device_spans: dict[int, dict[str, list[tuple[int, int]]]] = defaultdict(lambda: defaultdict(list))
     family_per_execution: dict[int, Counter[str]] = defaultdict(Counter)
     op_per_execution: dict[int, Counter[str]] = defaultdict(Counter)
     role_per_execution: dict[int, Counter[str]] = defaultdict(Counter)
@@ -483,6 +575,7 @@ def _trace_summary(path: Path, family_rules: Sequence[FamilyRule], *, decode_win
         if span["scope"] in ("eager_submit", "graph_launch"):
             submit_per_execution[execution_id] += duration_ms
             submit_by_backend[execution_id][backend_name(event)] += duration_ms
+            exec_device_spans[execution_id][backend_name(event)].append((span["device_start_ns"], span["device_end_ns"]))
         if span["scope"] == "eager_op":
             node = node_metadata(event) or {}
             op = node.get("op") or "unknown op"
@@ -521,6 +614,49 @@ def _trace_summary(path: Path, family_rules: Sequence[FamilyRule], *, decode_win
             name: _stats(submit_by_backend[item][name] / max(1, execution_info[item]["tokens"]) for item in ids)
             for name in backend_names
         }
+        # Resource busy time. The union of host spans is the time the report can
+        # account for, so the rest of the execution wall is unaccounted. CPU and
+        # device intervals are unioned separately to expose host/device overlap.
+        exec_unaccounted: dict[int, float] = {}
+        exec_cpu_busy: dict[int, float] = {}
+        exec_device_busy: dict[int, float] = {}
+        exec_device_union: dict[int, float] = {}
+        exec_combined: dict[int, float] = {}
+        for item in ids:
+            wall_ns = execution_info[item]["wall_ms"] * 1e6
+            host_ns = _union_duration_ns(exec_host_spans[item])
+            cpu_ns = _union_duration_ns(exec_cpu_spans[item])
+            device_intervals = [interval for intervals in exec_device_spans[item].values() for interval in intervals]
+            device_union_ns = _union_duration_ns(device_intervals)
+            exec_unaccounted[item] = max(0.0, wall_ns - host_ns)
+            exec_cpu_busy[item] = cpu_ns
+            exec_device_busy[item] = sum(_union_duration_ns(intervals) for intervals in exec_device_spans[item].values())
+            exec_device_union[item] = device_union_ns
+            exec_combined[item] = _union_duration_ns(exec_cpu_spans[item] + device_intervals)
+
+        def per_token_ms(values: Mapping[int, float]) -> dict[str, Any]:
+            return _stats(values[item] / 1e6 / max(1, execution_info[item]["tokens"]) for item in ids)
+
+        summary["unaccounted_ms"] = per_token_ms(exec_unaccounted)
+        summary["resource_busy_ms"] = {
+            "cpu": per_token_ms(exec_cpu_busy),
+            "device": per_token_ms(exec_device_busy),
+            "device_union": per_token_ms(exec_device_union),
+            "combined": per_token_ms(exec_combined),
+            "overlap": per_token_ms({item: max(0.0, exec_cpu_busy[item] + exec_device_union[item] - exec_combined[item]) for item in ids}),
+            "idle": per_token_ms({item: max(0.0, execution_info[item]["wall_ms"] * 1e6 - exec_combined[item]) for item in ids}),
+        }
+        device_names = sorted({name for item in ids for name in exec_device_spans[item]})
+        summary["device_busy_by_backend_ms"] = {
+            name: _stats(_union_duration_ns(exec_device_spans[item].get(name, [])) / 1e6 / max(1, execution_info[item]["tokens"]) for item in ids)
+            for name in device_names
+        }
+        counter_names = sorted({name for item in ids for name in exec_counters[item]})
+        if counter_names:
+            summary["counters_per_token"] = {
+                name: _stats(exec_counters[item][name] / max(1, execution_info[item]["tokens"]) for item in ids)
+                for name in counter_names
+            }
         for key, per_execution_data in (
             ("diagnostic_by_op_ms", op_per_execution),
             ("diagnostic_by_node_role_ms", role_per_execution),
@@ -575,6 +711,24 @@ def _trace_summary(path: Path, family_rules: Sequence[FamilyRule], *, decode_win
                 name: sum(submit_by_backend[item][name] for item in ids) / client_tokens
                 for name in backend_names
             }
+            aggregate["unaccounted_ms"] = sum(exec_unaccounted[item] for item in ids) / client_tokens / 1e6
+            aggregate["resource_busy_ms"] = {
+                "cpu": sum(exec_cpu_busy[item] for item in ids) / client_tokens / 1e6,
+                "device": sum(exec_device_busy[item] for item in ids) / client_tokens / 1e6,
+                "device_union": sum(exec_device_union[item] for item in ids) / client_tokens / 1e6,
+                "combined": sum(exec_combined[item] for item in ids) / client_tokens / 1e6,
+                "overlap": sum(max(0.0, exec_cpu_busy[item] + exec_device_union[item] - exec_combined[item]) for item in ids) / client_tokens / 1e6,
+                "idle": sum(max(0.0, execution_info[item]["wall_ms"] * 1e6 - exec_combined[item]) for item in ids) / client_tokens / 1e6,
+            }
+            aggregate["device_busy_by_backend_ms"] = {
+                name: sum(_union_duration_ns(exec_device_spans[item].get(name, [])) for item in ids) / client_tokens / 1e6
+                for name in device_names
+            }
+            if counter_names:
+                aggregate["counters_per_client_token"] = {
+                    name: sum(exec_counters[item][name] for item in ids) / client_tokens
+                    for name in counter_names
+                }
             summary["aggregate_per_client_token_ms"] = aggregate
         return summary
 
@@ -630,6 +784,7 @@ def _run_bench_arm(arm: BenchArm, artifacts: Path, common_env: Mapping[str, str]
         "binary_version": _version(command[0], env),
         "models": _model_identity(arm.model_paths),
         "metrics": _bench_metrics(_parse_json_output(completed.stdout, arm.name)),
+        "pipeline_parallelism": _pipeline_parallelism(arm_dir / "stderr.log"),
         "notes": list(arm.notes),
     }
     if arm.trace_mode != "off":
@@ -741,6 +896,7 @@ def _run_server_arm(arm: ServerArm, artifacts: Path, common_env: Mapping[str, st
         "models": _model_identity(arm.model_paths),
         "metrics": _speed_bench_metrics(_parse_json_output(output_path.read_text(), arm.name)),
         "extra_measurements": extra_measurements,
+        "pipeline_parallelism": _pipeline_parallelism(arm_dir / "server.stderr.log"),
         "notes": list(arm.notes),
     }
     if arm.trace_mode != "off":
@@ -901,8 +1057,36 @@ def _render_detail_rows(lines: list[str], values: Mapping[str, float], wall_ms: 
         return
     lines.extend(("", f"| measured detail | {unit} | optimistic gain ceiling | evidence |", "| --- | ---: | ---: | --- |"))
     for name, duration in ordered[:limit]:
-        evidence = "DEVICE_EVENT sum, non-additive" if name.startswith("device ") else "HOST_SAFE interval, non-additive"
+        evidence = "D" if name.startswith("device ") else "H"
         lines.append(f"| {name} | {_fmt(duration)} | {_serial_gain_ceiling(duration, wall_ms)} | {evidence} |")
+
+
+def _render_resource_table(lines: list[str], group: Mapping[str, Any], wall_ms: float | None, *, unit: str) -> None:
+    resource = group.get("resource_busy_ms") or {}
+    device = group.get("device_busy_by_backend_ms") or {}
+    if not resource and not device:
+        return
+    rows: list[tuple[str, Any]] = [("CPU compute", resource.get("cpu"))]
+    rows.extend((f"device {name}", value) for name, value in sorted(device.items()))
+    rows.append(("all devices", resource.get("device")))
+    rows.append(("CPU and device both busy", resource.get("overlap")))
+    rows.append(("neither CPU nor device", resource.get("idle")))
+    lines.extend(("", f"| resource | busy {unit} | utilization |", "| --- | ---: | ---: |"))
+    for label, item in rows:
+        value = _metric_value(item)
+        if value is None:
+            continue
+        utilization = 100.0 * value / wall_ms if wall_ms else None
+        lines.append(f"| {label} | {_fmt(value)} | {_fmt(utilization, '%')} |")
+    if device:
+        lines.append(f"With {len(device)} device(s), all-device utilization can reach {len(device) * 100}% when every device is busy at once.")
+
+
+def _render_counters(lines: list[str], group: Mapping[str, Any], *, unit: str) -> None:
+    counters = group.get("counters_per_token") or group.get("counters_per_client_token") or {}
+    parts = [f"{name} {_fmt(_metric_value(value))}" for name, value in sorted(counters.items()) if _metric_value(value) is not None]
+    if parts:
+        lines.append(f"Recurring work per {unit}: " + ", ".join(parts) + ".")
 
 
 def _render_diagnostic_groups(lines: list[str], title: str, values: Mapping[str, float], wall_ms: float | None, complete: bool, *, limit: int) -> None:
@@ -926,7 +1110,7 @@ def render_summary(result: Mapping[str, Any]) -> str:
     lines = [f"# {result['recipe']} bottleneck measurement", "", f"Measured: {result['created_utc']}"]
     repository = result["repository"]
     lines.append(f"Checkout: {repository.get('commit') or 'unknown'} ({repository.get('tree', 'unknown')} tree); arm-level Binary lines identify the tested build.")
-    lines.extend(("", "This is measured on this machine and configuration. It overrides prior assumptions. Rows can overlap; do not add their times or ceilings. The ceiling assumes removing only that measured interval without changing other work."))
+    lines.extend(("", "This is measured on this machine and configuration. It overrides prior assumptions. Evidence: H = host-clock span (upper bound, rows overlap); D = device-event interval (non-additive). Do not add rows or ceilings. The ceiling assumes removing only that measured interval without changing other work."))
     for arm in result["arms"]:
         if arm["name"].endswith("-op-diagnostic"):
             continue
@@ -936,6 +1120,9 @@ def render_summary(result: Mapping[str, Any]) -> str:
         binary_version = arm.get("binary_version")
         if binary_version:
             lines.append(f"Binary: {binary_version.splitlines()[0]}")
+        pp_info = arm.get("pipeline_parallelism")
+        if pp_info and pp_info.get("state") != "unknown":
+            lines.append(_pipeline_parallelism_text(pp_info))
         metrics = arm["metrics"]
         end_to_end_wall_ms = None
         if metrics["kind"] == "speed-bench":
@@ -981,18 +1168,24 @@ def render_summary(result: Mapping[str, Any]) -> str:
         else:
             span_values = decode_aggregate or {key: decode[key]["median"] for key in ("cpu_compute_ms", "copy_handling_ms", "host_submit_ms", "device_submit_ms")}
             span_label = "aggregate ms/output token" if decode_aggregate else "median ms/trace token"
+            wall_for_ceiling = end_to_end_wall_ms or decode_instrumented
             lines.extend(("", f"| measured decode span | {span_label} | optimistic gain ceiling | evidence |", "| --- | ---: | ---: | --- |"))
             for key, label in (("cpu_compute_ms", "CPU compute"), ("copy_handling_ms", "copy handling"), ("host_submit_ms", "host submit"), ("device_submit_ms", "device submit sum")):
-                evidence = "HOST interval, upper-bound only" if key != "device_submit_ms" else "DEVICE_EVENT, non-additive"
-                ceiling = _serial_gain_ceiling(span_values[key], end_to_end_wall_ms or decode_instrumented)
+                evidence = "D" if key == "device_submit_ms" else "H"
+                ceiling = _serial_gain_ceiling(span_values[key], wall_for_ceiling)
                 lines.append(f"| {label} | {_fmt(span_values[key])} | {ceiling} | {evidence} |")
+            unaccounted = decode_aggregate.get("unaccounted_ms") if decode_aggregate else _metric_value(decode.get("unaccounted_ms"))
+            if unaccounted is not None:
+                lines.append(f"| unaccounted host time | {_fmt(unaccounted)} | {_serial_gain_ceiling(unaccounted, wall_for_ceiling)} | H |")
             if decode_aggregate:
                 detail = dict(decode_aggregate.get("host_detail_ms", {}))
                 detail.update({f"device interval on {name}": value for name, value in decode_aggregate.get("device_submit_by_backend_ms", {}).items()})
             else:
                 detail = {name: stats["median"] for name, stats in decode.get("host_detail_ms", {}).items()}
                 detail.update({f"device interval on {name}": stats["median"] for name, stats in decode.get("device_submit_by_backend_ms", {}).items()})
-            _render_detail_rows(lines, detail, end_to_end_wall_ms or decode_instrumented, unit="ms/output token" if decode_aggregate else "ms/trace token")
+            _render_detail_rows(lines, detail, wall_for_ceiling, unit="ms/output token" if decode_aggregate else "ms/trace token")
+            _render_resource_table(lines, decode_aggregate or decode, wall_for_ceiling, unit="ms/output token" if decode_aggregate else "ms/trace token")
+            _render_counters(lines, decode_aggregate or decode, unit="output token" if decode_aggregate else "trace token")
         prefill = trace["analysis"].get("prefill")
         if prefill and prefill["executions"]:
             prefill_metric = next((item["metrics"] for item in arm.get("extra_measurements", ()) if item["metrics"].get("kind") == "prefill"), None)
@@ -1003,13 +1196,15 @@ def render_summary(result: Mapping[str, Any]) -> str:
             span_values = aggregate or {key: prefill[key]["median"] for key in ("cpu_compute_ms", "copy_handling_ms", "host_submit_ms", "device_submit_ms")}
             wall_ms = span_values["wall_ms"] if aggregate else prefill["wall_ms_per_token"]["median"]
             span_label = "aggregate ms/client token" if aggregate else "median ms/token"
-            evidence_suffix = " across trace contexts" if aggregate else ""
             lines.extend(("", f"Prefill trace: {prefill['executions']} selected executions, {prefill['tokens']['total']} trace-token executions; instrumented window {_fmt(wall_ms, ' ms/client token' if aggregate else ' ms/token')}"))
             lines.extend(("", f"| measured prefill span | {span_label} | optimistic gain ceiling | evidence |", "| --- | ---: | ---: | --- |"))
             for key, label in (("cpu_compute_ms", "CPU compute"), ("copy_handling_ms", "copy handling"), ("host_submit_ms", "host submit"), ("device_submit_ms", "device submit sum")):
-                evidence = f"HOST interval, upper-bound only{evidence_suffix}" if key != "device_submit_ms" else "DEVICE_EVENT, non-additive"
+                evidence = "D" if key == "device_submit_ms" else "H"
                 ceiling = _serial_gain_ceiling(span_values[key], prefill_wall_ms or wall_ms)
                 lines.append(f"| {label} | {_fmt(span_values[key])} | {ceiling} | {evidence} |")
+            unaccounted = aggregate.get("unaccounted_ms") if aggregate else _metric_value(prefill.get("unaccounted_ms"))
+            if unaccounted is not None:
+                lines.append(f"| unaccounted host time | {_fmt(unaccounted)} | {_serial_gain_ceiling(unaccounted, prefill_wall_ms or wall_ms)} | H |")
             if aggregate:
                 detail = dict(aggregate.get("host_detail_ms", {}))
                 detail.update({f"device interval on {name}": value for name, value in aggregate.get("device_submit_by_backend_ms", {}).items()})
@@ -1017,6 +1212,8 @@ def render_summary(result: Mapping[str, Any]) -> str:
                 detail = {name: stats["median"] for name, stats in prefill.get("host_detail_ms", {}).items()}
                 detail.update({f"device interval on {name}": stats["median"] for name, stats in prefill.get("device_submit_by_backend_ms", {}).items()})
             _render_detail_rows(lines, detail, prefill_wall_ms or wall_ms, unit="ms/client token" if aggregate else "ms/token")
+            _render_resource_table(lines, aggregate or prefill, prefill_wall_ms or wall_ms, unit="ms/client token" if aggregate else "ms/token")
+            _render_counters(lines, aggregate or prefill, unit="client token" if aggregate else "token")
     production = {arm["name"]: arm for arm in result["arms"] if not arm["name"].endswith("-op-diagnostic")}
     for arm in result["arms"]:
         if not arm["name"].endswith("-op-diagnostic"):

@@ -40,15 +40,12 @@ Use the ceiling to rank work, not to promise a speedup. Confirm any change with 
 
 ## Evidence labels
 
-Every row states how it was measured.
+Every row states how it was measured. The summary uses two one-letter markers, defined once near the top of the report.
 
-| evidence label | source | meaning |
-| --- | --- | --- |
-| `HOST interval, upper-bound only` | Host clock around host scheduler code | Measures host work, enqueue, or blocked time, not device execution. Other work can overlap it, so it is an upper bound. |
-| `HOST interval, upper-bound only across trace contexts` | The same, summed over several trace executions | Prefill traces more than one logical batch or context. |
-| `HOST_SAFE interval, non-additive` | Host clock, individual detail row | Do not add the rows. |
-| `DEVICE_EVENT, non-additive` | Backend timing events on the GPU stream | A device interval. |
-| `DEVICE_EVENT sum, non-additive` | The same device events, grouped or summed | Do not add the rows. |
+| marker | full label | source | meaning |
+| --- | --- | --- | --- |
+| `H` | host-clock span | Host clock around host scheduler code | Measures host work, enqueue, or blocked time, not device execution. Other work can overlap it, so it is an upper bound. Rows are non-additive; do not add them. Prefill rows sum several trace contexts. |
+| `D` | device-event interval | Backend timing events on the GPU stream | A device interval, summed or grouped per backend. Rows are non-additive; do not add them. |
 
 A `DEVICE_EVENT` interval is placed on the host clock by the backend timing events. It includes every gap between kernels inside the span, such as host launch latency. It is therefore an upper bound of kernel busy time, not the sum of kernel durations. In `submit` mode one span covers a whole eager submission or a whole graph launch, so the interval includes the gaps in that launch.
 
@@ -79,6 +76,36 @@ The span rows are category totals. The detail rows below them break each total i
 **What it is.** The sum of `DEVICE_EVENT` device intervals for the coarse spans: one interval per eager backend submission and one per whole-graph launch. It is device time, not host time.
 
 **What a high value means.** The GPU stream is busy for a large part of the wall time. If this row dominates and CPU compute is small, the workload is GPU-bound. Look at `device interval on <backend>` to find the busiest GPU, then at the operation diagnostic tables for that workload to name candidate kernels. Because a device interval includes gaps, it is an upper bound on kernel work. It can also be larger than the traced host wall, because device work continues after the host enqueues it.
+
+### unaccounted host time
+
+**What it is.** The execution wall minus the union of every host-clock span. It is time inside the traced `llama_decode` call that no measured span covers, such as graph construction, scheduler reserve, offload-cost calibration, or allocator work.
+
+**What a high value means.** A large value is the strongest signal that the report is missing work. The span rows cannot explain the token time, so look outside them: graph build and reserve, repeated calibration or planning, allocation, and anything that runs before the first scheduler split. A value near zero means the traced spans account for the wall. This row is complementary to the span rows, not additive with them.
+
+### Pipeline parallelism
+
+**What it is.** A line above the workload tables states whether the scheduler enabled pipeline parallelism and whether it kept it. It is read from the run log, not the trace.
+
+**What it means.** `enabled and kept` means the scheduler can overlap work across devices. `enabled, then disabled after a compute buffer allocation failure` means a larger compute buffer could not be reserved, so the scheduler fell back to a serial schedule without any command-line change. `not enabled` means one of the enable conditions did not hold, commonly a single device or a tensor override. Compare this line between arms before attributing a throughput difference to a kernel.
+
+## Resource utilization
+
+After each workload's detail table, a resource table shows how busy the CPU and each device were. It is derived from the same host spans and device events.
+
+| row | meaning |
+| --- | --- |
+| `CPU compute` | Union of the host CPU-compute spans divided by the wall. |
+| `device <name>` | Union of that device's coarse intervals divided by the wall. |
+| `all devices` | The per-device busy times summed and divided by the wall. With N devices the maximum is N x 100%, so a value near 100% on a multi-device host means only one device's worth of work is running. |
+| `CPU and device both busy` | Time the CPU and at least one device are both busy. A value near zero means the host and device work are serialized. |
+| `neither CPU nor device` | Wall time with no CPU compute and no device work, such as copy waits, host submission, or allocator time. |
+
+The CPU and device rows are upper bounds: a host span can include blocked time and a device interval includes gaps. Use the table to separate a serial hybrid schedule from an overlapped one before optimizing either side.
+
+## Recurring work
+
+A single line lists per-token counts for work that should not scale with tokens: offload decisions and offload measurements, cross-backend copies, backend splits, and graph capture, update, replay, and fallback. A count that grows with the token count, or an `offload_measurements` count far above the number of distinct tensor shapes, points to repeated setup rather than useful compute. This is the cheapest place to catch a calibration or reserve loop.
 
 ## Measured detail rows
 
@@ -198,6 +225,10 @@ The `conditional max throughput gain` column uses the matching production arm's 
 | `copy handling` with `user_input_sync` | Input staging blocks the host | number and size of graph inputs, pinned memory, split boundaries |
 | `host submit` / `GPU submission on GPU` | Many or falling-back GPU launches | graph lifecycle (`replay` vs `fallback`), graph updates, number of submissions |
 | `device submit sum` / `device interval on GPU` | GPU kernel-bound workload | operation diagnostic tables, kernel and quantization choices, work split across GPUs |
+| `unaccounted host time` | Work outside every measured span | graph build and reserve, repeated calibration or planning, allocation, offload cost model |
+| `CPU and device both busy` near zero | Host and device are serialized | cross-backend handoffs, async copies, layer pipelining, split balance |
+| `all devices` utilization far below N x 100% | Devices are idle or work is on one device | work split across devices, pipeline parallelism, placement |
+| `offload_measurements` high or growing | Repeated offload calibration | calibration cache keying, tensor shape variety, thread-count changes |
 | `wait previous_split` | Backend alternation serializes splits | number of backend switches per graph, work per split |
 | `wait moe_ids` | Expert-ID readback synchronization | expert caching, routing stability, fraction of active experts |
 | `wait graph_reallocation` | Unstable graph topology | fixed ubatch and batch shape, stable offload decisions |
