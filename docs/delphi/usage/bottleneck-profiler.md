@@ -90,3 +90,5 @@ For automatic discovery of operation-level bottlenecks, use a separate `op` diag
 The runner compares diagnostic per-op times against the matching production arm's wall time and labels the resulting gains conditional. Disabling graphs or fusion changes execution cost, so these values rank candidate work but are not certified bounds for graph-enabled production. The diagnostic can report both decode and long prefill when the arm includes the prefill client. A prefill request writes its `CLOCK_MONOTONIC_RAW` request window to JSON so the trace analysis can isolate it from speculative draft prefill during the preceding decode workload.
 
 Use `tools/exec-trace/exec-trace-integrity.py` when a `llama-bench` trace must be established as production-representative. Its seven-process GPU-timing sequence intentionally reloads the model, so run it on build, profiler, or deployment-configuration changes instead of treating it as a cheap repetition mechanism.
+
+`../reference/bottleneck-report-metrics.md` explains every row that can appear in the decode, prefill, and measured-detail tables, and what a large value of each row implies about where to optimize.
