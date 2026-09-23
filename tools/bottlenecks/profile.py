@@ -227,6 +227,24 @@ def _pipeline_parallelism(log_path: Path) -> dict[str, Any]:
     return {"state": state, "enabled_count": enabled, "disabled_count": disabled}
 
 
+def _merge_pipeline_parallelism(log_info: Mapping[str, Any], trace_value: str | None) -> dict[str, Any]:
+    """Combine the active scheduler state from the trace with the log fallback."""
+    if log_info.get("disabled_count"):
+        state = "enabled_then_disabled"
+    elif trace_value == "1":
+        state = "enabled"
+    elif trace_value == "0":
+        state = "not_enabled"
+    else:
+        state = str(log_info.get("state", "unknown"))
+    return {
+        "state": state,
+        "enabled_count": log_info.get("enabled_count", 0),
+        "disabled_count": log_info.get("disabled_count", 0),
+        "trace_value": trace_value,
+    }
+
+
 def _pipeline_parallelism_text(info: Mapping[str, Any] | None) -> str:
     state = (info or {}).get("state")
     if state == "enabled":
@@ -466,6 +484,11 @@ def _trace_summary(path: Path, family_rules: Sequence[FamilyRule], *, decode_win
     if trace["flags"] & 1 or trace["trace_stats"].get("dropped_event_count", 0):
         raise ProfileError(f"trace is truncated or dropped events: {path}")
     events, strings = trace["events"], trace["strings"]
+    # The scheduler records its active pipeline-parallelism state as run metadata.
+    pipeline_parallel = None
+    for event in events:
+        if event["kind"] == TRACE.K_RUN_METADATA and TRACE.string(strings, event["args"][0]) == "pipeline_parallel":
+            pipeline_parallel = TRACE.string(strings, event["args"][1])
     selected, execution_info = _selected_execution_ids(events)
     decode_ids, phase_selected_decode = _decode_execution_ids(selected, execution_info, decode_windows_ns)
     prefill_ids = _prefill_execution_ids(selected, execution_info, prefill_min_tokens, prefill_target_tokens, prefill_window_ns)
@@ -755,6 +778,7 @@ def _trace_summary(path: Path, family_rules: Sequence[FamilyRule], *, decode_win
             and execution_info[execution_id]["tokens"] < prefill_min_tokens
         ),
         "gpu_graph_lifecycle": dict(sorted(graph_states.items())),
+        "pipeline_parallel": pipeline_parallel,
     }
 
 
@@ -796,6 +820,8 @@ def _run_bench_arm(arm: BenchArm, artifacts: Path, common_env: Mapping[str, str]
             "integrity": "not-run",
             "analysis": _trace_summary(trace_path, arm.family_rules, prefill_min_tokens=arm.trace_prefill_min_tokens, prefill_target_tokens=arm.trace_prefill_target_tokens),
         }
+        result["pipeline_parallelism"] = _merge_pipeline_parallelism(
+            result["pipeline_parallelism"], result["trace"]["analysis"].get("pipeline_parallel"))
     return result
 
 
@@ -921,6 +947,8 @@ def _run_server_arm(arm: ServerArm, artifacts: Path, common_env: Mapping[str, st
                 prefill_window_ns=prefill_window_ns,
             ),
         }
+        result["pipeline_parallelism"] = _merge_pipeline_parallelism(
+            result["pipeline_parallelism"], result["trace"]["analysis"].get("pipeline_parallel"))
     return result
 
 

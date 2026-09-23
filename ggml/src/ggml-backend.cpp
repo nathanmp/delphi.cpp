@@ -860,6 +860,7 @@ struct ggml_backend_sched {
     uint64_t trace_backend_hash;
     uint64_t trace_split_hash;
     uint64_t trace_cross_backend_edges;
+    bool trace_pipeline_parallel_recorded;
 };
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
@@ -1389,6 +1390,13 @@ static void ggml_backend_sched_trace_graph(ggml_backend_sched_t sched, struct gg
     const uint32_t graph_id = ggml_exec_trace_next_graph_id();
     const bool topology_reused = sched->trace_graph_uid == graph->uid && sched->trace_topology_graph_id != 0;
     sched->trace_graph_id = graph_id;
+
+    // Pipeline parallelism changes the schedule but is only visible in a host log that most
+    // builds do not capture. Record the active scheduler state once so the analysis can report it.
+    if (!sched->trace_pipeline_parallel_recorded) {
+        sched->trace_pipeline_parallel_recorded = true;
+        ggml_exec_trace_metadata("pipeline_parallel", sched->n_copies > 1 ? "1" : "0");
+    }
 
     ggml_exec_trace_event graph_event = {};
     graph_event.timestamp_ns = timestamp;

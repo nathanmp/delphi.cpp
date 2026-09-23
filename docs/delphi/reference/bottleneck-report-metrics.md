@@ -85,9 +85,9 @@ The span rows are category totals. The detail rows below them break each total i
 
 ### Pipeline parallelism
 
-**What it is.** A line above the workload tables states whether the scheduler enabled pipeline parallelism and whether it kept it. It is read from the run log, not the trace.
+**What it is.** A line above the workload tables states whether the scheduler enabled pipeline parallelism and whether it kept it. The scheduler records its active state in the trace as run metadata, and the run log is scanned for the allocation-failure fallback.
 
-**What it means.** `enabled and kept` means the scheduler can overlap work across devices. `enabled, then disabled after a compute buffer allocation failure` means a larger compute buffer could not be reserved, so the scheduler fell back to a serial schedule without any command-line change. `not enabled` means one of the enable conditions did not hold, commonly a single device or a tensor override. Compare this line between arms before attributing a throughput difference to a kernel.
+**What it means.** `enabled and kept` means the scheduler can overlap work across devices. `enabled, then disabled after a compute buffer allocation failure` means a larger compute buffer could not be reserved, so the scheduler fell back to a serial schedule without any command-line change. `not enabled` means one of the enable conditions did not hold, commonly a single device or a tensor override. The enable path logs at info level, which many server configurations suppress, so the trace metadata is the reliable source. Compare this line between arms before attributing a throughput difference to a kernel.
 
 ## Resource utilization
 

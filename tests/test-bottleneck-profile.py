@@ -221,6 +221,14 @@ class TestBottleneckProfile(unittest.TestCase):
             path.write_text("nothing here\n")
             self.assertEqual(profile._pipeline_parallelism(path)["state"], "not_enabled")
 
+    def test_pipeline_parallelism_prefers_trace_state(self):
+        log = {"state": "not_enabled", "enabled_count": 0, "disabled_count": 0}
+        self.assertEqual(profile._merge_pipeline_parallelism(log, "1")["state"], "enabled")
+        self.assertEqual(profile._merge_pipeline_parallelism(log, "0")["state"], "not_enabled")
+        fallback = {"state": "enabled", "enabled_count": 1, "disabled_count": 1}
+        self.assertEqual(profile._merge_pipeline_parallelism(fallback, "0")["state"], "enabled_then_disabled")
+        self.assertEqual(profile._merge_pipeline_parallelism(log, None)["state"], "not_enabled")
+
     def test_summary_renders_unaccounted_resource_and_counters(self):
         result = {
             "recipe": "example", "created_utc": "2026-09-22T00:00:00Z", "repository": {"commit": "abc", "tree": "clean"}, "arms": [{
