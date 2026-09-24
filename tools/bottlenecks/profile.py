@@ -1051,6 +1051,11 @@ def load_recipe(reference: str) -> Recipe:
     if not spec or not spec.loader:
         raise ProfileError(f"cannot load recipe file: {path}")
     module = importlib.util.module_from_spec(spec)
+    # When this file runs as a script, it lives in sys.modules as __main__,
+    # so a recipe's `from tools.bottlenecks.profile import ...` would load a
+    # second copy of this module and the isinstance check below would fail.
+    # Alias the running module under its canonical name first.
+    sys.modules.setdefault("tools.bottlenecks.profile", sys.modules[__name__])
     sys.path.insert(0, str(ROOT))
     try:
         spec.loader.exec_module(module)
