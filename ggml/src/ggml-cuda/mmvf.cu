@@ -809,10 +809,18 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
     if (ggml_cuda_spec_invariant() && (type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16)) {
         return ne11 <= MMVF_MAX_BATCH_SIZE; // per-column sums do not depend on ne11
     }
+    // Set GGML_CUDA_MMVF_LEGACY to restore the width limits from before the small-matmul tuning.
+    static const bool mmvf_legacy_limits = getenv("GGML_CUDA_MMVF_LEGACY") != nullptr;
+    // Small matrices keep MMVF to a wide limit, large matrices fall back sooner.
+    // The row-count bound separates the router-gate shapes from large dense shapes (measured on Ampere/SM80 and RDNA4/gfx1201).
+    const bool src0_small = (src0_ne[1] <= 512);
     switch (type) {
         case GGML_TYPE_F32:
             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
                 if (ampere_mma_available(cc)) {
+                    if (!mmvf_legacy_limits && src0_small) {
+                        return ne11 <= 7;
+                    }
                     return ne11 <= 3;
                 }
                 if (cc >= GGML_CUDA_CC_TURING) {
@@ -867,6 +875,9 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
                 return ne11 <= 8;
             } else if (GGML_CUDA_CC_IS_AMD(cc)) {
                 if (bf16_mma_hardware_available(cc)) {
+                    if (GGML_CUDA_CC_IS_RDNA4(cc) && !mmvf_legacy_limits && src0_small) {
+                        return ne11 <= MMVF_MAX_BATCH_SIZE;
+                    }
                     return ne11 <= 3;
                 }
                 return ne11 <= 8;
