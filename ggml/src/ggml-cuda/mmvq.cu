@@ -632,6 +632,10 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
                 return 1;
         }
     }
+    if (table_id == MMVQ_PARAMETERS_RDNA4 && ncols_dst == 1) {
+        // Small K leaves most threads of a wide block idle, give each warp its own row (measured on gfx1201).
+        return small_k ? nwarps : 1;
+    }
     return 1;
 }
 
@@ -1237,6 +1241,9 @@ static void mul_mat_vec_q_switch_ncols_dst(
         const int  nwarps = calc_nwarps(type, c_ncols_dst, table_id);
         bool       use    = nwarps > 1 && blocks_per_row_x < nwarps * blocks_per_iter_1warp;
 
+        // Set GGML_CUDA_MMVQ_NO_SMALL_K to keep the old veto for RDNA4 as well.
+        static const bool no_rdna4_small_k = getenv("GGML_CUDA_MMVQ_NO_SMALL_K") != nullptr;
+
         constexpr std::array<ggml_type, 2> iq_slow_turing = {
             GGML_TYPE_IQ3_XXS,
             GGML_TYPE_IQ3_S,
@@ -1261,7 +1268,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
             }
         } else if ((ncols_dst == 1 && std::find(iq_slow_other.begin(), iq_slow_other.end(), type) != iq_slow_other.end()) ||
                 (is_nvidia_pascal_older && std::find(slow_pascal.begin(), slow_pascal.end(), type) != slow_pascal.end()) ||
-                GGML_CUDA_CC_IS_RDNA(cc)) {
+                (GGML_CUDA_CC_IS_RDNA(cc) && (!GGML_CUDA_CC_IS_RDNA4(cc) || no_rdna4_small_k))) {
             use = false;
         }
 
