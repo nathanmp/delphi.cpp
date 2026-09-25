@@ -810,6 +810,17 @@ struct ggml_backend_sched {
     struct ggml_tensor ** hv_tensor_copies;      // [hash_set.size][n_backends][n_copies]
     struct ggml_backend_sched_offload_decision * hv_offload_decisions; // [hash_set.size]
 
+    // Tracks which hash slots got copies/decisions written since the last reset, so the
+    // reset can clear only those instead of memsetting the full worst-case tables (which
+    // are sized for ubatch-sized prefill graphs and dominate MTP decode host time at
+    // large ubatches). hv_tensor_backend_ids keeps its full clear: it is small and its
+    // readers rely on the -1 default for slots that were inserted but never assigned.
+    ggml_bitset_t * hv_written; // [ggml_bitset_size(hash_set.size)]
+    size_t        * hv_touched;  // hash ids with written copies/decisions, each listed once
+    size_t          hv_touched_count;
+    size_t          hv_touched_capacity;
+    bool            scoped_reset; // GGML_SCHED_SCOPED_RESET=0 restores the full-table clear
+
     int * node_backend_ids; // [graph_size]
     int * leaf_backend_ids; // [graph_size]
 
@@ -866,6 +877,38 @@ struct ggml_backend_sched {
 #define tensor_backend_id(tensor) sched->hv_tensor_backend_ids[hash_id(tensor)]
 #define tensor_id_copy(id, backend_id, copy_id) sched->hv_tensor_copies[(id) * sched->n_backends * sched->n_copies + (backend_id) * sched->n_copies + (copy_id)]
 #define tensor_copy(tensor, backend_id, copy_id) tensor_id_copy(hash_id(tensor), backend_id, copy_id)
+
+// Mark a hash slot as holding copies/decisions written since the last reset. Each id is
+// recorded once per epoch; the reset clears exactly the recorded slots.
+static void sched_hv_mark_written(ggml_backend_sched_t sched, size_t id) {
+    if (ggml_bitset_get(sched->hv_written, id)) {
+        return;
+    }
+    ggml_bitset_set(sched->hv_written, id);
+    if (sched->hv_touched_count >= sched->hv_touched_capacity) {
+        const size_t new_capacity = sched->hv_touched_capacity == 0 ? 1024 : 2*sched->hv_touched_capacity;
+        size_t * new_touched = (size_t *) realloc(sched->hv_touched, new_capacity*sizeof(size_t));
+        if (new_touched == nullptr) {
+            GGML_ABORT("%s: failed to grow touched list\n", __func__);
+        }
+        sched->hv_touched = new_touched;
+        sched->hv_touched_capacity = new_capacity;
+    }
+    sched->hv_touched[sched->hv_touched_count++] = id;
+}
+
+// Read helpers that return the cleared default for slots with nothing written since the
+// last reset. They use find (no insert) so read-only touches do not pollute the hash set.
+static struct ggml_tensor * sched_hv_copy_id(ggml_backend_sched_t sched, size_t id, int backend_id, int copy_id) {
+    if (id == GGML_HASHSET_FULL || !ggml_bitset_get(sched->hv_written, id)) {
+        return nullptr;
+    }
+    return sched->hv_tensor_copies[id*sched->n_backends*sched->n_copies + backend_id*sched->n_copies + copy_id];
+}
+
+static struct ggml_tensor * sched_hv_copy(ggml_backend_sched_t sched, struct ggml_tensor * tensor, int backend_id, int copy_id) {
+    return sched_hv_copy_id(sched, ggml_hash_find(&sched->hash_set, tensor), backend_id, copy_id);
+}
 
 static bool ggml_backend_get_op_cost(
         ggml_backend_t backend, const struct ggml_tensor * op, const struct ggml_tensor * weight,
@@ -1018,7 +1061,11 @@ static int ggml_backend_sched_cost_offload(
     if (!found) {
         return -1;
     }
-    sched->hv_offload_decisions[hash_id(op)] = best;
+    {
+        const size_t op_id = hash_id(op);
+        sched_hv_mark_written(sched, op_id);
+        sched->hv_offload_decisions[op_id] = best;
+    }
     return best.result.offload ? best_backend_id : src_backend_id;
 }
 
@@ -1449,7 +1496,7 @@ static void ggml_backend_sched_trace_graph(ggml_backend_sched_t sched, struct gg
         }
         for (int backend_id = 0; backend_id < sched->n_backends; ++backend_id) {
             for (int copy_id = 0; copy_id < sched->n_copies; ++copy_id) {
-                ggml_tensor * copy = tensor_id_copy(tensor_id, backend_id, copy_id);
+                ggml_tensor * copy = sched_hv_copy_id(sched, tensor_id, backend_id, copy_id);
                 if (copy) {
                     tensor_ids.emplace(copy, trace_id);
                     const size_t copy_tensor_id = ggml_hash_find(&sched->hash_set, copy);
@@ -1586,8 +1633,9 @@ static void ggml_backend_sched_trace_graph(ggml_backend_sched_t sched, struct gg
         }
 
         const size_t decision_id = ggml_hash_find(&sched->hash_set, node);
-        const ggml_backend_sched_offload_decision * decision = decision_id == GGML_HASHSET_FULL ? nullptr :
-                &sched->hv_offload_decisions[decision_id];
+        const ggml_backend_sched_offload_decision * decision =
+            (decision_id == GGML_HASHSET_FULL || !ggml_bitset_get(sched->hv_written, decision_id)) ? nullptr :
+            &sched->hv_offload_decisions[decision_id];
         if (decision && decision->present) {
             const int candidate = decision->candidate_backend_id;
             event = {};
@@ -2035,7 +2083,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 GGML_ASSERT(src_backend_id != -1); // all inputs should be assigned by now
 
                 if (src->flags & GGML_TENSOR_FLAG_INPUT && sched->n_copies > 1) {
-                    if (tensor_id_copy(src_id, src_backend_id, 0) == NULL) {
+                    if (sched_hv_copy(sched, src, src_backend_id, 0) == NULL) {
                         ggml_backend_t backend = sched->backends[src_backend_id];
                         for (int c = 0; c < sched->n_copies; c++) {
                             struct ggml_tensor * tensor_copy;
@@ -2050,6 +2098,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                             tensor_id_copy(src_id, src_backend_id, c) = tensor_copy;
                             SET_CAUSE(tensor_copy, "4.cpy");
                         }
+                        sched_hv_mark_written(sched, src_id);
                         int n_graph_inputs = sched->n_graph_inputs++;
                         if (n_graph_inputs >= sched->graph_inputs_capacity) {
                             ggml_backend_sched_graph_inputs_grow(sched);
@@ -2060,7 +2109,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
                 if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
                     // create a copy of the input in the split's backend
-                    if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
+                    if (sched_hv_copy(sched, src, cur_backend_id, 0) == NULL) {
                         ggml_backend_t backend = sched->backends[cur_backend_id];
                         for (int c = 0; c < sched->n_copies; c++) {
                             struct ggml_tensor * tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
@@ -2072,13 +2121,14 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                             tensor_id_copy(src_id, cur_backend_id, c) = tensor_copy;
                             SET_CAUSE(tensor_copy, "4.cpy");
                         }
+                        sched_hv_mark_written(sched, src_id);
                         int n_inputs = split->n_inputs++;
                         if (n_inputs >= split->inputs_capacity) {
                             ggml_backend_sched_split_inputs_grow(split);
                         }
                         split->inputs[n_inputs] = src;
                     }
-                    node->src[j] = tensor_id_copy(src_id, cur_backend_id, sched->cur_copy);
+                    node->src[j] = sched_hv_copy(sched, src, cur_backend_id, sched->cur_copy);
                 }
             }
         }
@@ -2163,7 +2213,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
             struct ggml_tensor * input = split->inputs[j];
             const size_t input_id = hash_id(input);
-            struct ggml_tensor * input_cpy = tensor_id_copy(input_id, split->backend_id, sched->cur_copy);
+            struct ggml_tensor * input_cpy = sched_hv_copy_id(sched, input_id, split->backend_id, sched->cur_copy);
 
             // add a dependency to the input source so that it is not freed before the copy is done
             struct ggml_tensor * input_dep = ggml_view_tensor(sched->ctx, input);
@@ -2213,7 +2263,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             size_t id = hash_id(input);
             int backend_id = tensor_backend_id(input);
             for (int c = 0; c < sched->n_copies; c++) {
-                struct ggml_tensor * input_cpy = tensor_id_copy(id, backend_id, c);
+                struct ggml_tensor * input_cpy = sched_hv_copy_id(sched, id, backend_id, c);
                 sched->leaf_backend_ids[graph_copy->n_leafs] = backend_id;
                 assert(graph_copy->size > graph_copy->n_leafs);
                 graph_copy->leafs[graph_copy->n_leafs++] = input_cpy;
@@ -2227,7 +2277,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 struct ggml_tensor * input = split->inputs[j];
                 size_t id = hash_id(input);
                 for (int c = 0; c < sched->n_copies; c++) {
-                    struct ggml_tensor * input_cpy = tensor_id_copy(id, backend_id, c);
+                    struct ggml_tensor * input_cpy = sched_hv_copy_id(sched, id, backend_id, c);
                     sched->leaf_backend_ids[graph_copy->n_leafs] = backend_id;
                     assert(graph_copy->size > graph_copy->n_leafs);
                     graph_copy->leafs[graph_copy->n_leafs++] = input_cpy;
@@ -2345,7 +2395,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
-            struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+            struct ggml_tensor * input_cpy = sched_hv_copy(sched, input, split_backend_id, sched->cur_copy);
             const uint64_t copy_start = ggml_backend_sched_trace_span_begin();
             const bool observe_copy = copy_start || ggml_exec_trace_integrity_enabled();
             const int input_backend_id = observe_copy ? ggml_backend_sched_backend_id(sched, input_backend) : -1;
@@ -2431,7 +2481,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         // if the ids tensor is also an input of the split, it may not have been copied yet to the split backend
                         // in that case, we use the original ids tensor
                         for (int i = input_id + 1; i < split->n_inputs; i++) {
-                            if (ids_tensor == tensor_copy(split->inputs[i], split_backend_id, sched->cur_copy)) {
+                            if (ids_tensor == sched_hv_copy(sched, split->inputs[i], split_backend_id, sched->cur_copy)) {
                                 ids_tensor = split->inputs[i];
                                 ids_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[i]);
                                 break;
@@ -2673,6 +2723,15 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->hv_tensor_backend_ids = (int *) malloc(sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
     sched->hv_tensor_copies      = (ggml_tensor **) malloc(sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
     sched->hv_offload_decisions  = (ggml_backend_sched_offload_decision *) calloc(sched->hash_set.size, sizeof(sched->hv_offload_decisions[0]));
+    sched->hv_written            = (ggml_bitset_t *) calloc(ggml_bitset_size(sched->hash_set.size), sizeof(ggml_bitset_t));
+    sched->hv_touched            = nullptr;
+    sched->hv_touched_count      = 0;
+    sched->hv_touched_capacity   = 0;
+
+    {
+        const char * GGML_SCHED_SCOPED_RESET = getenv("GGML_SCHED_SCOPED_RESET");
+        sched->scoped_reset = GGML_SCHED_SCOPED_RESET ? atoi(GGML_SCHED_SCOPED_RESET) != 0 : true;
+    }
 
     const size_t ggml_sched_max_splits = graph_size; // at most there is one split for each node in the graph
     const size_t nodes_size = graph_size + ggml_sched_max_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2;
@@ -2735,6 +2794,8 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     free(sched->hv_tensor_backend_ids);
     free(sched->hv_tensor_copies);
     free(sched->hv_offload_decisions);
+    free(sched->hv_written);
+    free(sched->hv_touched);
     free(sched->trace_tensor_ids);
     free(sched->trace_backend_node_ids);
     free(sched->node_backend_ids);
@@ -2754,8 +2815,23 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     if (!sched->is_reset) {
         ggml_hash_set_reset(&sched->hash_set);
         memset(sched->hv_tensor_backend_ids, -1, sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
-        memset(sched->hv_tensor_copies,       0, sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
-        memset(sched->hv_offload_decisions,   0, sched->hash_set.size * sizeof(sched->hv_offload_decisions[0]));
+        if (sched->scoped_reset) {
+            // clear only the slots written since the last reset; every reader of these
+            // tables treats a slot without the written bit as the cleared default
+            const size_t n_copy_cells = (size_t) sched->n_backends*sched->n_copies;
+            for (size_t t = 0; t < sched->hv_touched_count; ++t) {
+                const size_t id = sched->hv_touched[t];
+                GGML_ASSERT(id < sched->hash_set.size);
+                memset(&sched->hv_tensor_copies[id*n_copy_cells], 0, n_copy_cells*sizeof(struct ggml_tensor *));
+                memset(&sched->hv_offload_decisions[id], 0, sizeof(sched->hv_offload_decisions[0]));
+                ggml_bitset_clear(sched->hv_written, id);
+            }
+            sched->hv_touched_count = 0;
+        } else {
+            memset(sched->hv_tensor_copies,       0, sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
+            memset(sched->hv_offload_decisions,   0, sched->hash_set.size * sizeof(sched->hv_offload_decisions[0]));
+            memset(sched->hv_written, 0, ggml_bitset_size(sched->hash_set.size)*sizeof(ggml_bitset_t));
+        }
         sched->is_reset = true;
     }
     sched->is_alloc = false;
