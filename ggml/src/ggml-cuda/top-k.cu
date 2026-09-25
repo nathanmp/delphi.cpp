@@ -623,16 +623,17 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     }
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
-#if !defined(CUB_TOP_K_AVAILABLE) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-    // GLM selects 512 pools. With CCCL < 3.2 the generic fallback fully sorts
-    // every active pool, even though Top-K explicitly does not require order.
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    // GLM selects up to 512 pools. With CCCL < 3.2 the generic fallback fully sorts
+    // every active pool, and with CCCL >= 3.2 it runs one DeviceTopK call per row,
+    // which fills the launch queue in prefill. The radix selector does all rows in one launch.
     // Keep a switch for model-level A/B validation.
     const char * radix_env = std::getenv("GGML_CUDA_TOPK_RADIX_SELECT");
     const bool use_radix_select = radix_env == nullptr || std::atoi(radix_env) != 0;
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const bool supported_device = GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE;
     const int max_radix_cols = cc >= GGML_CUDA_CC_ADA_LOVELACE ? 49152 : 32768;
-    if (use_radix_select && supported_device && ncols > 1024 && ncols <= max_radix_cols && k == 512) {
+    if (use_radix_select && supported_device && k <= ncols && ncols <= max_radix_cols) {
         top_k_radix_select_nvidia(src0_d, dst_d, ncols, nrows, k, stream);
         return;
     }
