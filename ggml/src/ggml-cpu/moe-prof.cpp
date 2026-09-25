@@ -17,6 +17,7 @@ struct moe_prof_counters {
     int64_t us[GGML_MOE_PROF_COUNT] = {};
     int64_t calls[GGML_MOE_PROF_COUNT] = {};
     int64_t rows_hist[k_row_buckets] = {};
+    int64_t rows_sum[k_row_buckets] = {};
     int64_t rows_total = 0;
     int64_t rows_samples = 0;
 };
@@ -41,6 +42,7 @@ struct moe_prof_state {
             }
             for (int b = 0; b < k_row_buckets; ++b) {
                 total.rows_hist[b] += t->rows_hist[b];
+                total.rows_sum[b]  += t->rows_sum[b];
             }
             total.rows_total   += t->rows_total;
             total.rows_samples += t->rows_samples;
@@ -98,6 +100,21 @@ struct moe_prof_state {
                 }
             }
             fprintf(stderr, "\n");
+            // Tagged block for tools/moe-schedule-stats/moe-rows-hist.py. One line
+            // per non-empty power-of-two bucket: lo is inclusive, hi is exclusive.
+            // The rows share is the script's MMID-time proxy: expert GEMM FLOPs
+            // scale with rows, while fixed per-expert overhead is not attributed.
+            fprintf(stderr, "moe_prof_begin samples=%lld rows=%lld mmid_thread_s=%.3f\n",
+                    (long long) total.rows_samples, (long long) total.rows_total,
+                    total_us / 1e6);
+            for (int b = 0; b < k_row_buckets; ++b) {
+                if (total.rows_hist[b] > 0) {
+                    fprintf(stderr, "moe_prof_bucket lo=%d hi=%d count=%lld rows=%lld\n",
+                            1 << b, 1 << (b + 1),
+                            (long long) total.rows_hist[b], (long long) total.rows_sum[b]);
+                }
+            }
+            fprintf(stderr, "moe_prof_end\n");
         }
     }
 };
@@ -141,6 +158,7 @@ void ggml_moe_prof_add_expert_rows(int64_t rows) {
         ++bucket;
     }
     c->rows_hist[bucket] += 1;
+    c->rows_sum[bucket]  += rows;
     c->rows_total        += rows;
     c->rows_samples      += 1;
 }
