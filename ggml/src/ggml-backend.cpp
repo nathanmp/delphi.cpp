@@ -815,6 +815,8 @@ struct ggml_backend_sched {
     // are sized for ubatch-sized prefill graphs and dominate MTP decode host time at
     // large ubatches). hv_tensor_backend_ids keeps its full clear: it is small and its
     // readers rely on the -1 default for slots that were inserted but never assigned.
+    // The copies/decisions arrays must be calloc'd: the reset never touches unwritten
+    // slots, so they have to read as the cleared default from the start.
     ggml_bitset_t * hv_written; // [ggml_bitset_size(hash_set.size)]
     size_t        * hv_touched;  // hash ids with written copies/decisions, each listed once
     size_t          hv_touched_count;
@@ -2721,7 +2723,10 @@ ggml_backend_sched_t ggml_backend_sched_new(
     // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)
     sched->hash_set    = ggml_hash_set_new(graph_size);
     sched->hv_tensor_backend_ids = (int *) malloc(sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
-    sched->hv_tensor_copies      = (ggml_tensor **) malloc(sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
+    // note: calloc, not malloc - the scoped reset below only clears slots written since the
+    // last reset, so slots that were never written must already hold the cleared default
+    // (NULL). this matters most for a fresh scheduler whose first reset clears nothing.
+    sched->hv_tensor_copies      = (ggml_tensor **) calloc(sched->hash_set.size * sched->n_backends * sched->n_copies, sizeof(struct ggml_tensor *));
     sched->hv_offload_decisions  = (ggml_backend_sched_offload_decision *) calloc(sched->hash_set.size, sizeof(sched->hv_offload_decisions[0]));
     sched->hv_written            = (ggml_bitset_t *) calloc(ggml_bitset_size(sched->hash_set.size), sizeof(ggml_bitset_t));
     sched->hv_touched            = nullptr;
