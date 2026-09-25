@@ -763,6 +763,10 @@ struct llama_model {
 
     bool has_tensor_overrides() const;
 
+    // true when a tensor buffer override matched a tensor other than an embedding
+    // lookup table (used to keep pipeline parallelism for embedding-only overrides)
+    bool has_non_embedding_tensor_overrides() const;
+
     const struct ggml_tensor * get_tensor(const char * name) const;
 
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;

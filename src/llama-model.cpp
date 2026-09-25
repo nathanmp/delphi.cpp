@@ -1208,6 +1208,7 @@ struct llama_model::impl {
     std::vector<layer_dev> dev_layer;
 
     bool has_tensor_overrides;
+    bool has_non_embedding_tensor_overrides = false;
 
     std::vector<float> tensor_split_owned;
 };
@@ -1860,6 +1861,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     if (ml.no_alloc) {
+        pimpl->has_non_embedding_tensor_overrides = ml.has_non_embedding_tensor_override;
         return true;
     }
 
@@ -1883,6 +1885,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             pimpl->mappings.emplace_back(std::move(mapping));
         }
     }
+
+    pimpl->has_non_embedding_tensor_overrides = ml.has_non_embedding_tensor_override;
 
     return true;
 }
@@ -2239,6 +2243,10 @@ ggml_backend_buffer_type_t llama_model::select_buft(int il) const {
 
 bool llama_model::has_tensor_overrides() const {
     return pimpl->has_tensor_overrides;
+}
+
+bool llama_model::has_non_embedding_tensor_overrides() const {
+    return pimpl->has_non_embedding_tensor_overrides;
 }
 
 const ggml_tensor * llama_model::get_tensor(const char * name) const {

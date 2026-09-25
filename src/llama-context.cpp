@@ -438,12 +438,25 @@ llama_context::llama_context(
 
         // TODO: move these checks to ggml_backend_sched
         // enabling pipeline parallelism in the scheduler increases memory usage, so it is only done when necessary
+        // tensor buffer overrides used to disable it unconditionally (upstream #11397), but
+        // overrides that only relocate embedding lookup tables do not change layer compute
+        // placement. LLAMA_PP_ALLOW_EMBEDDING_OVERRIDES=0 restores the upstream gate for A/B.
+        bool pp_blocked_by_overrides = model.has_tensor_overrides();
+        {
+            const char * LLAMA_PP_ALLOW_EMBEDDING_OVERRIDES = getenv("LLAMA_PP_ALLOW_EMBEDDING_OVERRIDES");
+            const bool allow_embedding_overrides =
+                LLAMA_PP_ALLOW_EMBEDDING_OVERRIDES ? atoi(LLAMA_PP_ALLOW_EMBEDDING_OVERRIDES) != 0 : true;
+            if (allow_embedding_overrides && !model.has_non_embedding_tensor_overrides()) {
+                pp_blocked_by_overrides = false;
+            }
+        }
+
         bool pipeline_parallel =
             model.n_devices() > 1 &&
             model.n_gpu_layers() > model.hparams.n_layer_all &&
             model.split_mode() == LLAMA_SPLIT_MODE_LAYER &&
             cparams.offload_kqv &&
-            !model.has_tensor_overrides();
+            !pp_blocked_by_overrides;
 
         // pipeline parallelism requires support for async compute and events in all devices
         if (pipeline_parallel) {

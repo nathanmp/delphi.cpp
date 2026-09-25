@@ -18,6 +18,14 @@ static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
 
+// Tensors that only feed row lookups (GET_ROWS). Relocating them does not change layer
+// compute placement, so pipeline parallelism stays valid when overrides touch only these.
+static bool is_embedding_lookup_table(const std::string & name) {
+    return name == "token_embd" ||
+           name == "per_layer_token_embd" ||
+           name.find("engram_embd") != std::string::npos;
+}
+
 const char * llama_file_version_name(llama_fver version) {
     switch (version) {
         case GGUF_FILE_VERSION_V1: return "GGUF V1 (support until nov 2023)";
@@ -1304,6 +1312,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             for (const auto * overrides = tensor_buft_overrides; overrides->pattern != nullptr; ++overrides) {
                 std::regex pattern(overrides->pattern);
                 if (std::regex_search(tensor_name, pattern)) {
+                    if (!is_embedding_lookup_table(tensor_name)) {
+                        has_non_embedding_tensor_override = true;
+                    }
                     if (overrides->buft == ggml_backend_cpu_buffer_type()) {
                         // when overriding to a CPU buffer, consider the extra buffer types
                         buft = select_weight_buft(hparams, t_meta, op, buft_list_cpu);

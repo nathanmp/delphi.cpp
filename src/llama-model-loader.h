@@ -129,6 +129,10 @@ struct llama_model_loader {
     std::unordered_map<std::string, llama_model_kv_override> kv_overrides;
     const llama_model_tensor_buft_override * tensor_buft_overrides;
 
+    // set when a tensor buffer override matches a tensor other than an embedding
+    // lookup table; pipeline parallelism stays valid for embedding-only overrides
+    bool has_non_embedding_tensor_override = false;
+
     gguf_context_ptr metadata_ptr;
     struct gguf_context * metadata; // either metadata_ptr.get() or externally set
     llama_model_set_tensor_data_t set_tensor_data;
