@@ -868,6 +868,10 @@ def load_recipe(reference: str) -> Recipe:
         raise ProfileError(f"cannot load recipe file: {path}")
     module = importlib.util.module_from_spec(spec)
     sys.path.insert(0, str(ROOT))
+    # Alias this runner under its canonical name so a recipe's
+    # `from tools.bottlenecks.profile import ...` reuses this module
+    # instead of loading a second copy with a distinct Recipe class.
+    sys.modules.setdefault("tools.bottlenecks.profile", sys.modules[__name__])
     try:
         spec.loader.exec_module(module)
     finally:
