@@ -9,6 +9,7 @@
 #include "llama-io.h"
 #include "llama-kv-cache-kpool.h"
 #include "llama-memory-hybrid.h"
+#include "llama-memory-hybrid-idx.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
@@ -862,16 +863,21 @@ void llama_context::sched_reserve() {
 void llama_context::reserve_max_prefill(
         const llama_ubatch & ubatch, const llama_memory_context_i * mctx,
         uint32_t n_tokens_all, uint32_t n_tokens_prev) {
-    // Only GLM's pooled indexer grows its compute reservation every prefill
-    // ubatch; other models keep today's behavior.
-    if (model.arch != LLM_ARCH_GLM5NEXT) {
-        return;
-    }
+    // The disease (prefill ubatches outgrowing the recorded compute reservation
+    // every time n_kv / pool sizes grow) is generic; only the variant decision
+    // depends on the memory type. See the per-variant checks below.
     {
+        const char * LLAMA_MAX_RESERVE = getenv("LLAMA_MAX_RESERVE");
         const char * LLAMA_GLM5_MAX_RESERVE = getenv("LLAMA_GLM5_MAX_RESERVE");
-        if (LLAMA_GLM5_MAX_RESERVE && atoi(LLAMA_GLM5_MAX_RESERVE) == 0) {
+        if ((LLAMA_MAX_RESERVE && atoi(LLAMA_MAX_RESERVE) == 0)
+                || (LLAMA_GLM5_MAX_RESERVE && atoi(LLAMA_GLM5_MAX_RESERVE) == 0)) {
             return;
         }
+    }
+    // DeepSeek's prefill is CPU routed-expert bound and ubatch-invariant, so the
+    // reallocation barriers are noise there; it stays out of the generic path.
+    if (model.arch == LLM_ARCH_DEEPSEEK4 || model.arch == LLM_ARCH_DEEPSEEK41) {
+        return;
     }
     // Only the first ubatch of a multi-ubatch single-sequence prefill: later
     // ubatches are already covered, and a single ubatch cannot grow.
@@ -884,14 +890,16 @@ void llama_context::reserve_max_prefill(
     if (model.hparams.no_alloc) {
         return;
     }
-    // The incoming ubatches must all use the same reservation variant. A cold
-    // pool cache changes shape after the first ubatch, so that case keeps
-    // today's behavior instead of recording a reservation nothing else fits.
-    {
-        const auto * mctx_hyb = static_cast<const llama_memory_hybrid_context *>(mctx);
-        if (mctx_hyb->get_idx() == nullptr) {
-            return;
-        }
+    // The incoming ubatches must all use the same reservation variant. Memory
+    // types with a single prefill variant need no check. The pooled indexer is
+    // the only known case that can switch shape mid-prefill: a cold pool cache
+    // changes shape after the first ubatch, so that case keeps today's behavior
+    // instead of recording a reservation nothing else fits. llama_memory_hybrid_idx
+    // shadows the base get_idx() with its own indexer cache and has no pool cache,
+    // so the base accessor being null covers it.
+    const auto * mctx_hyb = dynamic_cast<const llama_memory_hybrid_context *>(mctx);
+    const bool is_hyb_idx = dynamic_cast<const llama_memory_hybrid_idx_context *>(mctx) != nullptr;
+    if (mctx_hyb != nullptr && mctx_hyb->get_idx() != nullptr) {
         auto * cache = mctx_hyb->get_kpool_cache();
         if (cache != nullptr) {
             const char * pool_cache_env = getenv("LLAMA_GLM5_POOL_CACHE");
@@ -899,19 +907,24 @@ void llama_context::reserve_max_prefill(
                 cache = nullptr;
             }
         }
-        if (cache == nullptr) {
-            return;
-        }
-        const uint32_t n_select = model.hparams.indexer_top_k + model.hparams.indexer_kpool - 1;
-        const bool scoring = cparams.n_ctx > n_select;
-        const uint32_t stream0 = mctx_hyb->get_idx()->get_stream_base();
-        const uint32_t n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
-        if (scoring && cache->needs_rebuild(stream0, n_stream)) {
-            return;
+        if (cache != nullptr) {
+            const uint32_t n_select = model.hparams.indexer_top_k + model.hparams.indexer_kpool - 1;
+            const bool scoring = cparams.n_ctx > n_select;
+            const uint32_t stream0 = mctx_hyb->get_idx()->get_stream_base();
+            const uint32_t n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
+            if (scoring && cache->needs_rebuild(stream0, n_stream)) {
+                return;
+            }
         }
     }
 
-    auto mctx_max = memory->init_full_n_seq(1, cparams.n_ctx_seq, false);
+    // simulate the largest prefill ubatch in the variant that later ubatches will
+    // use: the single-stream warm pool-cache shape for plain hybrid memory; the
+    // worst-case full cache for everything else, including the derived hybrid-idx
+    // context type and non-hybrid memories (whose init_full_n_seq defaults here)
+    auto mctx_max = (mctx_hyb != nullptr && !is_hyb_idx)
+            ? memory->init_full_n_seq(1, cparams.n_ctx_seq, false)
+            : memory->init_full();
     if (!mctx_max) {
         LLAMA_LOG_WARN("%s: failed to initialize max-prefill memory module\n", __func__);
         return;
