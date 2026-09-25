@@ -56,6 +56,12 @@ struct llama_context {
     //   - etc.
     void sched_reserve();
 
+    // pre-record the largest prefill reservation ahead of a growing
+    // multi-ubatch prefill, so later ubatches fit without reallocating
+    void reserve_max_prefill(
+            const llama_ubatch & ubatch, const llama_memory_context_i * mctx,
+            uint32_t n_tokens_all, uint32_t n_tokens_prev);
+
     void synchronize();
 
     const llama_model   & get_model()   const;

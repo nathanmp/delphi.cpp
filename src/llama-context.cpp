@@ -7,6 +7,8 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-kv-cache-kpool.h"
+#include "llama-memory-hybrid.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
@@ -855,6 +857,74 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n",
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
+}
+
+void llama_context::reserve_max_prefill(
+        const llama_ubatch & ubatch, const llama_memory_context_i * mctx,
+        uint32_t n_tokens_all, uint32_t n_tokens_prev) {
+    // Only GLM's pooled indexer grows its compute reservation every prefill
+    // ubatch; other models keep today's behavior.
+    if (model.arch != LLM_ARCH_GLM5NEXT) {
+        return;
+    }
+    {
+        const char * LLAMA_GLM5_MAX_RESERVE = getenv("LLAMA_GLM5_MAX_RESERVE");
+        if (LLAMA_GLM5_MAX_RESERVE && atoi(LLAMA_GLM5_MAX_RESERVE) == 0) {
+            return;
+        }
+    }
+    // Only the first ubatch of a multi-ubatch single-sequence prefill: later
+    // ubatches are already covered, and a single ubatch cannot grow.
+    if (n_tokens_prev != 0 || n_tokens_all <= cparams.n_ubatch) {
+        return;
+    }
+    if (ubatch.n_tokens != cparams.n_ubatch || ubatch.n_seq_tokens != cparams.n_ubatch) {
+        return;
+    }
+    if (model.hparams.no_alloc) {
+        return;
+    }
+    // The incoming ubatches must all use the same reservation variant. A cold
+    // pool cache changes shape after the first ubatch, so that case keeps
+    // today's behavior instead of recording a reservation nothing else fits.
+    {
+        const auto * mctx_hyb = static_cast<const llama_memory_hybrid_context *>(mctx);
+        if (mctx_hyb->get_idx() == nullptr) {
+            return;
+        }
+        auto * cache = mctx_hyb->get_kpool_cache();
+        if (cache != nullptr) {
+            const char * pool_cache_env = getenv("LLAMA_GLM5_POOL_CACHE");
+            if (pool_cache_env != nullptr && atoi(pool_cache_env) == 0) {
+                cache = nullptr;
+            }
+        }
+        if (cache == nullptr) {
+            return;
+        }
+        const uint32_t n_select = model.hparams.indexer_top_k + model.hparams.indexer_kpool - 1;
+        const bool scoring = cparams.n_ctx > n_select;
+        const uint32_t stream0 = mctx_hyb->get_idx()->get_stream_base();
+        const uint32_t n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
+        if (scoring && cache->needs_rebuild(stream0, n_stream)) {
+            return;
+        }
+    }
+
+    auto mctx_max = memory->init_full_n_seq(1, cparams.n_ctx_seq, false);
+    if (!mctx_max) {
+        LLAMA_LOG_WARN("%s: failed to initialize max-prefill memory module\n", __func__);
+        return;
+    }
+
+    const uint32_t n_tokens_max  = std::min(cparams.n_ctx, cparams.n_ubatch);
+    const uint32_t n_outputs_max = std::min(n_tokens_max, cparams.n_outputs_max);
+
+    LLAMA_LOG_INFO("%s: pre-recording max prefill reservation for %u ubatch tokens\n", __func__, n_tokens_max);
+
+    if (!graph_reserve(n_tokens_max, 1, n_outputs_max, mctx_max.get())) {
+        LLAMA_LOG_WARN("%s: failed to reserve max prefill graph\n", __func__);
+    }
 }
 
 void llama_context::synchronize() {
@@ -2165,6 +2235,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     do {
         const auto & ubatch = mctx->get_ubatch();
+
+        // pre-record the largest prefill reservation ahead of a growing
+        // multi-ubatch prefill, so later ubatches fit without reallocating
+        reserve_max_prefill(ubatch, mctx.get(), n_tokens_all, n_tokens_prev);
 
         // count the outputs in this ubatch
         {
