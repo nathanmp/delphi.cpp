@@ -2767,6 +2767,46 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
                 GGML_EXEC_TRACE_GPU_GRAPH_REASON_NONE);
     }
 }
+
+// delphi: single-use prefill capture (design A of the GLM prefill graph task). The shape-keyed
+// cache keys every ubatch shape separately, so a prefill split never completes the 2-call warmup
+// within one prompt. During stream capture launches are recorded, not enqueued, so capture never
+// blocks on the launch queue; instantiating a ~2400-node graph costs a few to tens of ms against
+// ~330-380 ms of device time, so capturing on first use still wins. Gated to NVIDIA: the ROCm
+// queue absorbs a whole split, so Qwen does not need this. On by default; GGML_CUDA_GRAPH_PREFILL=0
+// restores the warmup path.
+static bool ggml_cuda_graph_prefill_capture_enabled() {
+    static const int enabled = [] {
+        const char * s = std::getenv("GGML_CUDA_GRAPH_PREFILL");
+        return s == nullptr || std::atoi(s) != 0;
+    }();
+    return enabled != 0;
+}
+
+// Large MoE prefill splits only: anything else stays on the warmup path so decode behavior
+// does not change. The test is MUL_MAT_ID tokens (src1 ne[2] is exactly the MoE token count,
+// mmq.cu sizes its schedule by it), not dense MUL_MAT dims: dense dims also hold hidden and
+// KV-cache sizes, which false-positive on decode/verify splits (e.g. indexer MUL_MATs with
+// pool-sized dims at 1-5 tokens). The token bar is 64: below it (decode, MTP target-verify)
+// eager submit drains without launch-queue pressure, so capture cannot win and would only add
+// capture+instantiate cost on first sight of every shape. Prefill ubatches (512+ tokens) are
+// far above it. Dense-only models never qualify and keep old behavior.
+static bool ggml_cuda_graph_is_prefill_candidate(ggml_cgraph * cgraph) {
+    if (cgraph->n_nodes <= 256) {
+        return false;
+    }
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (node->op != GGML_OP_MUL_MAT_ID) {
+            continue;
+        }
+        const ggml_tensor * src1 = node->src[1];
+        if (src1 != nullptr && src1->ne[2] >= 64) {
+            return true;
+        }
+    }
+    return false;
+}
 #endif // USE_CUDA_GRAPH
 
 static bool ggml_cuda_should_fuse_rope_set_rows(const ggml_tensor * rope,
@@ -4421,6 +4461,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     ggml_cuda_exec_trace_timer * trace_timer = cuda_ctx->exec_trace_timer;
     cudaStream_t trace_timer_stream = trace_timer ? cuda_ctx->stream(cuda_ctx->device, 0) : nullptr;
 
+#ifdef USE_CUDA_GRAPH
+    // delphi: host cost of a single-use prefill capture, for the worklog. Timing events cannot
+    // be recorded during stream capture (they would become graph nodes), so this is host wall time.
+    const bool prefill_timelog = use_cuda_graph && cuda_graph_update_required &&
+        ggml_cuda_graph_prefill_capture_enabled() && cgraph->n_nodes > 256;
+    const int64_t prefill_cap_t0 = prefill_timelog ? ggml_time_us() : 0;
+    int64_t prefill_cap_us = 0;
+#endif // USE_CUDA_GRAPH
+
     while (!graph_evaluated_or_captured) {
         // Only perform the graph execution if CUDA graphs are not enabled, or we are capturing the graph.
         // With the use of CUDA graphs, the execution will be performed by the graph launch.
@@ -4603,6 +4652,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
             graph->num_nodes = cgraph->n_nodes;
+            if (prefill_timelog) {
+                prefill_cap_us = ggml_time_us() - prefill_cap_t0;
+            }
             if (graph->trace_id == 0) {
                 graph->trace_id = ggml_exec_trace_next_gpu_graph_id();
             }
@@ -4622,7 +4674,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     if (use_cuda_graph) {
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         if (graph->instance == nullptr) { // Create executable graph from captured graph.
+            const int64_t prefill_inst_t0 = prefill_timelog ? ggml_time_us() : 0;
             CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+            if (prefill_timelog) {
+                GGML_LOG_INFO("%s: CUDA%d prefill graph: %d nodes, capture %.1f ms, instantiate %.1f ms\n",
+                    __func__, cuda_ctx->device, cgraph->n_nodes,
+                    prefill_cap_us/1000.0, (ggml_time_us() - prefill_inst_t0)/1000.0);
+            }
             if (graph->trace_id == 0) {
                 graph->trace_id = ggml_exec_trace_next_gpu_graph_id();
             }
@@ -4700,6 +4758,15 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     cuda_graph_update_required = true;
                 } else {
                     fallback_reason = GGML_EXEC_TRACE_GPU_GRAPH_REASON_WARMUP;
+                    // delphi: single-use prefill capture skips the warmup gate. Each ubatch
+                    // shape is a new key that would never warm up within one prompt; capture
+                    // itself never blocks on the launch queue, so first-use capture still wins.
+                    const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+                    if (ggml_cuda_graph_prefill_capture_enabled() && !GGML_CUDA_CC_IS_AMD(cc) &&
+                            ggml_cuda_graph_is_prefill_candidate(cgraph)) {
+                        use_cuda_graph = true;
+                        cuda_graph_update_required = true;
+                    }
                 }
                 // else: properties changed or first call - execute directly (use_cuda_graph stays false)
             } else {
