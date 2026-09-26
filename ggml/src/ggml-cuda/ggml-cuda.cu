@@ -4739,7 +4739,20 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     uint64_t graph_key = 0;
 
 #ifdef USE_CUDA_GRAPH
-    graph_key = ggml_cuda_graph_get_key(cgraph);
+    if (cgraph->uid != 0) {
+        auto it = cuda_ctx->graph_key_by_uid.find(cgraph->uid);
+        if (it != cuda_ctx->graph_key_by_uid.end()) {
+            graph_key = it->second;
+        } else {
+            if (cuda_ctx->graph_key_by_uid.size() >= 16384) {
+                cuda_ctx->graph_key_by_uid.clear();
+            }
+            graph_key = ggml_cuda_graph_get_key(cgraph);
+            cuda_ctx->graph_key_by_uid.emplace(cgraph->uid, graph_key);
+        }
+    } else {
+        graph_key = ggml_cuda_graph_get_key(cgraph);
+    }
 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 

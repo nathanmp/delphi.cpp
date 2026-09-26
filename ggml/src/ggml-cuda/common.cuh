@@ -1562,19 +1562,45 @@ struct ggml_backend_cuda_context {
 
 #ifdef USE_CUDA_GRAPH
     std::unordered_map<uint64_t, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
+    // Graph keys hash every node, which dominates host time when a split mode submits many small
+    // graphs per token. A uid is reassigned whenever a graph is rebuilt, so the key can be reused.
+    std::unordered_map<uint64_t, uint64_t> graph_key_by_uid;
+
+    // Tensor split runs one graph per reduction segment (about two per layer), so the working set
+    // is far above what layer split needs. Evicting it every token disables graph replay.
+    static size_t graph_cache_capacity() {
+        static const size_t capacity = [] {
+            const char * env = getenv("GGML_CUDA_GRAPH_CACHE_SIZE");
+            const long parsed = env ? atol(env) : 0;
+            return parsed > 0 ? (size_t) parsed : (size_t) 256;
+        }();
+        return capacity;
+    }
 
     ggml_cuda_graph * cuda_graph(uint64_t graph_key) {
         const int64_t time_now = ggml_time_us();
 
         auto it = cuda_graphs.find(graph_key);
         if (it == cuda_graphs.end()) {
-            if (cuda_graphs.size() >= 64) {
-                auto oldest = cuda_graphs.begin();
-                for (auto cur = cuda_graphs.begin(); cur != cuda_graphs.end(); ++cur) {
-                    if (cur->second->last_used_time < oldest->second->last_used_time) {
-                        oldest = cur;
+            // Large graphs (prefill splits, often used once) keep the old bound of 64 so the larger
+            // capacity cannot turn into device memory held by dead executables.
+            auto oldest       = cuda_graphs.end();
+            auto oldest_large = cuda_graphs.end();
+            size_t n_large = 0;
+            for (auto cur = cuda_graphs.begin(); cur != cuda_graphs.end(); ++cur) {
+                if (oldest == cuda_graphs.end() || cur->second->last_used_time < oldest->second->last_used_time) {
+                    oldest = cur;
+                }
+                if (cur->second->num_nodes > 256) {
+                    n_large++;
+                    if (oldest_large == cuda_graphs.end() || cur->second->last_used_time < oldest_large->second->last_used_time) {
+                        oldest_large = cur;
                     }
                 }
+            }
+            if (n_large >= 64) {
+                cuda_graphs.erase(oldest_large);
+            } else if (cuda_graphs.size() >= graph_cache_capacity()) {
                 cuda_graphs.erase(oldest);
             }
             it = cuda_graphs.emplace(graph_key, std::make_unique<ggml_cuda_graph>()).first;
