@@ -1194,7 +1194,6 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
         case LLM_ARCH_BAILINGMOE3:
         case LLM_ARCH_KIMI_K3:
         case LLM_ARCH_QWEN3TTS:
-        case LLM_ARCH_QWEN4EXP:   // TODO: fix test-llama-archs
         case LLM_ARCH_DEEPSEEK41: // TODO: split rules for the engram tensors
             return false;
         default:
