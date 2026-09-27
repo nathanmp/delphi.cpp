@@ -1912,14 +1912,20 @@ static void ggml_backend_meta_free(ggml_backend_t backend) {
     delete backend;
 }
 
+static void ggml_backend_meta_synchronize(ggml_backend_t backend);
+
 static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
-    GGML_ASSERT(offset == 0);
-    GGML_ASSERT(ggml_is_contiguous(tensor));
 
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
-    GGML_ASSERT(split_state.n_segments == 1);
-    GGML_ASSERT(split_state.nr[0]      == 1);
+    const bool async_axis = split_state.axis == GGML_BACKEND_SPLIT_AXIS_0 || split_state.axis == GGML_BACKEND_SPLIT_AXIS_1 ||
+        split_state.axis == GGML_BACKEND_SPLIT_AXIS_2 || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED;
+    if (!async_axis || offset != 0 || !ggml_is_contiguous(tensor) || split_state.n_segments != 1 || split_state.nr[0] != 1) {
+        // layouts only the synchronous buffer path can splice
+        ggml_backend_meta_synchronize(backend);
+        ggml_backend_tensor_set(tensor, data, offset, size);
+        return;
+    }
 
     switch (split_state.axis) {
         case GGML_BACKEND_SPLIT_AXIS_0:

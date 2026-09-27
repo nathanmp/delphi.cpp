@@ -856,6 +856,9 @@ struct ggml_backend_sched {
 
     bool op_offload;
 
+    // no backend has work in flight: set by ggml_backend_sched_synchronize, cleared when a graph is submitted
+    bool backends_idle;
+
     int debug;
 
     // used for debugging graph reallocations [GGML_SCHED_DEBUG_REALLOC]
@@ -2369,6 +2372,8 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
+    bool backends_idle = sched->backends_idle;
+    sched->backends_idle = false;
     struct ggml_backend_sched_split * splits = sched->splits;
 
     ggml_tensor * prev_ids_tensor = nullptr;
@@ -2402,6 +2407,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         // copy the input tensors to the split backend
+        const bool split_is_meta = ggml_backend_is_meta(split_backend);
+        bool input_sync_pending = false;
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
@@ -2433,7 +2440,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             GGML_EXEC_TRACE_WAIT_API_BACKEND_SYNCHRONIZE, copy_bytes);
                 }
                 const uint64_t body_start = ggml_backend_sched_trace_detail_span_begin();
-                ggml_backend_tensor_copy(input, input_cpy);
+                if (split_is_meta && backends_idle && ggml_backend_buffer_is_host(input->buffer)) {
+                    // one synchronous copy per input and simple device costs about 0.1 ms per input on a Meta
+                    // backend; queue them all and synchronize once after the last input instead. Only while
+                    // nothing else is queued: otherwise that synchronization would also wait for the previous
+                    // ubatch and serialize prefill
+                    ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+                    input_sync_pending = true;
+                } else {
+                    ggml_backend_tensor_copy(input, input_cpy);
+                }
                 ggml_backend_sched_trace_copy_end(
                         sched, body_start, GGML_EXEC_TRACE_EVENT_COPY_BODY, copy_path,
                         split_id, input_backend_id, split_backend_id,
@@ -2606,6 +2622,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     sched, copy_start, GGML_EXEC_TRACE_EVENT_COPY_HANDLING, copy_path,
                     split_id, input_backend_id, split_backend_id,
                     input_node_id, input_cpy_node_id, copy_bytes);
+        }
+
+        if (input_sync_pending) {
+            ggml_backend_synchronize(split_backend);
+        }
+        if (split_is_meta) {
+            backends_idle = false;
         }
 
         if (!sched->callback_eval) {
@@ -2781,6 +2804,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
     sched->op_offload = op_offload;
+    sched->backends_idle = true;
 
     ggml_backend_sched_reset(sched);
 
@@ -2941,6 +2965,7 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
                 GGML_EXEC_TRACE_WAIT_SCHEDULER_SYNCHRONIZE, -1, i,
                 GGML_EXEC_TRACE_ID_NONE, GGML_EXEC_TRACE_WAIT_API_BACKEND_SYNCHRONIZE);
     }
+    sched->backends_idle = true;
     if (!sched->is_alloc) {
         // if the graph is not already allocated, always use copy 0 after a synchronization
         // this ensures that during generation the same copy is used every time,
