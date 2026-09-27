@@ -866,6 +866,10 @@ struct ggml_backend_sched {
     // each other's memory (GGML_SCHED_PREV_SPLIT_WAIT=1 always waits)
     bool prev_split_wait_all;
 
+    // delphi: wait on the host once per graph and backend for the previous use of the copy slot, not once per split
+    // input (GGML_SCHED_COPY_REUSE_WAIT=1 waits for every input)
+    bool copy_reuse_wait_all;
+
     int debug;
 
     // used for debugging graph reallocations [GGML_SCHED_DEBUG_REALLOC]
@@ -2444,6 +2448,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     int prev_backend_id = -1;
 
+    // The input copies of this graph use copy slot cur_copy, which the last graph with the same slot may still read.
+    // Before its first event record in this graph, events[b][cur_copy] marks the end of that graph on backend b;
+    // afterwards it marks a split of this graph, which comes later in the stream of b. A host synchronization on it at
+    // any point of this graph therefore proves that the previous use of the slot on b has ended, and no later input
+    // of this graph needs to wait for it again. Waiting again would wait for the earlier splits of this graph on b,
+    // which with pipeline parallelism sit behind the previous ubatch, and would serialize the ubatches.
+    bool copy_slot_free[GGML_SCHED_MAX_BACKENDS] = { false };
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
@@ -2489,8 +2501,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 copy_path = GGML_EXEC_TRACE_COPY_USER_INPUT_SYNC;
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
                 const uint64_t wait_start = ggml_backend_sched_trace_detail_span_begin();
-                if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                if (copy_slot_free[split_backend_id] && !sched->copy_reuse_wait_all) {
+                    // the previous use of the slot has ended (see copy_slot_free)
+                } else if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+                    copy_slot_free[split_backend_id] = true;
                     ggml_backend_sched_trace_copy_wait_end(
                             sched, wait_start, GGML_EXEC_TRACE_EVENT_COPY_WAIT_DST, copy_path,
                             split_id, split_backend_id, input_backend_id, input_node_id,
@@ -2658,8 +2673,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 split_id, input_backend_id, split_backend_id, input_node_id,
                                 GGML_EXEC_TRACE_WAIT_API_BACKEND_SYNCHRONIZE, copy_bytes);
                         const uint64_t dst_wait_start = ggml_backend_sched_trace_detail_span_begin();
-                        if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                        if (copy_slot_free[split_backend_id] && !sched->copy_reuse_wait_all) {
+                            // the previous use of the slot has ended (see copy_slot_free)
+                        } else if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+                            copy_slot_free[split_backend_id] = true;
                             ggml_backend_sched_trace_copy_wait_end(
                                     sched, dst_wait_start, GGML_EXEC_TRACE_EVENT_COPY_WAIT_DST, copy_path,
                                     split_id, split_backend_id, input_backend_id, input_node_id,
@@ -2814,6 +2832,8 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->view_alias = GGML_SCHED_VIEW_ALIAS ? atoi(GGML_SCHED_VIEW_ALIAS) != 0 : true;
     const char * GGML_SCHED_PREV_SPLIT_WAIT = getenv("GGML_SCHED_PREV_SPLIT_WAIT");
     sched->prev_split_wait_all = GGML_SCHED_PREV_SPLIT_WAIT ? atoi(GGML_SCHED_PREV_SPLIT_WAIT) != 0 : false;
+    const char * GGML_SCHED_COPY_REUSE_WAIT = getenv("GGML_SCHED_COPY_REUSE_WAIT");
+    sched->copy_reuse_wait_all = GGML_SCHED_COPY_REUSE_WAIT ? atoi(GGML_SCHED_COPY_REUSE_WAIT) != 0 : false;
 
     sched->n_backends = n_backends;
     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
