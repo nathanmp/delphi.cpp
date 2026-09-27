@@ -17,12 +17,12 @@ struct ggml_cuda_ar_p2p {
     int    n_devices = 0;
     int    devices[GGML_CUDA_AR_P2P_MAX_DEVICES] = {};
     // receive buffers and flags live on their owning device, in fine-grained memory so that peer
-    // writes become visible to a running kernel. rbuf: [slot][src rank][max_count]; flags: [src rank][block]
+    // writes become visible to a running kernel. rbuf: [slot][src rank][max_count]; flags: [src rank][block],
+    // followed by one call counter per block. The counters live on the device so that a captured
+    // graph replays with fresh tokens; every rank runs every call, so they stay equal across ranks.
     float * rbuf [GGML_CUDA_AR_P2P_MAX_DEVICES] = {};
     int   * flags[GGML_CUDA_AR_P2P_MAX_DEVICES] = {};
     size_t max_count = 0;
-    // tokens only increase, so flags never need to be reset
-    int    token = 0;
 };
 
 struct ggml_cuda_ar_p2p_args {
@@ -33,16 +33,29 @@ struct ggml_cuda_ar_p2p_args {
     int     rank;
     int     count4;
     size_t  max_count;
-    int     slot;
-    int     token;
+    int     zero; // this rank holds an empty slice and contributes zeros
 };
 
 static __global__ void ggml_cuda_ar_p2p_kernel(const ggml_cuda_ar_p2p_args a) {
     const int gtid = blockIdx.x*blockDim.x + threadIdx.x;
     const int gnt  = gridDim.x*blockDim.x;
 
-    const size_t slot_offset = (size_t) a.slot*GGML_CUDA_AR_P2P_MAX_DEVICES*a.max_count;
+    // tokens only increase, so flags never need to be reset
+    int * counter = a.peer_flags[a.rank] + (GGML_CUDA_AR_P2P_MAX_DEVICES*GGML_CUDA_AR_P2P_BLOCKS + blockIdx.x)*GGML_CUDA_AR_P2P_FLAG_STRIDE;
+    __shared__ int s_token;
+    if (threadIdx.x == 0) {
+        s_token = *counter + 1;
+    }
+    __syncthreads();
+    const int token = s_token;
+
+    const size_t slot_offset = (size_t) (token % GGML_CUDA_AR_P2P_SLOTS)*GGML_CUDA_AR_P2P_MAX_DEVICES*a.max_count;
     float4 * buf = (float4 *) a.buf;
+    if (a.zero) {
+        for (int i = gtid; i < a.count4; i += gnt) {
+            buf[i] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        }
+    }
 
     // Push this rank's data into every peer. Each block handles the same stripe on every rank, so it
     // only has to wait for the matching block of each peer.
@@ -62,7 +75,7 @@ static __global__ void ggml_cuda_ar_p2p_kernel(const ggml_cuda_ar_p2p_args a) {
         for (int p = 0; p < a.n_devices; ++p) {
             if (p != a.rank) {
                 int * flag = a.peer_flags[p] + (a.rank*GGML_CUDA_AR_P2P_BLOCKS + blockIdx.x)*GGML_CUDA_AR_P2P_FLAG_STRIDE;
-                __hip_atomic_store(flag, a.token, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+                __hip_atomic_store(flag, token, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
             }
         }
         int * own_flags = a.peer_flags[a.rank];
@@ -71,7 +84,7 @@ static __global__ void ggml_cuda_ar_p2p_kernel(const ggml_cuda_ar_p2p_args a) {
                 continue;
             }
             const int * flag = own_flags + (p*GGML_CUDA_AR_P2P_BLOCKS + blockIdx.x)*GGML_CUDA_AR_P2P_FLAG_STRIDE;
-            while (__hip_atomic_load(flag, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < a.token) {
+            while (__hip_atomic_load(flag, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < token) {
                 __builtin_amdgcn_s_sleep(1);
             }
         }
@@ -90,6 +103,9 @@ static __global__ void ggml_cuda_ar_p2p_kernel(const ggml_cuda_ar_p2p_args a) {
             sum.w += v.w;
         }
         buf[i] = sum;
+    }
+    if (threadIdx.x == 0) {
+        *counter = token;
     }
 }
 
@@ -116,7 +132,7 @@ ggml_cuda_ar_p2p * ggml_cuda_ar_p2p_init(const int * devices, size_t n_devices) 
     p2p->max_count = max_bytes / sizeof(float);
 
     const size_t rbuf_size  = (size_t) GGML_CUDA_AR_P2P_SLOTS*GGML_CUDA_AR_P2P_MAX_DEVICES*p2p->max_count*sizeof(float);
-    const size_t flags_size = (size_t) GGML_CUDA_AR_P2P_MAX_DEVICES*GGML_CUDA_AR_P2P_BLOCKS*GGML_CUDA_AR_P2P_FLAG_STRIDE*sizeof(int);
+    const size_t flags_size = (size_t) (GGML_CUDA_AR_P2P_MAX_DEVICES + 1)*GGML_CUDA_AR_P2P_BLOCKS*GGML_CUDA_AR_P2P_FLAG_STRIDE*sizeof(int);
 
     bool ok = true;
     for (size_t i = 0; i < n_devices && ok; ++i) {
@@ -162,15 +178,33 @@ void ggml_cuda_ar_p2p_free(ggml_cuda_ar_p2p * p2p) {
     delete p2p;
 }
 
+bool ggml_cuda_ar_p2p_supports(const ggml_cuda_ar_p2p * p2p, const ggml_tensor * t) {
+    const int64_t ne = ggml_nelements(t);
+    return t->type == GGML_TYPE_F32 && ne % 4 == 0 && (size_t) ne <= p2p->max_count &&
+        ggml_is_contiguously_allocated(t) && ((uintptr_t) t->data & 0xF) == 0;
+}
+
+static void ggml_cuda_ar_p2p_launch(const ggml_cuda_ar_p2p * p2p, int rank, ggml_tensor * t, bool zero, cudaStream_t stream) {
+    ggml_cuda_ar_p2p_args args = {};
+    args.buf       = (float *) t->data;
+    args.n_devices = p2p->n_devices;
+    args.rank      = rank;
+    args.count4    = (int) (ggml_nelements(t) / 4);
+    args.max_count = p2p->max_count;
+    args.zero      = zero;
+    for (int i = 0; i < p2p->n_devices; ++i) {
+        args.peer_rbuf[i]  = p2p->rbuf[i];
+        args.peer_flags[i] = p2p->flags[i];
+    }
+    ggml_cuda_ar_p2p_kernel<<<GGML_CUDA_AR_P2P_BLOCKS, 256, 0, stream>>>(args);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 bool ggml_cuda_ar_p2p_allreduce(ggml_cuda_ar_p2p * p2p, ggml_backend_t * backends, ggml_tensor ** tensors) {
     const int64_t ne = ggml_nelements(tensors[0]);
-    if (ne % 4 != 0 || (size_t) ne > p2p->max_count) {
-        return false;
-    }
     for (int i = 0; i < p2p->n_devices; ++i) {
         const ggml_tensor * t = tensors[i];
-        if (t == nullptr || t->type != GGML_TYPE_F32 || ggml_nelements(t) != ne ||
-                !ggml_is_contiguously_allocated(t) || ((uintptr_t) t->data & 0xF) != 0) {
+        if (t == nullptr || ggml_nelements(t) != ne || !ggml_cuda_ar_p2p_supports(p2p, t)) {
             return false;
         }
     }
@@ -178,31 +212,20 @@ bool ggml_cuda_ar_p2p_allreduce(ggml_cuda_ar_p2p * p2p, ggml_backend_t * backend
         return true;
     }
 
-    p2p->token++;
-    ggml_cuda_ar_p2p_args args = {};
-    args.n_devices = p2p->n_devices;
-    args.count4    = (int) (ne / 4);
-    args.max_count = p2p->max_count;
-    args.slot      = p2p->token % GGML_CUDA_AR_P2P_SLOTS;
-    args.token     = p2p->token;
-    for (int i = 0; i < p2p->n_devices; ++i) {
-        args.peer_rbuf[i]  = p2p->rbuf[i];
-        args.peer_flags[i] = p2p->flags[i];
-    }
-
     for (int i = 0; i < p2p->n_devices; ++i) {
         ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backends[i]->context;
         ggml_cuda_set_device(cuda_ctx->device);
-        if ((tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
-            // this rank holds an empty slice and contributes zeros
-            CUDA_CHECK(cudaMemsetAsync(tensors[i]->data, 0, ggml_nbytes(tensors[i]), cuda_ctx->stream()));
-        }
-        args.buf  = (float *) tensors[i]->data;
-        args.rank = i;
-        ggml_cuda_ar_p2p_kernel<<<GGML_CUDA_AR_P2P_BLOCKS, 256, 0, cuda_ctx->stream()>>>(args);
-        CUDA_CHECK(cudaGetLastError());
+        ggml_cuda_ar_p2p_launch(p2p, i, tensors[i], (tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0, cuda_ctx->stream());
     }
     return true;
+}
+
+void ggml_cuda_ar_p2p_allreduce_rank(ggml_backend_cuda_context & ctx, const ggml_cuda_ar_p2p * p2p, int rank, ggml_tensor * dst, bool zero) {
+    GGML_ASSERT(rank >= 0 && rank < p2p->n_devices && p2p->devices[rank] == ctx.device);
+    if (ggml_nelements(dst) == 0) {
+        return;
+    }
+    ggml_cuda_ar_p2p_launch(p2p, rank, dst, zero, ctx.stream());
 }
 
 #else
@@ -222,6 +245,21 @@ bool ggml_cuda_ar_p2p_allreduce(ggml_cuda_ar_p2p * p2p, ggml_backend_t * backend
     GGML_UNUSED(backends);
     GGML_UNUSED(tensors);
     return false;
+}
+
+bool ggml_cuda_ar_p2p_supports(const ggml_cuda_ar_p2p * p2p, const ggml_tensor * t) {
+    GGML_UNUSED(p2p);
+    GGML_UNUSED(t);
+    return false;
+}
+
+void ggml_cuda_ar_p2p_allreduce_rank(ggml_backend_cuda_context & ctx, const ggml_cuda_ar_p2p * p2p, int rank, ggml_tensor * dst, bool zero) {
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(p2p);
+    GGML_UNUSED(rank);
+    GGML_UNUSED(dst);
+    GGML_UNUSED(zero);
+    GGML_ABORT("P2P AllReduce is only available on HIP");
 }
 
 #endif // defined(GGML_USE_HIP)

@@ -1834,6 +1834,9 @@ struct ggml_backend_meta_context {
         std::vector<ggml_tensor *>           nodes;
         std::vector<ggml_backend_buffer_ptr> bufs;
 
+        std::vector<ggml_cgraph *> cgraphs_merged; // consecutive subgraphs joined by GGML_OP_ALLREDUCE nodes
+        std::vector<ggml_tensor *> ar_nodes;
+
         backend_config(ggml_backend_t backend, const size_t n_reduce_steps) : backend(backend) {
             bufs.resize(n_reduce_steps);
         }
@@ -1849,6 +1852,12 @@ struct ggml_backend_meta_context {
     size_t                      max_subgraphs = 0;
     size_t                      n_subgraphs   = 0;
     uint64_t                    uid           = 0;
+
+    // If the simple backends can run every AllReduce of a graph as a GGML_OP_ALLREDUCE node, the subgraphs
+    // are joined into a few large cgraphs per device: one submission per group and device instead of one per
+    // subgraph plus a host-launched AllReduce, and far fewer graphs to capture.
+    ggml_context_ptr            ctx_merged;
+    bool                        merged = false;
 
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
@@ -2013,6 +2022,15 @@ static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
     for (size_t i = 0; i < n_backends; i++) {
         ggml_backend_synchronize(ggml_backend_meta_simple_backend(backend, i));
     }
+}
+
+// number of nodes in subgraphs [i0, i1) of one simple backend
+static size_t ggml_backend_meta_n_nodes_range(const ggml_backend_meta_context::backend_config & bcj, size_t i0, size_t i1) {
+    size_t n = 0;
+    for (size_t i = i0; i < i1; i++) {
+        n += bcj.cgraphs[i].cgraph_main->n_nodes;
+    }
+    return n;
 }
 
 static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
@@ -2337,6 +2355,138 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 cgraph_ij->uid = ggml_graph_next_uid();
             }
         }
+
+        backend_ctx->merged = false;
+        backend_ctx->ctx_merged.reset();
+        static const bool ar_in_graph = [] {
+            const char * env = getenv("GGML_META_AR_IN_GRAPH");
+            return env == nullptr || atoi(env) != 0;
+        }();
+        // A device stalls at an AllReduce until every peer reaches it. Launches are interleaved per group, so
+        // a device can only get one group ahead; a group must fit into the launch queue, or the host can block
+        // on a stalled device before it has launched the group on the peers.
+        static const int max_group_nodes = [] {
+            const char * env = getenv("GGML_META_AR_GROUP_NODES");
+            return env == nullptr ? 1024 : atoi(env);
+        }();
+        if (ar_in_graph && backend_ctx->comm_ctx != nullptr && n_backends > 1 && n_subgraphs > 1) {
+            const size_t n_ar = n_subgraphs - 1;
+
+            // group boundaries, as the first subgraph of each group, plus n_subgraphs
+            std::vector<size_t> group_start = {0};
+            {
+                int n_group_nodes = 0;
+                for (size_t i = 0; i < n_subgraphs; i++) {
+                    const int n_sub = backend_ctx->backend_configs[0].cgraphs[i].cgraph_main->n_nodes + 1;
+                    if (max_group_nodes > 0 && n_group_nodes > 0 && n_group_nodes + n_sub > max_group_nodes) {
+                        group_start.push_back(i);
+                        n_group_nodes = 0;
+                    }
+                    n_group_nodes += n_sub;
+                }
+                group_start.push_back(n_subgraphs);
+            }
+            const size_t n_groups = group_start.size() - 1;
+
+            size_t mem_size = n_backends*n_ar*ggml_tensor_overhead();
+            for (size_t g = 0; g < n_groups; g++) {
+                const size_t n_group_nodes = ggml_backend_meta_n_nodes_range(backend_ctx->backend_configs[0], group_start[g], group_start[g+1]) +
+                    (group_start[g+1] - group_start[g]);
+                mem_size += n_backends*ggml_graph_overhead_custom(n_group_nodes, false);
+            }
+            const ggml_init_params params = {
+                /*.mem_size   =*/ mem_size,
+                /*.mem_buffer =*/ nullptr,
+                /*.no_alloc   =*/ true,
+            };
+            backend_ctx->ctx_merged.reset(ggml_init(params));
+            ggml_context * ctx_merged = backend_ctx->ctx_merged.get();
+
+            bool supported = true;
+            for (size_t j = 0; j < n_backends && supported; j++) {
+                auto & bcj = backend_ctx->backend_configs[j];
+                bcj.ar_nodes.resize(n_ar);
+                for (size_t i = 0; i < n_ar && supported; i++) {
+                    ggml_cgraph * cgraph_ij = bcj.cgraphs[i].cgraph_main;
+                    ggml_tensor * node = cgraph_ij->nodes[cgraph_ij->n_nodes - 1];
+                    ggml_tensor * ar   = ggml_new_tensor_1d(ctx_merged, GGML_TYPE_F32, 1);
+                    memset(ar, 0, sizeof(ggml_tensor));
+                    ar->op   = GGML_OP_ALLREDUCE;
+                    ar->type = node->type;
+                    for (size_t k = 0; k < GGML_MAX_DIMS; k++) {
+                        ar->ne[k] = node->ne[k];
+                        ar->nb[k] = node->nb[k];
+                    }
+                    ar->src[0]    = node;
+                    ar->view_src  = node->view_src == nullptr ? node : node->view_src;
+                    ar->view_offs = node->view_offs;
+                    ar->buffer    = node->buffer;
+                    ar->data      = node->data;
+                    ar->flags     = GGML_TENSOR_FLAG_COMPUTE;
+                    // op_params: comm context, rank, and whether this rank holds an empty slice (see GGML_OP_ALLREDUCE)
+                    memcpy(ar->op_params, &backend_ctx->comm_ctx, sizeof(backend_ctx->comm_ctx));
+                    ar->op_params[2] = (int32_t) j;
+                    ar->op_params[3] = (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0;
+                    ggml_format_name(ar, "allreduce-%zu", i);
+                    bcj.ar_nodes[i] = ar;
+                    supported = ggml_backend_supports_op(bcj.backend, ar);
+                }
+            }
+
+            if (supported) {
+                for (size_t j = 0; j < n_backends; j++) {
+                    auto & bcj = backend_ctx->backend_configs[j];
+                    bcj.cgraphs_merged.resize(n_groups);
+                    for (size_t g = 0; g < n_groups; g++) {
+                        const size_t n_group_nodes = ggml_backend_meta_n_nodes_range(bcj, group_start[g], group_start[g+1]) +
+                            (group_start[g+1] - group_start[g]);
+                        ggml_cgraph * merged = ggml_new_graph_custom(ctx_merged, n_group_nodes, false);
+                        for (size_t i = group_start[g]; i < group_start[g+1]; i++) {
+                            ggml_cgraph * cgraph_ij = bcj.cgraphs[i].cgraph_main;
+                            for (int k = 0; k < cgraph_ij->n_nodes; k++) {
+                                ggml_tensor * node = cgraph_ij->nodes[k];
+                                const size_t hash_pos = ggml_hash_insert(&merged->visited_hash_set, node);
+                                merged->use_counts[hash_pos] = cgraph_ij->use_counts[ggml_hash_find(&cgraph_ij->visited_hash_set, node)];
+                                merged->nodes[merged->n_nodes++] = node;
+                            }
+                            if (i < n_ar) {
+                                ggml_tensor * ar = bcj.ar_nodes[i];
+                                // the AllReduce reads its source, so no fusion may skip writing it
+                                merged->use_counts[ggml_hash_find(&merged->visited_hash_set, ar->src[0])]++;
+                                const size_t hash_pos = ggml_hash_insert(&merged->visited_hash_set, ar);
+                                merged->use_counts[hash_pos] = 0;
+                                merged->nodes[merged->n_nodes++] = ar;
+                            }
+                        }
+                        merged->uid = ggml_graph_next_uid();
+                        bcj.cgraphs_merged[g] = merged;
+                    }
+                }
+                backend_ctx->merged = true;
+            }
+        }
+    }
+
+    if (backend_ctx->merged) {
+        for (size_t j = 0; j < n_backends; j++) {
+            auto & bcj = backend_ctx->backend_configs[j];
+            for (size_t i = 0; i + 1 < backend_ctx->n_subgraphs; i++) {
+                ggml_tensor * ar = bcj.ar_nodes[i];
+                ar->buffer = ar->src[0]->buffer;
+                ar->data   = ar->src[0]->data;
+            }
+        }
+        const size_t n_groups = backend_ctx->backend_configs[0].cgraphs_merged.size();
+        for (size_t g = 0; g < n_groups; g++) {
+            for (size_t j = 0; j < n_backends; j++) {
+                auto & bcj = backend_ctx->backend_configs[j];
+                const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs_merged[g]);
+                if (status != GGML_STATUS_SUCCESS) {
+                    return status;
+                }
+            }
+        }
+        return GGML_STATUS_SUCCESS;
     }
 
     size_t iga = 0; // i graph aux

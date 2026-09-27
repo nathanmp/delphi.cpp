@@ -1301,6 +1301,20 @@ static bool ggml_backend_cuda_comm_allreduce_tensor(void * comm_ctx_v, struct gg
     return comm_ctx->try_allreduce(comm_ctx, tensors);
 }
 
+// GGML_OP_ALLREDUCE op_params: the comm context from ggml_backend_comm_init (int32 0-1), this
+// device's rank (2) and whether the rank contributes zeros (3).
+static const ggml_cuda_ar_p2p * ggml_cuda_allreduce_node_p2p(const ggml_tensor * op) {
+    ggml_backend_cuda_comm_context * comm_ctx = nullptr;
+    memcpy(&comm_ctx, op->op_params, sizeof(comm_ctx));
+    return comm_ctx != nullptr ? comm_ctx->ar_p2p : nullptr;
+}
+
+static void ggml_cuda_op_allreduce(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_cuda_ar_p2p * p2p = ggml_cuda_allreduce_node_p2p(dst);
+    GGML_ASSERT(p2p != nullptr);
+    ggml_cuda_ar_p2p_allreduce_rank(ctx, p2p, ggml_get_op_params_i32(dst, 2), dst, ggml_get_op_params_i32(dst, 3) != 0);
+}
+
 // host buffer type
 
 static const char * ggml_backend_cuda_host_buffer_type_name(ggml_backend_buffer_type_t buft) {
@@ -2442,6 +2456,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_DSV4_HC_POST:
             ggml_cuda_op_dsv4_hc_post(ctx, dst);
+            break;
+        case GGML_OP_ALLREDUCE:
+            ggml_cuda_op_allreduce(ctx, dst);
             break;
         case GGML_OP_RWKV_WKV7:
             ggml_cuda_op_rwkv_wkv7(ctx, dst);
@@ -6181,6 +6198,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 && (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32) &&
                 op->type == GGML_TYPE_F32;
+        case GGML_OP_ALLREDUCE: {
+            const ggml_cuda_ar_p2p * p2p = ggml_cuda_allreduce_node_p2p(op);
+            return p2p != nullptr && ggml_cuda_ar_p2p_supports(p2p, op);
+        }
         case GGML_OP_FLASH_ATTN_EXT:
             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
         case GGML_OP_CROSS_ENTROPY_LOSS:

@@ -600,6 +600,7 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_ALLREDUCE, // in-place sum across devices; only built by the meta backend, op_params are backend-specific
 
         GGML_OP_UNARY,
 
