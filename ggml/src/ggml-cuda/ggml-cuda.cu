@@ -4,6 +4,7 @@
 #include "ggml-exec-trace.h"
 
 #include "ggml-cuda/allreduce.cuh"
+#include "ggml-cuda/allreduce-p2p.cuh"
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
@@ -1012,6 +1013,10 @@ struct ggml_backend_cuda_comm_context {
 
     ggml_cuda_ar_pipeline *     ar_pipeline = nullptr;
 
+    // Small reductions go through direct peer writes first: on 3x R9700 one RCCL AllReduce of a
+    // decode-sized tensor costs about 36 us, the P2P kernel about 16 us.
+    ggml_cuda_ar_p2p *          ar_p2p = nullptr;
+
 #ifdef GGML_USE_NCCL
     std::vector<ncclComm_t>     comms;
 #endif // GGML_USE_NCCL
@@ -1023,6 +1028,7 @@ struct ggml_backend_cuda_comm_context {
         }
 #endif // GGML_USE_NCCL
         ggml_cuda_ar_pipeline_free(ar_pipeline);
+        ggml_cuda_ar_p2p_free(ar_p2p);
     }
 };
 
@@ -1276,6 +1282,9 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
         }
     }
 
+    // GGML_CUDA_AR_P2P_MAX_BYTES=0 disables the P2P path
+    ret->ar_p2p = ggml_cuda_ar_p2p_init(ret->dev_ids.data(), ret->dev_ids.size());
+
     return ret;
 }
 
@@ -1286,6 +1295,9 @@ static bool ggml_backend_cuda_comm_allreduce_tensor(void * comm_ctx_v, struct gg
         return false;
     }
     auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    if (comm_ctx->ar_p2p && ggml_cuda_ar_p2p_allreduce(comm_ctx->ar_p2p, comm_ctx->backends.data(), tensors)) {
+        return true;
+    }
     return comm_ctx->try_allreduce(comm_ctx, tensors);
 }
 
