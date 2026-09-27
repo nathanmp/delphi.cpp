@@ -862,6 +862,10 @@ struct ggml_backend_sched {
     // delphi: copy the source of a full-size view input instead of the view (GGML_SCHED_VIEW_ALIAS=0 disables)
     bool view_alias;
 
+    // delphi: wait for the previous split before an input-less split only when the two backends can share or read
+    // each other's memory (GGML_SCHED_PREV_SPLIT_WAIT=1 always waits)
+    bool prev_split_wait_all;
+
     int debug;
 
     // used for debugging graph reallocations [GGML_SCHED_DEBUG_REALLOC]
@@ -2415,6 +2419,19 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+// The graph allocator reuses memory only within one buffer, shared by the backends with the same buffer type, and a
+// split reads a tensor on another backend without an input copy only when its backend supports that buffer type. Two
+// backends for which neither holds cannot touch each other's split memory, so an input-less split on one of them does
+// not need to wait for the previous split on the other. With pipeline parallelism, that wait would block the host
+// on the previous ubatch of the other device and serialize the ubatches.
+static bool ggml_backend_sched_splits_share_memory(ggml_backend_sched_t sched, int backend_a, int backend_b) {
+    if (sched->prev_split_wait_all || sched->bufts[backend_a] == sched->bufts[backend_b]) {
+        return true;
+    }
+    return ggml_backend_supports_buft(sched->backends[backend_b], sched->bufts[backend_a]) ||
+           ggml_backend_supports_buft(sched->backends[backend_a], sched->bufts[backend_b]);
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     bool backends_idle = sched->backends_idle;
@@ -2434,7 +2451,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
-        if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
+        if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id &&
+                ggml_backend_sched_splits_share_memory(sched, prev_backend_id, split_backend_id)) {
             const uint64_t wait_start = ggml_backend_sched_trace_span_begin();
             if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
                 ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
@@ -2794,6 +2812,8 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     const char * GGML_SCHED_VIEW_ALIAS = getenv("GGML_SCHED_VIEW_ALIAS");
     sched->view_alias = GGML_SCHED_VIEW_ALIAS ? atoi(GGML_SCHED_VIEW_ALIAS) != 0 : true;
+    const char * GGML_SCHED_PREV_SPLIT_WAIT = getenv("GGML_SCHED_PREV_SPLIT_WAIT");
+    sched->prev_split_wait_all = GGML_SCHED_PREV_SPLIT_WAIT ? atoi(GGML_SCHED_PREV_SPLIT_WAIT) != 0 : false;
 
     sched->n_backends = n_backends;
     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
