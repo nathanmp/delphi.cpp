@@ -859,6 +859,9 @@ struct ggml_backend_sched {
     // no backend has work in flight: set by ggml_backend_sched_synchronize, cleared when a graph is submitted
     bool backends_idle;
 
+    // delphi: copy the source of a full-size view input instead of the view (GGML_SCHED_VIEW_ALIAS=0 disables)
+    bool view_alias;
+
     int debug;
 
     // used for debugging graph reallocations [GGML_SCHED_DEBUG_REALLOC]
@@ -1778,6 +1781,24 @@ static bool ggml_backend_sched_buffer_supported(ggml_backend_sched_t sched, stru
     return buft != NULL && ggml_backend_supports_buft(sched->backends[backend_id], buft);
 }
 
+// delphi: the source of a view input that covers all of a computed tensor (for example a reshape), or NULL. The scheduler copies
+// that source and the node reads a view of the copy. Otherwise a split that reads both the tensor and the view receives the
+// same bytes twice. A view of a weight or of a graph input keeps the old copy.
+static struct ggml_tensor * ggml_backend_sched_full_view_src(ggml_backend_sched_t sched, struct ggml_tensor * t, int backend_id) {
+    struct ggml_tensor * src = t->view_src;
+    if (!sched->view_alias || src == NULL || src->view_src != NULL || !ggml_is_view_op(t->op) || (src->flags & GGML_TENSOR_FLAG_INPUT) ||
+            (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS)) {
+        return NULL;
+    }
+    if (t->view_offs != 0 || t->type != src->type || ggml_nbytes(t) != ggml_nbytes(src) || !ggml_is_contiguous(t) || !ggml_is_contiguous(src)) {
+        return NULL;
+    }
+    if (tensor_backend_id(src) != tensor_backend_id(t) || ggml_backend_sched_buffer_supported(sched, src, backend_id)) {
+        return NULL;
+    }
+    return src;
+}
+
 static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, struct ggml_tensor * node, int cur_backend_id, int * node_backend_id) {
     if (ggml_backend_supports_op(sched->backends[cur_backend_id], node)) {
         *node_backend_id = cur_backend_id;
@@ -2018,6 +2039,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     }
 
     // pass 5: split graph, find tensors that need to be copied
+    // views of input copies (ggml_backend_sched_full_view_src), with their split
+    std::vector<std::pair<int, struct ggml_tensor *>> view_aliases;
     {
         int i_split = 0;
         struct ggml_backend_sched_split * split = &sched->splits[0];
@@ -2121,6 +2144,12 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 }
 
                 if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
+                    struct ggml_tensor * view = src;
+                    struct ggml_tensor * view_src = ggml_backend_sched_full_view_src(sched, src, cur_backend_id);
+                    if (view_src != NULL) {
+                        src    = view_src;
+                        src_id = hash_id(src);
+                    }
                     // create a copy of the input in the split's backend
                     if (sched_hv_copy(sched, src, cur_backend_id, 0) == NULL) {
                         ggml_backend_t backend = sched->backends[cur_backend_id];
@@ -2142,6 +2171,14 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                         split->inputs[n_inputs] = src;
                     }
                     node->src[j] = sched_hv_copy(sched, src, cur_backend_id, sched->cur_copy);
+                    if (view_src != NULL) {
+                        // the view of the copy is a node of graph_copy (below), so that ggml-alloc keeps the copy while the view is used
+                        struct ggml_tensor * alias = ggml_view_4d(sched->ctx, node->src[j], view->ne[0], view->ne[1], view->ne[2], view->ne[3],
+                                view->nb[1], view->nb[2], view->nb[3], 0);
+                        ggml_format_name(alias, "%s#%s", ggml_backend_name(sched->backends[cur_backend_id]), view->name);
+                        view_aliases.push_back({ i_split, alias });
+                        node->src[j] = alias;
+                    }
                 }
             }
         }
@@ -2197,7 +2234,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     for (int i = 0; i < sched->n_splits; i++) {
         total_inputs += sched->splits[i].n_inputs;
     }
-    int graph_size = std::max(graph->n_nodes, graph->n_leafs) + total_inputs * 2 * sched->n_copies + n_dep_nodes;
+    int graph_size = std::max(graph->n_nodes, graph->n_leafs) + total_inputs * 2 * sched->n_copies + n_dep_nodes + (int) view_aliases.size();
 
     // remember the actual graph_size for performing reallocation checks later [GGML_SCHED_DEBUG_REALLOC]
     sched->debug_prev_graph_size = sched->debug_graph_size;
@@ -2237,6 +2274,14 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             // add a dependency to the input copy so that it is allocated at the start of the split
             sched->node_backend_ids[graph_copy->n_nodes] = split->backend_id;
             graph_copy->nodes[graph_copy->n_nodes++] = input_cpy;
+        }
+
+        for (const auto & it : view_aliases) {
+            if (it.first == i) {
+                assert(graph_copy->size > graph_copy->n_nodes);
+                sched->node_backend_ids[graph_copy->n_nodes] = split->backend_id;
+                graph_copy->nodes[graph_copy->n_nodes++] = it.second;
+            }
         }
 
         for (int j = split->i_start; j < split->i_end; j++) {
@@ -2746,6 +2791,9 @@ ggml_backend_sched_t ggml_backend_sched_new(
 #endif
     const char * GGML_SCHED_DEBUG_REALLOC = getenv("GGML_SCHED_DEBUG_REALLOC");
     sched->debug_realloc = GGML_SCHED_DEBUG_REALLOC ? atoi(GGML_SCHED_DEBUG_REALLOC) : sched->debug_realloc;
+
+    const char * GGML_SCHED_VIEW_ALIAS = getenv("GGML_SCHED_VIEW_ALIAS");
+    sched->view_alias = GGML_SCHED_VIEW_ALIAS ? atoi(GGML_SCHED_VIEW_ALIAS) != 0 : true;
 
     sched->n_backends = n_backends;
     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
