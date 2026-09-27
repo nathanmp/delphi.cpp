@@ -289,6 +289,11 @@ GGML_API void ggml_exec_trace_backend_begin(
         uint32_t n_nodes);
 GGML_API void ggml_exec_trace_backend_end(void);
 GGML_API void ggml_exec_trace_set_node(uint32_t node_index);
+// A backend that computes its graph through nested graphs (the meta backend's per-device graphs) maps the
+// nested node indices back to its own: node i of the nested graph is node map[i] of the current backend
+// graph, or no traced node if map[i] is UINT32_MAX. Every begin must be matched by an end.
+GGML_API void ggml_exec_trace_nested_begin(const uint32_t * map, uint32_t n_nodes);
+GGML_API void ggml_exec_trace_nested_end(void);
 GGML_API uint64_t ggml_exec_trace_cpu_node_begin(void);
 GGML_API void ggml_exec_trace_cpu_node_end(uint64_t start_ns, uint32_t node_index, uint32_t node_count);
 GGML_API void ggml_exec_trace_dispatch(

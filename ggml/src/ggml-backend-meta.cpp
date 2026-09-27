@@ -4,6 +4,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml-alloc.h"
 #include "ggml-cpp.h"
+#include "ggml-exec-trace.h"
 
 #include <algorithm>
 #include <cassert>
@@ -1859,6 +1860,10 @@ struct ggml_backend_meta_context {
     ggml_context_ptr            ctx_merged;
     bool                        merged = false;
 
+    // execution trace: nested graph node index -> index in the graph passed to graph_compute (see ggml_exec_trace_nested_begin)
+    std::vector<std::vector<uint32_t>> trace_maps_sub;
+    std::vector<std::vector<uint32_t>> trace_maps_merged;
+
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
 
@@ -2356,6 +2361,16 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
         }
 
+        backend_ctx->trace_maps_sub.resize(n_subgraphs);
+        for (size_t i_graph = 0; i_graph < n_subgraphs; i_graph++) {
+            const auto & bc0 = backend_ctx->backend_configs[0];
+            std::vector<uint32_t> & map = backend_ctx->trace_maps_sub[i_graph];
+            map.resize(bc0.cgraphs[i_graph].cgraph_main->n_nodes);
+            for (size_t k = 0; k < map.size(); k++) {
+                map[k] = (uint32_t) (bc0.cgraphs[i_graph].offset + k);
+            }
+        }
+
         backend_ctx->merged = false;
         backend_ctx->ctx_merged.reset();
         static const bool ar_in_graph = [] {
@@ -2434,6 +2449,17 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
 
             if (supported) {
+                backend_ctx->trace_maps_merged.assign(n_groups, {});
+                for (size_t g = 0; g < n_groups; g++) {
+                    std::vector<uint32_t> & map = backend_ctx->trace_maps_merged[g];
+                    for (size_t i = group_start[g]; i < group_start[g+1]; i++) {
+                        const std::vector<uint32_t> & map_sub = backend_ctx->trace_maps_sub[i];
+                        map.insert(map.end(), map_sub.begin(), map_sub.end());
+                        if (i < n_ar) {
+                            map.push_back(UINT32_MAX);
+                        }
+                    }
+                }
                 for (size_t j = 0; j < n_backends; j++) {
                     auto & bcj = backend_ctx->backend_configs[j];
                     bcj.cgraphs_merged.resize(n_groups);
@@ -2480,7 +2506,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         for (size_t g = 0; g < n_groups; g++) {
             for (size_t j = 0; j < n_backends; j++) {
                 auto & bcj = backend_ctx->backend_configs[j];
+                const std::vector<uint32_t> & map = backend_ctx->trace_maps_merged[g];
+                ggml_exec_trace_nested_begin(map.data(), (uint32_t) map.size());
                 const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs_merged[g]);
+                ggml_exec_trace_nested_end();
                 if (status != GGML_STATUS_SUCCESS) {
                     return status;
                 }
@@ -2638,7 +2667,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
+            const std::vector<uint32_t> & map = backend_ctx->trace_maps_sub[i];
+            ggml_exec_trace_nested_begin(map.data(), (uint32_t) map.size());
             const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
+            ggml_exec_trace_nested_end();
             if (status != GGML_STATUS_SUCCESS) {
                 return status;
             }
@@ -2658,7 +2690,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
 
             if (!backend_allreduce_success) {
+                // the fallback runs single-node graphs that are not part of the traced graph
+                static const uint32_t no_node = UINT32_MAX;
+                ggml_exec_trace_nested_begin(&no_node, 1);
                 const ggml_status status = allreduce_fallback(i);
+                ggml_exec_trace_nested_end();
                 if (status != GGML_STATUS_SUCCESS) {
                     return status;
                 }

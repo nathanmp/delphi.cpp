@@ -964,6 +964,35 @@ void ggml_exec_trace_set_node(uint32_t node_index) {
     t_backend.node_index = node_index;
 }
 
+thread_local std::vector<trace_backend_context> t_nested_saved;
+thread_local std::vector<std::vector<uint32_t>> t_nested_ids;
+
+void ggml_exec_trace_nested_begin(const uint32_t * map, uint32_t n_nodes) {
+    const size_t depth = t_nested_saved.size();
+    t_nested_saved.push_back(t_backend);
+    if (!t_backend.node_ids) {
+        return;
+    }
+    if (t_nested_ids.size() <= depth) {
+        t_nested_ids.resize(depth + 1);
+    }
+    std::vector<uint32_t> & ids = t_nested_ids[depth];
+    ids.resize(n_nodes);
+    for (uint32_t i = 0; i < n_nodes; ++i) {
+        // node ID 0 is never assigned, so it marks work without a traced node
+        ids[i] = map[i] < t_backend.n_nodes ? t_backend.node_ids[map[i]] : 0;
+    }
+    t_backend.node_ids   = ids.data();
+    t_backend.n_nodes    = n_nodes;
+    t_backend.node_index = 0;
+}
+
+void ggml_exec_trace_nested_end(void) {
+    GGML_ASSERT(!t_nested_saved.empty());
+    t_backend = t_nested_saved.back();
+    t_nested_saved.pop_back();
+}
+
 uint64_t ggml_exec_trace_cpu_node_begin(void) {
     return ggml_exec_trace_enabled() && g_trace.gpu_timing_mode == GGML_EXEC_TRACE_GPU_TIMING_OP &&
             t_backend.node_ids && t_backend.node_index < t_backend.n_nodes ? ggml_exec_trace_now_ns() : 0;
