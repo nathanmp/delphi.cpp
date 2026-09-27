@@ -870,6 +870,9 @@ struct ggml_backend_sched {
     // input (GGML_SCHED_COPY_REUSE_WAIT=1 waits for every input)
     bool copy_reuse_wait_all;
 
+    // delphi: copy the inputs of a split in the graph order of their producers (GGML_SCHED_INPUT_ORDER=0 disables)
+    bool input_order;
+
     int debug;
 
     // used for debugging graph reallocations [GGML_SCHED_DEBUG_REALLOC]
@@ -2209,6 +2212,26 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         sched->prev_leaf_backend_ids = tmp;
     }
 
+    // Pass 5 adds the inputs of a split in the order of their first use. A device without peer access may run the
+    // staged copies into one device in submission order, so a copy whose source is ready early can wait behind a
+    // copy whose source is still being computed, stalling the stream of its source device (e.g. a small tensor of
+    // the first pipeline stage queued behind the stream hand-off of the second stage). Sources produced earlier in
+    // the graph are ready earlier across pipelined devices, so copy the inputs in the graph order of their
+    // producers; leafs have no producer and come first. This changes only the submission order of copies that
+    // do not depend on each other, not which copies are made or what each split waits for.
+    if (sched->input_order) {
+        std::vector<int> producer(sched->hash_set.size, -1);
+        for (int i = 0; i < graph->n_nodes; i++) {
+            producer[hash_id(graph->nodes[i])] = i;
+        }
+        for (int i = 0; i < sched->n_splits; i++) {
+            struct ggml_backend_sched_split * split = &sched->splits[i];
+            std::stable_sort(split->inputs, split->inputs + split->n_inputs, [&](ggml_tensor * a, ggml_tensor * b) {
+                return producer[hash_id(a)] < producer[hash_id(b)];
+            });
+        }
+    }
+
     // optimize the split graphs and collect the allocation dependencies added by the backends
     // this needs to happen before we make graph_copy, so they are in sync
     // TODO: this may create many small allocations in the scheduler, restructure to use a flat array
@@ -2834,6 +2857,8 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->prev_split_wait_all = GGML_SCHED_PREV_SPLIT_WAIT ? atoi(GGML_SCHED_PREV_SPLIT_WAIT) != 0 : false;
     const char * GGML_SCHED_COPY_REUSE_WAIT = getenv("GGML_SCHED_COPY_REUSE_WAIT");
     sched->copy_reuse_wait_all = GGML_SCHED_COPY_REUSE_WAIT ? atoi(GGML_SCHED_COPY_REUSE_WAIT) != 0 : false;
+    const char * GGML_SCHED_INPUT_ORDER = getenv("GGML_SCHED_INPUT_ORDER");
+    sched->input_order = GGML_SCHED_INPUT_ORDER ? atoi(GGML_SCHED_INPUT_ORDER) != 0 : true;
 
     sched->n_backends = n_backends;
     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
