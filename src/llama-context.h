@@ -399,6 +399,24 @@ private:
     llm_graph_result_ptr gf_res_reserve;
 
     llm_graph_result * gf_res_prev_active = nullptr;
+    int                gf_res_prev_threads = 0; // backend_n_threads the active graph was built with
+
+    // A second scheduler for small ubatches keeps a second graph allocated, so decode loops that alternate
+    // between two shapes (MTP: draft-model update, then single-token drafts; target: prompt chunk, then verify)
+    // reuse both graphs instead of rebuilding on every switch. The live pair is always `sched`/`gf_res_prev`;
+    // graph_alt_swap exchanges it with the stored one. Its compute buffers only grow to the small graphs it runs.
+    ggml_backend_sched_ptr              sched_alt;
+    std::array<llm_graph_result_ptr, 2> gf_res_prev_alt;
+    llm_graph_result *                  gf_res_prev_active_alt  = nullptr;
+    int                                 gf_res_prev_threads_alt = 0;
+    bool                                sched_alt_live = false; // `sched` is the alternate scheduler
+
+    // env: LLAMA_GRAPH_ALT_MAX_TOKENS, largest ubatch that may use the alternate scheduler (0 disables it)
+    uint32_t graph_alt_max_tokens = 32;
+
+    void graph_alt_swap();
+    // make the main scheduler live and forget the graphs of both
+    void graph_alt_reset();
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

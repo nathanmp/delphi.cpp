@@ -298,6 +298,14 @@ llama_context::llama_context(
         if (graph_reuse_disable) {
             LLAMA_LOG_WARN("%s: graph reuse disabled\n", __func__);
         }
+
+        const char * LLAMA_GRAPH_ALT_MAX_TOKENS = getenv("LLAMA_GRAPH_ALT_MAX_TOKENS");
+        if (LLAMA_GRAPH_ALT_MAX_TOKENS) {
+            graph_alt_max_tokens = (uint32_t) std::max(0, atoi(LLAMA_GRAPH_ALT_MAX_TOKENS));
+        }
+        if (graph_reuse_disable) {
+            graph_alt_max_tokens = 0;
+        }
     }
 
     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
@@ -524,7 +532,8 @@ llama_context::~llama_context() {
             ggml_backend_buffer_type_t buft    = backend_buft[i];
 
             const size_t size_exp = backend_buf_exp_size[i];
-            const size_t size_act = ggml_backend_sched_get_buffer_size(sched.get(), backend);
+            // the expectation is for the main scheduler, the alternate one only holds small graphs
+            const size_t size_act = ggml_backend_sched_get_buffer_size((sched_alt_live ? sched_alt : sched).get(), backend);
             if (size_exp == size_act) {
                 LLAMA_LOG_DEBUG("%s: %10s compute buffer size is %8.4f MiB, matches expectation of %8.4f MiB\n",
                     __func__, ggml_backend_buft_name(buft), size_act / (1024.0*1024.0), size_exp / (1024.0*1024.0));
@@ -640,7 +649,13 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
 
+    // the alternate scheduler holds graphs of the old reservation
+    graph_alt_reset();
+    sched_alt.reset();
     for (auto & res : gf_res_prev) {
+        res.reset();
+    }
+    for (auto & res : gf_res_prev_alt) {
         res.reset();
     }
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
@@ -1051,12 +1066,8 @@ bool llama_context::memory_update(bool optimize) {
 
         // reset the previous graph results to make sure that they won't be reused
         // TODO: make mctx->apply() report if a graph reserve is needed, then reset graph results only if the memory module reset the scheduler
-        for (auto & res : gf_res_prev) {
-            if (res) {
-                res->reset();
-            }
-        }
-        gf_res_prev_active = nullptr;
+        // the memory module uses the main scheduler
+        graph_alt_reset();
 
         if (!mctx->apply()) {
             LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
@@ -1581,12 +1592,7 @@ bool llama_context::mtp_device_draft_begin(uint32_t n_steps) {
         }
 
         // Graph results retain pointers to the persistent destinations.
-        for (auto & res : gf_res_prev) {
-            if (res) {
-                res->reset();
-            }
-        }
-        gf_res_prev_active = nullptr;
+        graph_alt_reset();
 
         LLAMA_LOG_INFO("%s: %10s MTP device draft cache size = %.2f KiB\n", __func__,
                 ggml_backend_buffer_name(mtp_device_draft_buf.get()),
@@ -1777,16 +1783,30 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
-    auto * res = get_gf_res_prev();
-    auto * gf  = res->get_gf();
-
     set_backend_n_threads(ubatch.n_tokens > 1 ? cparams.n_threads_batch : cparams.n_threads);
+
+    auto * res = get_gf_res_prev();
 
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
-    const auto gparams = graph_params(res, ubatch, mctx, gtype);
+    auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
+    auto can_reuse = [&]() {
+        return !graph_reuse_disable && gf_res_prev_active == res && gf_res_prev_threads == backend_n_threads && res->can_reuse(gparams);
+    };
+
+    bool reuse = can_reuse();
+    if (!reuse && (sched_alt_live || (graph_alt_max_tokens > 0 && ubatch.n_tokens <= graph_alt_max_tokens))) {
+        // the other scheduler either holds this graph, or holds the older graph and gets rebuilt;
+        // large ubatches always go to the main scheduler, which is reserved for them
+        graph_alt_swap();
+        res     = get_gf_res_prev();
+        gparams = graph_params(res, ubatch, mctx, gtype);
+        reuse   = can_reuse();
+    }
+    auto * gf = res->get_gf();
+
+    if (reuse) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -1824,7 +1844,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
-        gf_res_prev_active = res;
+        gf_res_prev_active  = res;
+        gf_res_prev_threads = backend_n_threads;
     }
 
     // set the input data for the input tensors
@@ -2893,6 +2914,34 @@ llm_graph_result * llama_context::get_gf_res_prev() {
     return res.get();
 }
 
+void llama_context::graph_alt_swap() {
+    if (!sched_alt) {
+        sched_alt.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
+                gf_res_reserve->get_max_nodes(), cparams.pipeline_parallel, cparams.op_offload));
+        gf_res_prev_active_alt = nullptr;
+    }
+    std::swap(sched,               sched_alt);
+    std::swap(gf_res_prev,         gf_res_prev_alt);
+    std::swap(gf_res_prev_active,  gf_res_prev_active_alt);
+    std::swap(gf_res_prev_threads, gf_res_prev_threads_alt);
+    sched_alt_live = !sched_alt_live;
+}
+
+void llama_context::graph_alt_reset() {
+    if (sched_alt_live) {
+        graph_alt_swap();
+    }
+    for (auto * set : { &gf_res_prev, &gf_res_prev_alt }) {
+        for (auto & res : *set) {
+            if (res) {
+                res->reset();
+            }
+        }
+    }
+    gf_res_prev_active     = nullptr;
+    gf_res_prev_active_alt = nullptr;
+}
+
 // pack sampler outputs into as few sequences as possible before using sequences without samplers
 static void ubatch_prepare_reserve(
               llama_ubatch                            & ubatch,
@@ -2957,6 +3006,9 @@ ggml_cgraph * llama_context::graph_reserve(
         n_tokens = ((n_tokens + (n_seqs - 1)) / n_seqs) * n_seqs; // round to next multiple of n_seqs
         LLAMA_LOG_DEBUG("%s: making n_tokens a multiple of n_seqs - n_tokens = %u, n_seqs = %u, n_outputs = %u\n", __func__, n_tokens, n_seqs, n_outputs);
     }
+
+    // reserve on the main scheduler
+    graph_alt_reset();
 
     ggml_backend_sched_reset(sched.get());
 
@@ -3067,8 +3119,8 @@ void llama_context::set_backend_n_threads(int n_threads) {
     backend_n_threads = n_threads;
 
     // A graph assigned with a different CPU thread count has stale placement
-    // costs. Make the next evaluation rebuild it with the new calibration.
-    gf_res_prev_active = nullptr;
+    // costs: it is only reused under the thread count it was built with
+    // (gf_res_prev_threads).
 }
 
 llm_graph_cb llama_context::graph_get_cb() const {
@@ -3934,6 +3986,9 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
             ggml_backend_t             backend = backend_ptr.get();
             ggml_backend_buffer_type_t buft    = ggml_backend_sched_get_buffer_type(sched.get(), backend);
             ret[buft].compute += ggml_backend_sched_get_buffer_size(sched.get(), backend);
+            if (sched_alt) {
+                ret[buft].compute += ggml_backend_sched_get_buffer_size(sched_alt.get(), backend);
+            }
         }
     }
     return ret;
@@ -4073,11 +4128,13 @@ void llama_context::opt_epoch_iter(
                 break;
             }
 
+            // the optimizer graph is allocated outside sched, so the next decode must rebuild
+            graph_alt_reset();
+
             auto * res = get_gf_res_prev();
 
             const auto gparams = graph_params(res, ubatch, mctx.get(), ctx_type_to_graph_type(cparams.ctx_type));
 
-            // the optimizer graph is allocated outside sched, so the next decode must rebuild
             gf_res_prev_active = nullptr;
             res->reset();
 
