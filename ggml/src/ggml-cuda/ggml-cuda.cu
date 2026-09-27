@@ -2705,6 +2705,51 @@ static uint64_t ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
     return hash;
 }
 
+static uint64_t ggml_cuda_graph_get_topo_key(const ggml_cgraph * cgraph) {
+    uint64_t hash = 14695981039346656037ULL;
+    ggml_cuda_graph_hash(hash, &cgraph->n_nodes, sizeof(cgraph->n_nodes));
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        ggml_cuda_graph_hash(hash, &node->op,   sizeof(node->op));
+        ggml_cuda_graph_hash(hash, &node->type, sizeof(node->type));
+        ggml_cuda_graph_hash(hash,  node->name, sizeof(node->name));
+    }
+    return hash;
+}
+
+// When the KV cache view grows by a padding step, only the attention nodes of a graph change shape, and every
+// such graph gets a new key. The new graph can take over the executable of the previous size through
+// cudaGraphExecUpdate instead of instantiating its own: with HIP an instantiation costs about 1 ms, and tensor
+// split steps about 50 graphs per device at once. Graphs that differ in more than half of the node shapes
+// (another batch size) are left alone, since those usually stay in use.
+static ggml_cuda_graph * ggml_cuda_graph_find_sibling(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, ggml_cuda_graph * self) {
+    if (self->topo_key == 0) {
+        self->topo_key = ggml_cuda_graph_get_topo_key(cgraph);
+    }
+    if (cuda_ctx->graph_topo_no_lend.count(self->topo_key) != 0) {
+        return nullptr;
+    }
+    ggml_cuda_graph * best = nullptr;
+    for (auto & [key, other] : cuda_ctx->cuda_graphs) {
+        if (other.get() == self || other->instance == nullptr || other->topo_key != self->topo_key ||
+                (int) other->node_props.size() != cgraph->n_nodes) {
+            continue;
+        }
+        if (best != nullptr && other->last_used_time >= best->last_used_time) {
+            continue;
+        }
+        int n_changed = 0;
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            n_changed += memcmp(other->node_props[i].node.ne, cgraph->nodes[i]->ne, sizeof(cgraph->nodes[i]->ne)) != 0;
+        }
+        // a full-attention segment changes about half of its nodes; another batch size changes almost all
+        if (2*n_changed <= cgraph->n_nodes) {
+            best = other.get();
+        }
+    }
+    return best;
+}
+
 static bool ggml_cuda_graph_update_required(
         ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, uint64_t graph_key) {
     bool res = false;
@@ -2729,10 +2774,16 @@ static bool ggml_cuda_graph_update_required(
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_cuda_graph::node_properties prop = {};
         memcpy(&prop.node, cgraph->nodes[i], sizeof(ggml_tensor));
+        // The captured kernels only see data pointers, shapes and parameters. Host tensor addresses are
+        // left out: the meta backend recreates its per-device tensors whenever the graph is rebuilt, which
+        // would otherwise force a recapture of every tensor-split graph although nothing on the device changed.
+        prop.node.view_src = nullptr;
 
         for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            prop.node.src[j] = nullptr;
             if (cgraph->nodes[i]->src[j]) {
                 prop.node_src_data_ptrs[j] = cgraph->nodes[i]->src[j]->data;
+                prop.node_src_type[j]      = cgraph->nodes[i]->src[j]->type;
                 memcpy(prop.node_src_ne[j], cgraph->nodes[i]->src[j]->ne, sizeof(prop.node_src_ne[j]));
                 memcpy(prop.node_src_nb[j], cgraph->nodes[i]->src[j]->nb, sizeof(prop.node_src_nb[j]));
             }
@@ -4685,6 +4736,21 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
     if (use_cuda_graph) {
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+        if (graph->instance == nullptr && graph->instance_lent) {
+            // this graph needs its executable back, so shapes of this topology alternate
+            cuda_ctx->graph_topo_no_lend.insert(graph->topo_key);
+            graph->instance_lent = false;
+        }
+        ggml_cuda_graph * sibling = graph->instance == nullptr ? ggml_cuda_graph_find_sibling(cuda_ctx, cgraph, graph) : nullptr;
+        if (sibling != nullptr) {
+            // cuda_graph_update_required is set whenever there is no instance, so the executable is updated below
+            graph->instance    = sibling->instance;
+            sibling->instance  = nullptr;
+            sibling->instance_lent = true;
+            if (graph->trace_id == 0) {
+                graph->trace_id = ggml_exec_trace_next_gpu_graph_id();
+            }
+        }
         if (graph->instance == nullptr) { // Create executable graph from captured graph.
             const int64_t prefill_inst_t0 = prefill_timelog ? ggml_time_us() : 0;
             CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
@@ -4789,6 +4855,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
                     if (ggml_cuda_graph_prefill_capture_enabled() && !GGML_CUDA_CC_IS_AMD(cc) &&
                             ggml_cuda_graph_is_prefill_candidate(cgraph)) {
+                        use_cuda_graph = true;
+                        cuda_graph_update_required = true;
+                    } else if (ggml_cuda_graph_find_sibling(cuda_ctx, cgraph, graph) != nullptr) {
+                        // capture right away: updating the sibling's executable is cheaper than an eager run
+                        graph->warmup_complete = true;
                         use_cuda_graph = true;
                         cuda_graph_update_required = true;
                     }

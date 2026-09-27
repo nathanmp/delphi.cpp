@@ -30,6 +30,7 @@
 #include <cstdio>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -1368,9 +1369,14 @@ struct ggml_cuda_graph {
     bool warmup_complete = false;
     uint64_t uid = 0;
     int64_t last_used_time = 0;
+    // hash of node ops, types and names only: graphs that differ just in shapes share it
+    uint64_t topo_key = 0;
+    // another graph of the same topology took over this executable (ggml_cuda_graph_find_sibling)
+    bool instance_lent = false;
     struct node_properties {
         ggml_tensor node;
         void *   node_src_data_ptrs[GGML_MAX_SRC];
+        int32_t  node_src_type[GGML_MAX_SRC];
         int64_t  node_src_ne[GGML_MAX_SRC][GGML_MAX_DIMS];
         size_t   node_src_nb[GGML_MAX_SRC][GGML_MAX_DIMS];
     };
@@ -1565,6 +1571,8 @@ struct ggml_backend_cuda_context {
     // Graph keys hash every node, which dominates host time when a split mode submits many small
     // graphs per token. A uid is reassigned whenever a graph is rebuilt, so the key can be reused.
     std::unordered_map<uint64_t, uint64_t> graph_key_by_uid;
+    // topologies whose shapes alternate: lending executables between them would only move the instantiation around
+    std::unordered_set<uint64_t> graph_topo_no_lend;
 
     // Tensor split runs one graph per reduction segment (about two per layer), so the working set
     // is far above what layer split needs. Evicting it every token disables graph replay.
@@ -1584,9 +1592,14 @@ struct ggml_backend_cuda_context {
         if (it == cuda_graphs.end()) {
             // Large graphs (prefill splits, often used once) keep the old bound of 64 so the larger
             // capacity cannot turn into device memory held by dead executables.
-            auto oldest       = cuda_graphs.end();
-            auto oldest_large = cuda_graphs.end();
-            size_t n_large = 0;
+            // Graphs that were never captured get at most half of the capacity: with tensor split every
+            // prompt chunk size adds about one uncaptured graph per segment, and under plain LRU a
+            // chunked prompt evicted all captured decode graphs, costing a full recapture per request.
+            auto oldest            = cuda_graphs.end();
+            auto oldest_large      = cuda_graphs.end();
+            auto oldest_uncaptured = cuda_graphs.end();
+            size_t n_large      = 0;
+            size_t n_uncaptured = 0;
             for (auto cur = cuda_graphs.begin(); cur != cuda_graphs.end(); ++cur) {
                 if (oldest == cuda_graphs.end() || cur->second->last_used_time < oldest->second->last_used_time) {
                     oldest = cur;
@@ -1597,9 +1610,17 @@ struct ggml_backend_cuda_context {
                         oldest_large = cur;
                     }
                 }
+                if (cur->second->instance == nullptr) {
+                    n_uncaptured++;
+                    if (oldest_uncaptured == cuda_graphs.end() || cur->second->last_used_time < oldest_uncaptured->second->last_used_time) {
+                        oldest_uncaptured = cur;
+                    }
+                }
             }
             if (n_large >= 64) {
                 cuda_graphs.erase(oldest_large);
+            } else if (n_uncaptured >= graph_cache_capacity()/2) {
+                cuda_graphs.erase(oldest_uncaptured);
             } else if (cuda_graphs.size() >= graph_cache_capacity()) {
                 cuda_graphs.erase(oldest);
             }
