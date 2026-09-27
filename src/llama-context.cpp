@@ -454,10 +454,16 @@ llama_context::llama_context(
             }
         }
 
+        // tensor split runs every layer on all GPUs at once, so there is no pipeline across devices, but
+        // the extra input copies still let the next ubatch's CPU splits and input copies proceed while
+        // the Meta device is busy, instead of draining every GPU at each CPU -> GPU copy
+        const bool split_mode_pp =
+            (model.split_mode() == LLAMA_SPLIT_MODE_LAYER  && model.n_devices() > 1) ||
+            (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR && model.get_split_state_ud.n_devices > 1);
+
         bool pipeline_parallel =
-            model.n_devices() > 1 &&
+            split_mode_pp &&
             model.n_gpu_layers() > model.hparams.n_layer_all &&
-            model.split_mode() == LLAMA_SPLIT_MODE_LAYER &&
             cparams.offload_kqv &&
             !pp_blocked_by_overrides;
 
