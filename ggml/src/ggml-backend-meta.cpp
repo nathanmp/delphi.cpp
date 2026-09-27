@@ -20,6 +20,13 @@
 #include <utility>
 #include <vector>
 
+// Default number of graphs whose per-device state a Meta backend keeps, including the one it last ran. A decode loop that alternates
+// between graphs (MTP: draft-model update, then drafts) replays all of them instead of rebuilding on every switch.
+#define GGML_META_GRAPH_CACHE 4
+// Rotating containers for external views per Meta buffer; must exceed GGML_META_GRAPH_CACHE (see stc_compute).
+#define GGML_META_STC_RING 8
+static_assert(GGML_META_GRAPH_CACHE < GGML_META_STC_RING, "cached graphs would outlive their views");
+
 struct ggml_backend_meta_device;
 struct ggml_backend_meta_buffer_type;
 struct ggml_backend_meta_buffer;
@@ -457,11 +464,15 @@ struct ggml_backend_meta_buffer_context {
     // Most tensors can simply be stored statically in their own buffer.
     // Externally created views however also need a mapping to simple tensors but they use the buffer of the view source.
     // If external views are simply using that buffer they will slowly deplete its memory.
-    // Current solution: rotating set of 2 "compute" containers to hold external views, works correctly for llama.cpp.
+    // Current solution: rotating set of "compute" containers to hold external views, works correctly for llama.cpp.
+    // Each graph rebuild moves to the next container and clears it, so a graph's views stay valid for the
+    // following GGML_META_STC_RING - 1 rebuilds; the Meta backend caches fewer graphs than that.
     // Long-term: tie the lifetime of external views to the meta backend executing the graph instead,
     //     currently not possible due to graph-external operations in the backend scheduler.
     ggml_backend_meta_simple_tensor_container stc_static;
-    ggml_backend_meta_simple_tensor_container stc_compute[2];
+    std::vector<ggml_backend_meta_simple_tensor_container> stc_compute; // [GGML_META_STC_RING], created on first use
+    ggml_init_params stc_compute_params;
+    int n_simple_bufs;
     int stc_compute_index      = 0;
     int stc_compute_index_next = 0;
     std::vector<ggml_backend_buffer_ptr> bufs;
@@ -476,10 +487,11 @@ struct ggml_backend_meta_buffer_context {
 
     ggml_backend_meta_buffer_context(
             ggml_backend_meta_simple_tensor_container & stc_static,
-            ggml_backend_meta_simple_tensor_container & stc_compute_0,
-            ggml_backend_meta_simple_tensor_container & stc_compute_1,
+            const ggml_init_params & stc_compute_params,
             const std::vector<ggml_backend_buffer_t> & bufs)
-            : stc_static(std::move(stc_static)), stc_compute{std::move(stc_compute_0), std::move(stc_compute_1)} {
+            : stc_static(std::move(stc_static)), stc_compute(GGML_META_STC_RING), stc_compute_params(stc_compute_params),
+              n_simple_bufs(int(bufs.size())) {
+        stc_compute[0] = ggml_backend_meta_simple_tensor_container(stc_compute_params, n_simple_bufs);
         this->bufs.reserve(bufs.size());
         for (ggml_backend_buffer_t buf : bufs) {
             this->bufs.emplace_back(buf);
@@ -492,7 +504,31 @@ struct ggml_backend_meta_buffer_context {
         if (stc_static.simple_tensors.find(tensor) != stc_static.simple_tensors.end()) {
             return stc_static;
         }
+        // A graph kept by the backend scheduler can be rebuilt by the Meta backend after other graphs were built:
+        // its views are then in an older container. Search newest first, since tensor addresses get reused.
+        if (stc_compute[stc_compute_index].simple_tensors.count(tensor) == 0) {
+            for (int k = 1; k < GGML_META_STC_RING; k++) {
+                ggml_backend_meta_simple_tensor_container & stc =
+                    stc_compute[(stc_compute_index + GGML_META_STC_RING - k) % GGML_META_STC_RING];
+                if (stc.simple_tensors.count(tensor) != 0) {
+                    return stc;
+                }
+            }
+        }
         return stc_compute[stc_compute_index];
+    }
+
+    // advance to the next compute container for the views of a new graph and clear it
+    void stc_compute_advance() {
+        stc_compute_index_next = (stc_compute_index + 1) % GGML_META_STC_RING;
+        ggml_backend_meta_simple_tensor_container & stc = stc_compute[stc_compute_index_next];
+        if (stc.ctxs.empty()) {
+            stc = ggml_backend_meta_simple_tensor_container(stc_compute_params, n_simple_bufs);
+        }
+        for (ggml_context_ptr & ctx : stc.ctxs) {
+            ggml_reset(ctx.get());
+        }
+        stc.simple_tensors.clear();
     }
 };
 
@@ -515,6 +551,8 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_simple_buffer(ggml_backend
     return buf_ctx->bufs[index].get();
 }
 
+static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_meta_simple_tensor_container & stc, ggml_tensor * tensor);
+
 static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct ggml_tensor * tensor, size_t index) {
     GGML_ASSERT(ggml_backend_buffer_is_meta(tensor->buffer));
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
@@ -523,7 +561,14 @@ static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct 
     ggml_backend_meta_simple_tensor_container & stc = buf_ctx->get_simple_tensor_container(tensor);
     auto it = stc.simple_tensors.find(tensor);
     if (it == stc.simple_tensors.end()) {
-        return nullptr;
+        // The backend scheduler can keep a graph for longer than the rotating containers keep its views, so the
+        // Meta backend may have to rebuild it after they were cleared: recreate the slices, as init_tensor did.
+        ggml_backend_meta_simple_tensor_container & stc_cur = buf_ctx->stc_compute[buf_ctx->stc_compute_index];
+        if (ggml_backend_meta_buffer_init_tensor_impl(stc_cur, const_cast<ggml_tensor *>(tensor)) != GGML_STATUS_SUCCESS) {
+            return nullptr;
+        }
+        it = stc_cur.simple_tensors.find(tensor);
+        GGML_ASSERT(it != stc_cur.simple_tensors.end());
     }
     return it->second[index];
 }
@@ -1357,7 +1402,9 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor(ggml_backend_buffer
     GGML_ASSERT(ggml_backend_buffer_is_meta(buffer));
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buffer->context;
     buf_ctx->stc_compute_index = buf_ctx->stc_compute_index_next;
-    return ggml_backend_meta_buffer_init_tensor_impl(buf_ctx->get_simple_tensor_container(tensor), tensor);
+    const bool is_static = buf_ctx->stc_static.simple_tensors.count(tensor) != 0;
+    return ggml_backend_meta_buffer_init_tensor_impl(
+        is_static ? buf_ctx->stc_static : buf_ctx->stc_compute[buf_ctx->stc_compute_index], tensor);
 }
 
 static void ggml_backend_meta_buffer_memset_tensor(
@@ -1742,8 +1789,6 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
         /*.no_alloc   =*/ true,
     };
     ggml_backend_meta_simple_tensor_container stc_static;
-    ggml_backend_meta_simple_tensor_container stc_compute_0(params, n_simple_bufts);
-    ggml_backend_meta_simple_tensor_container stc_compute_1(params, n_simple_bufts);
 
     size_t max_size = 0;
     std::vector<ggml_backend_buffer_t> bufs;
@@ -1753,7 +1798,7 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
         GGML_ASSERT(bufs.back() != nullptr);
         max_size = std::max(max_size, ggml_backend_buffer_get_size(bufs.back()));
     }
-    ggml_backend_meta_buffer_context * buf_ctx = new ggml_backend_meta_buffer_context(stc_static, stc_compute_0, stc_compute_1, bufs);
+    ggml_backend_meta_buffer_context * buf_ctx = new ggml_backend_meta_buffer_context(stc_static, params, bufs);
 
     return ggml_backend_buffer_init(buft, ggml_backend_meta_buffer_iface, buf_ctx, max_size);
 }
@@ -1773,11 +1818,9 @@ struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struc
         /*.no_alloc   =*/ true,
     };
     ggml_backend_meta_simple_tensor_container stc_static   (params_static,  n_simple_bufts);
-    ggml_backend_meta_simple_tensor_container stc_compute_0(params_compute, n_simple_bufts);
-    ggml_backend_meta_simple_tensor_container stc_compute_1(params_compute, n_simple_bufts);
 
     std::vector<ggml_backend_buffer_t> bufs(n_simple_bufts, nullptr);
-    ggml_backend_meta_buffer_context * meta_buf_ctx = new ggml_backend_meta_buffer_context(stc_static, stc_compute_0, stc_compute_1, bufs);
+    ggml_backend_meta_buffer_context * meta_buf_ctx = new ggml_backend_meta_buffer_context(stc_static, params_compute, bufs);
 
     ggml_backend_buffer_t meta_buf = ggml_backend_buffer_init(buft, ggml_backend_meta_buffer_iface, meta_buf_ctx, 0);
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
@@ -1864,6 +1907,78 @@ struct ggml_backend_meta_context {
     std::vector<std::vector<uint32_t>> trace_maps_sub;
     std::vector<std::vector<uint32_t>> trace_maps_merged;
 
+    // Per-graph state of graphs other than the live one, see GGML_META_GRAPH_CACHE. A graph is switched in by
+    // swapping its state with the live members above. The least recently built graph is evicted: a graph built
+    // n rebuilds ago still has its external views as long as n < GGML_META_STC_RING.
+    struct graph_state {
+        uint64_t uid           = 0;
+        uint64_t build         = 0;
+        int      max_nnodes    = 0;
+        size_t   max_subgraphs = 0;
+        size_t   n_subgraphs   = 0;
+        bool     merged        = false;
+        ggml_context_ptr           ctx;
+        ggml_context_ptr           ctx_merged;
+        std::vector<ggml_cgraph *> cgraphs_aux;
+        std::vector<ggml_tensor *> nodes_aux;
+        std::vector<std::vector<uint32_t>> trace_maps_sub;
+        std::vector<std::vector<uint32_t>> trace_maps_merged;
+        struct per_backend {
+            std::vector<cgraph_config> cgraphs;
+            std::vector<ggml_tensor *> nodes;
+            std::vector<ggml_cgraph *> cgraphs_merged;
+            std::vector<ggml_tensor *> ar_nodes;
+        };
+        std::vector<per_backend> backends;
+    };
+    std::vector<graph_state> graph_cache; // [GGML_META_GRAPH_CACHE - 1]
+    uint64_t build      = 0; // build counter of the live graph
+    uint64_t n_builds   = 0;
+
+    void swap_graph_state(graph_state & gs) {
+        std::swap(uid,               gs.uid);
+        std::swap(build,             gs.build);
+        std::swap(max_nnodes,        gs.max_nnodes);
+        std::swap(max_subgraphs,     gs.max_subgraphs);
+        std::swap(n_subgraphs,       gs.n_subgraphs);
+        std::swap(merged,            gs.merged);
+        std::swap(ctx,               gs.ctx);
+        std::swap(ctx_merged,        gs.ctx_merged);
+        std::swap(cgraphs_aux,       gs.cgraphs_aux);
+        std::swap(nodes_aux,         gs.nodes_aux);
+        std::swap(trace_maps_sub,    gs.trace_maps_sub);
+        std::swap(trace_maps_merged, gs.trace_maps_merged);
+        gs.backends.resize(backend_configs.size());
+        for (size_t j = 0; j < backend_configs.size(); j++) {
+            std::swap(backend_configs[j].cgraphs,        gs.backends[j].cgraphs);
+            std::swap(backend_configs[j].nodes,          gs.backends[j].nodes);
+            std::swap(backend_configs[j].cgraphs_merged, gs.backends[j].cgraphs_merged);
+            std::swap(backend_configs[j].ar_nodes,       gs.backends[j].ar_nodes);
+        }
+    }
+
+    // make the state of the graph with this uid live; if it is not cached, the live state is replaced by the
+    // least recently built one, which the caller rebuilds
+    void select_graph_state(uint64_t graph_uid) {
+        if (graph_uid == 0 || graph_uid == uid || graph_cache.empty()) {
+            return;
+        }
+        graph_state * victim = nullptr;
+        for (graph_state & gs : graph_cache) {
+            if (gs.uid == graph_uid) {
+                swap_graph_state(gs);
+                return;
+            }
+            if (victim == nullptr || gs.build < victim->build) {
+                victim = &gs;
+            }
+        }
+        if (build < victim->build) {
+            return; // the live graph is the oldest: rebuild it in place
+        }
+        swap_graph_state(*victim);
+    }
+
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
 
@@ -1873,6 +1988,12 @@ struct ggml_backend_meta_context {
         name = "Meta(";
         std::vector<ggml_backend_t> simple_backends;
         backend_configs.reserve(n_devs);
+        {
+            // GGML_META_GRAPH_CACHE=1 keeps only the last graph
+            const char * env = getenv("GGML_META_GRAPH_CACHE");
+            const int n_graphs = env == nullptr ? GGML_META_GRAPH_CACHE : std::clamp(atoi(env), 1, GGML_META_STC_RING - 1);
+            graph_cache.resize(n_graphs - 1);
+        }
         simple_backends.reserve(n_devs);
         for (size_t i = 0; i < n_devs; i++) {
             ggml_backend_dev_t simple_dev = ggml_backend_meta_dev_simple_dev(meta_dev, i);
@@ -2044,6 +2165,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
 
     // If the previous cgraph had a defined UID it can be used to skip rebuilding the subgraphs per simple backend.
+    backend_ctx->select_graph_state(cgraph->uid);
     const bool needs_rebuild = (cgraph->uid == 0) || (cgraph->uid != backend_ctx->uid);
 
     bool max_nnodes_raised = false;
@@ -2072,12 +2194,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
         for (ggml_backend_buffer_t buf : used_buffers) {
             ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buf->context;
-            buf_ctx->stc_compute_index_next = buf_ctx->stc_compute_index ^ 1;
-            ggml_backend_meta_simple_tensor_container & stc = buf_ctx->stc_compute[buf_ctx->stc_compute_index_next];
-            for (ggml_context_ptr & ctx : stc.ctxs) {
-                ggml_reset(ctx.get());
-            }
-            stc.simple_tensors.clear();
+            buf_ctx->stc_compute_advance();
         }
         size_t n_subgraphs  = 0;
         size_t max_tmp_size = 0;
@@ -2301,6 +2418,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
 
         backend_ctx->uid         = cgraph->uid;
+        backend_ctx->build       = ++backend_ctx->n_builds;
         backend_ctx->n_subgraphs = n_subgraphs;
 
         if (max_tmp_size > backend_ctx->max_tmp_size) {
