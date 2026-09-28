@@ -674,7 +674,84 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q2_K_q8_1_mma(
         const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
-#if defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+#if defined(AMD_WMMA_AVAILABLE)
+    // The tile holds q*sc as int8 (see ggml_cuda_mmq_load_tiles_q2_K), the super-block d/dmin and one min
+    // byte per 16 values. Over each 64 values that share a q8_1 scale, the scaled quants and the mins
+    // (a per-row constant A) go through int8 mmas into two int32 accumulators, and the float scaling
+    // happens once per 64 values instead of after every mma.
+    constexpr data_layout input_layout = get_input_data_layout();
+    typedef tile<16,  4, int, input_layout>        tile_A;
+    typedef tile<16,  4, int, input_layout>        tile_B;
+    typedef tile<16, 16, int, DATA_LAYOUT_J_MAJOR> tile_C;
+
+    constexpr int sram_stride   = ggml_cuda_mmq_get_sram_stride(type, J, fallback);
+    constexpr int rows_per_warp = ggml_cuda_mmq_get_rows_per_warp(type, J, fallback);
+    constexpr int ntx           = rows_per_warp/tile_C::I; // Number of x minitiles per warp.
+
+    y += (threadIdx.y % ntx) * (tile_C::J*MMQ_TILE_Y_K);
+
+    const int   * x_qs = (const int   *) x;
+    const half2 * x_dm = (const half2 *) x_qs + MMQ_TILE_NE_K*2;
+    const int   * y_qs = (const int   *) y + 4;
+    const half2 * y_ds = (const half2 *) y;
+
+    const int i0 = (threadIdx.y / ntx) * rows_per_warp;
+
+#pragma unroll 1
+    for (int h = 0; h < 2; ++h) {
+        const int k0 = k00 + h*(MMQ_TILE_NE_K/2); // 16 ints = 64 values = 4 sub-blocks
+
+        tile_A A[ntx][4];
+        tile_A Am[ntx][4];
+#pragma unroll
+        for (int n = 0; n < ntx; ++n) {
+#pragma unroll
+            for (int t = 0; t < 4; ++t) {
+                load_ldmatrix(A[n][t], x_qs + (i0 + n*tile_A::I)*sram_stride + k0 + 4*t, sram_stride);
+            }
+#pragma unroll
+            for (int l = 0; l < tile_A::ne; ++l) {
+                const int i = i0 + n*tile_A::I + tile_A::get_i(l);
+                const int m4 = ((const int *) (x_dm + i*sram_stride + 1))[k0/16];
+#pragma unroll
+                for (int t = 0; t < 4; ++t) {
+                    Am[n][t].x[l] = ((m4 >> (8*t)) & 0xFF) * 0x01010101;
+                }
+            }
+        }
+
+#pragma unroll
+        for (int j0 = 0; j0 < J; j0 += ntx*tile_C::J) {
+            tile_B B[4];
+#pragma unroll
+            for (int t = 0; t < 4; ++t) {
+                load_ldmatrix(B[t], y_qs + j0*MMQ_TILE_Y_K + (k0 % MMQ_TILE_NE_K) + 4*t, MMQ_TILE_Y_K);
+            }
+
+            const int j = j0 + tile_C::get_j(0);
+            const float2 dB2 = __half22float2(y_ds[j*MMQ_TILE_Y_K]);
+            const float dB = h == 0 ? dB2.x : dB2.y;
+
+#pragma unroll
+            for (int n = 0; n < ntx; ++n) {
+                tile_C Cq;
+                tile_C Cm;
+#pragma unroll
+                for (int t = 0; t < 4; ++t) {
+                    mma(Cq, A[n][t], B[t]);
+                    mma(Cm, Am[n][t], B[t]);
+                }
+
+#pragma unroll
+                for (int l = 0; l < tile_C::ne; ++l) {
+                    // d and dmin of the row, read here rather than kept in registers for the whole tile
+                    const float2 dm = __half22float2(x_dm[(i0 + n*tile_C::I + tile_C::get_i(l))*sram_stride]);
+                    sum[(j0/tile_C::J + n)*tile_C::ne + l] += dB*(dm.x*Cq.x[l] - dm.y*Cm.x[l]);
+                }
+            }
+        }
+    }
+#elif defined(AMD_MFMA_AVAILABLE)
     constexpr data_layout input_layout = get_input_data_layout();
     typedef tile<16,  4, int, input_layout>        tile_A;
     typedef tile<16,  4, int, input_layout>        tile_B;
