@@ -690,9 +690,18 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     // AMD WMMA is faster than the tile kernel if the wide tiles with high arithmetic intensity can be utilized.
-    if ((amd_wmma_available(cc) && gqa_opt_applies && Q->ne[0] <= 256) && Q->ne[0] != 40 && Q->ne[0] != 72 &&
+    // delphi: RDNA4 also takes heads up to 576 (llama-cpp-rdna-boosts block 04). GGML_CUDA_FA_WMMA_MAX_HEAD overrides
+    // the cap, for example 256 to compare with the tile kernel.
+    static const int wmma_max_head_env = getenv("GGML_CUDA_FA_WMMA_MAX_HEAD") ? atoi(getenv("GGML_CUDA_FA_WMMA_MAX_HEAD")) : -1;
+    const int wmma_max_head = wmma_max_head_env >= 0 ? wmma_max_head_env : GGML_CUDA_CC_IS_RDNA4(cc) ? 576 : 256;
+    if ((amd_wmma_available(cc) && gqa_opt_applies && Q->ne[0] <= wmma_max_head) && Q->ne[0] != 40 && Q->ne[0] != 72 &&
             Q->ne[1] * gqa_ratio_eff > (Q->ne[0] <= 128 ? 8 : 16)) {
-        return BEST_FATTN_KERNEL_MMA_F16;
+        // the kernel instantiates logit_softcap only for heads 128, 256 and 512
+        float logit_softcap = 0.0f;
+        memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
+        if (logit_softcap == 0.0f || Q->ne[0] == 128 || Q->ne[0] == 256 || Q->ne[0] == 512) {
+            return BEST_FATTN_KERNEL_MMA_F16;
+        }
     }
 
     // If there are no tensor cores available, use the generic tile kernel:
