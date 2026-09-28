@@ -2095,6 +2095,23 @@ static __global__ void moe_down_q_reduction_packed(
     }
 }
 
+// the packed formats of moe_down_q_reduction_packed_switch_fmt
+static bool moe_down_q_reduction_packed_fmt_supported(const int fmt) {
+    switch (fmt) {
+        case GGML_CUDA_MOE_PACKED_Q5K:
+        case GGML_CUDA_MOE_PACKED_IQ2KS:
+        case GGML_CUDA_MOE_PACKED_IQ3KS:
+        case GGML_CUDA_MOE_PACKED_IQ4KS:
+        case GGML_CUDA_MOE_PACKED_IQ5KS:
+        case GGML_CUDA_MOE_PACKED_IQ4XS:
+        case GGML_CUDA_MOE_PACKED_Q4K:
+        case GGML_CUDA_MOE_PACKED_Q6K:
+            return true;
+        default:
+            return false;
+    }
+}
+
 static void moe_down_q_reduction_packed_switch_fmt(
         const int fmt, const char * vx, const block_q8_1 * vy, const int32_t * ids, const float * weights, float * dst,
         const int ncols_x, const int nrows_x, const int64_t stride_channel_x, const int stride_channel_y, cudaStream_t stream) {
@@ -2150,6 +2167,11 @@ static void mul_mat_vec_q_packed_switch_fmt(
     GGML_UNUSED_VARS(vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_col_y, stride_col_dst, nchannels_y, nchannels_dst,
         stride_channel_x, stride_channel_y, stride_channel_dst, ids_stride, stream);
     GGML_ABORT("MMVQ: no kernel for packed format %d on this backend", fmt);
+}
+
+static bool moe_down_q_reduction_packed_fmt_supported(const int fmt) {
+    GGML_UNUSED(fmt);
+    return false;
 }
 
 static void moe_down_q_reduction_packed_switch_fmt(
@@ -2308,6 +2330,13 @@ bool ggml_cuda_moe_down_q_reduction_supported(
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     if (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_AMPERE || cc >= GGML_CUDA_CC_HOPPER) {
+        return false;
+    }
+
+    // delphi: weights packed in place in a format without a fused kernel (for example q3_K, iq3_xxs) take the
+    // packed MMVQ path instead
+    const int packed = ggml_cuda_moe_packed_inplace_fmt(src0);
+    if (packed != GGML_CUDA_MOE_PACKED_NONE && !moe_down_q_reduction_packed_fmt_supported(packed)) {
         return false;
     }
 
