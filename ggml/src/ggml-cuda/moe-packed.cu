@@ -324,8 +324,12 @@ static bool moe_packed_nocache() {
 
 static std::atomic<int> moe_packed_inplace_override{-1};
 
+// delphi: in place by default (no second copy of the experts), unless GGML_CUDA_MOE_PACKED_NOCACHE asks for no cache at all
 static bool moe_packed_inplace() {
-    static const bool env = moe_packed_env_flag("GGML_CUDA_MOE_PACKED_INPLACE");
+    static const bool env = [] {
+        const char * s = getenv("GGML_CUDA_MOE_PACKED_INPLACE");
+        return s != nullptr ? atoi(s) != 0 : !moe_packed_nocache();
+    }();
     const int o = moe_packed_inplace_override.load(std::memory_order_relaxed);
     return o >= 0 ? o != 0 : env;
 }
@@ -706,6 +710,15 @@ void ggml_cuda_moe_packed_prepare(ggml_backend_cuda_context & ctx, const ggml_cg
         if (src0->op != GGML_OP_NONE || src0->view_src != nullptr || src0->buffer == nullptr ||
                 ggml_backend_buffer_get_type(src0->buffer) != buft ||
                 ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+            continue;
+        }
+        // delphi: only for an activation layout that the grouped schedule serves (ggml_cuda_mul_mat_q, mmq.cu); the old path of
+        // any other layout reads the GGUF layout, and a weight packed in place would abort there
+        const ggml_tensor * src1   = node->src[1];
+        const int64_t       n_used = node->src[2]->ne[0];
+        const bool bcast    = src1->ne[1] == 1 && n_used > 1;
+        const bool gathered = src1->ne[1] == n_used && src1->nb[2] == n_used*src1->nb[1];
+        if (src1->ne[3] != 1 || !(bcast || gathered)) {
             continue;
         }
         const int fmt = ggml_cuda_moe_packed_select(src0, /*warn =*/ false);

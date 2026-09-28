@@ -94,8 +94,12 @@ static std::atomic<int> moe_grouped_mode_override{-1};
 
 static int moe_grouped_env_mode() {
     static const int mode = [] {
+        // delphi: packed by default; it applies to NVIDIA Ampere and newer, other devices keep the old path
         const char * s = getenv("GGML_CUDA_MOE_GROUPED");
-        if (s == nullptr || strcmp(s, "old") == 0 || strcmp(s, "0") == 0) {
+        if (s == nullptr) {
+            return (int) GGML_CUDA_MOE_GROUPED_PACKED;
+        }
+        if (strcmp(s, "old") == 0 || strcmp(s, "0") == 0) {
             return (int) GGML_CUDA_MOE_GROUPED_OLD;
         }
         if (strcmp(s, "auto") == 0 || strcmp(s, "1") == 0) {
@@ -122,6 +126,12 @@ static int moe_grouped_env_mode() {
 static int moe_grouped_mode() {
     const int mode = moe_grouped_mode_override.load(std::memory_order_relaxed);
     return mode >= 0 ? mode : moe_grouped_env_mode();
+}
+
+// delphi: the packed default was validated on NVIDIA only; other vendors need an explicit GGML_CUDA_MOE_GROUPED
+static bool moe_grouped_mode_is_default() {
+    static const bool unset = getenv("GGML_CUDA_MOE_GROUPED") == nullptr;
+    return unset && moe_grouped_mode_override.load(std::memory_order_relaxed) < 0;
 }
 
 int ggml_cuda_moe_grouped_packed_mode(void) {
@@ -219,7 +229,7 @@ static bool moe_grouped_type_supported(ggml_type type) {
 
 bool ggml_cuda_moe_grouped_select(int device, ggml_type type, int cc, int64_t n_tokens, bool shape_ok) {
     const int mode = moe_grouped_mode();
-    if (mode == GGML_CUDA_MOE_GROUPED_OLD) {
+    if (mode == GGML_CUDA_MOE_GROUPED_OLD || (!GGML_CUDA_CC_IS_NVIDIA(cc) && moe_grouped_mode_is_default())) {
         return false;
     }
 

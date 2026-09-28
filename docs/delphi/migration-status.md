@@ -44,8 +44,8 @@ CPU tests ran under `numactl --cpunodebind=0 --membind=0` (except NUMA). GPU tes
 
   | path | pp512 | tg32 |
   | --- | ---: | ---: |
-  | default (`GGML_CUDA_MOE_GROUPED=old`) | 361.4 | 32.6 |
-  | `GGML_CUDA_MOE_GROUPED=packed GGML_CUDA_MOE_PACKED_INPLACE=1` | 571.9 | 33.6 |
+  | `GGML_CUDA_MOE_GROUPED=old` (the default at the time) | 361.4 | 32.6 |
+  | `GGML_CUDA_MOE_GROUPED=packed GGML_CUDA_MOE_PACKED_INPLACE=1` (now the default; see `usage/environment-variables.md`) | 571.9 | 33.6 |
 
   test-mixed-logits (mixed prefill and decode, 3 requests) with packed in place against the default: mean KLD 0.015 to 0.030, same top-1 95 to 96%, the fp32 summation-order floor; the 1-token request is bitwise.
 - SM80 MoE: test-moe-schedule passes on CPU and ROCm1 (2243/0). On CUDA0 it gives 4231 passed, 39 failed. The 39 are the known legacy gap: IQ2_KS, IQ3_KS and IQ5_KS packed-in-place MMVQ is not bitwise equal to the GGUF-layout MMVQ at T <= 8 (the row scale is applied before the sum instead of after it; NMSE ~1e-14). test-backend-ops routing cases (moe-devsort) pass.
