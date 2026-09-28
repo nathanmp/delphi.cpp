@@ -1553,6 +1553,7 @@ struct ggml_backend_cuda_context {
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;
+    cudaStream_t stage_stream = nullptr; // delphi: host-to-device uploads of the scheduler staging ring
     // null unless GGML_EXEC_TRACE_GPU_TIMING is active; owned by this context
     ggml_cuda_exec_trace_timer * exec_trace_timer = nullptr;
 

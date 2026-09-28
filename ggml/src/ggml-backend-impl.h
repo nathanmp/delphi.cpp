@@ -131,6 +131,15 @@ extern "C" {
             ggml_backend_t backend, const struct ggml_tensor * op, const struct ggml_tensor * weight,
             uint64_t operations, uint64_t active_weight_bytes, struct ggml_backend_op_cost * cost);
 
+    // delphi: host-to-device staging on a copy stream, for the scheduler's staging ring (GGML_SCHED_STAGE).
+    // upload copies size bytes from host memory src to device memory dst of the backend's device on a stream
+    // that runs beside the compute stream, then records done there. wait makes that copy stream wait for
+    // ev. d2d copies device memory on the compute stream. Found through get_proc_address under the names
+    // "ggml_backend_stage_upload", "ggml_backend_stage_wait" and "ggml_backend_stage_d2d".
+    typedef void (*ggml_backend_stage_upload_t)(ggml_backend_t backend, void * dst, const void * src, size_t size, ggml_backend_event_t done);
+    typedef void (*ggml_backend_stage_wait_t)  (ggml_backend_t backend, ggml_backend_event_t ev);
+    typedef void (*ggml_backend_stage_d2d_t)   (ggml_backend_t backend, void * dst, const void * src, size_t size);
+
     struct ggml_backend_i {
         const char * (*get_name)(ggml_backend_t backend);
 
