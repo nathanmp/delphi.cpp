@@ -34,6 +34,11 @@
 #include <sys/sysctl.h>
 #endif
 
+#ifdef __linux__
+#include <pthread.h>
+#include <sched.h>
+#endif
+
 
 // backend buffer type
 
@@ -2505,6 +2510,60 @@ static bool ggml_backend_sched_splits_share_memory(ggml_backend_sched_t sched, i
 #define GGML_SCHED_STAGE_MAX_BOUNCE 16
 #define GGML_SCHED_STAGE_MIN_BYTES  (1u << 20)
 
+// the CPUs next to a PCI device, from sysfs; empty if unknown
+static std::vector<int> ggml_backend_sched_stage_local_cpus(const char * pci_id) {
+    std::vector<int> cpus;
+#ifdef __linux__
+    if (pci_id == nullptr) {
+        return cpus;
+    }
+    char path[256];
+    snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/local_cpulist", pci_id);
+    FILE * f = fopen(path, "r");
+    if (f == nullptr) {
+        return cpus;
+    }
+    int first, last;
+    char sep;
+    while (fscanf(f, "%d", &first) == 1) {
+        last = first;
+        sep = (char) fgetc(f);
+        if (sep == '-') {
+            if (fscanf(f, "%d", &last) != 1) {
+                break;
+            }
+            sep = (char) fgetc(f);
+        }
+        for (int c = first; c <= last && c < CPU_SETSIZE; c++) {
+            cpus.push_back(c);
+        }
+        if (sep != ',') {
+            break;
+        }
+    }
+    fclose(f);
+#else
+    GGML_UNUSED(pci_id);
+#endif
+    return cpus;
+}
+
+static void ggml_backend_sched_stage_pin(const std::vector<int> & cpus) {
+#ifdef __linux__
+    if (cpus.empty()) {
+        return;
+    }
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    for (int c : cpus) {
+        CPU_SET(c, &set);
+    }
+    pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+#else
+    GGML_UNUSED(cpus);
+#endif
+}
+
 // splits a memcpy over the calling thread and n - 1 helper threads
 struct ggml_backend_sched_stage_copier {
     std::vector<std::thread> threads;
@@ -2527,10 +2586,11 @@ struct ggml_backend_sched_stage_copier {
         }
     }
 
-    void start(int n_threads) {
+    void start(int n_threads, const std::vector<int> & cpus) {
         n = std::max(1, n_threads);
         for (int i = 1; i < n; i++) {
-            threads.emplace_back([this, i] {
+            threads.emplace_back([this, i, cpus] {
+                ggml_backend_sched_stage_pin(cpus);
                 uint64_t seen = 0;
                 for (;;) {
                     {
@@ -2639,6 +2699,7 @@ struct ggml_backend_sched_stage {
     uint64_t n_issued = 0; // jobs whose copies and done record are queued on the device
     bool stop = false;
     ggml_backend_sched_stage_copier copier;
+    std::vector<int> cpus; // the staging threads run here: the CPUs next to every staging device, if they share them
 };
 
 static void ggml_backend_sched_stage_run_job(ggml_backend_sched_stage * stage, const ggml_backend_sched_stage_job & job) {
@@ -2669,6 +2730,7 @@ static void ggml_backend_sched_stage_run_job(ggml_backend_sched_stage * stage, c
 }
 
 static void ggml_backend_sched_stage_worker(ggml_backend_sched_stage * stage) {
+    ggml_backend_sched_stage_pin(stage->cpus);
     for (;;) {
         ggml_backend_sched_stage_job job;
         {
@@ -2716,6 +2778,12 @@ static ggml_backend_sched_stage * ggml_backend_sched_stage_new(ggml_backend_sche
     if (const char * e = getenv("GGML_SCHED_STAGE_THREADS")) {
         n_threads = std::max(1, atoi(e));
     }
+    // run the staging threads next to the device: left to the scheduler, they land on both sockets of a NUMA host,
+    // and filling the bounce buffers ran at 26 GB/s instead of 35 GB/s, below the PCIe 5.0 x16 link rate
+    bool pin_ok = true;
+    if (const char * e = getenv("GGML_SCHED_STAGE_PIN")) {
+        pin_ok = atoi(e) != 0;
+    }
     bool any = false;
     for (int b = 0; b < sched->n_backends; b++) {
         stage->backends[b] = sched->backends[b];
@@ -2731,14 +2799,22 @@ static ggml_backend_sched_stage * ggml_backend_sched_stage_new(ggml_backend_sche
             ring.upload = nullptr;
             continue;
         }
+        ggml_backend_dev_props props = {};
+        ggml_backend_dev_get_props(dev, &props);
+        std::vector<int> cpus = ggml_backend_sched_stage_local_cpus(props.device_id);
+        pin_ok = pin_ok && !cpus.empty() && (!any || cpus == stage->cpus);
+        stage->cpus = cpus;
         any = true;
+    }
+    if (!pin_ok || !any) {
+        stage->cpus.clear();
     }
     if (!any) {
         GGML_LOG_WARN("%s: GGML_SCHED_STAGE=1, but no backend supports staging\n", __func__);
         stage->enabled = false;
     }
     if (stage->enabled && stage->use_bounce) {
-        stage->copier.start(n_threads);
+        stage->copier.start(n_threads, stage->cpus);
     }
     stage->worker = std::thread(ggml_backend_sched_stage_worker, stage);
     return stage;
