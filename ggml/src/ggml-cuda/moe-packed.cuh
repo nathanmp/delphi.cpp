@@ -20,7 +20,8 @@
 //               experiment). packed-f16 and packed-i8 are 2.1-4.7x the GGUF size and are for measurement only.
 // The packed weights of the MUL_MAT_ID nodes of a graph are built before the graph runs (ggml_cuda_moe_packed_prepare). They are
 // cached per src0 tensor in device memory that is freed by ggml_backend_cuda_moe_packed_clear or with the buffer of src0.
-// GGML_CUDA_MOE_PACKED_INPLACE=1 (packed only) overwrites the GGUF data of src0 with the packed layout instead of allocating a copy.
+// GGML_CUDA_MOE_PACKED_INPLACE (packed only; default 1 unless GGML_CUDA_MOE_PACKED_NOCACHE=1, 0 allocates a copy) overwrites the
+// GGUF data of src0 with the packed layout. Only a src0 whose MUL_MAT_ID activations have a layout of the grouped schedule is packed.
 // After that, the grouped packed kernel and MMVQ read src0 in the packed layout (MMVQ with the same results as on the GGUF layout).
 // Every other reader of src0 (MMQ, the MUL_MAT_ID fallback, a later ggml_backend_tensor_get) sees the packed bytes: MMQ and the
 // fallback abort, and new data written to src0 after the pack is not detected.

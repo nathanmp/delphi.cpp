@@ -6,11 +6,11 @@
 struct mmq_args;
 
 // delphi.cpp: grouped routed-MoE execution of MUL_MAT_ID MMQ (mmq-grouped.cuh), selected by GGML_CUDA_MOE_GROUPED:
-//   old     (default) the MMQ path with mm_ids_helper and one tile width for all experts
+//   old     the MMQ path with mm_ids_helper and one tile width for all experts
 //   auto    grouped for supported types from GGML_CUDA_MOE_GROUPED_MIN_TOKENS tokens on (default 128)
 //   grouped grouped for every supported MMQ MUL_MAT_ID
-//   packed  as grouped, but IQ3_S and IQ4_XS run with the packed-weight kernel of moe-packed.cuh (packed-f16 and packed-i8: Phase 3A0
-//           experiments)
+//   packed  (default) as grouped, but the types of moe-packed.cuh run with its packed-weight kernel (packed-f16 and packed-i8:
+//           Phase 3A0 experiments). Only NVIDIA Ampere and newer take the grouped and packed paths; other devices keep old.
 // GGML_CUDA_MOE_GROUPED_CLASSES sets the tile-width classes as "J:rows,...,J": an expert with rows <= the limit of the first
 // class that fits takes that class, the last class takes the rest. The routing decides the tile count of a class, not its launch.
 // GGML_CUDA_MOE_GROUPED_TIMING=1 times the tile list and each class kernel and fixup with events and logs them at backend free
