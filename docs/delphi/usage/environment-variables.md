@@ -34,6 +34,24 @@ What each default does:
 
 Validation used a layer split over three NVIDIA GPUs on narrow PCIe links without peer access, with multi-token prediction. Prompt processing rose by 15-29% at `-ub 2048` and by up to 52% with several ubatches per batch. Generation speed and outputs were unchanged. Most of the ub2048 gain comes from the view alias, because each device hand-off moves half as many bytes. The two wait changes and the input order matter when a server batch holds several ubatches: switching all three back cost 25% of prompt throughput at `-ub 512`.
 
+## Weight streaming (staging ring)
+
+With routed experts in host memory (`-cmoe`, `-ncmoe`, `--numa tensors`), a wide prompt batch can run the expert matrix multiplications on the GPU: the scheduler copies each expert tensor to the device when it reaches the split that uses it (op offload). That copy runs in turn with the device's computation, and a copy from ordinary (pageable) host memory also blocks the scheduler thread at well below the PCIe rate.
+
+| variable | default | effect |
+| --- | --- | --- |
+| `GGML_SCHED_STAGE` | `0` | `1` uploads offloaded host weights ahead of the splits that use them |
+| `GGML_SCHED_STAGE_SLOTS` | `4` | device slots, each the size of the largest staged tensor; more slots run further ahead and use more VRAM |
+| `GGML_SCHED_STAGE_BOUNCE` | `4` | pinned host bounce buffers; `0` uploads from the weights directly (pageable) |
+| `GGML_SCHED_STAGE_CHUNK_MB` | `64` | size of each bounce buffer |
+| `GGML_SCHED_STAGE_THREADS` | `8` | memcpy threads that fill the bounce buffers |
+
+At the start of each graph, the scheduler lists the host weights that its splits will copy whole, in split order. A background thread copies them in chunks into pinned host buffers, and the device copies each chunk into a slot on a separate stream, so the uploads of later layers overlap the computation of earlier ones. When the scheduler reaches the split, the device copies the slot into the split input. Expert tensors are staged only when the batch is wide enough that nearly every expert is used; for narrower batches the scheduler keeps copying only the used experts, and decode is unaffected. Supported on CUDA and ROCm devices.
+
+Each slot takes VRAM equal to the largest staged tensor (1.4 GiB for DeepSeek V4.1 Flash at Q2_K). If the slots cannot be allocated, staging turns itself off with a warning. Staging does not change what is computed, so outputs are identical with it on or off.
+
+The offload cost model (or `GGML_OP_OFFLOAD_MIN_BATCH`) still decides whether the experts are offloaded at all, so staging matters only on a fast host link. Measured with DeepSeek V4.1 Flash (routed experts at Q2_K in host memory) on one Radeon AI PRO R9700 on PCIe 4.0 x16 at `-ub 2048`: a real-text prompt went from 84.5 to 134 tokens/s, random tokens (llama-bench pp4096) from 92 to 125 tokens/s, and decode was unchanged. On a PCIe 4.0 x2 link, the cost model keeps the experts on the CPU.
+
 ## CUDA routed MoE (NVIDIA Ampere and newer)
 
 These variables choose how routed-expert matrix multiplications (`MUL_MAT_ID`) run on NVIDIA GPUs of compute capability 8.0 and newer. Other devices, including ROCm, always use the standard path and ignore them.
