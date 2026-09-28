@@ -4139,10 +4139,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX"));
     add_opt(common_arg(
         {"--spec-draft-ubatch-size", "-ubd"}, "N",
-        "physical batch size of the draft context (default: same as -ub); a draft rarely gains from a large ubatch, "
-        "and its compute buffer grows with it",
+        string_format("physical batch size of the draft context, 0 = same as -ub (default: %d); a draft rarely gains "
+        "from a large ubatch, and its compute buffer grows with it", params.speculative.draft.n_ubatch),
         [](common_params & params, int value) {
-            if (value <= 0) {
+            if (value < 0) {
                 throw std::invalid_argument("invalid value");
             }
             params.speculative.draft.n_ubatch = value;
