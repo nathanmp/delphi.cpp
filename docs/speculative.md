@@ -103,6 +103,12 @@ llama-server -m Qwen3-4B.gguf -md Qwen3-4B-DSpark.gguf \
 `--spec-draft-conf-min P` truncates each drafted block at the first position whose predicted
 acceptance (from the draft's confidence head, if present) falls below `P` (default 0 = disabled).
 
+The draft context inherits `-ub` from the target unless `-ubd N` (`--spec-draft-ubatch-size`) sets its own
+ubatch size. A large target ubatch (for example `-ub 4096` for a model with streamed experts) then no longer sizes
+the draft's compute buffer: with DeepSeek V4.1 Flash and its DSpark draft on one 32 GB GPU, `-ubd 128` lowered
+peak VRAM from 30.1 to 25.7 GB with unchanged prefill and decode speed. The ubatch is raised if needed to fit
+every slot's draft block.
+
 Currently only drafts with a Qwen3 backbone are supported; support for other backbones
 (e.g. Gemma4) is planned.
 
