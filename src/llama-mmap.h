@@ -55,6 +55,10 @@ struct llama_mmap {
 
     void unmap_fragment(size_t first, size_t last);
 
+    // [first, last) is about to be read once, front to back: undo the NUMA random-access advice there so
+    // page faults read ahead instead of fetching one page each
+    void read_sequential(size_t first, size_t last);
+
     static const bool SUPPORTED;
 
 private:
