@@ -52,6 +52,8 @@ Each slot takes VRAM equal to the largest staged tensor (1.4 GiB for DeepSeek V4
 
 The offload cost model (or `GGML_OP_OFFLOAD_MIN_BATCH`) still decides whether the experts are offloaded at all, so staging matters only on a fast host link. Measured with DeepSeek V4.1 Flash (routed experts at Q2_K in host memory) on one Radeon AI PRO R9700 on PCIe 4.0 x16 at `-ub 2048`: a real-text prompt went from 84.5 to 134 tokens/s, random tokens (llama-bench pp4096) from 92 to 125 tokens/s, and decode was unchanged. On a PCIe 4.0 x2 link, the cost model keeps the experts on the CPU.
 
+Every ubatch uploads all staged weights once, so the link sets a floor per token of (staged bytes) / (link rate × ubatch size): for DeepSeek V4.1 Flash, about 3.1 ms/token at `-ub 2048` and 1.6 ms/token at `-ub 4096`. A larger ubatch therefore pays off for long prompts, as long as its compute buffer fits. With the later kernel work on the same card, real-text prefill reached 255 tokens/s at `-ub 2048` and 484-489 tokens/s at `-ub 4096`. At `-ub 4096`, three slots ran as fast as four and used 1.4 GiB less VRAM (two slots lost 25%), so `GGML_SCHED_STAGE_SLOTS=3` is a good choice when VRAM is tight, for example next to a draft model.
+
 ## CUDA routed MoE (NVIDIA Ampere and newer)
 
 These variables choose how routed-expert matrix multiplications (`MUL_MAT_ID`) run on NVIDIA GPUs of compute capability 8.0 and newer. Other devices, including ROCm, always use the standard path and ignore them.
