@@ -6400,12 +6400,6 @@ static void ggml_backend_cuda_stage_upload(ggml_backend_t backend, void * dst, c
     CUDA_CHECK(cudaEventRecord((cudaEvent_t) done->context, stream));
 }
 
-static void ggml_backend_cuda_stage_wait(ggml_backend_t backend, ggml_backend_event_t ev) {
-    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
-    ggml_cuda_set_device(cuda_ctx->device);
-    CUDA_CHECK(cudaStreamWaitEvent(ggml_backend_cuda_stage_stream(cuda_ctx), (cudaEvent_t) ev->context, 0));
-}
-
 static void ggml_backend_cuda_stage_d2d(ggml_backend_t backend, void * dst, const void * src, size_t size) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_cuda_set_device(cuda_ctx->device);
@@ -6416,9 +6410,6 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_stage_upload") == 0) {
         return (void *) ggml_backend_cuda_stage_upload;
-    }
-    if (strcmp(name, "ggml_backend_stage_wait") == 0) {
-        return (void *) ggml_backend_cuda_stage_wait;
     }
     if (strcmp(name, "ggml_backend_stage_d2d") == 0) {
         return (void *) ggml_backend_cuda_stage_d2d;

@@ -2492,10 +2492,9 @@ static bool ggml_backend_sched_splits_share_memory(ggml_backend_sched_t sched, i
 // allocator placed in the compute buffer as usual.
 //
 // Invariants:
-// - A slot is uploaded again only after the device-to-device copy that read its previous content has been recorded
-//   on the compute stream (busy is cleared together with that record), and the copy stream waits for that record.
-//   A wait on an event that has no record yet would not order anything, so the job that waits is queued only after
-//   the record.
+// - A slot is uploaded again only after the device-to-device copy that read its previous content has completed: the
+//   staging thread waits for its record on the compute stream. A wait on an event that has no record yet would not
+//   order anything, so the job that waits is queued only after the record (busy is cleared together with it).
 // - The compute stream waits for the done event of a slot only after the staging thread has recorded it for this
 //   upload (issued), for the same reason.
 // - A bounce buffer is refilled only after the host has synchronized with the copy that read it.
@@ -2602,7 +2601,6 @@ struct ggml_backend_sched_stage_job {
 
 struct ggml_backend_sched_stage_ring {
     ggml_backend_stage_upload_t upload = nullptr;
-    ggml_backend_stage_wait_t   wait   = nullptr;
     ggml_backend_stage_d2d_t    d2d    = nullptr;
     ggml_backend_buffer_t buffers[GGML_SCHED_STAGE_MAX_SLOTS] = {};
     ggml_backend_event_t  done[GGML_SCHED_STAGE_MAX_SLOTS]    = {}; // upload finished, recorded on the copy stream
@@ -2647,7 +2645,8 @@ static void ggml_backend_sched_stage_run_job(ggml_backend_sched_stage * stage, c
     ggml_backend_sched_stage_ring & ring = stage->rings[job.backend_id];
     ggml_backend_t backend = stage->backends[job.backend_id];
     if (job.wait_free) {
-        ring.wait(backend, ring.free[job.slot]);
+        // a host wait: HIP rejects a copy stream wait on an event of the compute stream while that stream captures
+        ggml_backend_event_synchronize(ring.free[job.slot]);
     }
     char * dst = (char *) ggml_backend_buffer_get_base(ring.buffers[job.slot]);
     if (ring.bounce == nullptr) {
@@ -2727,9 +2726,8 @@ static ggml_backend_sched_stage * ggml_backend_sched_stage_new(ggml_backend_sche
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
         ggml_backend_sched_stage_ring & ring = stage->rings[b];
         ring.upload = (ggml_backend_stage_upload_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_stage_upload");
-        ring.wait   = (ggml_backend_stage_wait_t)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_stage_wait");
         ring.d2d    = (ggml_backend_stage_d2d_t)    ggml_backend_reg_get_proc_address(reg, "ggml_backend_stage_d2d");
-        if (ring.upload == nullptr || ring.wait == nullptr || ring.d2d == nullptr) {
+        if (ring.upload == nullptr || ring.d2d == nullptr) {
             ring.upload = nullptr;
             continue;
         }
