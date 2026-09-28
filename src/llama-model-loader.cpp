@@ -9,10 +9,15 @@
 #include <algorithm>
 #include <array>
 #include <cinttypes>
+#include <chrono>
 #include <cstdint>
+#include <condition_variable>
 #include <cstring>
+#include <deque>
 #include <future>
+#include <mutex>
 #include <regex>
+#include <thread>
 
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
@@ -1596,6 +1601,132 @@ const void * llama_model_loader::load_data_range(const llama_tensor_weight & w, 
     return data;
 }
 
+// delphi: each device's link is slow compared to the host, so uploading the weights of one device at a time leaves the
+// other links idle; one thread per device copies its tensors while the loader walks the rest
+struct llama_upload_workers {
+    struct upload {
+        ggml_tensor * tensor;
+        const void  * data;
+        size_t        size;
+    };
+
+    struct worker {
+        std::thread             thread;
+        std::deque<upload>      queue;
+        std::condition_variable cv;
+    };
+
+    std::mutex                                            mutex;
+    std::condition_variable                               idle;
+    std::map<ggml_backend_dev_t, std::unique_ptr<worker>> workers;
+    size_t                                                size_queued = 0; // bytes submitted but not yet uploaded
+    size_t                                                n_busy      = 0; // uploads in progress
+    bool                                                  stop        = false;
+
+    static bool enabled() {
+        const char * env = getenv("LLAMA_LOAD_PARALLEL");
+        return env == nullptr || atoi(env) != 0;
+    }
+
+    // the device whose worker can upload t, or nullptr to upload it on the calling thread
+    // only plain device buffers qualify: a split buffer writes several devices in one call
+    static ggml_backend_dev_t device_of(const ggml_tensor * t) {
+        if (t->buffer == nullptr || ggml_backend_buffer_is_host(t->buffer)) {
+            return nullptr;
+        }
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(t->buffer);
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+        if (dev == nullptr || buft != ggml_backend_dev_buffer_type(dev)) {
+            return nullptr;
+        }
+        return dev;
+    }
+
+    void submit(ggml_backend_dev_t dev, ggml_tensor * t, const void * data, size_t size) {
+        std::unique_lock<std::mutex> lock(mutex);
+        auto & w = workers[dev];
+        if (!w) {
+            w = std::make_unique<worker>();
+            w->thread = std::thread([this, ptr = w.get()] { run(*ptr); });
+        }
+        w->queue.push_back({ t, data, size });
+        size_queued += size;
+        w->cv.notify_one();
+    }
+
+    void run(worker & w) {
+        std::unique_lock<std::mutex> lock(mutex);
+        while (true) {
+            w.cv.wait(lock, [&] { return stop || !w.queue.empty(); });
+            if (w.queue.empty()) {
+                return;
+            }
+            const upload u = w.queue.front();
+            w.queue.pop_front();
+            n_busy++;
+            lock.unlock();
+            ggml_backend_tensor_set(u.tensor, u.data, 0, u.size);
+            lock.lock();
+            n_busy--;
+            size_queued -= u.size;
+            idle.notify_all();
+        }
+    }
+
+    size_t queued() {
+        std::unique_lock<std::mutex> lock(mutex);
+        return size_queued;
+    }
+
+    // wait until every submitted upload has finished; on_progress(bytes pending) returning false drops the uploads not started yet
+    template <typename F>
+    bool wait(F && on_progress) {
+        std::unique_lock<std::mutex> lock(mutex);
+        bool cancelled = false;
+        while (size_queued > 0) {
+            if (!cancelled) {
+                lock.unlock();
+                const bool keep = on_progress(queued());
+                lock.lock();
+                if (!keep) {
+                    cancelled = true;
+                    for (auto & [_, w] : workers) {
+                        for (const auto & u : w->queue) {
+                            size_queued -= u.size;
+                        }
+                        w->queue.clear();
+                    }
+                }
+            }
+            idle.wait_for(lock, std::chrono::milliseconds(100));
+        }
+        return !cancelled;
+    }
+
+    ~llama_upload_workers() {
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            stop = true;
+            for (auto & [_, w] : workers) {
+                w->queue.clear();
+                w->cv.notify_one();
+            }
+        }
+        for (auto & [_, w] : workers) {
+            w->thread.join();
+        }
+    }
+};
+
+bool llama_model_loader::wait_uploads(llama_progress_callback progress_callback, void * progress_callback_user_data) {
+    if (!upload_workers) {
+        return true;
+    }
+    return upload_workers->wait([&](size_t pending) {
+        return !progress_callback || progress_callback((float) (size_done - pending) / size_data, progress_callback_user_data);
+    });
+}
+
 bool llama_model_loader::load_all_data(
         struct ggml_context * ctx,
         llama_buf_map & bufs,
@@ -1611,6 +1742,10 @@ bool llama_model_loader::load_all_data(
     GGML_ASSERT(size_data != 0 && "call init_mappings() first");
 
     std::vector<std::future<std::pair<ggml_tensor *, bool>>> validation_result;
+
+    if (!upload_workers && llama_upload_workers::enabled()) {
+        upload_workers = std::make_shared<llama_upload_workers>();
+    }
 
     // 4 staging buffers for async uploads, each sized 1MB seems to be a good default for single NVMe drives.
     // NVMe raid configurations might require more / larger buffers.
@@ -1751,7 +1886,9 @@ bool llama_model_loader::load_all_data(
         }
 
         if (progress_callback) {
-            if (!progress_callback((float) size_done / size_data, progress_callback_user_data)) {
+            const size_t size_pending = upload_workers ? upload_workers->queued() : 0;
+            if (!progress_callback((float) (size_done - size_pending) / size_data, progress_callback_user_data)) {
+                upload_workers.reset(); // finishes the uploads in progress, which write buffers the caller frees
                 return false;
             }
         }
@@ -1815,6 +1952,9 @@ bool llama_model_loader::load_all_data(
                 auto & mmap_used = mmaps_used[weight->idx];
                 mmap_used.first  = std::min(mmap_used.first,  weight->offs);
                 mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
+            } else if (ggml_backend_dev_t dev = upload_workers ? llama_upload_workers::device_of(cur) : nullptr) {
+                // the mapping stays in place until the final cleanup below, which waits for the upload
+                upload_workers->submit(dev, cur, data, n_size);
             } else {
                 ggml_backend_tensor_set(cur, data, 0, n_size);
             }
@@ -1924,6 +2064,10 @@ bool llama_model_loader::load_all_data(
 
     // check if this is the last call and do final cleanup
     if (size_done >= size_data) {
+        // the device uploads read the mapping that is unmapped below
+        if (!wait_uploads(progress_callback, progress_callback_user_data)) {
+            return false;
+        }
         // unmap offloaded tensors and metadata
         if (use_mmap) {
             for (uint32_t idx = 0; idx < mappings.size(); idx++) {

@@ -1880,6 +1880,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    // delphi: the last load_all_data call waits for the device uploads, unless skipped weights kept it from knowing it was last
+    if (!ml.wait_uploads(params.progress_callback, params.progress_callback_user_data)) {
+        return false;
+    }
+
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));

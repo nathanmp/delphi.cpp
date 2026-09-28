@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <set>
 #include <stdexcept>
 #include <unordered_map>
@@ -146,6 +147,9 @@ struct llama_model_loader {
     size_t size_data = 0;
     std::vector<std::pair<size_t, size_t>> mmaps_used;
 
+    // delphi: mapped weights are uploaded to device buffers by one thread per device (LLAMA_LOAD_PARALLEL=0 disables)
+    std::shared_ptr<struct llama_upload_workers> upload_workers;
+
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
     struct ggml_backend_buft_comparator {
         bool operator()(const ggml_backend_buffer_type_t & lhs, const ggml_backend_buffer_type_t & rhs) const {
@@ -266,6 +270,9 @@ struct llama_model_loader {
             llama_mlocks * lmlocks,
             llama_progress_callback progress_callback,
             void * progress_callback_user_data);
+
+    // wait for the device uploads started by load_all_data; returns false if cancelled by progress_callback
+    bool wait_uploads(llama_progress_callback progress_callback = nullptr, void * progress_callback_user_data = nullptr);
 
     std::string ftype_name() const;
 
