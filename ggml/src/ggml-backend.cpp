@@ -1794,11 +1794,14 @@ static bool ggml_backend_sched_buffer_supported(ggml_backend_sched_t sched, stru
 
 // delphi: the source of a view input that covers all of a computed tensor (for example a reshape), or NULL. The scheduler copies
 // that source and the node reads a view of the copy. Otherwise a split that reads both the tensor and the view receives the
-// same bytes twice. A view of a weight or of a graph input keeps the old copy.
-static struct ggml_tensor * ggml_backend_sched_full_view_src(ggml_backend_sched_t sched, struct ggml_tensor * t, int backend_id) {
+// same bytes twice. A view of a weight or of a graph input keeps the old copy. So does a view of a tensor that an op of the
+// graph writes in place (src_written): a backend receives one copy of a tensor per graph, taken at its first use, so views
+// of such a tensor read at different points of the graph need copies of their own.
+static struct ggml_tensor * ggml_backend_sched_full_view_src(ggml_backend_sched_t sched, struct ggml_tensor * t, int backend_id,
+        const std::vector<bool> & src_written) {
     struct ggml_tensor * src = t->view_src;
     if (!sched->view_alias || src == NULL || src->view_src != NULL || !ggml_is_view_op(t->op) || (src->flags & GGML_TENSOR_FLAG_INPUT) ||
-            (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS)) {
+            (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) || src_written[hash_id(src)]) {
         return NULL;
     }
     if (t->view_offs != 0 || t->type != src->type || ggml_nbytes(t) != ggml_nbytes(src) || !ggml_is_contiguous(t) || !ggml_is_contiguous(src)) {
@@ -2052,6 +2055,18 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     // pass 5: split graph, find tensors that need to be copied
     // views of input copies (ggml_backend_sched_full_view_src), with their split
     std::vector<std::pair<int, struct ggml_tensor *>> view_aliases;
+    // tensors whose memory an op other than a view writes (in-place ops, SET_ROWS, CPY into a view): such an op is a view of
+    // the tensor with a non-view op
+    std::vector<bool> view_src_written;
+    if (sched->view_alias) {
+        view_src_written.assign(sched->hash_set.size, false);
+        for (int i = 0; i < graph->n_nodes; i++) {
+            struct ggml_tensor * node = graph->nodes[i];
+            if (node->view_src != NULL && !ggml_is_view_op(node->op)) {
+                view_src_written[hash_id(node->view_src)] = true;
+            }
+        }
+    }
     {
         int i_split = 0;
         struct ggml_backend_sched_split * split = &sched->splits[0];
@@ -2156,7 +2171,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
                 if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
                     struct ggml_tensor * view = src;
-                    struct ggml_tensor * view_src = ggml_backend_sched_full_view_src(sched, src, cur_backend_id);
+                    struct ggml_tensor * view_src = ggml_backend_sched_full_view_src(sched, src, cur_backend_id, view_src_written);
                     if (view_src != NULL) {
                         src    = view_src;
                         src_id = hash_id(src);
