@@ -6,12 +6,18 @@
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
 
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#if !defined(GGML_USE_MUSA)
 __launch_bounds__(256, 1)
 static __global__ void flash_attn_mask_to_sparse_indices(
         const half * mask_ptr, int32_t * indices_ptr, const int ne30, const int n_kv_max,
         const int64_t s31, const int64_t s33) {
     ggml_cuda_pdl_sync();
+
+    // delphi: the ballots below assume 32-wide warps; HIP only launches this on RDNA (wave32)
+    if constexpr (ggml_cuda_get_physical_warp_size() != 32) {
+        NO_DEVICE_CODE;
+        return;
+    }
 
     constexpr int values_per_lane = 8;
     const int tid      = threadIdx.x;
@@ -39,7 +45,11 @@ static __global__ void flash_attn_mask_to_sparse_indices(
         for (int item = 0; item < values_per_lane; ++item) {
             const int i = i0 + (warp*values_per_lane + item)*WARP_SIZE + lane;
             const bool selected = i < ne30 && isfinite(__half2float(mask[i]));
+#if defined(GGML_USE_HIP)
+            selected_warp[item] = (uint32_t) __ballot(selected);
+#else
             selected_warp[item] = __ballot_sync(0xFFFFFFFF, selected);
+#endif // defined(GGML_USE_HIP)
             warp_count += __popc(selected_warp[item]);
         }
 
@@ -88,13 +98,13 @@ static __global__ void flash_attn_mask_to_sparse_indices(
     // the dependent grid reads indices, signal once the row is complete
     ggml_cuda_pdl_lc();
 }
-#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#endif // !defined(GGML_USE_MUSA)
 
 void ggml_cuda_flash_attn_ext_compact_mask(
         const ggml_tensor * mask, int32_t * indices, int32_t n_kv_max, cudaStream_t stream) {
-#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+#if defined(GGML_USE_MUSA)
     GGML_UNUSED_VARS(mask, indices, n_kv_max, stream);
-    GGML_ABORT("sparse flash attention is only supported on NVIDIA CUDA");
+    GGML_ABORT("sparse flash attention is not supported on MUSA");
 #else
     const int64_t s31 = mask->nb[1] / sizeof(half);
     const int64_t s33 = mask->nb[3] / sizeof(half);
@@ -104,12 +114,12 @@ void ggml_cuda_flash_attn_ext_compact_mask(
     ggml_cuda_kernel_launch(flash_attn_mask_to_sparse_indices, launch_params,
         (const half *) mask->data, indices, int(mask->ne[0]), n_kv_max, s31, s33);
     CUDA_CHECK(cudaGetLastError());
-#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#endif // defined(GGML_USE_MUSA)
 }
 
 static bool ggml_cuda_flash_attn_ext_mma_f16_sparse_supported(
         const int device, const ggml_tensor * dst) {
-#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+#if defined(GGML_USE_MUSA)
     GGML_UNUSED_VARS(device, dst);
     return false;
 #else
@@ -125,8 +135,21 @@ static bool ggml_cuda_flash_attn_ext_mma_f16_sparse_supported(
     memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
     memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
 
-    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || !turing_mma_available(cc) ||
-            max_bias != 0.0f || logit_softcap != 0.0f) {
+    if (max_bias != 0.0f || logit_softcap != 0.0f) {
+        return false;
+    }
+
+    // delphi: on RDNA4 the WMMA kernel takes a mask-backed sparse launch for 512-wide heads
+    // (DeepSeek V4.1: a sliding window plus the indexer's top-k, out of thousands of rows)
+    if (GGML_CUDA_CC_IS_RDNA4(cc)) {
+        const int32_t n_kv_max = ggml_get_op_params_i32(dst, 4);
+        return indices == nullptr && mask != nullptr && n_kv_max > 0 &&
+            Q->ne[0] == 512 && V->ne[0] == 512 && Q->ne[2] % (16*K->ne[2]) == 0 &&
+            mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1 &&
+            K->ne[1] >= std::max<int64_t>(4096, 2LL*n_kv_max);
+    }
+
+    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || !turing_mma_available(cc)) {
         return false;
     }
 
@@ -145,7 +168,7 @@ static bool ggml_cuda_flash_attn_ext_mma_f16_sparse_supported(
     return mask != nullptr && n_kv_max > 0 &&
         mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1 &&
         K->ne[1] >= std::max<int64_t>(4096, 2LL*n_kv_max);
-#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#endif // defined(GGML_USE_MUSA)
 }
 
 bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -157,14 +180,14 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const ggml_tensor * Q = dst->src[0];
 
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#if !defined(GGML_USE_MUSA)
     if constexpr (ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, 1, ncols2)) {
         if (ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ctx, dst)) {
             ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 1, ncols2>(ctx, dst);
             return;
         }
     }
-#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#endif // !defined(GGML_USE_MUSA)
 
     if constexpr (ncols2 <= 8) {
         if (turing_mma_available(cc) && Q->ne[1] <= 8/ncols2) {
@@ -248,6 +271,16 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
 
     // On RDNA it is preferable to minimize wasted compute vs. duplicate I/O for the mask.
     if (amd_wmma_available(cc)) {
+#if defined(GGML_USE_HIP)
+        // delphi: a sparse launch gathers one query's rows for 16 heads at a time
+        if constexpr (ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, 1, 16)) {
+            if (use_gqa_opt && gqa_ratio % 16 == 0 && ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ctx, dst)) {
+                ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 1, 16>(ctx, dst);
+                return;
+            }
+        }
+#endif // defined(GGML_USE_HIP)
+
         if (use_gqa_opt && gqa_ratio % 8 == 0) {
             ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8>(ctx, dst);
             return;
@@ -690,9 +723,18 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     // AMD WMMA is faster than the tile kernel if the wide tiles with high arithmetic intensity can be utilized.
-    if ((amd_wmma_available(cc) && gqa_opt_applies && Q->ne[0] <= 256) && Q->ne[0] != 40 && Q->ne[0] != 72 &&
+    // delphi: RDNA4 also takes heads up to 576 (llama-cpp-rdna-boosts block 04). GGML_CUDA_FA_WMMA_MAX_HEAD overrides
+    // the cap, for example 256 to compare with the tile kernel.
+    static const int wmma_max_head_env = getenv("GGML_CUDA_FA_WMMA_MAX_HEAD") ? atoi(getenv("GGML_CUDA_FA_WMMA_MAX_HEAD")) : -1;
+    const int wmma_max_head = wmma_max_head_env >= 0 ? wmma_max_head_env : GGML_CUDA_CC_IS_RDNA4(cc) ? 576 : 256;
+    if ((amd_wmma_available(cc) && gqa_opt_applies && Q->ne[0] <= wmma_max_head) && Q->ne[0] != 40 && Q->ne[0] != 72 &&
             Q->ne[1] * gqa_ratio_eff > (Q->ne[0] <= 128 ? 8 : 16)) {
-        return BEST_FATTN_KERNEL_MMA_F16;
+        // the kernel instantiates logit_softcap only for heads 128, 256 and 512
+        float logit_softcap = 0.0f;
+        memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
+        if (logit_softcap == 0.0f || Q->ne[0] == 128 || Q->ne[0] == 256 || Q->ne[0] == 512) {
+            return BEST_FATTN_KERNEL_MMA_F16;
+        }
     }
 
     // If there are no tensor cores available, use the generic tile kernel:

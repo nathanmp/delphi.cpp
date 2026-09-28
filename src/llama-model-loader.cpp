@@ -1899,6 +1899,7 @@ bool llama_model_loader::load_all_data(
             const void * source = nullptr;
             if (use_mmap) {
                 const auto & mapping = mappings.at(weight->idx);
+                mapping->read_sequential(weight->offs, weight->offs + n_size);
                 source = (const uint8_t *) mapping->addr() + weight->offs;
                 if (check_tensors) {
                     validation_result.emplace_back(std::async(std::launch::async, [cur, source, n_size] {
@@ -1954,8 +1955,10 @@ bool llama_model_loader::load_all_data(
                 mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
             } else if (ggml_backend_dev_t dev = upload_workers ? llama_upload_workers::device_of(cur) : nullptr) {
                 // the mapping stays in place until the final cleanup below, which waits for the upload
+                mapping->read_sequential(weight->offs, weight->offs + n_size);
                 upload_workers->submit(dev, cur, data, n_size);
             } else {
+                mapping->read_sequential(weight->offs, weight->offs + n_size);
                 ggml_backend_tensor_set(cur, data, 0, n_size);
             }
         } else {

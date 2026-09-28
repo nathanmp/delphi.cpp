@@ -2817,11 +2817,16 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 n_tasks = n_threads;
             } break;
         case GGML_OP_GET_ROWS:
-        case GGML_OP_SET_ROWS:
             {
                 // FIXME: get_rows can use additional threads, but the cost of launching additional threads
                 // decreases performance with GPU offloading
-                //n_tasks = n_threads;
+                // delphi: except for many rows: a gather from a lazily mapped table can fault on nearly every
+                // row, and one thread then waits for each disk read in turn
+                const int64_t n_rows = ggml_nelements(node->src[1]);
+                n_tasks = n_rows >= 256 ? (int) MIN((int64_t) n_threads, n_rows) : 1;
+            } break;
+        case GGML_OP_SET_ROWS:
+            {
                 n_tasks = 1;
             } break;
         case GGML_OP_SCALE:

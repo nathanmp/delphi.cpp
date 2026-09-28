@@ -418,14 +418,28 @@ static double ggml_backend_cpu_measure_dot_throughput(enum ggml_type type) {
 
 // Measure the actual routed-expert kernel using the already loaded weight tensor.
 // This preserves any CPU-specific packed layout and does not retain model data.
+// delphi: the MUL_MAT_ID calibration runs the whole op three times, so measuring every token count again
+// re-ran it for each new prompt length (seconds per request for large CPU experts). Measure and cache at
+// the token count rounded to the nearest power of two instead; throughput follows tokens per expert, which
+// that resolves well enough.
+static int64_t ggml_backend_cpu_offload_token_bucket(int64_t n_tokens) {
+    if (n_tokens <= 1) {
+        return 1;
+    }
+    int64_t lower = 1;
+    while (2*lower <= n_tokens) {
+        lower *= 2;
+    }
+    return n_tokens - lower < 2*lower - n_tokens ? lower : 2*lower;
+}
+
 static double ggml_backend_cpu_measure_mul_mat_id_throughput(
         ggml_backend_t backend, const struct ggml_backend_cpu_context * cpu_ctx,
-        const struct ggml_tensor * op, const struct ggml_tensor * weight) {
+        const struct ggml_tensor * op, const struct ggml_tensor * weight, int64_t n_tokens) {
     if (op->op != GGML_OP_MUL_MAT_ID || !op->src[1] || !op->src[2] || weight->ne[2] <= 0) {
         return 0.0;
     }
 
-    const int64_t n_tokens = op->src[1]->ne[2];
     const int64_t top_k = op->src[2]->ne[0];
     if (n_tokens <= 0 || top_k <= 0) {
         return 0.0;
@@ -534,13 +548,13 @@ static bool ggml_backend_cpu_get_op_cost(
                 /*.rows   =*/ weight->ne[0],
                 /*.cols   =*/ weight->ne[1],
                 /*.top_k  =*/ op->src[2]->ne[0],
-                /*.tokens =*/ op->src[1]->ne[2],
+                /*.tokens =*/ ggml_backend_cpu_offload_token_bucket(op->src[1]->ne[2]),
             };
             auto it = cpu_ctx->offload_mul_mat_id_operations_per_second.find(shape);
             if (it != cpu_ctx->offload_mul_mat_id_operations_per_second.end()) {
                 mul_mat_id_operations_per_second = it->second;
             } else {
-                const double measured = ggml_backend_cpu_measure_mul_mat_id_throughput(backend, cpu_ctx, op, weight);
+                const double measured = ggml_backend_cpu_measure_mul_mat_id_throughput(backend, cpu_ctx, op, weight, shape.tokens);
                 // A lazy weight that is not resident yet measures 0; do not cache that so a
                 // later call with resident data can still calibrate.
                 if (measured > 0.0) {

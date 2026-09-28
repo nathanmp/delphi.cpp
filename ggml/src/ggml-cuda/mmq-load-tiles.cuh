@@ -566,11 +566,24 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
         const int x_ql_0 = get_int_b2(bxi->qs, kqsx);
 
+#if defined(AMD_WMMA_AVAILABLE)
+        // RDNA: fold the 4-bit scale into the quants (at most 3*15 per byte) and keep the super-block
+        // d/dmin plus one min byte per 16 values; the vec_dot then needs float work only once per 64 values
+        if (kqsx == 0) {
+            x_dm[i*sram_stride] = bxi->dm;
+        }
+        ((uint8_t *) (x_dm + i*sram_stride + 1))[kqsx] = bxi->scales[kqsx] >> 4;
+#endif // defined(AMD_WMMA_AVAILABLE)
+
 #pragma unroll
         for (int l = 0; l < QR2_K; ++l) {
             const int k = (kqsx/8)*32 + l*8 + kqsx % 8;
 
+#if defined(AMD_WMMA_AVAILABLE)
+            const int x_qs_k = ((x_ql_0 >> (2*l)) & 0x03030303) * (bxi->scales[k/4] & 0x0F);
+#else
             const int x_qs_k = (x_ql_0 >> (2*l)) & 0x03030303;
+#endif // defined(AMD_WMMA_AVAILABLE)
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
             x_qs[i*sram_stride           + k] = x_qs_k;
@@ -579,6 +592,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
         }
 
+#if !defined(AMD_WMMA_AVAILABLE)
         const int sc_m = bxi->scales[kqsx];
 #ifdef FAST_FP16_AVAILABLE
         const half2 x_dm_ik = __hmul2(bxi->dm, make_half2(sc_m & 0x0F, sc_m >> 4));
@@ -587,11 +601,12 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         const half2 x_dm_ik = make_half2(bxi_dmf.x*(sc_m & 0x0F), bxi_dmf.y*(sc_m >> 4));
 #endif // FAST_FP16_AVAILABLE
 
-#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE)
         x_dm[i*sram_stride         + kqsx] = x_dm_ik;
 #else
         x_dm[i*(MMQ_TILE_NE_K + 1) + kqsx] = x_dm_ik;
-#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE)
+#endif // !defined(AMD_WMMA_AVAILABLE)
     }
 }
 

@@ -22,12 +22,21 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
 #ifdef __APPLE__
 #include <sys/types.h>
 #include <sys/sysctl.h>
+#endif
+
+#ifdef __linux__
+#include <pthread.h>
+#include <sched.h>
 #endif
 
 
@@ -872,6 +881,9 @@ struct ggml_backend_sched {
 
     // delphi: copy the inputs of a split in the graph order of their producers (GGML_SCHED_INPUT_ORDER=0 disables)
     bool input_order;
+
+    // delphi: staging ring for host weights that splits copy whole to a device (GGML_SCHED_STAGE=1), NULL when off
+    struct ggml_backend_sched_stage * stage;
 
     int debug;
 
@@ -2474,6 +2486,555 @@ static bool ggml_backend_sched_splits_share_memory(ggml_backend_sched_t sched, i
            ggml_backend_supports_buft(sched->backends[backend_a], sched->bufts[backend_b]);
 }
 
+// delphi: staging ring (GGML_SCHED_STAGE=1).
+//
+// A host weight that a split copies whole to a device (an offloaded expert tensor in a wide prefill batch) is
+// otherwise copied when the host reaches that split, in the order of the compute stream, so the link and the device
+// take turns, and a pageable copy also blocks the host thread. The ring instead uploads these weights ahead, in split
+// order, into a few device slots. A staging thread copies each weight in chunks into pinned host bounce buffers with
+// several memcpy threads, and the device copies each chunk into the slot on its own copy stream. When the host
+// reaches the split, the compute stream waits for the upload and copies the slot into the split input, which the
+// allocator placed in the compute buffer as usual.
+//
+// Invariants:
+// - A slot is uploaded again only after the device-to-device copy that read its previous content has completed: the
+//   staging thread waits for its record on the compute stream. A wait on an event that has no record yet would not
+//   order anything, so the job that waits is queued only after the record (busy is cleared together with it).
+// - The compute stream waits for the done event of a slot only after the staging thread has recorded it for this
+//   upload (issued), for the same reason.
+// - A bounce buffer is refilled only after the host has synchronized with the copy that read it.
+// - The split input is written only by the device-to-device copy on the compute stream of its split, at the point
+//   where the old copy path wrote it, so allocator reuse of the compute buffer keeps the same ordering.
+// - The uploads read the weights, which nothing writes while graphs run.
+#define GGML_SCHED_STAGE_MAX_SLOTS  16
+#define GGML_SCHED_STAGE_MAX_BOUNCE 16
+#define GGML_SCHED_STAGE_MIN_BYTES  (1u << 20)
+
+// the CPUs next to a PCI device, from sysfs; empty if unknown
+static std::vector<int> ggml_backend_sched_stage_local_cpus(const char * pci_id) {
+    std::vector<int> cpus;
+#ifdef __linux__
+    if (pci_id == nullptr) {
+        return cpus;
+    }
+    char path[256];
+    snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/local_cpulist", pci_id);
+    FILE * f = fopen(path, "r");
+    if (f == nullptr) {
+        return cpus;
+    }
+    int first, last;
+    char sep;
+    while (fscanf(f, "%d", &first) == 1) {
+        last = first;
+        sep = (char) fgetc(f);
+        if (sep == '-') {
+            if (fscanf(f, "%d", &last) != 1) {
+                break;
+            }
+            sep = (char) fgetc(f);
+        }
+        for (int c = first; c <= last && c < CPU_SETSIZE; c++) {
+            cpus.push_back(c);
+        }
+        if (sep != ',') {
+            break;
+        }
+    }
+    fclose(f);
+#else
+    GGML_UNUSED(pci_id);
+#endif
+    return cpus;
+}
+
+static void ggml_backend_sched_stage_pin(const std::vector<int> & cpus) {
+#ifdef __linux__
+    if (cpus.empty()) {
+        return;
+    }
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    for (int c : cpus) {
+        CPU_SET(c, &set);
+    }
+    pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+#else
+    GGML_UNUSED(cpus);
+#endif
+}
+
+// splits a memcpy over the calling thread and n - 1 helper threads
+struct ggml_backend_sched_stage_copier {
+    std::vector<std::thread> threads;
+    std::mutex mutex;
+    std::condition_variable cv_start;
+    std::condition_variable cv_done;
+    uint64_t generation = 0;
+    int pending = 0;
+    bool stop = false;
+    char * dst = nullptr;
+    const char * src = nullptr;
+    size_t size = 0;
+    int n = 1;
+
+    void part(int i) {
+        const size_t begin = (size/n*i) & ~(size_t) 63;
+        const size_t end   = i == n - 1 ? size : (size/n*(i + 1)) & ~(size_t) 63;
+        if (end > begin) {
+            memcpy(dst + begin, src + begin, end - begin);
+        }
+    }
+
+    void start(int n_threads, const std::vector<int> & cpus) {
+        n = std::max(1, n_threads);
+        for (int i = 1; i < n; i++) {
+            threads.emplace_back([this, i, cpus] {
+                ggml_backend_sched_stage_pin(cpus);
+                uint64_t seen = 0;
+                for (;;) {
+                    {
+                        std::unique_lock<std::mutex> lock(mutex);
+                        cv_start.wait(lock, [&] { return stop || generation != seen; });
+                        if (stop) {
+                            return;
+                        }
+                        seen = generation;
+                    }
+                    part(i);
+                    std::lock_guard<std::mutex> lock(mutex);
+                    if (--pending == 0) {
+                        cv_done.notify_one();
+                    }
+                }
+            });
+        }
+    }
+
+    void copy(void * d, const void * s, size_t sz) {
+        if (n == 1 || sz < (4u << 20)) {
+            memcpy(d, s, sz);
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            dst = (char *) d;
+            src = (const char *) s;
+            size = sz;
+            pending = n - 1;
+            generation++;
+        }
+        cv_start.notify_all();
+        part(0);
+        std::unique_lock<std::mutex> lock(mutex);
+        cv_done.wait(lock, [&] { return pending == 0; });
+    }
+
+    ~ggml_backend_sched_stage_copier() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stop = true;
+        }
+        cv_start.notify_all();
+        for (auto & t : threads) {
+            t.join();
+        }
+    }
+};
+
+struct ggml_backend_sched_stage_item {
+    struct ggml_tensor * input;     // host weight
+    struct ggml_tensor * input_cpy; // its split input on the split backend
+    int split_id;
+    int backend_id;
+    int slot;                       // -1 until queued
+    uint64_t seq;                   // job number of the upload
+};
+
+struct ggml_backend_sched_stage_job {
+    int backend_id;
+    int slot;
+    bool wait_free;
+    const void * src;
+    size_t size;
+};
+
+struct ggml_backend_sched_stage_ring {
+    ggml_backend_stage_upload_t upload = nullptr;
+    ggml_backend_stage_d2d_t    d2d    = nullptr;
+    ggml_backend_buffer_t buffers[GGML_SCHED_STAGE_MAX_SLOTS] = {};
+    ggml_backend_event_t  done[GGML_SCHED_STAGE_MAX_SLOTS]    = {}; // upload finished, recorded on the copy stream
+    ggml_backend_event_t  free[GGML_SCHED_STAGE_MAX_SLOTS]    = {}; // slot read, recorded on the compute stream
+    bool busy[GGML_SCHED_STAGE_MAX_SLOTS]          = {};            // queued, and the read is not recorded yet
+    bool free_recorded[GGML_SCHED_STAGE_MAX_SLOTS] = {};
+    size_t slot_size = 0;
+    int next = 0;
+
+    // pinned host bounce buffers, used by the staging thread only; bounce == nullptr uploads from the weight directly
+    ggml_backend_buffer_t bounce = nullptr;
+    ggml_backend_event_t  chunk_ev[GGML_SCHED_STAGE_MAX_BOUNCE]  = {};
+    ggml_backend_event_t  bounce_ev[GGML_SCHED_STAGE_MAX_BOUNCE] = {}; // last copy that reads the bounce buffer
+    int bounce_next = 0;
+};
+
+struct ggml_backend_sched_stage {
+    bool enabled = true;
+    int  n_slots = 4;
+    int  n_bounce = 4;
+    size_t chunk_size = 64u << 20;
+    bool use_bounce = true;
+    std::vector<ggml_backend_sched_stage_item> items; // staged inputs of the current graph, in split order
+    size_t n_queued   = 0;
+    size_t n_consumed = 0;
+    ggml_backend_sched_stage_ring rings[GGML_SCHED_MAX_BACKENDS];
+    ggml_backend_t backends[GGML_SCHED_MAX_BACKENDS] = {};
+
+    // staging thread
+    std::thread worker;
+    std::mutex mutex;
+    std::condition_variable cv_job;
+    std::condition_variable cv_issued;
+    std::deque<ggml_backend_sched_stage_job> jobs;
+    uint64_t n_pushed = 0; // jobs queued since the start
+    uint64_t n_issued = 0; // jobs whose copies and done record are queued on the device
+    bool stop = false;
+    ggml_backend_sched_stage_copier copier;
+    std::vector<int> cpus; // the staging threads run here: the CPUs next to every staging device, if they share them
+};
+
+static void ggml_backend_sched_stage_run_job(ggml_backend_sched_stage * stage, const ggml_backend_sched_stage_job & job) {
+    ggml_backend_sched_stage_ring & ring = stage->rings[job.backend_id];
+    ggml_backend_t backend = stage->backends[job.backend_id];
+    if (job.wait_free) {
+        // a host wait: HIP rejects a copy stream wait on an event of the compute stream while that stream captures
+        ggml_backend_event_synchronize(ring.free[job.slot]);
+    }
+    char * dst = (char *) ggml_backend_buffer_get_base(ring.buffers[job.slot]);
+    if (ring.bounce == nullptr) {
+        ring.upload(backend, dst, job.src, job.size, ring.done[job.slot]);
+        return;
+    }
+    char * bounce = (char *) ggml_backend_buffer_get_base(ring.bounce);
+    for (size_t off = 0; off < job.size; off += stage->chunk_size) {
+        const size_t n = std::min(stage->chunk_size, job.size - off);
+        const int c = ring.bounce_next;
+        ring.bounce_next = (c + 1) % stage->n_bounce;
+        if (ring.bounce_ev[c] != nullptr) {
+            ggml_backend_event_synchronize(ring.bounce_ev[c]);
+        }
+        stage->copier.copy(bounce + c*stage->chunk_size, (const char *) job.src + off, n);
+        ggml_backend_event_t ev = off + n >= job.size ? ring.done[job.slot] : ring.chunk_ev[c];
+        ring.upload(backend, dst + off, bounce + c*stage->chunk_size, n, ev);
+        ring.bounce_ev[c] = ev;
+    }
+}
+
+static void ggml_backend_sched_stage_worker(ggml_backend_sched_stage * stage) {
+    ggml_backend_sched_stage_pin(stage->cpus);
+    for (;;) {
+        ggml_backend_sched_stage_job job;
+        {
+            std::unique_lock<std::mutex> lock(stage->mutex);
+            stage->cv_job.wait(lock, [&] { return stage->stop || !stage->jobs.empty(); });
+            if (stage->jobs.empty()) {
+                return;
+            }
+            job = stage->jobs.front();
+            stage->jobs.pop_front();
+        }
+        ggml_backend_sched_stage_run_job(stage, job);
+        {
+            std::lock_guard<std::mutex> lock(stage->mutex);
+            stage->n_issued++;
+        }
+        stage->cv_issued.notify_all();
+    }
+}
+
+// wait until the staging thread has queued the copies of job seq on the device
+static void ggml_backend_sched_stage_wait_issued(ggml_backend_sched_stage * stage, uint64_t seq) {
+    std::unique_lock<std::mutex> lock(stage->mutex);
+    stage->cv_issued.wait(lock, [&] { return stage->n_issued > seq; });
+}
+
+static ggml_backend_sched_stage * ggml_backend_sched_stage_new(ggml_backend_sched_t sched) {
+    const char * env = getenv("GGML_SCHED_STAGE");
+    if (env == nullptr || atoi(env) == 0) {
+        return nullptr;
+    }
+    auto * stage = new ggml_backend_sched_stage;
+    if (const char * e = getenv("GGML_SCHED_STAGE_SLOTS")) {
+        stage->n_slots = std::max(1, std::min(GGML_SCHED_STAGE_MAX_SLOTS, atoi(e)));
+    }
+    if (const char * e = getenv("GGML_SCHED_STAGE_BOUNCE")) {
+        stage->n_bounce = std::min(GGML_SCHED_STAGE_MAX_BOUNCE, atoi(e));
+        stage->use_bounce = stage->n_bounce > 0;
+        stage->n_bounce = std::max(2, stage->n_bounce);
+    }
+    if (const char * e = getenv("GGML_SCHED_STAGE_CHUNK_MB")) {
+        stage->chunk_size = (size_t) std::max(1, atoi(e)) << 20;
+    }
+    int n_threads = 8;
+    if (const char * e = getenv("GGML_SCHED_STAGE_THREADS")) {
+        n_threads = std::max(1, atoi(e));
+    }
+    // run the staging threads next to the device: left to the scheduler, they land on both sockets of a NUMA host,
+    // and filling the bounce buffers ran at 26 GB/s instead of 35 GB/s, below the PCIe 5.0 x16 link rate
+    bool pin_ok = true;
+    if (const char * e = getenv("GGML_SCHED_STAGE_PIN")) {
+        pin_ok = atoi(e) != 0;
+    }
+    bool any = false;
+    for (int b = 0; b < sched->n_backends; b++) {
+        stage->backends[b] = sched->backends[b];
+        ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[b]);
+        if (dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            continue;
+        }
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        ggml_backend_sched_stage_ring & ring = stage->rings[b];
+        ring.upload = (ggml_backend_stage_upload_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_stage_upload");
+        ring.d2d    = (ggml_backend_stage_d2d_t)    ggml_backend_reg_get_proc_address(reg, "ggml_backend_stage_d2d");
+        if (ring.upload == nullptr || ring.d2d == nullptr) {
+            ring.upload = nullptr;
+            continue;
+        }
+        ggml_backend_dev_props props = {};
+        ggml_backend_dev_get_props(dev, &props);
+        std::vector<int> cpus = ggml_backend_sched_stage_local_cpus(props.device_id);
+        pin_ok = pin_ok && !cpus.empty() && (!any || cpus == stage->cpus);
+        stage->cpus = cpus;
+        any = true;
+    }
+    if (!pin_ok || !any) {
+        stage->cpus.clear();
+    }
+    if (!any) {
+        GGML_LOG_WARN("%s: GGML_SCHED_STAGE=1, but no backend supports staging\n", __func__);
+        stage->enabled = false;
+    }
+    if (stage->enabled && stage->use_bounce) {
+        stage->copier.start(n_threads, stage->cpus);
+    }
+    stage->worker = std::thread(ggml_backend_sched_stage_worker, stage);
+    return stage;
+}
+
+// wait until the staging thread has queued every job on the device
+static void ggml_backend_sched_stage_drain(ggml_backend_sched_stage * stage) {
+    std::unique_lock<std::mutex> lock(stage->mutex);
+    stage->cv_issued.wait(lock, [&] { return stage->n_issued == stage->n_pushed; });
+}
+
+static void ggml_backend_sched_stage_release_ring(ggml_backend_sched_stage_ring & ring) {
+    for (int s = 0; s < GGML_SCHED_STAGE_MAX_SLOTS; s++) {
+        if (ring.done[s] != nullptr) {
+            ggml_backend_event_synchronize(ring.done[s]);
+        }
+        if (ring.free[s] != nullptr && ring.free_recorded[s]) {
+            ggml_backend_event_synchronize(ring.free[s]);
+        }
+        ggml_backend_buffer_free(ring.buffers[s]);
+        ring.buffers[s] = nullptr;
+        ring.busy[s] = false;
+        ring.free_recorded[s] = false;
+    }
+    for (int c = 0; c < GGML_SCHED_STAGE_MAX_BOUNCE; c++) {
+        if (ring.bounce_ev[c] != nullptr) {
+            ggml_backend_event_synchronize(ring.bounce_ev[c]);
+        }
+        ring.bounce_ev[c] = nullptr;
+    }
+    ggml_backend_buffer_free(ring.bounce);
+    ring.bounce = nullptr;
+    ring.bounce_next = 0;
+    ring.slot_size = 0;
+    ring.next = 0;
+}
+
+static void ggml_backend_sched_stage_free(ggml_backend_sched_stage * stage) {
+    if (stage == nullptr) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(stage->mutex);
+        stage->stop = true;
+    }
+    stage->cv_job.notify_all();
+    stage->worker.join();
+    for (auto & ring : stage->rings) {
+        ggml_backend_sched_stage_release_ring(ring);
+        for (int s = 0; s < GGML_SCHED_STAGE_MAX_SLOTS; s++) {
+            ggml_backend_event_free(ring.done[s]);
+            ggml_backend_event_free(ring.free[s]);
+        }
+        for (int c = 0; c < GGML_SCHED_STAGE_MAX_BOUNCE; c++) {
+            ggml_backend_event_free(ring.chunk_ev[c]);
+        }
+    }
+    delete stage;
+}
+
+// the host weights of a split that the copy loop would copy whole to the split backend
+static bool ggml_backend_sched_stage_eligible(
+        ggml_backend_sched_t sched, const struct ggml_backend_sched_split * split,
+        const struct ggml_tensor * input, const struct ggml_tensor * input_cpy) {
+    if ((input->flags & GGML_TENSOR_FLAG_INPUT) || input->buffer == nullptr ||
+            ggml_backend_buffer_get_usage(input->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
+            !ggml_backend_buffer_is_host(input->buffer) || ggml_nbytes(input) < GGML_SCHED_STAGE_MIN_BYTES ||
+            sched->stage->rings[split->backend_id].upload == nullptr) {
+        return false;
+    }
+    const struct ggml_tensor * node = split->graph.n_nodes > 0 ? split->graph.nodes[0] : nullptr;
+    if (node != nullptr && node->op == GGML_OP_MUL_MAT_ID && node->src[0] == input_cpy) {
+        // the copy loop copies only the used experts when it expects some experts to stay unused
+        const struct ggml_tensor * ids = node->src[2];
+        return ggml_offload_cost_expected_active_experts(input->ne[2], ids->ne[1], ids->ne[0]) >= input->ne[2] - 0.5;
+    }
+    return true;
+}
+
+// queue uploads for the next items while their slots are free
+static void ggml_backend_sched_stage_pump(ggml_backend_sched_t sched) {
+    ggml_backend_sched_stage * stage = sched->stage;
+    bool pushed = false;
+    while (stage->n_queued < stage->items.size()) {
+        ggml_backend_sched_stage_item & item = stage->items[stage->n_queued];
+        ggml_backend_sched_stage_ring & ring = stage->rings[item.backend_id];
+        const int slot = ring.next;
+        if (ring.busy[slot]) {
+            break;
+        }
+        {
+            std::lock_guard<std::mutex> lock(stage->mutex);
+            stage->jobs.push_back({ item.backend_id, slot, ring.free_recorded[slot], item.input->data, ggml_nbytes(item.input) });
+            item.seq = stage->n_pushed++;
+        }
+        ring.busy[slot] = true;
+        ring.next = (slot + 1) % stage->n_slots;
+        item.slot = slot;
+        stage->n_queued++;
+        pushed = true;
+    }
+    if (pushed) {
+        stage->cv_job.notify_one();
+    }
+}
+
+// collect the staged inputs of the graph, size the rings and queue the first uploads
+static void ggml_backend_sched_stage_begin(ggml_backend_sched_t sched) {
+    ggml_backend_sched_stage * stage = sched->stage;
+    // an interrupted graph can leave jobs behind; let them reach the device before the slots are reused
+    ggml_backend_sched_stage_drain(stage);
+    stage->items.clear();
+    stage->n_queued = 0;
+    stage->n_consumed = 0;
+    if (!stage->enabled) {
+        return;
+    }
+
+    size_t need[GGML_SCHED_MAX_BACKENDS] = { 0 };
+    for (int split_id = 0; split_id < sched->n_splits; split_id++) {
+        const struct ggml_backend_sched_split * split = &sched->splits[split_id];
+        for (int i = 0; i < split->n_inputs; i++) {
+            struct ggml_tensor * input = split->inputs[i];
+            struct ggml_tensor * input_cpy = sched_hv_copy(sched, input, split->backend_id, sched->cur_copy);
+            if (!ggml_backend_sched_stage_eligible(sched, split, input, input_cpy)) {
+                continue;
+            }
+            stage->items.push_back({ input, input_cpy, split_id, split->backend_id, -1, 0 });
+            need[split->backend_id] = std::max(need[split->backend_id], ggml_nbytes(input));
+        }
+    }
+
+    for (int b = 0; b < sched->n_backends; b++) {
+        ggml_backend_sched_stage_ring & ring = stage->rings[b];
+        // the uploads of interrupted items still complete in copy stream order before any later one
+        for (int s = 0; s < stage->n_slots; s++) {
+            ring.busy[s] = false;
+        }
+        if (need[b] <= ring.slot_size) {
+            continue;
+        }
+        ggml_backend_sched_stage_release_ring(ring);
+        ggml_backend_t backend = sched->backends[b];
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend);
+        bool ok = true;
+        for (int s = 0; s < stage->n_slots && ok; s++) {
+            ring.buffers[s] = ggml_backend_buft_alloc_buffer(buft, need[b]);
+            ok = ring.buffers[s] != nullptr;
+            if (ok && ring.done[s] == nullptr) {
+                ring.done[s] = ggml_backend_event_new(dev);
+                ring.free[s] = ggml_backend_event_new(dev);
+                ok = ring.done[s] != nullptr && ring.free[s] != nullptr;
+            }
+        }
+        if (!ok) {
+            ggml_backend_sched_stage_release_ring(ring);
+            GGML_LOG_WARN("%s: staging disabled: cannot allocate %d slots of %.1f MiB on %s\n", __func__,
+                    stage->n_slots, need[b]/1048576.0, ggml_backend_name(backend));
+            stage->enabled = false;
+            stage->items.clear();
+            return;
+        }
+        ring.slot_size = need[b];
+
+        ggml_backend_buffer_type_t host_buft = stage->use_bounce ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+        if (host_buft != nullptr) {
+            ring.bounce = ggml_backend_buft_alloc_buffer(host_buft, stage->n_bounce*stage->chunk_size);
+            for (int c = 0; ring.bounce != nullptr && c < stage->n_bounce; c++) {
+                if (ring.chunk_ev[c] == nullptr) {
+                    ring.chunk_ev[c] = ggml_backend_event_new(dev);
+                }
+                if (ring.chunk_ev[c] == nullptr) {
+                    ggml_backend_buffer_free(ring.bounce);
+                    ring.bounce = nullptr;
+                }
+            }
+        }
+        GGML_LOG_INFO("%s: staging ring on %s: %d slots of %.1f MiB, %s\n", __func__, ggml_backend_name(backend),
+                stage->n_slots, need[b]/1048576.0, ring.bounce != nullptr ? "pinned bounce buffers" : "direct uploads");
+    }
+
+    ggml_backend_sched_stage_pump(sched);
+}
+
+// copy a staged input into its split input on the compute stream; false if the input is not staged
+static bool ggml_backend_sched_stage_consume(
+        ggml_backend_sched_t sched, int split_id, ggml_backend_t split_backend, struct ggml_tensor * input_cpy) {
+    ggml_backend_sched_stage * stage = sched->stage;
+    if (stage == nullptr) {
+        return false;
+    }
+    size_t k = stage->n_consumed;
+    while (k < stage->items.size() && stage->items[k].split_id == split_id && stage->items[k].input_cpy != input_cpy) {
+        k++;
+    }
+    if (k >= stage->items.size() || stage->items[k].split_id != split_id) {
+        return false;
+    }
+    // the inputs of a split are copied in order, so earlier items of this split are consumed already
+    GGML_ASSERT(k == stage->n_consumed && "staging: split inputs consumed out of order");
+    if (stage->items[k].slot < 0) {
+        // the item waits for a slot that an earlier input of this split read, which is free now
+        GGML_ASSERT(stage->n_queued == k && "staging: ring stalled");
+        ggml_backend_sched_stage_pump(sched);
+        GGML_ASSERT(stage->items[k].slot >= 0 && "staging: ring stalled");
+    }
+    const ggml_backend_sched_stage_item & item = stage->items[k];
+    ggml_backend_sched_stage_ring & ring = stage->rings[item.backend_id];
+    ggml_backend_sched_stage_wait_issued(stage, item.seq);
+    ggml_backend_event_wait(split_backend, ring.done[item.slot]);
+    ring.d2d(split_backend, input_cpy->data, ggml_backend_buffer_get_base(ring.buffers[item.slot]), ggml_nbytes(item.input));
+    ggml_backend_event_record(ring.free[item.slot], split_backend);
+    ring.free_recorded[item.slot] = true;
+    ring.busy[item.slot] = false;
+    stage->n_consumed++;
+    ggml_backend_sched_stage_pump(sched);
+    return true;
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     bool backends_idle = sched->backends_idle;
@@ -2493,6 +3054,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     // of this graph needs to wait for it again. Waiting again would wait for the earlier splits of this graph on b,
     // which with pipeline parallelism sit behind the previous ubatch, and would serialize the ubatches.
     bool copy_slot_free[GGML_SCHED_MAX_BACKENDS] = { false };
+
+    if (sched->stage != nullptr) {
+        ggml_backend_sched_stage_begin(sched);
+    }
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
@@ -2570,6 +3135,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         sched, body_start, GGML_EXEC_TRACE_EVENT_COPY_BODY, copy_path,
                         split_id, input_backend_id, split_backend_id,
                         input_node_id, input_cpy_node_id, copy_bytes);
+            } else if (ggml_backend_sched_stage_consume(sched, split_id, split_backend, input_cpy)) {
+                // uploaded ahead by the staging ring; the device-to-device copy is ordered on the compute stream
             } else {
                 // wait for the split backend to finish using the input before overwriting it
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
@@ -2932,6 +3499,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
     sched->op_offload = op_offload;
+    sched->stage = ggml_backend_sched_stage_new(sched);
     sched->backends_idle = true;
 
     ggml_backend_sched_reset(sched);
@@ -2948,6 +3516,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
             ggml_backend_event_free(sched->events[b][c]);
         }
     }
+    ggml_backend_sched_stage_free(sched->stage);
     ggml_gallocr_free(sched->galloc);
     ggml_free(sched->ctx);
     ggml_hash_set_free(&sched->hash_set);

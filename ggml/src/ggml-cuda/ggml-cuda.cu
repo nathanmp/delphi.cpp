@@ -736,6 +736,10 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
+    if (stage_stream != nullptr) {
+        CUDA_CHECK(cudaStreamSynchronize(stage_stream));
+        CUDA_CHECK(cudaStreamDestroy(stage_stream));
+    }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
@@ -6379,8 +6383,37 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+// delphi: staging ring hooks of ggml_backend_sched (GGML_SCHED_STAGE). The uploads run on their own stream so that
+// they overlap the compute stream; events order the two streams.
+static cudaStream_t ggml_backend_cuda_stage_stream(ggml_backend_cuda_context * cuda_ctx) {
+    if (cuda_ctx->stage_stream == nullptr) {
+        CUDA_CHECK(cudaStreamCreateWithFlags(&cuda_ctx->stage_stream, cudaStreamNonBlocking));
+    }
+    return cuda_ctx->stage_stream;
+}
+
+static void ggml_backend_cuda_stage_upload(ggml_backend_t backend, void * dst, const void * src, size_t size, ggml_backend_event_t done) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    cudaStream_t stream = ggml_backend_cuda_stage_stream(cuda_ctx);
+    CUDA_CHECK(cudaMemcpyAsync(dst, src, size, cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaEventRecord((cudaEvent_t) done->context, stream));
+}
+
+static void ggml_backend_cuda_stage_d2d(ggml_backend_t backend, void * dst, const void * src, size_t size) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    CUDA_CHECK(cudaMemcpyAsync(dst, src, size, cudaMemcpyDeviceToDevice, cuda_ctx->stream()));
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_stage_upload") == 0) {
+        return (void *) ggml_backend_cuda_stage_upload;
+    }
+    if (strcmp(name, "ggml_backend_stage_d2d") == 0) {
+        return (void *) ggml_backend_cuda_stage_d2d;
+    }
     if (strcmp(name, "ggml_backend_get_op_cost") == 0) {
         return (void *) ggml_backend_cuda_get_op_cost;
     }

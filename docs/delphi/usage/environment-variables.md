@@ -34,6 +34,27 @@ What each default does:
 
 Validation used a layer split over three NVIDIA GPUs on narrow PCIe links without peer access, with multi-token prediction. Prompt processing rose by 15-29% at `-ub 2048` and by up to 52% with several ubatches per batch. Generation speed and outputs were unchanged. Most of the ub2048 gain comes from the view alias, because each device hand-off moves half as many bytes. The two wait changes and the input order matter when a server batch holds several ubatches: switching all three back cost 25% of prompt throughput at `-ub 512`.
 
+## Weight streaming (staging ring)
+
+With routed experts in host memory (`-cmoe`, `-ncmoe`, `--numa tensors`), a wide prompt batch can run the expert matrix multiplications on the GPU: the scheduler copies each expert tensor to the device when it reaches the split that uses it (op offload). That copy runs in turn with the device's computation, and a copy from ordinary (pageable) host memory also blocks the scheduler thread at well below the PCIe rate.
+
+| variable | default | effect |
+| --- | --- | --- |
+| `GGML_SCHED_STAGE` | `0` | `1` uploads offloaded host weights ahead of the splits that use them |
+| `GGML_SCHED_STAGE_SLOTS` | `4` | device slots, each the size of the largest staged tensor; more slots run further ahead and use more VRAM |
+| `GGML_SCHED_STAGE_BOUNCE` | `4` | pinned host bounce buffers; `0` uploads from the weights directly (pageable) |
+| `GGML_SCHED_STAGE_CHUNK_MB` | `64` | size of each bounce buffer |
+| `GGML_SCHED_STAGE_THREADS` | `8` | memcpy threads that fill the bounce buffers |
+| `GGML_SCHED_STAGE_PIN` | `1` | run the staging threads on the CPUs next to the device (Linux; skipped when staging devices sit on different nodes) |
+
+At the start of each graph, the scheduler lists the host weights that its splits will copy whole, in split order. A background thread copies them in chunks into pinned host buffers, and the device copies each chunk into a slot on a separate stream, so the uploads of later layers overlap the computation of earlier ones. When the scheduler reaches the split, the device copies the slot into the split input. Expert tensors are staged only when the batch is wide enough that nearly every expert is used; for narrower batches the scheduler keeps copying only the used experts, and decode is unaffected. Supported on CUDA and ROCm devices.
+
+Each slot takes VRAM equal to the largest staged tensor (1.4 GiB for DeepSeek V4.1 Flash at Q2_K). If the slots cannot be allocated, staging turns itself off with a warning. Staging does not change what is computed, so outputs are identical with it on or off.
+
+The offload cost model (or `GGML_OP_OFFLOAD_MIN_BATCH`) still decides whether the experts are offloaded at all, so staging matters only on a fast host link. Measured with DeepSeek V4.1 Flash (routed experts at Q2_K in host memory) on one Radeon AI PRO R9700 on PCIe 4.0 x16 at `-ub 2048`: a real-text prompt went from 84.5 to 134 tokens/s, random tokens (llama-bench pp4096) from 92 to 125 tokens/s, and decode was unchanged. On a PCIe 4.0 x2 link, the cost model keeps the experts on the CPU.
+
+Every ubatch uploads all staged weights once, so the link sets a floor per token of (staged bytes) / (link rate × ubatch size): for DeepSeek V4.1 Flash, about 3.1 ms/token at `-ub 2048` and 1.6 ms/token at `-ub 4096`. A larger ubatch therefore pays off for long prompts, as long as its compute buffer fits. With the later kernel work on the same card, real-text prefill reached 255 tokens/s at `-ub 2048` and 484-489 tokens/s at `-ub 4096`. At `-ub 4096`, three slots ran as fast as four and used 1.4 GiB less VRAM (two slots lost 25%), so `GGML_SCHED_STAGE_SLOTS=3` is a good choice when VRAM is tight, for example next to a draft model. On a dual-socket EPYC 7532 host, pinning the staging threads next to the GPU raised the bounce-buffer fill rate from 26 to 35 GB/s and prefill from 468 to 494 tokens/s at `-ub 4096` (11.4k-token prompt); `GGML_SCHED_STAGE_THREADS=4` added a little more (508 tokens/s).
+
 ## CUDA routed MoE (NVIDIA Ampere and newer)
 
 These variables choose how routed-expert matrix multiplications (`MUL_MAT_ID`) run on NVIDIA GPUs of compute capability 8.0 and newer. Other devices, including ROCm, always use the standard path and ignore them.

@@ -506,6 +506,7 @@ struct llama_mmap::impl {
             advise(range.first, range.second, POSIX_MADV_RANDOM, "POSIX_MADV_RANDOM");
         }
         if (numa) {
+            numa_random = true;
             if (posix_madvise(addr, file->size(), POSIX_MADV_RANDOM)) {
                 LLAMA_LOG_WARN("warning: posix_madvise(.., POSIX_MADV_RANDOM) failed: %s\n",
                         strerror(errno));
@@ -526,6 +527,20 @@ struct llama_mmap::impl {
             *last = *first;
         }
     }
+
+    void read_sequential(size_t first, size_t last) {
+        if (!numa_random) {
+            return;
+        }
+        const size_t page_size = sysconf(_SC_PAGESIZE);
+        first = first & ~(page_size - 1);
+        last  = std::min((last + page_size - 1) & ~(page_size - 1), size);
+        if (first < last && posix_madvise((char *) addr + first, last - first, POSIX_MADV_NORMAL)) {
+            LLAMA_LOG_WARN("warning: posix_madvise(.., POSIX_MADV_NORMAL) failed: %s\n", strerror(errno));
+        }
+    }
+
+    bool numa_random = false;
 
     void unmap_fragment(size_t first, size_t last) {
         int page_size = sysconf(_SC_PAGESIZE);
@@ -627,6 +642,11 @@ struct llama_mmap::impl {
         GGML_UNUSED(last);
     }
 
+    void read_sequential(size_t first, size_t last) {
+        GGML_UNUSED(first);
+        GGML_UNUSED(last);
+    }
+
     ~impl() {
         if (hMapping) {
             if (addr) {
@@ -657,6 +677,11 @@ struct llama_mmap::impl {
 
         throw std::runtime_error("mmap not supported");
     }
+
+    void read_sequential(size_t first, size_t last) {
+        GGML_UNUSED(first);
+        GGML_UNUSED(last);
+    }
 #endif
 
     void * addr;
@@ -671,6 +696,7 @@ size_t llama_mmap::size() const { return pimpl->size; }
 void * llama_mmap::addr() const { return pimpl->addr; }
 
 void llama_mmap::unmap_fragment(size_t first, size_t last) { pimpl->unmap_fragment(first, last); }
+void llama_mmap::read_sequential(size_t first, size_t last) { pimpl->read_sequential(first, last); }
 
 #if defined(_POSIX_MEMLOCK_RANGE) || defined(_WIN32)
 const bool llama_mmap::SUPPORTED  = true;
