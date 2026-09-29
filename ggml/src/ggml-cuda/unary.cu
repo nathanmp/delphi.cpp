@@ -154,6 +154,61 @@ void ggml_cuda_op_unary(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     }
 }
 
+// delphi: fused GGML_OP_SCALE + GGML_UNARY_OP_SIGMOID/SILU [+ GGML_OP_SCALE]. Each step evaluates the same fp32
+// expression as its separate kernel, so the result does not change.
+template <float (*op)(float), bool post>
+static __global__ void scale_unary_kernel(const float * x, float * dst, const float s0, const float b0, const float s1,
+                                          const float b1, const int64_t k) {
+    ggml_cuda_pdl_lc();
+    const int64_t i = (int64_t) blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i >= k) {
+        return;
+    }
+
+    ggml_cuda_pdl_sync();
+    const float t = s0 * x[i] + b0;
+    float y = op(t);
+    if constexpr (post) {
+        y = s1 * y + b1;
+    }
+    dst[i] = y;
+}
+
+template <float (*op)(float)>
+static void scale_unary_cuda(const float * x, float * dst, const float s0, const float b0, const bool post, const float s1,
+                             const float b1, const int64_t k, cudaStream_t stream) {
+    const int64_t num_blocks = (k + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE;
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3) num_blocks, CUDA_NEG_BLOCK_SIZE, 0, stream);
+    if (post) {
+        ggml_cuda_kernel_launch(scale_unary_kernel<op, true>, launch_params, x, dst, s0, b0, s1, b1, k);
+    } else {
+        ggml_cuda_kernel_launch(scale_unary_kernel<op, false>, launch_params, x, dst, s0, b0, s1, b1, k);
+    }
+}
+
+void ggml_cuda_op_scale_unary(ggml_backend_cuda_context & ctx, ggml_tensor * scale, ggml_tensor * unary, ggml_tensor * scale2) {
+    const float * x = (const float *) scale->src[0]->data;
+    ggml_tensor * dst = scale2 != nullptr ? scale2 : unary;
+    const float s0 = ggml_get_op_params_f32(scale, 0);
+    const float b0 = ggml_get_op_params_f32(scale, 1);
+    const float s1 = scale2 != nullptr ? ggml_get_op_params_f32(scale2, 0) : 1.0f;
+    const float b1 = scale2 != nullptr ? ggml_get_op_params_f32(scale2, 1) : 0.0f;
+    const int64_t k = ggml_nelements(dst);
+    cudaStream_t stream = ctx.stream();
+
+    switch (ggml_get_unary_op(unary)) {
+        case GGML_UNARY_OP_SIGMOID:
+            scale_unary_cuda<op_sigmoid>(x, (float *) dst->data, s0, b0, scale2 != nullptr, s1, b1, k, stream);
+            break;
+        case GGML_UNARY_OP_SILU:
+            scale_unary_cuda<op_silu>(x, (float *) dst->data, s0, b0, scale2 != nullptr, s1, b1, k, stream);
+            break;
+        default:
+            GGML_ABORT("unsupported unary op for scale fusion");
+    }
+}
+
 void ggml_cuda_op_abs(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_op_unary<op_abs>(ctx, dst);
 }

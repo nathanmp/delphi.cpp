@@ -760,6 +760,80 @@ static __global__ void mul_mat_vec_q(
     const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
     const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
 
+#if defined(RDNA4)
+    // delphi: with a short K the loop below leaves most threads idle (K = 640 in Q5_0 is 40 work items for 256 threads).
+    // Give each warp one row instead and spread that row's items over the lanes; a warp reduction then replaces the
+    // shared-memory one. The inv kernels take the same path per column, so verify batches still match decode.
+    constexpr bool item_split = small_k && rows_per_cuda_block == nwarps && (ncols_dst == 1 || inv) && type != GGML_TYPE_NVFP4;
+    if constexpr (item_split) {
+        constexpr int items_per_block = qi/vdr;
+        const int i = threadIdx.y;
+        const int items = blocks_per_row_x * items_per_block;
+
+        float acc[ncols_dst] = { 0.0f };
+        [[maybe_unused]] float acc_gate[ncols_dst] = { 0.0f };
+        for (int it = threadIdx.x; it < items; it += warp_size) {
+            const int kbx = it / items_per_block;
+            const int kqs = vdr * (it % items_per_block);
+            const int kby = kbx * (qk/QK8_1);
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                acc[j] += mmvq_vec_dot<type>(vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, stride_row_x, kqs);
+                if constexpr (has_fusion) {
+                    if (use_gate) {
+                        acc_gate[j] += mmvq_vec_dot<type>(vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, stride_row_x, kqs);
+                    }
+                }
+            }
+        }
+
+        dst += sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row0;
+        const bool row_ok = uint32_t(row0 + i) < stride_col_dst;
+        [[maybe_unused]] const uint32_t bias_off = sample_dst*stride_sample_dst + (ids ? channel_x : channel_dst)*stride_channel_dst + row0 + i;
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            float result = warp_reduce_sum<warp_size>(acc[j]);
+            if constexpr (has_fusion) {
+                const float gate_sum = use_gate ? warp_reduce_sum<warp_size>(acc_gate[j]) : 0.0f;
+                if (threadIdx.x == 0 && row_ok) {
+                    if (use_bias) {
+                        result += ((const float *) fusion.x_bias)[bias_off + j*stride_col_dst];
+                    }
+                    if (use_gate) {
+                        float gate_value = gate_sum;
+                        if (use_gate_bias) {
+                            gate_value += ((const float *) fusion.gate_bias)[bias_off + j*stride_col_dst];
+                        }
+                        switch (active_glu) {
+                            case GGML_GLU_OP_SWIGLU:
+                                result *= ggml_cuda_op_silu_single(gate_value);
+                                break;
+                            case GGML_GLU_OP_GEGLU:
+                                result *= ggml_cuda_op_gelu_single(gate_value);
+                                break;
+                            case GGML_GLU_OP_SWIGLU_OAI:
+                                result = ggml_cuda_op_swiglu_oai_single(gate_value, result);
+                                break;
+                            case GGML_GLU_OP_SWIGLU_CLAMP:
+                                result = ggml_cuda_op_swiglu_clamp_single(gate_value, result, glu_limit);
+                                break;
+                            default:
+                                result = result * gate_value;
+                                break;
+                        }
+                    }
+                }
+            }
+            if (threadIdx.x == 0 && row_ok) {
+                dst[j*stride_col_dst + i] = result;
+            }
+        }
+        GGML_UNUSED_VARS(tmp, tmp_gate, x_biases, gate_biases, x_scales, gate_scales, use_scale, use_gate_scale, x_scale, gate_scale,
+                         gate_bias, x_bias, tid, blocks_per_iter, use_gate, use_bias, use_gate_bias, active_glu, glu_limit);
+        return;
+    }
+#endif // defined(RDNA4)
+
     for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
 
@@ -2269,12 +2343,18 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
-    {
+    const size_t  q8_1_bytes  = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
+    // delphi: several matrices often read the same activation (qkv/gate/alpha/beta, shared and routed experts)
+    char * src1_q8_1_ptr = nullptr;
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
+    if (!ctx.q8_1_cache_get(src1, q8_1_bytes, &src1_q8_1_ptr)) {
+        if (src1_q8_1_ptr == nullptr) {
+            src1_q8_1_ptr = src1_q8_1.alloc(q8_1_bytes);
+        }
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1_ptr, src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
     }
 
     const bool has_row_meta = ggml_row_meta_size(src0->type) != 0;
@@ -2302,13 +2382,13 @@ void ggml_cuda_mul_mat_vec_q(
 
     if (packed != GGML_CUDA_MOE_PACKED_NONE) {
         GGML_ASSERT(fusion_local.x_scale == nullptr && fusion_local.gate_scale == nullptr);
-        mul_mat_vec_q_packed_switch_fmt(packed, (const char *) src0->data, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00, ne01,
+        mul_mat_vec_q_packed_switch_fmt(packed, (const char *) src0->data, src1_q8_1_ptr, ids_d, fusion_local, dst_d, ne00, ne01,
             ncols_dst, stride_col_y, stride_col_dst, nchannels_y, nchannels_dst, nb02, stride_channel_y, stride_channel_dst, ids_stride, stream);
         return;
     }
 
     mul_mat_vec_q_switch_type(
-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
+        src0->data, src0->type, src1_q8_1_ptr, ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);

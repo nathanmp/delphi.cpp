@@ -43,6 +43,9 @@ void ggml_cuda_op_relu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_sigmoid(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
+// fused GGML_OP_SCALE + GGML_UNARY_OP_SIGMOID/SILU, with an optional trailing GGML_OP_SCALE (scale2 may be null)
+void ggml_cuda_op_scale_unary(ggml_backend_cuda_context & ctx, ggml_tensor * scale, ggml_tensor * unary, ggml_tensor * scale2);
+
 void ggml_cuda_op_hardsigmoid(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_exp(ggml_backend_cuda_context & ctx, ggml_tensor * dst);

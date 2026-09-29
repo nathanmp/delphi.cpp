@@ -3518,6 +3518,43 @@ struct test_softcap : public test_case {
     }
 };
 
+// GGML_OP_SCALE + GGML_UNARY_OP_SIGMOID/SILU [+ GGML_OP_SCALE] (fused on CUDA/HIP)
+struct test_scale_unary : public test_case {
+    const ggml_unary_op op;
+    const std::array<int64_t, 4> ne;
+    const float s0, b0;
+    const bool post;
+    const float s1, b1;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SCALE_UNARY";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR7(op, ne, s0, b0, post, s1, b1);
+    }
+
+    test_scale_unary(ggml_unary_op op = GGML_UNARY_OP_SIGMOID, std::array<int64_t, 4> ne = {10, 4, 3, 1},
+            float s0 = 0.25f, float b0 = 0.0f, bool post = true, float s1 = 2.0f, float b1 = 0.0f)
+        : op(op), ne(ne), s0(s0), b0(b0), post(post), s1(s1), b1(b1) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_name(a, "a");
+
+        ggml_tensor * out = ggml_unary(ctx, ggml_scale_bias(ctx, a, s0, b0), op);
+        if (post) {
+            out = ggml_scale_bias(ctx, out, s1, b1);
+        }
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // GGML_OP_SILU_BACK
 struct test_silu_back : public test_case {
     const ggml_type type;
@@ -10225,6 +10262,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_scale(GGML_TYPE_F32, {10, 10, 10, 10}, 2.0f, 1.0f, true)); // inplace test
     test_cases.emplace_back(new test_scale(GGML_TYPE_F32, {100, 10, 10, 10}, 2.0f, 1.0f));
     test_cases.emplace_back(new test_softcap(GGML_TYPE_F32, {10, 10, 10, 10}, 50.0f));
+    for (ggml_unary_op op : { GGML_UNARY_OP_SIGMOID, GGML_UNARY_OP_SILU }) {
+        for (bool post : { false, true }) {
+            test_cases.emplace_back(new test_scale_unary(op, {10, 4, 3, 1}, 0.25f, 0.0f, post, 2.0f, 0.0f));
+            test_cases.emplace_back(new test_scale_unary(op, {10240, 1, 1, 1}, 0.25f, 0.5f, post, 2.0f, -1.0f));
+            test_cases.emplace_back(new test_scale_unary(op, {4, 1, 1, 1}, 0.25f, 0.0f, post, 2.0f, 0.0f));
+        }
+    }
     test_cases.emplace_back(new test_silu_back());
 
     for (float eps : { 0.0f, 1e-6f, 1e-4f, 1e-1f, 10.f }) {
