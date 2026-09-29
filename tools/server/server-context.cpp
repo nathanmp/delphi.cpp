@@ -4086,6 +4086,7 @@ private:
                         }
 
                         // partial acceptance is not supported by the context -> truncate the draft and restore the state
+                        common_speculative_accept_partial(spec.get(), slot.id, accepted.size() - 1);
                         slot.spec_is_replay = true;
                         slot.spec_draft = std::move(accepted);
 
