@@ -230,7 +230,9 @@ void ggml_cuda_mul_mat_q(
     const int sis1 = nb12 / nb11;
 
     // delphi: the grouped schedule serves a broadcast src1, and a src1 packed as [ne10, n_expert_used, ne12], whose slot array is also the forward gather map.
-    const bool schedule_ok = dedup_bcast || (ne11 == n_expert_used && sis1 == n_expert_used);
+    // a partial MUL_MAT_ID skips ids outside [0, ne02): only mm_ids_helper and the plain MMQ path handle that
+    const bool partial     = ggml_mul_mat_id_is_partial(dst);
+    const bool schedule_ok = !partial && (dedup_bcast || (ne11 == n_expert_used && sis1 == n_expert_used));
     const bool grouped     = ggml_cuda_moe_grouped_select(ctx.device, src0->type, cc, ne12, schedule_ok);
 
     // delphi: grouped execution with packed weights (moe-packed.cuh). A packed-only type such as MXFP4 has no grouped MMQ case;
@@ -239,6 +241,12 @@ void ggml_cuda_mul_mat_q(
     const bool use_packed = packed != GGML_CUDA_MOE_PACKED_NONE;
     if (!use_packed) {
         ggml_cuda_moe_packed_check_not_inplace(src0);
+    }
+
+    if (partial) {
+        // skipped slots keep zero rows; the inverse map marks them -1, the forward map pads with row 0
+        CUDA_CHECK(cudaMemsetAsync(dst_d, 0, ggml_nbytes(dst), stream));
+        CUDA_CHECK(cudaMemsetAsync(ids_src1.get(), dedup_bcast ? 0xFF : 0, ne_get_rows*sizeof(int32_t), stream));
     }
 
     {

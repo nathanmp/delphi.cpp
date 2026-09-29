@@ -1522,6 +1522,14 @@ extern "C" {
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids);
 
+    // like ggml_mul_mat_id, but ids outside [0, as->ne[2]) are skipped and their result rows are zero
+    // this lets one set of expert ids drive several matmuls over disjoint views of the experts
+    GGML_API struct ggml_tensor * ggml_mul_mat_id_partial(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * as,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * ids);
+
     // A: m columns, n rows,
     // B: p columns, n rows,
     // result is m columns, p rows

@@ -1182,6 +1182,21 @@ struct llm_graph_context {
              ggml_tensor * down_exps_s = nullptr,
              ggml_tensor * selected_experts_in = nullptr) const;
 
+    // routed experts split between two devices (LLAMA_MOE_SPLIT), see build_moe_ffn
+    ggml_tensor * build_moe_ffn_split(
+             ggml_tensor * cur,
+             ggml_tensor * up_exps,
+             ggml_tensor * gate_exps,
+             ggml_tensor * down_exps,
+             ggml_tensor * selected_experts,
+             ggml_tensor * weights,
+                 int64_t   n_expert,
+                     int   il) const;
+
+    // names the nodes added to gf from node n0 on "attn_xs_*" (remote) or "attn_xa_*", which the graph callback pins to the
+    // split device or to the layer's device; views of allocated tensors (weights, caches) stay where their data is
+    void pin_split_nodes(int n0, bool remote, int il) const;
+
     //
     // inputs
     //

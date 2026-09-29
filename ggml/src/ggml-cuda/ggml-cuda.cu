@@ -1810,6 +1810,10 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
 
     GGML_ASSERT(ffn_up && ffn_gate && glu);
 
+    if (ggml_mul_mat_id_is_partial(ffn_up) || ggml_mul_mat_id_is_partial(ffn_gate)) {
+        return false;
+    }
+
     if (!is_mul_mat && !is_mul_mat_id) {
         return false;
     }
@@ -2054,6 +2058,12 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+
+    if (ggml_mul_mat_id_is_partial(dst)) {
+        // only the MMQ path skips the out-of-range ids of a partial MUL_MAT_ID (see supports_op)
+        ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
+        return;
+    }
 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
@@ -3486,7 +3496,8 @@ static bool ggml_cuda_match_moe_down_reduction(
     }
 
     const ggml_tensor * mmid = cgraph->nodes[node_idx];
-    if (mmid->op != GGML_OP_MUL_MAT_ID || mmid->type != GGML_TYPE_F32 || !ggml_is_contiguous(mmid)) {
+    if (mmid->op != GGML_OP_MUL_MAT_ID || mmid->type != GGML_TYPE_F32 || !ggml_is_contiguous(mmid) ||
+            ggml_mul_mat_id_is_partial(mmid)) {
         return false;
     }
 
@@ -5909,6 +5920,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 if (b->type == GGML_TYPE_F16 && a->type != GGML_TYPE_F16) {
                     return false;
                 }
+                if (ggml_mul_mat_id_is_partial(op) && (b->type != GGML_TYPE_F32 ||
+                        !ggml_cuda_should_use_mmq(a->type, ggml_cuda_info().devices[dev_ctx->device].cc, 1, a->ne[2]) ||
+                        ggml_cuda_moe_packed_inplace_fmt(a) != GGML_CUDA_MOE_PACKED_NONE)) {
+                    return false; // see ggml_cuda_mul_mat_id
+                }
 #ifdef GGML_USE_MUSA
                 const int cc = ggml_cuda_info().devices[dev_ctx->device].cc;
                 if (b->ne[2]*b->ne[3] > 1 && !ggml_is_transposed(a) && !ggml_is_transposed(b)) {
@@ -6506,8 +6522,30 @@ static void ggml_backend_cuda_stage_d2d(ggml_backend_t backend, void * dst, cons
     CUDA_CHECK(cudaMemcpyAsync(dst, src, size, cudaMemcpyDeviceToDevice, cuda_ctx->stream()));
 }
 
+static bool ggml_backend_cuda_stage_register(void * ptr, size_t size) {
+    cudaError_t err = cudaHostRegister(ptr, size, cudaHostRegisterPortable | cudaHostRegisterReadOnly);
+    if (err != cudaSuccess) {
+        (void) cudaGetLastError();
+        GGML_LOG_WARN("%s: failed to page-lock %.1f MiB: %s\n", __func__, size/1048576.0, cudaGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+static void ggml_backend_cuda_stage_unregister(void * ptr) {
+    if (cudaHostUnregister(ptr) != cudaSuccess) {
+        (void) cudaGetLastError();
+    }
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_stage_register") == 0) {
+        return (void *) ggml_backend_cuda_stage_register;
+    }
+    if (strcmp(name, "ggml_backend_stage_unregister") == 0) {
+        return (void *) ggml_backend_cuda_stage_unregister;
+    }
     if (strcmp(name, "ggml_backend_stage_upload") == 0) {
         return (void *) ggml_backend_cuda_stage_upload;
     }

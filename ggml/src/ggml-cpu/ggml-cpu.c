@@ -1973,11 +1973,17 @@ static void ggml_compute_forward_mul_mat_id_impl(
         // initialize matrix_row_counts
         memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
 
+        const bool partial = ggml_mul_mat_id_is_partial(dst);
+
         // group rows by src0 matrix
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
             for (int id = 0; id < n_ids; ++id) {
                 const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
 
+                if (partial && (i02 < 0 || i02 >= n_as)) {
+                    memset((char *) dst->data + id*nb1 + iid1*nb2, 0, ne0*sizeof(float));
+                    continue;
+                }
                 assert(i02 >= 0 && i02 < n_as);
 
                 MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
@@ -3630,6 +3636,9 @@ static bool ggml_cpu_moe_fuse_up_gate_match(
     struct ggml_tensor * gate = glu->src[0];
     struct ggml_tensor * up   = glu->src[1];
     if (!((gate == mm0 && up == mm1) || (gate == mm1 && up == mm0))) {
+        return false;
+    }
+    if (ggml_mul_mat_id_is_partial(mm0) || ggml_mul_mat_id_is_partial(mm1)) {
         return false;
     }
 

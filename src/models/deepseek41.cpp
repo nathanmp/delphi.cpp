@@ -526,6 +526,22 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_tail(
         ggml_tensor * inp_pos,
         int64_t nt,
         int il) const {
+    ggml_tensor * oa = build_attention_wo_a(model, out, inp_pos, nt, 0, hparams.dsv4_o_group_count, il);
+
+    out = build_lora_mm(model.layers[il].wo_b, oa);
+    cb(out, "attn_out", il);
+
+    return out;
+}
+
+ggml_tensor * llama_model_deepseek41::graph::build_attention_wo_a(
+        const llama_model & model,
+        ggml_tensor * out,
+        ggml_tensor * inp_pos,
+        int64_t nt,
+        int64_t g0,
+        int64_t ng,
+        int il) const {
     const auto & layer = model.layers[il];
 
     const int64_t n_embd_head      = hparams.n_embd_head_k();
@@ -533,26 +549,171 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_tail(
     const int64_t n_embd_head_nope = n_embd_head - n_embd_head_rope;
     const int64_t n_groups         = hparams.dsv4_o_group_count;
     const int64_t o_lora_rank      = hparams.dsv4_o_lora_rank;
-    const int64_t o_group_dim      = (n_head/n_groups)*n_embd_head;
+    const int64_t n_heads_group    = n_head/n_groups;
+    const int64_t o_group_dim      = n_heads_group*n_embd_head;
 
     const dsv41_rope_cfg rc = rope_cfg(il);
 
-    out = ggml_reshape_3d(ctx0, out, n_embd_head, n_head, nt);
+    out = ggml_reshape_3d(ctx0, out, n_embd_head, ng*n_heads_group, nt);
     out = ggml_rope_ext_back(ctx0, out, inp_pos, nullptr, n_embd_head_rope, rope_type, rc.n_ctx_orig,
             rc.base, rc.scale, rc.ext_factor, rc.attn_factor, rc.beta_fast, rc.beta_slow);
     out = ggml_rope_set_offset(out, n_embd_head_nope);
     cb(out, "attn_derope", il);
 
-    out = ggml_reshape_3d(ctx0, out, o_group_dim, n_groups, nt);
+    out = ggml_reshape_3d(ctx0, out, o_group_dim, ng, nt);
     out = ggml_permute(ctx0, out, 0, 2, 1, 3);
 
-    ggml_tensor * oa = ggml_mul_mat(ctx0, layer.wo_a, out);
+    ggml_tensor * wo_a = layer.wo_a;
+    if (g0 > 0 && cparams.attn_split_w && cparams.attn_split_w->wo_a[il]) {
+        wo_a = cparams.attn_split_w->wo_a[il];
+        GGML_ASSERT(g0 + ng == n_groups && wo_a->ne[2] == ng);
+    } else if (ng != n_groups) {
+        wo_a = ggml_view_3d(ctx0, wo_a, wo_a->ne[0], wo_a->ne[1], ng, wo_a->nb[1], wo_a->nb[2], g0*wo_a->nb[2]);
+    }
+    ggml_tensor * oa = ggml_mul_mat(ctx0, wo_a, out);
     cb(oa, "attn_wo_a", il);
 
     oa = ggml_permute(ctx0, oa, 0, 2, 1, 3);
-    oa = ggml_cont_2d(ctx0, oa, o_lora_rank*n_groups, nt);
+    oa = ggml_cont_2d(ctx0, oa, o_lora_rank*ng, nt);
 
-    out = build_lora_mm(layer.wo_b, oa);
+    return oa;
+}
+
+ggml_tensor * llama_model_deepseek41::graph::build_query(
+        const llama_model & model,
+        ggml_tensor * qr,
+        ggml_tensor * inp_pos,
+        int64_t h0,
+        int64_t nh,
+        int il) const {
+    const int64_t n_embd_head      = hparams.n_embd_head_k();
+    const int64_t n_embd_head_rope = hparams.n_rot();
+    const int64_t nt               = qr->ne[1];
+
+    const dsv41_rope_cfg rc = rope_cfg(il);
+
+    ggml_tensor * wq_b = model.layers[il].wq_b;
+    if (h0 > 0 && cparams.attn_split_w && cparams.attn_split_w->wq_b[il]) {
+        // the heads of the split device, copied into its memory
+        wq_b = cparams.attn_split_w->wq_b[il];
+        GGML_ASSERT(h0 + nh == n_head && wq_b->ne[1] == nh*n_embd_head);
+    } else if (nh != n_head) {
+        wq_b = ggml_view_2d(ctx0, wq_b, wq_b->ne[0], nh*n_embd_head, wq_b->nb[1], h0*n_embd_head*wq_b->nb[1]);
+    }
+    ggml_tensor * q = build_lora_mm(wq_b, qr);
+    q = ggml_reshape_3d(ctx0, q, n_embd_head, nh, nt);
+    q = ggml_rope_ext(ctx0, q, inp_pos, nullptr, n_embd_head_rope, rope_type, rc.n_ctx_orig,
+            rc.base, rc.scale, rc.ext_factor, rc.attn_factor, rc.beta_fast, rc.beta_slow);
+    q = ggml_rope_set_offset(q, n_embd_head - n_embd_head_rope);
+    cb(q, "q", il);
+
+    return q;
+}
+
+// Heads split over two devices (LLAMA_ATTN_SPLIT). The split device computes the queries, attention and wo_a of the last
+// attn_split_groups output groups, this device those of the others, and wo_b runs here on both. K has one head and the
+// top-k is per query, so both devices use the same K and top-k; the split device builds its own mask from the top-k, since
+// the mask is as wide as the compressed stream. It takes every input from here before its first kernel: an input copied
+// later would wait on this device for all the work queued before it (see ggml_backend_sched_compute_splits).
+ggml_tensor * llama_model_deepseek41::graph::build_attention_split(
+        const llama_model & model,
+        ggml_tensor * qr,
+        ggml_tensor * k,
+        ggml_tensor * k_rot,
+        ggml_tensor * raw_mask,
+        ggml_tensor * comp_mask,
+        ggml_tensor * top_k,
+        int64_t n_kv_max,
+        ggml_tensor * inp_pos,
+        int64_t nt,
+        int il) const {
+    const auto & layer = model.layers[il];
+
+    const int64_t n_embd_head   = hparams.n_embd_head_k();
+    const int64_t n_groups      = hparams.dsv4_o_group_count;
+    const int64_t n_heads_group = n_head/n_groups;
+    const int64_t ng_b          = cparams.attn_split_groups;
+    const float   kq_scale      = 1.0f/sqrtf(float(n_embd_head));
+
+    // qr crosses as F16: wq_b quantizes it to 8 bits anyway
+    ggml_tensor * qr16 = ggml_cast(ctx0, qr, GGML_TYPE_F16);
+    cb(qr16, "attn_xa_qr16", il);
+    // everything that both parts read is in the graph before them, or it would be pinned with the first part
+    ggml_build_forward_expand(gf, qr);
+    ggml_build_forward_expand(gf, qr16);
+    ggml_build_forward_expand(gf, k);
+    if (top_k) {
+        ggml_build_forward_expand(gf, top_k);
+    }
+
+    auto part = [&](int64_t g0, int64_t ng, bool remote) {
+        const int n0 = ggml_graph_n_nodes(gf);
+        const int64_t h0 = g0*n_heads_group;
+        const int64_t nh = ng*n_heads_group;
+
+        ggml_tensor * q_in = qr;
+        ggml_tensor * k_in = k;
+        ggml_tensor * top_k_in = top_k;
+        if (remote) {
+            q_in = ggml_cast(ctx0, qr16, GGML_TYPE_F32);
+            ggml_build_forward_expand(gf, q_in);
+            k_in = ggml_cont(ctx0, k);
+            ggml_build_forward_expand(gf, k_in);
+            if (top_k) {
+                top_k_in = ggml_cont(ctx0, top_k);
+                ggml_build_forward_expand(gf, top_k_in);
+            }
+        }
+
+        ggml_tensor * q = build_query(model, q_in, inp_pos, h0, nh, il);
+        if (k_rot) {
+            q = llama_mul_mat_hadamard(ctx0, q, k_rot);
+        }
+
+        ggml_tensor * kq_mask = raw_mask;
+        if (comp_mask) {
+            ggml_tensor * m = top_k_in ? build_top_k_mask(comp_mask, top_k_in, "comp_top_k_mask", il) : comp_mask;
+            kq_mask = ggml_concat(ctx0, raw_mask, m, 0);
+            cb(kq_mask, "kq_mask", il);
+        }
+
+        ggml_tensor * sinks = remote && cparams.attn_split_w && cparams.attn_split_w->sinks[il]
+            ? cparams.attn_split_w->sinks[il]
+            : ggml_view_1d(ctx0, layer.attn_sinks, nh, h0*ggml_element_size(layer.attn_sinks));
+
+        ggml_tensor * out = build_attn_mha(q, k_in, k_in, nullptr, kq_mask, sinks, nullptr, n_kv_max, kq_scale, il);
+        if (k_rot) {
+            out = llama_mul_mat_hadamard(ctx0, out, k_rot);
+        }
+        cb(out, "attn_out_raw", il);
+
+        ggml_tensor * oa = build_attention_wo_a(model, out, inp_pos, nt, g0, ng, il);
+        if (remote) {
+            // the result crosses as F16 too: wo_b quantizes it to 8 bits
+            oa = ggml_cast(ctx0, oa, GGML_TYPE_F16);
+        }
+        ggml_build_forward_expand(gf, oa);
+        pin_split_nodes(n0, remote, il);
+        return oa;
+    };
+
+    ggml_tensor * oa_b = part(n_groups - ng_b, ng_b, true);
+    ggml_tensor * oa_a = part(0, n_groups - ng_b, false);
+
+    // wo_b as two partial products over its input columns, so that this device multiplies its own half while the other
+    // half is still on its way
+    ggml_tensor * wo_b = layer.wo_b;
+    const int64_t n_in_a = oa_a->ne[0];
+    GGML_ASSERT(n_in_a % ggml_blck_size(wo_b->type) == 0);
+    ggml_tensor * wo_b_a = ggml_view_2d(ctx0, wo_b, n_in_a,               wo_b->ne[1], wo_b->nb[1], 0);
+    ggml_tensor * wo_b_b = ggml_view_2d(ctx0, wo_b, wo_b->ne[0] - n_in_a, wo_b->ne[1], wo_b->nb[1],
+            ggml_row_size(wo_b->type, n_in_a));
+    ggml_tensor * out_a = ggml_mul_mat(ctx0, wo_b_a, oa_a);
+    cb(out_a, "attn_xa_out", il);
+    ggml_build_forward_expand(gf, out_a);
+
+    oa_b = ggml_cast(ctx0, oa_b, GGML_TYPE_F32);
+    ggml_tensor * out = ggml_add(ctx0, out_a, ggml_mul_mat(ctx0, wo_b_b, oa_b));
     cb(out, "attn_out", il);
 
     return out;
@@ -624,19 +785,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_indexer_top_k(
     GGML_ASSERT(inp_comp.kq_mask);
     GGML_ASSERT(n_idx_head_dim >= n_idx_head_rope);
 
-    ggml_tensor * idx_q = build_lora_mm(layer.indexer_attn_q_b, qr);
-    idx_q = ggml_reshape_3d(ctx0, idx_q, n_idx_head_dim, n_idx_head, nt);
-    idx_q = ggml_rope_ext(ctx0, idx_q, inp_pos, nullptr, n_idx_head_rope, rope_type, n_ctx_orig,
-            hparams.dsv4_compress_rope_base, freq_scale, ext_factor,
-            dsv4_rope_attn_factor(freq_scale, ext_factor), beta_fast, beta_slow);
-    idx_q = ggml_rope_set_offset(idx_q, n_idx_head_nope);
-    cb(idx_q, "idx_q", il);
-
     ggml_tensor * idx_k_rot = inp_dsv4->get_lid().k_rot;
-    if (idx_k_rot) {
-        idx_q = llama_mul_mat_hadamard(ctx0, idx_q, idx_k_rot);
-        cb(idx_q, "idx_q_rot", il);
-    }
 
     // one weight per head, scaled so the score matches the reference's
     // softmax_scale * n_heads**-0.5
@@ -656,63 +805,131 @@ ggml_tensor * llama_model_deepseek41::graph::build_indexer_top_k(
     cb(idx_k, "idx_k", il);
 
     const int64_t n_stream = idx_k->ne[3];
-    idx_q = ggml_view_4d(ctx0, idx_q,
-            idx_q->ne[0], idx_q->ne[1], idx_q->ne[2]/n_stream, n_stream,
-            idx_q->nb[1], idx_q->nb[2], idx_q->nb[3]/n_stream, 0);
-    idx_w = ggml_view_4d(ctx0, idx_w,
-            idx_w->ne[0], idx_w->ne[1]/n_stream, idx_w->ne[2], n_stream,
-            idx_w->nb[1], idx_w->nb[2]/n_stream, idx_w->nb[3]/n_stream, 0);
-
-    // the stream mask is F16 only when flash attention is on. it only ever holds 0 or -inf, so a
-    // cast to the type that the score path needs is exact.
-    ggml_tensor * mask = inp_comp.kq_mask;
-
-    ggml_tensor * score = nullptr;
-    if (cparams.fused_lid) {
-        if (mask->type != GGML_TYPE_F16) {
-            mask = ggml_cast(ctx0, mask, GGML_TYPE_F16);
-        }
-        score = ggml_lightning_indexer(ctx0, idx_q, idx_k, idx_w, mask);
-        res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
-    } else {
-        idx_q = ggml_permute(ctx0, idx_q, 0, 2, 1, 3);
-        idx_k = ggml_permute(ctx0, idx_k, 0, 2, 1, 3);
-
-        score = ggml_mul_mat(ctx0, idx_k, idx_q);
-        score = ggml_cont(ctx0, ggml_permute(ctx0, score, 2, 1, 0, 3));
-
-        score = ggml_relu(ctx0, score);
-        score = ggml_mul(ctx0, score, idx_w);
-        score = ggml_sum_rows(ctx0, score);
-        score = ggml_cont(ctx0, ggml_permute(ctx0, score, 2, 1, 0, 3));
-
-        if (mask->type != score->type) {
-            mask = ggml_cast(ctx0, mask, score->type);
-        }
-        score = ggml_add(ctx0, score, mask);
-    }
-    cb(score, "idx_score", il);
-
-    // The candidate source publishes its block mask and does not apply it. The index sources after it add the mask before they pick positions.
     const int32_t cand_src = hparams.dsv41_candidate_source;
-    if (cand_src == il) {
-        *shared_cand = build_candidate_mask(score, inp_comp.cand_pin, il);
-    } else if (cand_src >= 0 && il > cand_src && *shared_cand != nullptr) {
-        ggml_tensor * cand = *shared_cand;
-        const int64_t n_blocks = cand->ne[1];
 
-        GGML_ASSERT(ggml_is_contiguous(score) && score->ne[2] == 1);
-        GGML_ASSERT(score->ne[0] % n_blocks == 0 && score->ne[1] == cand->ne[2] && score->ne[3] == cand->ne[3]);
+    // the top-k of the query rows [r0, r0 + nr), from their qr and weights
+    auto rows_top_k = [&](ggml_tensor * qr_r, ggml_tensor * w_r, ggml_tensor * k_r, int64_t r0, int64_t nr) {
+        ggml_tensor * pos_r = nr == nt ? inp_pos : ggml_view_1d(ctx0, inp_pos, nr, r0*ggml_element_size(inp_pos));
+        ggml_tensor * idx_q = build_lora_mm(layer.indexer_attn_q_b, qr_r);
+        idx_q = ggml_reshape_3d(ctx0, idx_q, n_idx_head_dim, n_idx_head, nr);
+        idx_q = ggml_rope_ext(ctx0, idx_q, pos_r, nullptr, n_idx_head_rope, rope_type, n_ctx_orig,
+                hparams.dsv4_compress_rope_base, freq_scale, ext_factor,
+                dsv4_rope_attn_factor(freq_scale, ext_factor), beta_fast, beta_slow);
+        idx_q = ggml_rope_set_offset(idx_q, n_idx_head_nope);
+        cb(idx_q, "idx_q", il);
 
-        score = ggml_reshape_4d(ctx0, score, score->ne[0]/n_blocks, n_blocks, score->ne[1], score->ne[3]);
-        score = ggml_add(ctx0, score, cand);
-        score = ggml_reshape_4d(ctx0, score, score->ne[0]*n_blocks, score->ne[2], 1, score->ne[3]);
-        cb(score, "idx_score_cand", il);
+        if (idx_k_rot) {
+            idx_q = llama_mul_mat_hadamard(ctx0, idx_q, idx_k_rot);
+            cb(idx_q, "idx_q_rot", il);
+        }
+
+        idx_q = ggml_view_4d(ctx0, idx_q,
+                idx_q->ne[0], idx_q->ne[1], idx_q->ne[2]/n_stream, n_stream,
+                idx_q->nb[1], idx_q->nb[2], idx_q->nb[3]/n_stream, 0);
+        w_r = ggml_view_4d(ctx0, w_r,
+                w_r->ne[0], w_r->ne[1]/n_stream, w_r->ne[2], n_stream,
+                w_r->nb[1], w_r->nb[2]/n_stream, w_r->nb[3]/n_stream, 0);
+
+        // the stream mask is F16 only when flash attention is on. it only ever holds 0 or -inf, so a
+        // cast to the type that the score path needs is exact.
+        ggml_tensor * mask = inp_comp.kq_mask;
+        if (nr != nt) {
+            mask = ggml_view_4d(ctx0, mask, mask->ne[0], nr, mask->ne[2], mask->ne[3],
+                    mask->nb[1], mask->nb[2], mask->nb[3], r0*mask->nb[1]);
+        }
+
+        ggml_tensor * score = nullptr;
+        if (cparams.fused_lid) {
+            if (mask->type != GGML_TYPE_F16) {
+                mask = ggml_cast(ctx0, mask, GGML_TYPE_F16);
+            }
+            score = ggml_lightning_indexer(ctx0, idx_q, k_r, w_r, mask);
+            res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
+        } else {
+            idx_q = ggml_permute(ctx0, idx_q, 0, 2, 1, 3);
+            ggml_tensor * k_p = ggml_permute(ctx0, k_r, 0, 2, 1, 3);
+
+            score = ggml_mul_mat(ctx0, k_p, idx_q);
+            score = ggml_cont(ctx0, ggml_permute(ctx0, score, 2, 1, 0, 3));
+
+            score = ggml_relu(ctx0, score);
+            score = ggml_mul(ctx0, score, w_r);
+            score = ggml_sum_rows(ctx0, score);
+            score = ggml_cont(ctx0, ggml_permute(ctx0, score, 2, 1, 0, 3));
+
+            if (mask->type != score->type) {
+                mask = ggml_cast(ctx0, mask, score->type);
+            }
+            score = ggml_add(ctx0, score, mask);
+        }
+        cb(score, "idx_score", il);
+
+        // The candidate source publishes its block mask and does not apply it. The index sources after it add the mask before they pick positions.
+        if (cand_src == il) {
+            *shared_cand = build_candidate_mask(score, inp_comp.cand_pin, il);
+        } else if (cand_src >= 0 && il > cand_src && *shared_cand != nullptr) {
+            ggml_tensor * cand = *shared_cand;
+            if (nr != nt) {
+                cand = ggml_view_4d(ctx0, cand, cand->ne[0], cand->ne[1], nr, cand->ne[3],
+                        cand->nb[1], cand->nb[2], cand->nb[3], r0*cand->nb[2]);
+            }
+            const int64_t n_blocks = cand->ne[1];
+
+            GGML_ASSERT(ggml_is_contiguous(score) && score->ne[2] == 1);
+            GGML_ASSERT(score->ne[0] % n_blocks == 0 && score->ne[1] == cand->ne[2] && score->ne[3] == cand->ne[3]);
+
+            score = ggml_reshape_4d(ctx0, score, score->ne[0]/n_blocks, n_blocks, score->ne[1], score->ne[3]);
+            score = ggml_add(ctx0, score, cand);
+            score = ggml_reshape_4d(ctx0, score, score->ne[0]*n_blocks, score->ne[2], 1, score->ne[3]);
+            cb(score, "idx_score_cand", il);
+        }
+
+        const uint32_t n_top_k = score->ne[0] < hparams.indexer_top_k ? score->ne[0] : hparams.indexer_top_k;
+
+        ggml_tensor * top_k = ggml_cont(ctx0, ggml_top_k(ctx0, score, n_top_k));
+        cb(top_k, "idx_top_k", il);
+
+        return top_k;
+    };
+
+    // LLAMA_ATTN_SPLIT_INDEXER=1 (with LLAMA_ATTN_SPLIT): the split device scores the second half of the query rows, which
+    // is as much work as the first on long prompts, and sends back only their top-k. The candidate source keeps all rows,
+    // since it pools over them. Opt-in: the greedy output changes (12.8k-token prompt), although each row should score the
+    // same, so this is not validated yet.
+    const char * env_idx = getenv("LLAMA_ATTN_SPLIT_INDEXER");
+    const bool split = cparams.attn_split_groups > 0 && cparams.moe_split_n > 0 && nt >= (int64_t) cparams.moe_split_min_tokens &&
+            n_stream == 1 && cand_src != il && env_idx != nullptr && atoi(env_idx) != 0;
+    if (!split) {
+        return rows_top_k(qr, idx_w, idx_k, 0, nt);
     }
 
-    const uint32_t n_top_k = score->ne[0] < hparams.indexer_top_k ? score->ne[0] : hparams.indexer_top_k;
+    const int64_t nr_a = nt/2;
+    const int64_t nr_b = nt - nr_a;
+    ggml_build_forward_expand(gf, qr);
+    ggml_build_forward_expand(gf, idx_w);
+    if (*shared_cand != nullptr) {
+        ggml_build_forward_expand(gf, *shared_cand);
+    }
 
-    ggml_tensor * top_k = ggml_cont(ctx0, ggml_top_k(ctx0, score, n_top_k));
+    int n0 = ggml_graph_n_nodes(gf);
+    ggml_tensor * qr_b = ggml_cont(ctx0, ggml_view_2d(ctx0, qr,    qr->ne[0],    nr_b, qr->nb[1],    nr_a*qr->nb[1]));
+    ggml_tensor * w_b  = ggml_cont(ctx0, ggml_view_2d(ctx0, idx_w, idx_w->ne[0], nr_b, idx_w->nb[1], nr_a*idx_w->nb[1]));
+    ggml_tensor * k_b  = ggml_cont(ctx0, idx_k);
+    ggml_build_forward_expand(gf, qr_b);
+    ggml_build_forward_expand(gf, w_b);
+    ggml_build_forward_expand(gf, k_b);
+    ggml_tensor * top_k_b = rows_top_k(qr_b, w_b, k_b, nr_a, nr_b);
+    ggml_build_forward_expand(gf, top_k_b);
+    pin_split_nodes(n0, true, il);
+
+    n0 = ggml_graph_n_nodes(gf);
+    ggml_tensor * qr_a = ggml_view_2d(ctx0, qr,    qr->ne[0],    nr_a, qr->nb[1],    0);
+    ggml_tensor * w_a  = ggml_view_2d(ctx0, idx_w, idx_w->ne[0], nr_a, idx_w->nb[1], 0);
+    ggml_tensor * top_k_a = rows_top_k(qr_a, w_a, idx_k, 0, nr_a);
+    ggml_build_forward_expand(gf, top_k_a);
+    pin_split_nodes(n0, false, il);
+
+    ggml_tensor * top_k = ggml_concat(ctx0, top_k_a, top_k_b, 1);
     cb(top_k, "idx_top_k", il);
 
     return top_k;
@@ -825,12 +1042,11 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
     qr = build_norm(qr, layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
     cb(qr, "qr", il);
 
-    ggml_tensor * q = build_lora_mm(layer.wq_b, qr);
-    q = ggml_reshape_3d(ctx0, q, n_embd_head, n_head, nt);
-    q = ggml_rope_ext(ctx0, q, inp_pos, nullptr, n_embd_head_rope, rope_type, rc.n_ctx_orig,
-            rc.base, rc.scale, rc.ext_factor, rc.attn_factor, rc.beta_fast, rc.beta_slow);
-    q = ggml_rope_set_offset(q, n_embd_head - n_embd_head_rope);
-    cb(q, "q", il);
+    // LLAMA_ATTN_SPLIT: the queries are built per device in build_attention_split
+    const bool split = cparams.attn_split_groups > 0 && cparams.attn_split_groups < (int32_t) hparams.dsv4_o_group_count &&
+            cparams.moe_split_n > 0 && nt >= (int64_t) cparams.moe_split_min_tokens;
+
+    ggml_tensor * q = split ? nullptr : build_query(model, qr, inp_pos, 0, n_head, il);
 
     // the sliding window KV, which every layer keeps for itself
     ggml_tensor * kv = build_lora_mm(layer.wkv, cur);
@@ -844,6 +1060,18 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
     const float kq_scale = 1.0f/sqrtf(float(n_embd_head));
 
     ggml_tensor * out = nullptr;
+
+    if (ratio == 0 && split) {
+        ggml_tensor * k_rot = inp_attn->self_k_rot;
+        if (k_rot) {
+            kv = llama_mul_mat_hadamard(ctx0, kv, k_rot);
+        }
+        ggml_build_forward_expand(gf, kv);
+        ggml_build_forward_expand(gf, inp_attn->mctx->cpy_k(ctx0, kv, inp_attn->get_k_idxs(), il));
+
+        return build_attention_split(model, qr, inp_attn->mctx->get_k(ctx0, il), k_rot, inp_attn->get_kq_mask(),
+                nullptr, nullptr, 0, inp_pos, nt, il);
+    }
 
     if (ratio == 0) {
         // no compressed stream, so this layer sees only its own window
@@ -966,11 +1194,15 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
 
     ggml_tensor * k_rot = inp_attn->self_k_rot;
     if (k_rot) {
-        q  = llama_mul_mat_hadamard(ctx0, q, k_rot);
+        if (q) {
+            q = llama_mul_mat_hadamard(ctx0, q, k_rot);
+        }
         kv = llama_mul_mat_hadamard(ctx0, kv, k_rot);
     }
 
-    ggml_build_forward_expand(gf, q);
+    if (q) {
+        ggml_build_forward_expand(gf, q);
+    }
     ggml_build_forward_expand(gf, kv);
 
     const llama_kv_cache_dsv4_raw_context * mctx_raw = inp_attn->mctx;
@@ -993,11 +1225,11 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
 
     ggml_tensor * raw_mask  = inp_attn->get_kq_mask();
     const int64_t n_stream = raw_k->ne[3];
-    const bool use_compact = top_k != nullptr && cparams.flash_attn &&
+    const bool use_compact = !split && top_k != nullptr && cparams.flash_attn &&
             dsv41_compact_attn_enabled(n_comp, top_k->ne[0], nt, n_stream);
-    const bool use_verify_compact = !use_compact && top_k != nullptr && cparams.flash_attn &&
+    const bool use_verify_compact = !split && !use_compact && top_k != nullptr && cparams.flash_attn &&
             dsv41_verify_compact_enabled(nt, n_stream);
-    const bool use_prefill_indexed = !use_compact && !use_verify_compact && top_k != nullptr &&
+    const bool use_prefill_indexed = !split && !use_compact && !use_verify_compact && top_k != nullptr &&
             dsv41_prefill_indexed_enabled(hparams, cparams.flash_attn, n_comp, top_k->ne[0], nt, n_stream);
 
     if (use_compact) {
@@ -1176,6 +1408,10 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
         const int64_t n_kv_max = top_k
             ? std::min<int64_t>(raw_mask->ne[0], hparams.n_swa) + top_k->ne[0]
             : 0;
+
+        if (split) {
+            return build_attention_split(model, qr, k_all, k_rot, raw_mask, inp_comp.kq_mask, top_k, n_kv_max, inp_pos, nt, il);
+        }
 
         out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, layer.attn_sinks,
                 nullptr, n_kv_max, kq_scale, il);

@@ -827,6 +827,11 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
         return true;
     }
 
+    // the extra buffer types do not skip the out-of-range ids of a partial MUL_MAT_ID
+    if (ggml_mul_mat_id_is_partial(op) && src0->buffer && ggml_backend_cpu_is_extra_buffer_type(src0->buffer->buft)) {
+        return false;
+    }
+
     // check extra buffer types
     // note: only the first sources are checked for extra buffer types to reduce overhead, increase if necessary
     for (int i = 0; i < 4; i++) {

@@ -155,6 +155,12 @@ static int32_t ggml_get_op_params_i32(const struct ggml_tensor * tensor, uint32_
     return ((const int32_t *)(tensor->op_params))[i];
 }
 
+#define GGML_MUL_MAT_ID_PARAM_PARTIAL 15 // see TAG_GGML_PREC below
+
+static bool ggml_mul_mat_id_is_partial(const struct ggml_tensor * tensor) {
+    return tensor->op == GGML_OP_MUL_MAT_ID && ((const int32_t *)(tensor->op_params))[GGML_MUL_MAT_ID_PARAM_PARTIAL] != 0;
+}
+
 static float ggml_get_op_params_f32(const struct ggml_tensor * tensor, uint32_t i) {
     assert(i < GGML_MAX_OP_PARAMS / sizeof(float));
     return ((const float *)(tensor->op_params))[i];
@@ -172,6 +178,7 @@ static float ggml_get_op_params_f32(const struct ggml_tensor * tensor, uint32_t 
 //   1 - hint
 //   2 - src0 precision
 //   3 - src1 precision
+//  15 - partial: ids outside [0, ne02) are skipped and their rows are zero (ggml_mul_mat_id_partial)
 static void ggml_set_op_params_i32(struct ggml_tensor * tensor, uint32_t i, int32_t value) {
     assert(i < GGML_MAX_OP_PARAMS / sizeof(int32_t));
     ((int32_t *)(tensor->op_params))[i] = value;

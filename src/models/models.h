@@ -1423,6 +1423,39 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
                 int64_t nt,
                 int il) const;
 
+        // the rotated queries of heads [h0, h0 + nh)
+        ggml_tensor * build_query(
+                const llama_model & model,
+                ggml_tensor * qr,
+                ggml_tensor * inp_pos,
+                int64_t h0,
+                int64_t nh,
+                int il) const;
+
+        // derope and wo_a of the output groups [g0, g0 + ng), whose heads out holds
+        ggml_tensor * build_attention_wo_a(
+                const llama_model & model,
+                ggml_tensor * out,
+                ggml_tensor * inp_pos,
+                int64_t nt,
+                int64_t g0,
+                int64_t ng,
+                int il) const;
+
+        // attention with the heads of some output groups on the LLAMA_MOE_SPLIT device (LLAMA_ATTN_SPLIT)
+        ggml_tensor * build_attention_split(
+                const llama_model & model,
+                ggml_tensor * qr,
+                ggml_tensor * k,
+                ggml_tensor * k_rot,
+                ggml_tensor * raw_mask,
+                ggml_tensor * comp_mask,
+                ggml_tensor * top_k,
+                int64_t n_kv_max,
+                ggml_tensor * inp_pos,
+                int64_t nt,
+                int il) const;
+
         // which compressed positions this layer's queries attend to
         ggml_tensor * build_indexer_top_k(
                 const llama_model & model,

@@ -290,6 +290,9 @@ llama_context::llama_context(
 
     // initialized later
     cparams.pipeline_parallel = false;
+    cparams.moe_split_n = 0;
+    cparams.moe_split_min_tokens = 1024;
+    cparams.attn_split_groups = 0;
 
     {
         const char * LLAMA_GRAPH_REUSE_DISABLE = getenv("LLAMA_GRAPH_REUSE_DISABLE");
@@ -359,6 +362,55 @@ llama_context::llama_context(
                 throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev.dev)));
             }
             backends.emplace_back(backend);
+        }
+
+        // LLAMA_MOE_SPLIT=<device>[:<n>]: compute n routed experts (default half) of each host-resident MoE layer on another
+        // device, while the rest run where the scheduler puts them (see llm_graph_context::build_moe_ffn_split)
+        if (const char * env = getenv("LLAMA_MOE_SPLIT"); env != nullptr && *env != '\0' && hparams.n_expert > 1) {
+            std::string spec = env;
+            int32_t n = (int32_t) hparams.n_expert / 2;
+            if (const size_t colon = spec.find(':'); colon != std::string::npos) {
+                n = atoi(spec.c_str() + colon + 1);
+                spec.resize(colon);
+            }
+            ggml_backend_dev_t dev = ggml_backend_dev_by_name(spec.c_str());
+            if (dev == nullptr || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU || n <= 0 || n >= (int32_t) hparams.n_expert) {
+                throw std::runtime_error(format("LLAMA_MOE_SPLIT=%s: expected <GPU device>[:<experts, 1..%u>]", env, hparams.n_expert - 1));
+            }
+            for (auto & backend : backends) {
+                if (ggml_backend_get_device(backend.get()) == dev) {
+                    backend_moe_split = backend.get();
+                }
+            }
+            if (backend_moe_split == nullptr) {
+                backend_moe_split = ggml_backend_dev_init(dev, nullptr);
+                if (backend_moe_split == nullptr) {
+                    throw std::runtime_error(format("failed to initialize %s backend", spec.c_str()));
+                }
+                backends.emplace_back(backend_moe_split);
+            }
+            cparams.moe_split_n = n;
+            // the two devices hand over twice per layer: order those copies on the devices, not with host waits
+            // (see GGML_SCHED_XDEV_EVENTS in ggml_backend_sched_new)
+            if (getenv("GGML_SCHED_XDEV_EVENTS") == nullptr) {
+                setenv("GGML_SCHED_XDEV_EVENTS", "1", 0);
+            }
+            if (const char * e = getenv("LLAMA_MOE_SPLIT_MIN_TOKENS")) {
+                cparams.moe_split_min_tokens = (uint32_t) std::max(1, atoi(e));
+            }
+            LLAMA_LOG_INFO("%s: MoE split: %d of %u routed experts on %s for ubatches of %u+ tokens\n", __func__,
+                    n, hparams.n_expert, spec.c_str(), cparams.moe_split_min_tokens);
+            // LLAMA_ATTN_SPLIT=<groups>: the same device also computes the attention heads of that many output groups
+            // (DeepSeek V4.1, see llama_model_deepseek41::graph::build_attention_split)
+            if (const char * e = getenv("LLAMA_ATTN_SPLIT"); e != nullptr && atoi(e) > 0) {
+                cparams.attn_split_groups = atoi(e);
+                LLAMA_LOG_INFO("%s: attention split: %d output groups on %s\n", __func__, cparams.attn_split_groups, spec.c_str());
+                const char * ec = getenv("LLAMA_ATTN_SPLIT_COPY"); // 0: read slices of the layer device's weights
+                if (model.arch == LLM_ARCH_DEEPSEEK41 && cparams.attn_split_groups < (int32_t) hparams.dsv4_o_group_count &&
+                        (ec == nullptr || atoi(ec) != 0)) {
+                    init_attn_split_weights();
+                }
+            }
         }
 
         // add ACCEL backends (such as BLAS)
@@ -3123,12 +3175,89 @@ void llama_context::set_backend_n_threads(int n_threads) {
     // (gf_res_prev_threads).
 }
 
+// copy the split device's slices of the head weights once, so that it does not take them from the layer's device every ubatch
+void llama_context::init_attn_split_weights() {
+    const auto & hparams = model.hparams;
+    const int64_t n_layer     = hparams.n_layer();
+    const int64_t n_groups    = hparams.dsv4_o_group_count;
+    const int64_t ng          = cparams.attn_split_groups;
+    const int64_t n_head_grp  = hparams.n_head()/n_groups;
+    const int64_t n_embd_head = hparams.n_embd_head_k();
+    const int64_t g0          = n_groups - ng;
+    const int64_t h0          = g0*n_head_grp;
+    const int64_t nh          = ng*n_head_grp;
+
+    ggml_init_params ip = { (size_t) (3*n_layer + 1)*ggml_tensor_overhead(), nullptr, true };
+    attn_split_ctx.reset(ggml_init(ip));
+    ggml_context * ctx = attn_split_ctx.get();
+
+    attn_split_w.wq_b.assign(n_layer, nullptr);
+    attn_split_w.wo_a.assign(n_layer, nullptr);
+    attn_split_w.sinks.assign(n_layer, nullptr);
+    for (int64_t il = 0; il < n_layer; ++il) {
+        const auto & layer = model.layers[il];
+        if (layer.wq_b == nullptr || layer.wo_a == nullptr || layer.attn_sinks == nullptr || layer.wo_a->ne[2] != n_groups ||
+                layer.wq_b->data == nullptr || layer.wo_a->data == nullptr || layer.attn_sinks->data == nullptr ||
+                layer.attn_sinks->type != GGML_TYPE_F32) {
+            continue;
+        }
+        attn_split_w.wq_b[il]  = ggml_new_tensor_2d(ctx, layer.wq_b->type, layer.wq_b->ne[0], nh*n_embd_head);
+        attn_split_w.wo_a[il]  = ggml_new_tensor_3d(ctx, layer.wo_a->type, layer.wo_a->ne[0], layer.wo_a->ne[1], ng);
+        attn_split_w.sinks[il] = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nh);
+        ggml_format_name(attn_split_w.wq_b[il],  "blk.%d.attn_q_b.split",      (int) il);
+        ggml_format_name(attn_split_w.wo_a[il],  "blk.%d.attn_output_a.split", (int) il);
+        ggml_format_name(attn_split_w.sinks[il], "blk.%d.attn_sinks.split",    (int) il);
+    }
+    if (ggml_get_first_tensor(ctx) == nullptr) {
+        return; // no weights loaded (a context that only measures memory)
+    }
+    attn_split_buf.reset(ggml_backend_alloc_ctx_tensors(ctx, backend_moe_split));
+    if (!attn_split_buf) {
+        throw std::runtime_error("LLAMA_ATTN_SPLIT: failed to allocate the head weights on the split device");
+    }
+    ggml_backend_buffer_set_usage(attn_split_buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    std::vector<uint8_t> tmp;
+    auto copy = [&](ggml_tensor * dst, const ggml_tensor * src, size_t offset) {
+        tmp.resize(ggml_nbytes(dst));
+        ggml_backend_tensor_get(src, tmp.data(), offset, tmp.size());
+        ggml_backend_tensor_set(dst, tmp.data(), 0, tmp.size());
+    };
+    for (int64_t il = 0; il < n_layer; ++il) {
+        if (attn_split_w.wq_b[il] == nullptr) {
+            continue;
+        }
+        const auto & layer = model.layers[il];
+        copy(attn_split_w.wq_b[il],  layer.wq_b,       h0*n_embd_head*layer.wq_b->nb[1]);
+        copy(attn_split_w.wo_a[il],  layer.wo_a,       g0*layer.wo_a->nb[2]);
+        copy(attn_split_w.sinks[il], layer.attn_sinks, h0*sizeof(float));
+    }
+    cparams.attn_split_w = &attn_split_w;
+    LLAMA_LOG_INFO("%s: %.1f MiB of head weights on %s\n", __func__,
+            ggml_backend_buffer_get_size(attn_split_buf.get())/1048576.0, ggml_backend_name(backend_moe_split));
+}
+
 llm_graph_cb llama_context::graph_get_cb() const {
     return [&](const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il) {
         if (il >= 0) {
             ggml_format_name(cur, "%s-%d", name, il);
         } else {
             ggml_set_name(cur, name);
+        }
+
+        const char * split_tag = strncmp(name, "ffn_moe_x", 9) == 0 ? name + 9 : strncmp(name, "attn_x", 6) == 0 ? name + 6 : nullptr;
+        if (backend_moe_split != nullptr && split_tag != nullptr && il >= 0) {
+            // expert and attention split: x?s_* on the split device, x?a_* on the layer's device (views of host weights are
+            // not weights to the scheduler, so the xa_* nodes would otherwise follow the xs_* nodes)
+            ggml_backend_t target = split_tag[0] == 's' ? backend_moe_split : nullptr;
+            for (const auto & backend : backends) {
+                if (target == nullptr && ggml_backend_get_device(backend.get()) == model.dev_layer(il)) {
+                    target = backend.get();
+                }
+            }
+            if (target != nullptr) {
+                ggml_backend_sched_set_tensor_backend(sched.get(), cur, target);
+            }
         }
 
         // - norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends

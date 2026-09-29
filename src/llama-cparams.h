@@ -26,6 +26,13 @@ struct llama_mtp_device_draft_cache {
     ggml_tensor * result_probs  = nullptr;
 };
 
+// copies of the head slices that the LLAMA_ATTN_SPLIT device reads, per layer, in its memory (see llama_context)
+struct llama_attn_split_weights {
+    std::vector<ggml_tensor *> wq_b;
+    std::vector<ggml_tensor *> wo_a;
+    std::vector<ggml_tensor *> sinks;
+};
+
 struct llama_cparams {
     uint32_t n_ctx;           // context size used during inference
     uint32_t n_ctx_seq;       // context for a single sequence
@@ -74,6 +81,11 @@ struct llama_cparams {
     bool op_offload;
     bool kv_unified;
     bool pipeline_parallel;
+
+    int32_t  moe_split_n;          // routed experts computed on the LLAMA_MOE_SPLIT device, the top of the range (0: off)
+    uint32_t moe_split_min_tokens; // smallest ubatch that splits the experts
+    int32_t  attn_split_groups;    // attention output groups (and their heads) computed on the LLAMA_MOE_SPLIT device (0: off)
+    const llama_attn_split_weights * attn_split_w = nullptr; // null: the split device reads slices of the model's weights
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 
