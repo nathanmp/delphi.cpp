@@ -11144,6 +11144,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    // draft samplers: top-k over a whole vocabulary, one row per draft position
+    for (int k : {1, 10}) {
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {248320, 4, 1, 1}, k));
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {129280, 40, 1, 1}, k));
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {129280, 40, 1, 1}, k, true));
+    }
     // GLM lightning indexer: 4-token pools, selecting 512 pools (2048 tokens).
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {3330, 1, 1, 1}, 512));
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {4096, 1, 1, 1}, 512, true));
