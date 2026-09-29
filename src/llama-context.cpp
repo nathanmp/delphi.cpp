@@ -292,6 +292,7 @@ llama_context::llama_context(
     cparams.pipeline_parallel = false;
     cparams.moe_split_n = 0;
     cparams.moe_split_min_tokens = 1024;
+    cparams.attn_split_groups = 0;
 
     {
         const char * LLAMA_GRAPH_REUSE_DISABLE = getenv("LLAMA_GRAPH_REUSE_DISABLE");
@@ -399,6 +400,12 @@ llama_context::llama_context(
             }
             LLAMA_LOG_INFO("%s: MoE split: %d of %u routed experts on %s for ubatches of %u+ tokens\n", __func__,
                     n, hparams.n_expert, spec.c_str(), cparams.moe_split_min_tokens);
+            // LLAMA_ATTN_SPLIT=<groups>: the same device also computes the attention heads of that many output groups
+            // (DeepSeek V4.1, see llama_model_deepseek41::graph::build_attention_split)
+            if (const char * e = getenv("LLAMA_ATTN_SPLIT"); e != nullptr && atoi(e) > 0) {
+                cparams.attn_split_groups = atoi(e);
+                LLAMA_LOG_INFO("%s: attention split: %d output groups on %s\n", __func__, cparams.attn_split_groups, spec.c_str());
+            }
         }
 
         // add ACCEL backends (such as BLAS)
@@ -3171,10 +3178,11 @@ llm_graph_cb llama_context::graph_get_cb() const {
             ggml_set_name(cur, name);
         }
 
-        if (backend_moe_split != nullptr && strncmp(name, "ffn_moe_x", 9) == 0 && il >= 0) {
-            // expert split: xs_* on the split device, xa_* on the layer's device (views of host weights are not
-            // weights to the scheduler, so the xa_* nodes would otherwise follow the xs_* nodes)
-            ggml_backend_t target = name[9] == 's' ? backend_moe_split : nullptr;
+        const char * split_tag = strncmp(name, "ffn_moe_x", 9) == 0 ? name + 9 : strncmp(name, "attn_x", 6) == 0 ? name + 6 : nullptr;
+        if (backend_moe_split != nullptr && split_tag != nullptr && il >= 0) {
+            // expert and attention split: x?s_* on the split device, x?a_* on the layer's device (views of host weights are
+            // not weights to the scheduler, so the xa_* nodes would otherwise follow the xs_* nodes)
+            ggml_backend_t target = split_tag[0] == 's' ? backend_moe_split : nullptr;
             for (const auto & backend : backends) {
                 if (target == nullptr && ggml_backend_get_device(backend.get()) == model.dev_layer(il)) {
                     target = backend.get();

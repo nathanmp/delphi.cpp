@@ -2505,9 +2505,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn_split(
     ids_b = ggml_cast(ctx0, ids_b, GGML_TYPE_I32);
     cb(ids_a, "ffn_moe_ids_a", il);
     cb(ids_b, "ffn_moe_ids_b", il);
+    // the input crosses as F16: the expert matmuls quantize it to 8 bits anyway
+    ggml_tensor * cur16 = ggml_cast(ctx0, cur, GGML_TYPE_F16);
+    cb(cur16, "ffn_moe_xa_cur16", il);
     // both before either part: nodes added after the pinned ffn_moe_xs_* nodes would follow them to the split device
     ggml_build_forward_expand(gf, ids_a);
     ggml_build_forward_expand(gf, ids_b);
+    ggml_build_forward_expand(gf, cur16);
 
     float limit = 0.0f;
     if (il >= 0 && (arch == LLM_ARCH_MAPLE || arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK41 || arch == LLM_ARCH_GLM5NEXT ||
@@ -2527,14 +2531,18 @@ ggml_tensor * llm_graph_context::build_moe_ffn_split(
         // the split device takes all its inputs from the other device before its work: an input copied later waits on
         // the device for everything queued before it there (see ggml_backend_sched_compute_splits)
         ggml_tensor * w = weights;
+        ggml_tensor * x = cur;
         if (remote) {
             w = ggml_scale(ctx0, weights, 1.0f);
             name(w, "weights");
             ggml_build_forward_expand(gf, w);
+            x = ggml_cast(ctx0, cur16, GGML_TYPE_F32);
+            name(x, "cur");
+            ggml_build_forward_expand(gf, x);
         }
-        ggml_tensor * up = ggml_mul_mat_id_partial(ctx0, view(up_exps), cur, ids);
+        ggml_tensor * up = ggml_mul_mat_id_partial(ctx0, view(up_exps), x, ids);
         name(up, "up");
-        ggml_tensor * gate = ggml_mul_mat_id_partial(ctx0, view(gate_exps), cur, ids);
+        ggml_tensor * gate = ggml_mul_mat_id_partial(ctx0, view(gate_exps), x, ids);
         name(gate, "gate");
         ggml_tensor * act = limit > 1e-6f ? ggml_swiglu_clamp(ctx0, gate, up, limit) : ggml_swiglu_split(ctx0, gate, up);
         name(act, "swiglu");
@@ -2569,6 +2577,23 @@ ggml_tensor * llm_graph_context::build_moe_ffn_split(
     cb(moe_out, "ffn_moe_out", il);
 
     return moe_out;
+}
+
+void llm_graph_context::pin_split_nodes(int n0, bool remote, int il) const {
+    const int n1 = ggml_graph_n_nodes(gf);
+    for (int i = n0; i < n1; ++i) {
+        ggml_tensor * t = ggml_graph_node(gf, i);
+        if (t->buffer != nullptr || (t->view_src != nullptr && t->view_src->buffer != nullptr)) {
+            continue;
+        }
+        // drop the "-<il>" that the callback appended to the old name, it appends it again
+        std::string base = t->name;
+        const std::string suffix = "-" + std::to_string(il);
+        if (base.size() > suffix.size() && base.compare(base.size() - suffix.size(), suffix.size(), suffix) == 0) {
+            base.resize(base.size() - suffix.size());
+        }
+        cb(t, ((remote ? "attn_xs_" : "attn_xa_") + base).c_str(), il);
+    }
 }
 
 // input embeddings with optional lora

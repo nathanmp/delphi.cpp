@@ -67,6 +67,7 @@ With a layer split over two GPUs (DeepSeek V4.1 Flash, two R9700s on PCIe 4.0 x1
 | --- | --- | --- |
 | `LLAMA_MOE_SPLIT` | unset | `<device>[:<n>]`: compute `n` of the routed experts (default half) of each MoE layer whose experts sit in host memory on a second GPU, for example `ROCm2` |
 | `LLAMA_MOE_SPLIT_MIN_TOKENS` | `1024` | smallest ubatch that splits the experts; smaller ubatches (decode) run as before |
+| `LLAMA_ATTN_SPLIT` | unset | `<groups>`: with `LLAMA_MOE_SPLIT`, the same device also computes the attention heads of that many output groups (DeepSeek V4.1, 8 groups of 8 heads; use an even number, since the FA kernel takes 16 heads at a time) |
 
 With the experts in host memory (`-cmoe`) and the staging ring on, each device streams and computes its own part of every MoE layer: the second device takes the top `n` experts, the first device the rest, together with everything else. Both parts run the same routing through `ggml_mul_mat_id_partial`, which skips the ids of the other part, and the first device adds the two partial sums. Per MoE layer the devices exchange the normed activations and the partial sum (64 MiB each at 4096 tokens). The second device needs no model layers: it is added to the context as an extra backend. Outputs change only by summation order: on DeepSeek V4.1 Flash the KL divergence to the one-device run is 0.0077 (same top token 98.1%), below the 0.0086 between `-ub 4096` and `-ub 512` on one device.
 
@@ -79,6 +80,18 @@ Measured with DeepSeek V4.1 Flash (Q2_K experts, `--numa tensors`) on two R9700s
 | split + `GGML_SCHED_STAGE_REGISTER=1` | 546 t/s | 481 t/s |
 
 Without page-locked weights the two staging threads share the host's memcpy bandwidth (about 30 GB/s together, against 50 GB/s for the two links). With them, the first device becomes compute-bound: it keeps attention and the dense layers, about 120 ms per layer against 43 ms for the second device's experts, and the heavier attention layers take 170 ms. Giving the second device more experts does not help (224 of 384: 556 / 478 t/s; 256: 542 / 465). Page-locking 166 GiB of experts adds 142 s before the first staged prompt, which is why it is off by default.
+
+With `LLAMA_ATTN_SPLIT=4` the second device also takes half the attention heads. Attention in DeepSeek V4.1 has one K head, and each query's top-k selection covers all its heads, so the second device reads the same K and top-k as the first and builds its own mask. It computes the queries, sparse FlashAttention and `wo_a` of its groups; the first device adds its half of `wo_b` to the product of the second half. Per layer, `qr` (F16, 10 MiB at 4096 tokens), K (6-36 MiB, growing with the context) and the top-k go to the second device, and the `wo_a` output (F16, 32 MiB) comes back. The second device takes all of these, and the slices of `wq_b`, `wo_a` and the sinks, before its first kernel, since with `GGML_SCHED_XDEV_EVENTS` a copy in the middle of its work would wait for everything the first device queued before it. The indexer stays on the first device. The KL divergence to the one-device run is 0.0080 (same top token 97.7%), against 0.0086 (97.7%) for `-ub 4096` against `-ub 512` on one device.
+
+Same host, server, `GGML_SCHED_STAGE_SLOTS=8`, several requests per server (3.9k and 12.8k tokens), then one 30.7k-token request per server from an earlier build:
+
+| setup | 3.9k tokens | 12.8k tokens | 30.7k tokens |
+| --- | ---: | ---: | ---: |
+| one device | 516-534 t/s | 453 t/s | |
+| expert split | 508-575 t/s | 436-483 t/s | 492 t/s |
+| expert and attention split | 541-617 t/s (mostly 595-617) | 501-507 t/s | 517 t/s |
+
+With the attention split, a layer without heavy attention takes about 112 ms instead of 141 ms. With three staging slots, though, the expert stream can no longer run a layer ahead and every other layer waits for its experts. Use more slots: four or more (the default is four), and five to eight measured best. With eight slots, page-locking the experts no longer helps. On long prompts the indexer, which stays on the first device, takes about as long as FlashAttention.
 
 ## CUDA routed MoE (NVIDIA Ampere and newer)
 

@@ -77,6 +77,7 @@ struct llama_cparams {
 
     int32_t  moe_split_n;          // routed experts computed on the LLAMA_MOE_SPLIT device, the top of the range (0: off)
     uint32_t moe_split_min_tokens; // smallest ubatch that splits the experts
+    int32_t  attn_split_groups;    // attention output groups (and their heads) computed on the LLAMA_MOE_SPLIT device (0: off)
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 

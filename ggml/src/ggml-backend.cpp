@@ -2112,7 +2112,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
             // check if we should start a new split based on the sources of the current node
             bool need_new_split = false;
-            if (node_backend_id == cur_backend_id && split->n_inputs > 0) {
+            // with device-ordered copies, a result of another device also ends a split that has no inputs yet: the work
+            // before it runs while the other device finishes
+            const bool xdev = sched->xdev_events[cur_backend_id] != NULL;
+            if (node_backend_id == cur_backend_id && (split->n_inputs > 0 || (xdev && i > split->i_start))) {
                 for (int j = 0; j < GGML_MAX_SRC; j++) {
                     struct ggml_tensor * src = node->src[j];
                     if (src == NULL) {
@@ -2120,9 +2123,22 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     }
                     // check if a weight is on a different and incompatible backend
                     // by starting a new split, the memory of the previously offloaded weights can be reused
+                    // a view of a weight (a slice of the experts or the heads) has no buffer until it is allocated
+                    ggml_backend_buffer_t xdev_wbuf = xdev && src->view_src != NULL ? src->view_src->buffer : NULL;
+                    if (xdev_wbuf != NULL && xdev_wbuf->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS && !ggml_backend_buffer_is_host(xdev_wbuf)) {
+                        // a weight of another GPU is ready from the start: with device-ordered copies it is copied with the
+                        // split's other inputs, since a new split here would wait for the work queued on this device so far
+                        continue;
+                    }
                     if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
                         int src_backend_id = tensor_backend_id(src);
                         if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
+                            if (xdev && !ggml_backend_buffer_is_host(src->buffer)) {
+                                continue;
+                            }
+                            if (split->n_inputs == 0) {
+                                continue;
+                            }
                             need_new_split = true;
                             break;
                         }

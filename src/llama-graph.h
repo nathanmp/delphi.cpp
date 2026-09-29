@@ -1193,6 +1193,10 @@ struct llm_graph_context {
                  int64_t   n_expert,
                      int   il) const;
 
+    // names the nodes added to gf from node n0 on "attn_xs_*" (remote) or "attn_xa_*", which the graph callback pins to the
+    // split device or to the layer's device; views of allocated tensors (weights, caches) stay where their data is
+    void pin_split_nodes(int n0, bool remote, int il) const;
+
     //
     // inputs
     //
