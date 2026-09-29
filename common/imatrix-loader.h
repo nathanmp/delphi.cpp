@@ -11,6 +11,7 @@ inline constexpr const char * LLM_KV_IMATRIX_CHUNK_SIZE  = "imatrix.chunk_size";
 
 struct common_imatrix_entry {
     std::vector<float>   sums;
+    std::vector<float>   sums1;
     std::vector<int64_t> counts;
 };
 

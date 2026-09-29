@@ -116,9 +116,11 @@ bool common_imatrix_load(const std::string & fname, common_imatrix & imatrix) {
     imatrix.chunk_size   = (chunk_size_key  != -1) ? gguf_get_val_u32(ctx_gguf, chunk_size_key)  : 0;
 
     const std::string in_sum2_suffix{ ".in_sum2" };
+    const std::string in_sum1_suffix{ ".in_sum1" };
     const std::string counts_suffix{ ".counts" };
 
     std::map<std::string, std::pair<struct ggml_tensor *, struct ggml_tensor *>> sums_counts_for;
+    std::map<std::string, struct ggml_tensor *> sums1_for;
 
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
         std::string name = cur->name;
@@ -127,6 +129,8 @@ bool common_imatrix_load(const std::string & fname, common_imatrix & imatrix) {
 
         if (string_remove_suffix(name, in_sum2_suffix)) {
             sums_counts_for[std::move(name)].first = cur;
+        } else if (string_remove_suffix(name, in_sum1_suffix)) {
+            sums1_for[std::move(name)] = cur;
         } else if (string_remove_suffix(name, counts_suffix)) {
             sums_counts_for[std::move(name)].second = cur;
         }
@@ -155,6 +159,18 @@ bool common_imatrix_load(const std::string & fname, common_imatrix & imatrix) {
 
         const int64_t nval    = ggml_nelements(in_sum2);
         const int64_t ncounts = ggml_nelements(counts);
+
+        const auto sum1_it = sums1_for.find(name);
+        if (sum1_it != sums1_for.end()) {
+            const ggml_tensor * in_sum1 = sum1_it->second;
+            if (in_sum1->type != GGML_TYPE_F32 || ggml_nelements(in_sum1) != nval) {
+                LOG_ERR("%s: invalid activation means for %s\n", __func__, name.c_str());
+                gguf_free(ctx_gguf);
+                ggml_free(ctx);
+                return false;
+            }
+            e.sums1.assign((const float *) in_sum1->data, (const float *) in_sum1->data + nval);
+        }
 
         e.sums.resize(nval);
         for (int64_t j = 0; j < nval; ++j) {
