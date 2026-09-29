@@ -36,6 +36,14 @@ What each default does:
 
 Validation used a layer split over three NVIDIA GPUs on narrow PCIe links without peer access, with multi-token prediction. Prompt processing rose by 15-29% at `-ub 2048` and by up to 52% with several ubatches per batch. Generation speed and outputs were unchanged. Most of the ub2048 gain comes from the view alias, because each device hand-off moves half as many bytes. The two wait changes and the input order matter when a server batch holds several ubatches: switching all three back cost 25% of prompt throughput at `-ub 512`.
 
+## GPU graphs (CUDA and HIP)
+
+| variable | default | effect |
+| --- | --- | --- |
+| `GGML_CUDA_GRAPH_CACHE_SIZE` | `2048` | number of captured graphs a device keeps; graphs with more than 256 nodes stay bounded at 64 |
+
+Every distinct graph (each verify width and each draft step of speculative decoding, on every device) takes an entry. With 256 entries, Qwen 3.8 Flash Next with MTP on three R9700s (layer split) sometimes evicted its decode graphs: a whole request at draft depth 3 ran at 18 instead of 58 t/s, and at depth 5 most requests ran at 7-17 t/s. With 2048 entries every request ran at full speed, at under 0.1 GiB more memory per device.
+
 ## Weight streaming (staging ring)
 
 With routed experts in host memory (`-cmoe`, `-ncmoe`, `--numa tensors`), a wide prompt batch can run the expert matrix multiplications on the GPU: the scheduler copies each expert tensor to the device when it reaches the split that uses it (op offload). That copy runs in turn with the device's computation, and a copy from ordinary (pageable) host memory also blocks the scheduler thread at well below the PCIe rate.

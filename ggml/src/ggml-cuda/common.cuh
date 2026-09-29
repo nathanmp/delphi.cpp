@@ -1584,11 +1584,16 @@ struct ggml_backend_cuda_context {
 
     // Tensor split runs one graph per reduction segment (about two per layer), so the working set
     // is far above what layer split needs. Evicting it every token disables graph replay.
+    // Speculative decoding needs a large working set too: each verify width and each draft step is its
+    // own graph on every device. On Qwen 3.8 Flash Next (MTP, layer split over three R9700s) 256
+    // entries thrashed now and then at draft depth 3 (58 -> 18 t/s for a whole request) and at depth 5
+    // on most requests (7-47 t/s); with 2048 every request ran at full speed. The large graphs keep
+    // their own bound below, so the extra entries cost little device memory (< 0.1 GiB per device).
     static size_t graph_cache_capacity() {
         static const size_t capacity = [] {
             const char * env = getenv("GGML_CUDA_GRAPH_CACHE_SIZE");
             const long parsed = env ? atol(env) : 0;
-            return parsed > 0 ? (size_t) parsed : (size_t) 256;
+            return parsed > 0 ? (size_t) parsed : (size_t) 2048;
         }();
         return capacity;
     }
