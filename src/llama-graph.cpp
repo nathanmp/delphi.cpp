@@ -2270,6 +2270,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
+    if (cparams.moe_split_n > 0 && cparams.moe_split_n < n_expert && n_tokens >= (int64_t) cparams.moe_split_min_tokens &&
+            !weight_before_ffn && type_op == LLM_FFN_SILU && up_exps && gate_exps && !gate_up_exps &&
+            !up_exps_b && !gate_exps_b && !down_exps_b && !up_exps_s && !gate_exps_s && !down_exps_s &&
+            (loras == nullptr || loras->empty()) && up_exps->ne[2] == n_expert &&
+            up_exps->buffer && ggml_backend_buffer_is_host(up_exps->buffer)) {
+        return build_moe_ffn_split(cur, up_exps, gate_exps, down_exps, selected_experts, weights, n_expert, il);
+    }
+
     if (weight_before_ffn) {
         // repeat cur to [n_embd, n_expert_used, n_tokens]
         ggml_tensor * repeated = ggml_repeat_4d(ctx0, cur, n_embd, n_expert_used, n_tokens, 1);
@@ -2463,6 +2471,101 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         moe_out = ggml_cont(ctx0, moe_out);
     }
 
+    cb(moe_out, "ffn_moe_out", il);
+
+    return moe_out;
+}
+
+// The top cparams.moe_split_n experts run on the LLAMA_MOE_SPLIT device and the rest where the scheduler puts them. Each part
+// is a partial MUL_MAT_ID over a view of its experts, driven by the same routing with the other part's ids pushed out of
+// range, so every (token, slot) is computed once. The nodes named ffn_moe_xs_* are pinned to the split device
+// (llama_context::graph_get_cb), and are built first so that the device starts while the other part runs.
+ggml_tensor * llm_graph_context::build_moe_ffn_split(
+         ggml_tensor * cur,
+         ggml_tensor * up_exps,
+         ggml_tensor * gate_exps,
+         ggml_tensor * down_exps,
+         ggml_tensor * selected_experts,
+         ggml_tensor * weights,
+             int64_t   n_expert,
+                 int   il) const {
+    const int64_t n_embd   = cur->ne[0];
+    const int64_t n_tokens = cur->ne[2];
+    const int64_t n_b = cparams.moe_split_n;
+    const int64_t n_a = n_expert - n_b;
+
+    // local ids: part A keeps [0, n_a), part B shifts by -n_a; an id of the other part becomes big, out of range
+    const float big = (float) (1 << 20);
+    ggml_tensor * ids_f = ggml_cast(ctx0, selected_experts, GGML_TYPE_F32);
+    ggml_tensor * ids_a = ggml_add(ctx0, ids_f,
+            ggml_scale(ctx0, ggml_step(ctx0, ggml_scale_bias(ctx0, ids_f, 1.0f, 0.5f - (float) n_a)), big));
+    ggml_tensor * ids_b = ggml_scale_bias(ctx0, ids_f, 1.0f, -(float) n_a);
+    ids_b = ggml_add(ctx0, ids_b, ggml_scale(ctx0, ggml_step(ctx0, ggml_scale_bias(ctx0, ids_b, -1.0f, -0.5f)), big));
+    ids_a = ggml_cast(ctx0, ids_a, GGML_TYPE_I32);
+    ids_b = ggml_cast(ctx0, ids_b, GGML_TYPE_I32);
+    cb(ids_a, "ffn_moe_ids_a", il);
+    cb(ids_b, "ffn_moe_ids_b", il);
+    // both before either part: nodes added after the pinned ffn_moe_xs_* nodes would follow them to the split device
+    ggml_build_forward_expand(gf, ids_a);
+    ggml_build_forward_expand(gf, ids_b);
+
+    float limit = 0.0f;
+    if (il >= 0 && (arch == LLM_ARCH_MAPLE || arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK41 || arch == LLM_ARCH_GLM5NEXT ||
+            (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0) || arch == LLM_ARCH_HY_V4)) {
+        limit = hparams.swiglu_clamp_exp[il];
+    }
+
+    const uint32_t n_expert_used_il = hparams.n_expert_used(il);
+
+    auto part = [&](int64_t e0, int64_t ne, ggml_tensor * ids, bool remote) {
+        auto name = [&](ggml_tensor * t, const char * base) {
+            cb(t, (std::string(remote ? "ffn_moe_xs_" : "ffn_moe_xa_") + base).c_str(), il);
+        };
+        auto view = [&](ggml_tensor * t) {
+            return ggml_view_3d(ctx0, t, t->ne[0], t->ne[1], ne, t->nb[1], t->nb[2], e0*t->nb[2]);
+        };
+        // the split device takes all its inputs from the other device before its work: an input copied later waits on
+        // the device for everything queued before it there (see ggml_backend_sched_compute_splits)
+        ggml_tensor * w = weights;
+        if (remote) {
+            w = ggml_scale(ctx0, weights, 1.0f);
+            name(w, "weights");
+            ggml_build_forward_expand(gf, w);
+        }
+        ggml_tensor * up = ggml_mul_mat_id_partial(ctx0, view(up_exps), cur, ids);
+        name(up, "up");
+        ggml_tensor * gate = ggml_mul_mat_id_partial(ctx0, view(gate_exps), cur, ids);
+        name(gate, "gate");
+        ggml_tensor * act = limit > 1e-6f ? ggml_swiglu_clamp(ctx0, gate, up, limit) : ggml_swiglu_split(ctx0, gate, up);
+        name(act, "swiglu");
+        ggml_tensor * experts = ggml_mul_mat_id_partial(ctx0, view(down_exps), act, ids);
+        name(experts, "down");
+        experts = ggml_mul(ctx0, experts, w);
+        name(experts, "weighted");
+        ggml_build_forward_expand(gf, experts);
+
+        ggml_tensor * out = nullptr;
+        for (uint32_t i = 0; i < n_expert_used_il; ++i) {
+            ggml_tensor * e = ggml_view_2d(ctx0, experts, n_embd, n_tokens, experts->nb[2], i*experts->nb[1]);
+            ggml_build_forward_expand(gf, e);
+            if (out == nullptr) {
+                out = e;
+            } else {
+                out = ggml_add(ctx0, out, e);
+                name(out, "sum");
+            }
+        }
+        if (n_expert_used_il == 1) {
+            out = ggml_cont(ctx0, out);
+            name(out, "sum");
+        }
+        ggml_build_forward_expand(gf, out);
+        return out;
+    };
+
+    ggml_tensor * out_b = part(n_a, n_b, ids_b, true);
+    ggml_tensor * out_a = part(0, n_a, ids_a, false);
+    ggml_tensor * moe_out = ggml_add(ctx0, out_a, out_b);
     cb(moe_out, "ffn_moe_out", il);
 
     return moe_out;

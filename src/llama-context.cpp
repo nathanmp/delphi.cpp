@@ -290,6 +290,8 @@ llama_context::llama_context(
 
     // initialized later
     cparams.pipeline_parallel = false;
+    cparams.moe_split_n = 0;
+    cparams.moe_split_min_tokens = 1024;
 
     {
         const char * LLAMA_GRAPH_REUSE_DISABLE = getenv("LLAMA_GRAPH_REUSE_DISABLE");
@@ -359,6 +361,44 @@ llama_context::llama_context(
                 throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev.dev)));
             }
             backends.emplace_back(backend);
+        }
+
+        // LLAMA_MOE_SPLIT=<device>[:<n>]: compute n routed experts (default half) of each host-resident MoE layer on another
+        // device, while the rest run where the scheduler puts them (see llm_graph_context::build_moe_ffn_split)
+        if (const char * env = getenv("LLAMA_MOE_SPLIT"); env != nullptr && *env != '\0' && hparams.n_expert > 1) {
+            std::string spec = env;
+            int32_t n = (int32_t) hparams.n_expert / 2;
+            if (const size_t colon = spec.find(':'); colon != std::string::npos) {
+                n = atoi(spec.c_str() + colon + 1);
+                spec.resize(colon);
+            }
+            ggml_backend_dev_t dev = ggml_backend_dev_by_name(spec.c_str());
+            if (dev == nullptr || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU || n <= 0 || n >= (int32_t) hparams.n_expert) {
+                throw std::runtime_error(format("LLAMA_MOE_SPLIT=%s: expected <GPU device>[:<experts, 1..%u>]", env, hparams.n_expert - 1));
+            }
+            for (auto & backend : backends) {
+                if (ggml_backend_get_device(backend.get()) == dev) {
+                    backend_moe_split = backend.get();
+                }
+            }
+            if (backend_moe_split == nullptr) {
+                backend_moe_split = ggml_backend_dev_init(dev, nullptr);
+                if (backend_moe_split == nullptr) {
+                    throw std::runtime_error(format("failed to initialize %s backend", spec.c_str()));
+                }
+                backends.emplace_back(backend_moe_split);
+            }
+            cparams.moe_split_n = n;
+            // the two devices hand over twice per layer: order those copies on the devices, not with host waits
+            // (see GGML_SCHED_XDEV_EVENTS in ggml_backend_sched_new)
+            if (getenv("GGML_SCHED_XDEV_EVENTS") == nullptr) {
+                setenv("GGML_SCHED_XDEV_EVENTS", "1", 0);
+            }
+            if (const char * e = getenv("LLAMA_MOE_SPLIT_MIN_TOKENS")) {
+                cparams.moe_split_min_tokens = (uint32_t) std::max(1, atoi(e));
+            }
+            LLAMA_LOG_INFO("%s: MoE split: %d of %u routed experts on %s for ubatches of %u+ tokens\n", __func__,
+                    n, hparams.n_expert, spec.c_str(), cparams.moe_split_min_tokens);
         }
 
         // add ACCEL backends (such as BLAS)
@@ -3129,6 +3169,20 @@ llm_graph_cb llama_context::graph_get_cb() const {
             ggml_format_name(cur, "%s-%d", name, il);
         } else {
             ggml_set_name(cur, name);
+        }
+
+        if (backend_moe_split != nullptr && strncmp(name, "ffn_moe_x", 9) == 0 && il >= 0) {
+            // expert split: xs_* on the split device, xa_* on the layer's device (views of host weights are not
+            // weights to the scheduler, so the xa_* nodes would otherwise follow the xs_* nodes)
+            ggml_backend_t target = name[9] == 's' ? backend_moe_split : nullptr;
+            for (const auto & backend : backends) {
+                if (target == nullptr && ggml_backend_get_device(backend.get()) == model.dev_layer(il)) {
+                    target = backend.get();
+                }
+            }
+            if (target != nullptr) {
+                ggml_backend_sched_set_tensor_backend(sched.get(), cur, target);
+            }
         }
 
         // - norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends

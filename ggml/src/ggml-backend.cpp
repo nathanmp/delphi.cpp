@@ -26,6 +26,7 @@
 #include <deque>
 #include <mutex>
 #include <memory>
+#include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -852,6 +853,9 @@ struct ggml_backend_sched {
     int cur_copy;
     int next_copy;
     ggml_backend_event_t events[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_COPIES];
+    // without pipeline parallelism (one input copy): lets a device-to-device input copy wait on the device for the
+    // destination to finish with its previous contents, instead of synchronizing the destination on the host
+    ggml_backend_event_t xdev_events[GGML_SCHED_MAX_BACKENDS];
     struct ggml_tensor ** graph_inputs;
     int n_graph_inputs;
     int graph_inputs_capacity;
@@ -2122,6 +2126,20 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                             need_new_split = true;
                             break;
                         }
+                    } else if (!(src->flags & GGML_TENSOR_FLAG_INPUT)) {
+                        // a result of another device: its copy waits for that device, so start a new split and let
+                        // the work before this node run meanwhile (a MoE split waits for the other device's experts)
+                        int src_backend_id = tensor_backend_id(src);
+                        if (src_backend_id != -1 && src_backend_id != cur_backend_id && src_backend_id != sched->n_backends - 1) {
+                            bool is_input = false;
+                            for (int k = 0; k < split->n_inputs && !is_input; k++) {
+                                is_input = split->inputs[k] == src;
+                            }
+                            if (!is_input) {
+                                need_new_split = true;
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -2643,6 +2661,67 @@ struct ggml_backend_sched_stage_copier {
     }
 };
 
+// page-locks the host weight buffers that the ring stages from (GGML_SCHED_STAGE_REGISTER), so that uploads go straight
+// from the weights to the device, without the memcpy into the bounce buffers. hipHostRegister runs at ~1.2 GB/s (DeepSeek
+// V4.1 Flash: 166 GiB in 142 s), and in the background it stalls the devices' queues for its whole duration, so each
+// buffer is locked when the ring first stages from it, before any upload. Each buffer is one registration: HIP treats a
+// registration as its own allocation and rejects any copy, also outside the ring, that crosses from one into the next.
+struct ggml_backend_sched_stage_registrar {
+    struct region {
+        ggml_backend_buffer_t buffer;
+        char * base; // page-aligned
+        size_t size;
+        bool locked;
+    };
+
+    ggml_backend_stage_register_t   lock   = nullptr;
+    ggml_backend_stage_unregister_t unlock = nullptr;
+    std::mutex mutex; // regions is read by the staging threads
+    std::vector<region> regions;
+
+    void add(ggml_backend_buffer_t buffer) {
+        std::lock_guard<std::mutex> guard(mutex);
+        for (const auto & r : regions) {
+            if (r.buffer == buffer) {
+                return;
+            }
+        }
+        const uintptr_t page = 4096;
+        const uintptr_t begin = ((uintptr_t) ggml_backend_buffer_get_base(buffer) + page - 1) & ~(page - 1);
+        const uintptr_t end = ((uintptr_t) ggml_backend_buffer_get_base(buffer) + ggml_backend_buffer_get_size(buffer)) & ~(page - 1);
+        region r = { buffer, (char *) begin, end > begin ? end - begin : 0, false };
+        if (r.size > 0) {
+            const int64_t t0 = ggml_time_us();
+            r.locked = lock(r.base, r.size);
+            if (r.locked) {
+                GGML_LOG_INFO("%s: page-locked %.1f GiB of staged weights in %.1f s\n", "ggml_backend_sched_stage",
+                        r.size/1073741824.0, (ggml_time_us() - t0)/1e6);
+            }
+        }
+        regions.push_back(r);
+    }
+
+    // true if [src, src + size) lies in one page-locked region
+    bool locked(const void * src, size_t size) {
+        const char * s = (const char *) src;
+        std::lock_guard<std::mutex> guard(mutex);
+        for (const auto & r : regions) {
+            if (r.locked && s >= r.base && s + size <= r.base + r.size) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    ~ggml_backend_sched_stage_registrar() {
+        for (const auto & r : regions) {
+            if (r.locked) {
+                unlock(r.base);
+            }
+        }
+    }
+};
+
 struct ggml_backend_sched_stage_item {
     struct ggml_tensor * input;     // host weight
     struct ggml_tensor * input_cpy; // its split input on the split backend
@@ -2690,6 +2769,11 @@ struct ggml_backend_sched_stage_worker {
     bool stop = false;
     ggml_backend_sched_stage_copier copier;
     std::vector<int> cpus; // the thread and its copier run here: the CPUs next to the device
+
+    // GGML_SCHED_STAGE_STATS=1: where the thread spends its time, printed when the stage is freed
+    std::string name; // the backends can be gone when the stage is freed
+    int64_t us_idle = 0, us_free = 0, us_bounce = 0, us_copy = 0, us_upload = 0;
+    uint64_t bytes_copy = 0, bytes_direct = 0;
 };
 
 struct ggml_backend_sched_stage {
@@ -2704,17 +2788,28 @@ struct ggml_backend_sched_stage {
     ggml_backend_sched_stage_ring rings[GGML_SCHED_MAX_BACKENDS];
     ggml_backend_t backends[GGML_SCHED_MAX_BACKENDS] = {};
     std::unique_ptr<ggml_backend_sched_stage_worker> workers[GGML_SCHED_MAX_BACKENDS]; // null for backends without a ring
+    std::unique_ptr<ggml_backend_sched_stage_registrar> registrar; // GGML_SCHED_STAGE_REGISTER
 };
 
 static void ggml_backend_sched_stage_run_job(
         ggml_backend_sched_stage * stage, ggml_backend_sched_stage_worker * w, const ggml_backend_sched_stage_job & job) {
     ggml_backend_sched_stage_ring & ring = stage->rings[job.backend_id];
     ggml_backend_t backend = stage->backends[job.backend_id];
+    int64_t t = ggml_time_us();
+    auto lap = [&](int64_t & acc) { const int64_t now = ggml_time_us(); acc += now - t; t = now; };
     if (job.wait_free) {
         // a host wait: HIP rejects a copy stream wait on an event of the compute stream while that stream captures
         ggml_backend_event_synchronize(ring.free[job.slot]);
     }
+    lap(w->us_free);
     char * dst = (char *) ggml_backend_buffer_get_base(ring.buffers[job.slot]);
+    if (stage->registrar && stage->registrar->locked(job.src, job.size)) {
+        // straight from the page-locked weights
+        ring.upload(backend, dst, job.src, job.size, ring.done[job.slot]);
+        w->bytes_direct += job.size;
+        lap(w->us_upload);
+        return;
+    }
     if (ring.bounce == nullptr) {
         ring.upload(backend, dst, job.src, job.size, ring.done[job.slot]);
         return;
@@ -2727,10 +2822,14 @@ static void ggml_backend_sched_stage_run_job(
         if (ring.bounce_ev[c] != nullptr) {
             ggml_backend_event_synchronize(ring.bounce_ev[c]);
         }
+        lap(w->us_bounce);
         w->copier.copy(bounce + c*stage->chunk_size, (const char *) job.src + off, n);
+        lap(w->us_copy);
         ggml_backend_event_t ev = off + n >= job.size ? ring.done[job.slot] : ring.chunk_ev[c];
         ring.upload(backend, dst + off, bounce + c*stage->chunk_size, n, ev);
         ring.bounce_ev[c] = ev;
+        lap(w->us_upload);
+        w->bytes_copy += n;
     }
 }
 
@@ -2739,8 +2838,10 @@ static void ggml_backend_sched_stage_work(ggml_backend_sched_stage * stage, ggml
     for (;;) {
         ggml_backend_sched_stage_job job;
         {
+            const int64_t t_idle = ggml_time_us();
             std::unique_lock<std::mutex> lock(w->mutex);
             w->cv_job.wait(lock, [&] { return w->stop || !w->jobs.empty(); });
+            w->us_idle += ggml_time_us() - t_idle;
             if (w->jobs.empty()) {
                 return;
             }
@@ -2807,6 +2908,7 @@ static ggml_backend_sched_stage * ggml_backend_sched_stage_new(ggml_backend_sche
         ggml_backend_dev_props props = {};
         ggml_backend_dev_get_props(dev, &props);
         stage->workers[b].reset(new ggml_backend_sched_stage_worker);
+        stage->workers[b]->name = ggml_backend_name(sched->backends[b]);
         if (pin_ok) {
             stage->workers[b]->cpus = ggml_backend_sched_stage_local_cpus(props.device_id);
         }
@@ -2818,6 +2920,21 @@ static ggml_backend_sched_stage * ggml_backend_sched_stage_new(ggml_backend_sche
     }
     if (n_threads == 0) {
         n_threads = std::max(2, 8/std::max(1, n_dev));
+    }
+    if (const char * e = getenv("GGML_SCHED_STAGE_REGISTER"); e != nullptr && atoi(e) != 0 && n_dev > 0) {
+        for (int b = 0; b < sched->n_backends && stage->registrar == nullptr; b++) {
+            if (stage->workers[b] == nullptr) {
+                continue;
+            }
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(sched->backends[b]));
+            auto lock   = (ggml_backend_stage_register_t)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_stage_register");
+            auto unlock = (ggml_backend_stage_unregister_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_stage_unregister");
+            if (lock != nullptr && unlock != nullptr) {
+                stage->registrar.reset(new ggml_backend_sched_stage_registrar);
+                stage->registrar->lock   = lock;
+                stage->registrar->unlock = unlock;
+            }
+        }
     }
     for (auto & w : stage->workers) {
         if (w == nullptr) {
@@ -2871,7 +2988,9 @@ static void ggml_backend_sched_stage_free(ggml_backend_sched_stage * stage) {
     if (stage == nullptr) {
         return;
     }
-    for (auto & w : stage->workers) {
+    const char * stats = getenv("GGML_SCHED_STAGE_STATS");
+    for (int b = 0; b < GGML_SCHED_MAX_BACKENDS; b++) {
+        auto & w = stage->workers[b];
         if (w == nullptr) {
             continue;
         }
@@ -2881,6 +3000,12 @@ static void ggml_backend_sched_stage_free(ggml_backend_sched_stage * stage) {
         }
         w->cv_job.notify_all();
         w->thread.join();
+        if (stats != nullptr && atoi(stats) != 0) {
+            GGML_LOG_WARN("%s: %s: memcpy %.1f GB in %.2f s (%.1f GB/s), direct %.1f GB; wait free %.2f s, bounce %.2f s, "
+                    "upload calls %.2f s, idle %.2f s\n", __func__, w->name.c_str(),
+                    w->bytes_copy/1e9, w->us_copy/1e6, w->us_copy > 0 ? w->bytes_copy/1e3/w->us_copy : 0.0,
+                    w->bytes_direct/1e9, w->us_free/1e6, w->us_bounce/1e6, w->us_upload/1e6, w->us_idle/1e6);
+        }
     }
     for (auto & ring : stage->rings) {
         ggml_backend_sched_stage_release_ring(ring);
@@ -2960,6 +3085,9 @@ static void ggml_backend_sched_stage_begin(ggml_backend_sched_t sched) {
                 continue;
             }
             stage->items.push_back({ input, input_cpy, split_id, split->backend_id, -1, 0 });
+            if (stage->registrar) {
+                stage->registrar->add(input->buffer);
+            }
             need[split->backend_id] = std::max(need[split->backend_id], ggml_nbytes(input));
         }
     }
@@ -3104,6 +3232,19 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // copy the input tensors to the split backend
         const bool split_is_meta = ggml_backend_is_meta(split_backend);
         bool input_sync_pending = false;
+
+        // the point after which the split backend no longer reads the previous contents of this split's inputs: it is
+        // recorded before the staged inputs are queued, so a device-to-device copy does not also wait for their uploads
+        ggml_backend_event_t xdev_ev = NULL;
+        for (int input_id = 0; input_id < split->n_inputs && sched->xdev_events[split_backend_id] != NULL && xdev_ev == NULL; input_id++) {
+            ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
+            ggml_backend_dev_t input_dev = input_backend ? ggml_backend_get_device(input_backend) : nullptr;
+            if (input_backend != split_backend && input_dev != nullptr && ggml_backend_dev_type(input_dev) != GGML_BACKEND_DEVICE_TYPE_CPU &&
+                    !(split->inputs[input_id]->flags & GGML_TENSOR_FLAG_INPUT)) {
+                xdev_ev = sched->xdev_events[split_backend_id];
+                ggml_backend_event_record(xdev_ev, split_backend);
+            }
+        }
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
@@ -3156,8 +3297,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 // uploaded ahead by the staging ring; the device-to-device copy is ordered on the compute stream
             } else {
                 // wait for the split backend to finish using the input before overwriting it
+                ggml_backend_dev_t input_dev = ggml_backend_get_device(input_backend);
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
+                } else if (xdev_ev != NULL && input_backend != split_backend &&
+                        input_dev != nullptr && ggml_backend_dev_type(input_dev) != GGML_BACKEND_DEVICE_TYPE_CPU &&
+                        input_backend->iface.event_wait != NULL && split_backend->iface.cpy_tensor_async != NULL) {
+                    // the async copy runs on the input backend's stream: make that stream wait for the split backend
+                    ggml_backend_event_wait(input_backend, xdev_ev);
                 } else {
                     const uint64_t wait_start = ggml_backend_sched_trace_detail_span_begin();
                     ggml_backend_synchronize(split_backend);
@@ -3514,6 +3661,16 @@ ggml_backend_sched_t ggml_backend_sched_new(
         }
     }
 
+    const char * xdev_env = getenv("GGML_SCHED_XDEV_EVENTS");
+    if (sched->n_copies == 1 && xdev_env != nullptr && atoi(xdev_env) != 0) {
+        for (int b = 0; b < n_backends; b++) {
+            ggml_backend_dev_t dev = backends[b]->device;
+            if (dev != nullptr && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                sched->xdev_events[b] = ggml_backend_event_new(dev);
+            }
+        }
+    }
+
     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
     sched->op_offload = op_offload;
     sched->stage = ggml_backend_sched_stage_new(sched);
@@ -3531,6 +3688,9 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
             ggml_backend_event_free(sched->events[b][c]);
+        }
+        if (sched->xdev_events[b] != NULL) {
+            ggml_backend_event_free(sched->xdev_events[b]);
         }
     }
     ggml_backend_sched_stage_free(sched->stage);

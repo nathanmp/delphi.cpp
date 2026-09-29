@@ -24,12 +24,14 @@ These switches control how `ggml_backend_sched` copies and synchronizes split in
 | `GGML_SCHED_PREV_SPLIT_WAIT` | off | `1` | Before an input-less split, always wait for the previous split's backend |
 | `GGML_SCHED_COPY_REUSE_WAIT` | off | `1` | Wait for the reuse of the input copy slot before every host input copy |
 | `GGML_SCHED_INPUT_ORDER` | on | `0` | Copy split inputs in first-use order instead of the order of their producers |
+| `GGML_SCHED_XDEV_EVENTS` | off (on with `LLAMA_MOE_SPLIT`) | `1` | Without pipeline parallelism, order a device-to-device input copy with an event on the devices instead of a host wait for the destination |
 
 What each default does:
 
 - **View alias.** When a split needs a view that covers all of a tensor from another backend, the scheduler copies the source once and gives the consumer a view of that copy. Previously the view and its source were each copied. This is skipped for weights, graph inputs, and any tensor that the graph writes in place, so every read sees the data it would have seen with two copies.
 - **Previous-split wait.** The wait exists because the allocator may give a later split memory that the previous split still reads. It is now kept only when the two backends can share memory: the same buffer type, or one backend can use the other's buffer type (host buffers on integrated GPUs, CPU-like backends). Separate discrete GPUs never share compute memory, so they no longer wait on each other here.
 - **Copy-slot reuse wait.** Before input copies into a slot, the host waits for the previous graph that used that slot. Once one host wait on a backend in the current graph has proven the slot free, later copies into the same backend skip it.
+- **Device-to-device events.** Without pipeline parallelism there is one copy of each split input, and before overwriting it the host waits until the destination device is idle. With `GGML_SCHED_XDEV_EVENTS=1` the scheduler records an event on the destination at the start of the split and makes the source device's stream wait for it before the copy, so the host keeps queueing work. A node that reads a result of another device also starts a new split, so that the work before it does not wait for that device.
 - **Input order.** Inputs are copied in the graph order of their producers. On systems without peer-to-peer access, the driver stages peer copies into a device one at a time in submission order. Copying the earliest-ready tensor first keeps a small copy from queueing behind one whose source is still being computed.
 
 Validation used a layer split over three NVIDIA GPUs on narrow PCIe links without peer access, with multi-token prediction. Prompt processing rose by 15-29% at `-ub 2048` and by up to 52% with several ubatches per batch. Generation speed and outputs were unchanged. Most of the ub2048 gain comes from the view alias, because each device hand-off moves half as many bytes. The two wait changes and the input order matter when a server batch holds several ubatches: switching all three back cost 25% of prompt throughput at `-ub 512`.
@@ -46,6 +48,8 @@ With routed experts in host memory (`-cmoe`, `-ncmoe`, `--numa tensors`), a wide
 | `GGML_SCHED_STAGE_CHUNK_MB` | `64` | size of each bounce buffer |
 | `GGML_SCHED_STAGE_THREADS` | 8 / staging devices, at least 2 | memcpy threads per staging device that fill its bounce buffers |
 | `GGML_SCHED_STAGE_PIN` | `1` | run each device's staging threads on the CPUs next to that device (Linux) |
+| `GGML_SCHED_STAGE_REGISTER` | `0` | `1` page-locks the staged host weight buffers when the ring first stages from them, so uploads go straight from the weights to the device without the bounce buffers |
+| `GGML_SCHED_STAGE_STATS` | `0` | `1` prints where each staging thread spent its time when the scheduler is freed |
 
 At the start of each graph, the scheduler lists the host weights that its splits will copy whole, in split order. Each staging device has its own background thread, which copies that device's weights in chunks into pinned host buffers, and the device copies each chunk into a slot on a separate stream, so the uploads of later layers overlap the computation of earlier ones. When the scheduler reaches the split, the device copies the slot into the split input. Expert tensors are staged only when the batch is wide enough that nearly every expert is used; for narrower batches the scheduler keeps copying only the used experts, and decode is unaffected. Supported on CUDA and ROCm devices.
 
@@ -56,6 +60,25 @@ The offload cost model (or `GGML_OP_OFFLOAD_MIN_BATCH`) still decides whether th
 Every ubatch uploads all staged weights once, so the link sets a floor per token of (staged bytes) / (link rate × ubatch size): for DeepSeek V4.1 Flash, about 3.1 ms/token at `-ub 2048` and 1.6 ms/token at `-ub 4096`. A larger ubatch therefore pays off for long prompts, as long as its compute buffer fits. With the later kernel work on the same card, real-text prefill reached 255 tokens/s at `-ub 2048` and 484-489 tokens/s at `-ub 4096`. At `-ub 4096`, three slots ran as fast as four and used 1.4 GiB less VRAM (two slots lost 25%), so `GGML_SCHED_STAGE_SLOTS=3` is a good choice when VRAM is tight, for example next to a draft model. On a dual-socket EPYC 7532 host, pinning the staging threads next to the GPU raised the bounce-buffer fill rate from 26 to 35 GB/s and prefill from 468 to 494 tokens/s at `-ub 4096` (11.4k-token prompt); `GGML_SCHED_STAGE_THREADS=4` added a little more (508 tokens/s).
 
 With a layer split over two GPUs (DeepSeek V4.1 Flash, two R9700s on PCIe 4.0 x16, `-ub 4096`), staging does not speed up prefill: 476 vs 530 tokens/s (3.9k-token prompt) and 417 vs 448 tokens/s (30.7k tokens) on one GPU. Within a ubatch the second GPU waits for the first, and its ring refills only as the scheduler reaches its splits, so the two links take turns rather than running at once. The per-device staging threads are for layouts where devices consume staged weights at the same time.
+
+### Expert split over two devices
+
+| variable | default | effect |
+| --- | --- | --- |
+| `LLAMA_MOE_SPLIT` | unset | `<device>[:<n>]`: compute `n` of the routed experts (default half) of each MoE layer whose experts sit in host memory on a second GPU, for example `ROCm2` |
+| `LLAMA_MOE_SPLIT_MIN_TOKENS` | `1024` | smallest ubatch that splits the experts; smaller ubatches (decode) run as before |
+
+With the experts in host memory (`-cmoe`) and the staging ring on, each device streams and computes its own part of every MoE layer: the second device takes the top `n` experts, the first device the rest, together with everything else. Both parts run the same routing through `ggml_mul_mat_id_partial`, which skips the ids of the other part, and the first device adds the two partial sums. Per MoE layer the devices exchange the normed activations and the partial sum (64 MiB each at 4096 tokens). The second device needs no model layers: it is added to the context as an extra backend. Outputs change only by summation order: on DeepSeek V4.1 Flash the KL divergence to the one-device run is 0.0077 (same top token 98.1%), below the 0.0086 between `-ub 4096` and `-ub 512` on one device.
+
+Measured with DeepSeek V4.1 Flash (Q2_K experts, `--numa tensors`) on two R9700s on PCIe 4.0 x16 next to one socket, server, `-ub 4096`, 3.9k- and 30.7k-token prompts:
+
+| setup | 3.9k tokens | 30.7k tokens |
+| --- | ---: | ---: |
+| one device | 503 t/s | 440 t/s |
+| split | 514 t/s | 459 t/s |
+| split + `GGML_SCHED_STAGE_REGISTER=1` | 546 t/s | 481 t/s |
+
+Without page-locked weights the two staging threads share the host's memcpy bandwidth (about 30 GB/s together, against 50 GB/s for the two links). With them, the first device becomes compute-bound: it keeps attention and the dense layers, about 120 ms per layer against 43 ms for the second device's experts, and the heavier attention layers take 170 ms. Giving the second device more experts does not help (224 of 384: 556 / 478 t/s; 256: 542 / 465). Page-locking 166 GiB of experts adds 142 s before the first staged prompt, which is why it is off by default.
 
 ## CUDA routed MoE (NVIDIA Ampere and newer)
 

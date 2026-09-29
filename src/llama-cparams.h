@@ -75,6 +75,9 @@ struct llama_cparams {
     bool kv_unified;
     bool pipeline_parallel;
 
+    int32_t  moe_split_n;          // routed experts computed on the LLAMA_MOE_SPLIT device, the top of the range (0: off)
+    uint32_t moe_split_min_tokens; // smallest ubatch that splits the experts
+
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 
     enum llama_context_type ctx_type;

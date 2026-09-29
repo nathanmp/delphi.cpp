@@ -137,6 +137,10 @@ extern "C" {
     // stream. Found through get_proc_address under the names "ggml_backend_stage_upload" and "ggml_backend_stage_d2d".
     typedef void (*ggml_backend_stage_upload_t)(ggml_backend_t backend, void * dst, const void * src, size_t size, ggml_backend_event_t done);
     typedef void (*ggml_backend_stage_d2d_t)   (ggml_backend_t backend, void * dst, const void * src, size_t size);
+    // page-lock a host range for direct uploads from every device ("ggml_backend_stage_register"), and undo it
+    // ("ggml_backend_stage_unregister"); register returns false if the range could not be locked
+    typedef bool (*ggml_backend_stage_register_t)  (void * ptr, size_t size);
+    typedef void (*ggml_backend_stage_unregister_t)(void * ptr);
 
     struct ggml_backend_i {
         const char * (*get_name)(ggml_backend_t backend);

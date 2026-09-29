@@ -1182,6 +1182,17 @@ struct llm_graph_context {
              ggml_tensor * down_exps_s = nullptr,
              ggml_tensor * selected_experts_in = nullptr) const;
 
+    // routed experts split between two devices (LLAMA_MOE_SPLIT), see build_moe_ffn
+    ggml_tensor * build_moe_ffn_split(
+             ggml_tensor * cur,
+             ggml_tensor * up_exps,
+             ggml_tensor * gate_exps,
+             ggml_tensor * down_exps,
+             ggml_tensor * selected_experts,
+             ggml_tensor * weights,
+                 int64_t   n_expert,
+                     int   il) const;
+
     //
     // inputs
     //

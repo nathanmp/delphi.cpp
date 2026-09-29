@@ -5199,6 +5199,70 @@ struct test_mul_mat_id : public test_case {
     }
 };
 
+// GGML_OP_MUL_MAT_ID, partial: the ids come from twice the number of experts, some negative, and the ids outside
+// [0, n_mats) must give zero rows
+struct test_mul_mat_id_partial : public test_case {
+    const ggml_type type_a;
+    const int n_mats;
+    const int n_used;
+    const bool b; // broadcast b matrix
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+
+    std::string vars() override {
+        return VARS_TO_STR7(type_a, n_mats, n_used, b, m, n, k);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_mul_mat_id_partial(ggml_type type_a = GGML_TYPE_Q4_0, int n_mats = 16, int n_used = 6, bool b = true,
+            int64_t m = 256, int64_t n = 64, int64_t k = 256)
+        : type_a(type_a), n_mats(n_mats), n_used(n_used), b(b), m(m), n(n), k(k) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * as = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_set_name(as, "as");
+
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 2*n_mats, n);
+        ggml_set_name(ids, "ids");
+        ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+        ggml_set_name(ids, "view_of_ids");
+
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, this->b ? 1 : n_used, n);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out = ggml_mul_mat_id_partial(ctx, as, b, ids);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::random_device rd;
+        std::default_random_engine rng(rd());
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_I32) {
+                init_tensor_uniform(t);
+                continue;
+            }
+            if (ggml_is_view_op(t->op)) {
+                continue;
+            }
+            for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                std::vector<int32_t> data(t->ne[0]);
+                for (int i = 0; i < t->ne[0]; i++) {
+                    data[i] = i - n_mats/2;
+                }
+                std::shuffle(data.begin(), data.end(), rng);
+                ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
+            }
+        }
+    }
+};
+
 // GGML_OP_MUL_MAT_ID with the routed rows concentrated on a small pool of the
 // experts, so that a single expert receives enough rows to reach the batched
 // repack/GEMM thresholds of the CPU IQK and repack paths.
@@ -10796,6 +10860,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         // concentrated routing: 128 rows * 4 experts over a pool of 8 is well
         // past the per-expert row count at which the weights are repacked
         test_cases.emplace_back(new test_mul_mat_id_pool(type_a, GGML_TYPE_F32, 128, 4, 8, false, 256, 128, 256));
+    }
+    // partial MUL_MAT_ID (expert split): broadcast gate/up and per-slot down, few and many tokens
+    for (ggml_type type_a : {GGML_TYPE_Q2_K, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0}) {
+        for (int64_t n : {3, 64, 600}) {
+            test_cases.emplace_back(new test_mul_mat_id_partial(type_a, 16, 6, true,  256, n, 512));
+            test_cases.emplace_back(new test_mul_mat_id_partial(type_a, 16, 6, false, 512, n, 256));
+        }
     }
     for (ggml_type type_a : {GGML_TYPE_IQ3_K, GGML_TYPE_IQ4_K,
                              GGML_TYPE_IQ3_KS, GGML_TYPE_IQ4_KS}) {

@@ -375,6 +375,7 @@ private:
     bool sched_need_reserve = true;
 
     ggml_backend_t backend_cpu = nullptr;
+    ggml_backend_t backend_moe_split = nullptr; // LLAMA_MOE_SPLIT device
     std::vector<ggml_backend_ptr> backends;
 
     // training

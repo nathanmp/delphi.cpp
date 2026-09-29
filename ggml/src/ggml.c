@@ -3505,6 +3505,16 @@ struct ggml_tensor * ggml_mul_mat_id(
     return result;
 }
 
+struct ggml_tensor * ggml_mul_mat_id_partial(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * as,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * ids) {
+    struct ggml_tensor * result = ggml_mul_mat_id(ctx, as, b, ids);
+    ggml_set_op_params_i32(result, GGML_MUL_MAT_ID_PARAM_PARTIAL, 1);
+    return result;
+}
+
 // ggml_out_prod
 
 static inline bool ggml_can_out_prod(const struct ggml_tensor * t0, const struct ggml_tensor * t1) {
