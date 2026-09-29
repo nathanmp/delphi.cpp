@@ -760,6 +760,80 @@ static __global__ void mul_mat_vec_q(
     const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
     const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
 
+#if defined(RDNA4)
+    // delphi: with a short K the loop below leaves most threads idle (K = 640 in Q5_0 is 40 work items for 256 threads).
+    // Give each warp one row instead and spread that row's items over the lanes; a warp reduction then replaces the
+    // shared-memory one. The inv kernels take the same path per column, so verify batches still match decode.
+    constexpr bool item_split = small_k && rows_per_cuda_block == nwarps && (ncols_dst == 1 || inv) && type != GGML_TYPE_NVFP4;
+    if constexpr (item_split) {
+        constexpr int items_per_block = qi/vdr;
+        const int i = threadIdx.y;
+        const int items = blocks_per_row_x * items_per_block;
+
+        float acc[ncols_dst] = { 0.0f };
+        [[maybe_unused]] float acc_gate[ncols_dst] = { 0.0f };
+        for (int it = threadIdx.x; it < items; it += warp_size) {
+            const int kbx = it / items_per_block;
+            const int kqs = vdr * (it % items_per_block);
+            const int kby = kbx * (qk/QK8_1);
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                acc[j] += mmvq_vec_dot<type>(vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, stride_row_x, kqs);
+                if constexpr (has_fusion) {
+                    if (use_gate) {
+                        acc_gate[j] += mmvq_vec_dot<type>(vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, stride_row_x, kqs);
+                    }
+                }
+            }
+        }
+
+        dst += sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row0;
+        const bool row_ok = uint32_t(row0 + i) < stride_col_dst;
+        [[maybe_unused]] const uint32_t bias_off = sample_dst*stride_sample_dst + (ids ? channel_x : channel_dst)*stride_channel_dst + row0 + i;
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            float result = warp_reduce_sum<warp_size>(acc[j]);
+            if constexpr (has_fusion) {
+                const float gate_sum = use_gate ? warp_reduce_sum<warp_size>(acc_gate[j]) : 0.0f;
+                if (threadIdx.x == 0 && row_ok) {
+                    if (use_bias) {
+                        result += ((const float *) fusion.x_bias)[bias_off + j*stride_col_dst];
+                    }
+                    if (use_gate) {
+                        float gate_value = gate_sum;
+                        if (use_gate_bias) {
+                            gate_value += ((const float *) fusion.gate_bias)[bias_off + j*stride_col_dst];
+                        }
+                        switch (active_glu) {
+                            case GGML_GLU_OP_SWIGLU:
+                                result *= ggml_cuda_op_silu_single(gate_value);
+                                break;
+                            case GGML_GLU_OP_GEGLU:
+                                result *= ggml_cuda_op_gelu_single(gate_value);
+                                break;
+                            case GGML_GLU_OP_SWIGLU_OAI:
+                                result = ggml_cuda_op_swiglu_oai_single(gate_value, result);
+                                break;
+                            case GGML_GLU_OP_SWIGLU_CLAMP:
+                                result = ggml_cuda_op_swiglu_clamp_single(gate_value, result, glu_limit);
+                                break;
+                            default:
+                                result = result * gate_value;
+                                break;
+                        }
+                    }
+                }
+            }
+            if (threadIdx.x == 0 && row_ok) {
+                dst[j*stride_col_dst + i] = result;
+            }
+        }
+        GGML_UNUSED_VARS(tmp, tmp_gate, x_biases, gate_biases, x_scales, gate_scales, use_scale, use_gate_scale, x_scale, gate_scale,
+                         gate_bias, x_bias, tid, blocks_per_iter, use_gate, use_bias, use_gate_bias, active_glu, glu_limit);
+        return;
+    }
+#endif // defined(RDNA4)
+
     for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
 
