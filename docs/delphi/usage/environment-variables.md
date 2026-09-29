@@ -43,6 +43,7 @@ With routed experts in host memory (`-cmoe`, `-ncmoe`, `--numa tensors`), a wide
 | variable | default | effect |
 | --- | --- | --- |
 | `GGML_SCHED_STAGE` | `0` | `1` uploads offloaded host weights ahead of the splits that use them |
+| `GGML_SCHED_STAGE_REDIRECT` | `1` | kernels read staged inputs in their ring slots instead of a copy of them; the slot is freed once the split's work is queued. `0` copies each staged input from its slot first (about 3 ms per expert tensor) |
 | `GGML_SCHED_STAGE_SLOTS` | `4` | device slots, each the size of the largest staged tensor; more slots run further ahead and use more VRAM |
 | `GGML_SCHED_STAGE_BOUNCE` | `4` | pinned host bounce buffers; `0` uploads from the weights directly (pageable) |
 | `GGML_SCHED_STAGE_CHUNK_MB` | `64` | size of each bounce buffer |
@@ -68,6 +69,8 @@ With a layer split over two GPUs (DeepSeek V4.1 Flash, two R9700s on PCIe 4.0 x1
 | `LLAMA_MOE_SPLIT` | unset | `<device>[:<n>]`: compute `n` of the routed experts (default half) of each MoE layer whose experts sit in host memory on a second GPU, for example `ROCm2` |
 | `LLAMA_MOE_SPLIT_MIN_TOKENS` | `1024` | smallest ubatch that splits the experts; smaller ubatches (decode) run as before |
 | `LLAMA_ATTN_SPLIT` | unset | `<groups>`: with `LLAMA_MOE_SPLIT`, the same device also computes the attention heads of that many output groups (DeepSeek V4.1, 8 groups of 8 heads; use an even number, since the FA kernel takes 16 heads at a time) |
+| `LLAMA_ATTN_SPLIT_COPY` | `1` | with `LLAMA_ATTN_SPLIT`, keep the split device's slices of `wq_b`, `wo_a` and the sinks in its memory (copied once at context creation, 1.5 GiB for DeepSeek V4.1 Flash) instead of copying them from the first device every ubatch; `0` turns it off |
+| `LLAMA_ATTN_SPLIT_INDEXER` | `0` | `1`: with `LLAMA_ATTN_SPLIT`, the split device also scores the second half of the query rows in the indexer. Experimental: faster on long prompts, but it changes the greedy output although each row should score the same |
 
 With the experts in host memory (`-cmoe`) and the staging ring on, each device streams and computes its own part of every MoE layer: the second device takes the top `n` experts, the first device the rest, together with everything else. Both parts run the same routing through `ggml_mul_mat_id_partial`, which skips the ids of the other part, and the first device adds the two partial sums. Per MoE layer the devices exchange the normed activations and the partial sum (64 MiB each at 4096 tokens). The second device needs no model layers: it is added to the context as an extra backend. Outputs change only by summation order: on DeepSeek V4.1 Flash the KL divergence to the one-device run is 0.0077 (same top token 98.1%), below the 0.0086 between `-ub 4096` and `-ub 512` on one device.
 
@@ -91,7 +94,7 @@ Same host, server, `GGML_SCHED_STAGE_SLOTS=8`, several requests per server (3.9k
 | expert split | 508-575 t/s | 436-483 t/s | 492 t/s |
 | expert and attention split | 541-617 t/s (mostly 595-617) | 501-507 t/s | 517 t/s |
 
-With the attention split, a layer without heavy attention takes about 112 ms instead of 141 ms. With three staging slots, though, the expert stream can no longer run a layer ahead and every other layer waits for its experts. Use more slots: four or more (the default is four), and five to eight measured best. With eight slots, page-locking the experts no longer helps. On long prompts the indexer, which stays on the first device, takes about as long as FlashAttention.
+With the attention split, a layer without heavy attention takes about 112 ms instead of 141 ms. With three staging slots, though, the expert stream can no longer run a layer ahead and every other layer waits for its experts. Use more slots: four or more (the default is four), and five to eight measured best. With eight slots, page-locking the experts no longer helps. On long prompts the indexer, which stays on the first device, takes about as long as FlashAttention. Reading staged inputs in their slots, and keeping the split device's head weights in its memory, raised a 3.9k-token prompt from 600 to 667 t/s and a 12.8k-token prompt from 506 to 535 t/s (`llama-completion`, eight slots), with identical output. With the experimental indexer split as well, the 12.8k-token prompt ran at 553 t/s.
 
 ## CUDA routed MoE (NVIDIA Ampere and newer)
 

@@ -405,6 +405,11 @@ llama_context::llama_context(
             if (const char * e = getenv("LLAMA_ATTN_SPLIT"); e != nullptr && atoi(e) > 0) {
                 cparams.attn_split_groups = atoi(e);
                 LLAMA_LOG_INFO("%s: attention split: %d output groups on %s\n", __func__, cparams.attn_split_groups, spec.c_str());
+                const char * ec = getenv("LLAMA_ATTN_SPLIT_COPY"); // 0: read slices of the layer device's weights
+                if (model.arch == LLM_ARCH_DEEPSEEK41 && cparams.attn_split_groups < (int32_t) hparams.dsv4_o_group_count &&
+                        (ec == nullptr || atoi(ec) != 0)) {
+                    init_attn_split_weights();
+                }
             }
         }
 
@@ -3168,6 +3173,68 @@ void llama_context::set_backend_n_threads(int n_threads) {
     // A graph assigned with a different CPU thread count has stale placement
     // costs: it is only reused under the thread count it was built with
     // (gf_res_prev_threads).
+}
+
+// copy the split device's slices of the head weights once, so that it does not take them from the layer's device every ubatch
+void llama_context::init_attn_split_weights() {
+    const auto & hparams = model.hparams;
+    const int64_t n_layer     = hparams.n_layer();
+    const int64_t n_groups    = hparams.dsv4_o_group_count;
+    const int64_t ng          = cparams.attn_split_groups;
+    const int64_t n_head_grp  = hparams.n_head()/n_groups;
+    const int64_t n_embd_head = hparams.n_embd_head_k();
+    const int64_t g0          = n_groups - ng;
+    const int64_t h0          = g0*n_head_grp;
+    const int64_t nh          = ng*n_head_grp;
+
+    ggml_init_params ip = { (size_t) (3*n_layer + 1)*ggml_tensor_overhead(), nullptr, true };
+    attn_split_ctx.reset(ggml_init(ip));
+    ggml_context * ctx = attn_split_ctx.get();
+
+    attn_split_w.wq_b.assign(n_layer, nullptr);
+    attn_split_w.wo_a.assign(n_layer, nullptr);
+    attn_split_w.sinks.assign(n_layer, nullptr);
+    for (int64_t il = 0; il < n_layer; ++il) {
+        const auto & layer = model.layers[il];
+        if (layer.wq_b == nullptr || layer.wo_a == nullptr || layer.attn_sinks == nullptr || layer.wo_a->ne[2] != n_groups ||
+                layer.wq_b->data == nullptr || layer.wo_a->data == nullptr || layer.attn_sinks->data == nullptr ||
+                layer.attn_sinks->type != GGML_TYPE_F32) {
+            continue;
+        }
+        attn_split_w.wq_b[il]  = ggml_new_tensor_2d(ctx, layer.wq_b->type, layer.wq_b->ne[0], nh*n_embd_head);
+        attn_split_w.wo_a[il]  = ggml_new_tensor_3d(ctx, layer.wo_a->type, layer.wo_a->ne[0], layer.wo_a->ne[1], ng);
+        attn_split_w.sinks[il] = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nh);
+        ggml_format_name(attn_split_w.wq_b[il],  "blk.%d.attn_q_b.split",      (int) il);
+        ggml_format_name(attn_split_w.wo_a[il],  "blk.%d.attn_output_a.split", (int) il);
+        ggml_format_name(attn_split_w.sinks[il], "blk.%d.attn_sinks.split",    (int) il);
+    }
+    if (ggml_get_first_tensor(ctx) == nullptr) {
+        return; // no weights loaded (a context that only measures memory)
+    }
+    attn_split_buf.reset(ggml_backend_alloc_ctx_tensors(ctx, backend_moe_split));
+    if (!attn_split_buf) {
+        throw std::runtime_error("LLAMA_ATTN_SPLIT: failed to allocate the head weights on the split device");
+    }
+    ggml_backend_buffer_set_usage(attn_split_buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    std::vector<uint8_t> tmp;
+    auto copy = [&](ggml_tensor * dst, const ggml_tensor * src, size_t offset) {
+        tmp.resize(ggml_nbytes(dst));
+        ggml_backend_tensor_get(src, tmp.data(), offset, tmp.size());
+        ggml_backend_tensor_set(dst, tmp.data(), 0, tmp.size());
+    };
+    for (int64_t il = 0; il < n_layer; ++il) {
+        if (attn_split_w.wq_b[il] == nullptr) {
+            continue;
+        }
+        const auto & layer = model.layers[il];
+        copy(attn_split_w.wq_b[il],  layer.wq_b,       h0*n_embd_head*layer.wq_b->nb[1]);
+        copy(attn_split_w.wo_a[il],  layer.wo_a,       g0*layer.wo_a->nb[2]);
+        copy(attn_split_w.sinks[il], layer.attn_sinks, h0*sizeof(float));
+    }
+    cparams.attn_split_w = &attn_split_w;
+    LLAMA_LOG_INFO("%s: %.1f MiB of head weights on %s\n", __func__,
+            ggml_backend_buffer_get_size(attn_split_buf.get())/1048576.0, ggml_backend_name(backend_moe_split));
 }
 
 llm_graph_cb llama_context::graph_get_cb() const {

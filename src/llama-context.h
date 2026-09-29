@@ -281,6 +281,8 @@ private:
 
     llm_graph_cb graph_get_cb() const;
 
+    void init_attn_split_weights();
+
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)
     void resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs);
@@ -376,6 +378,10 @@ private:
 
     ggml_backend_t backend_cpu = nullptr;
     ggml_backend_t backend_moe_split = nullptr; // LLAMA_MOE_SPLIT device
+    // LLAMA_ATTN_SPLIT: the split device's head slices of wq_b, wo_a and the sinks, copied into its memory
+    llama_attn_split_weights attn_split_w;
+    ggml_context_ptr         attn_split_ctx;
+    ggml_backend_buffer_ptr  attn_split_buf;
     std::vector<ggml_backend_ptr> backends;
 
     // training

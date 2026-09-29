@@ -2805,6 +2805,10 @@ struct ggml_backend_sched_stage {
     ggml_backend_t backends[GGML_SCHED_MAX_BACKENDS] = {};
     std::unique_ptr<ggml_backend_sched_stage_worker> workers[GGML_SCHED_MAX_BACKENDS]; // null for backends without a ring
     std::unique_ptr<ggml_backend_sched_stage_registrar> registrar; // GGML_SCHED_STAGE_REGISTER
+    // GGML_SCHED_STAGE_REDIRECT: a split reads its staged inputs in their slots, which it frees once its work is queued
+    bool redirect = true;
+    struct held { ggml_tensor * input_cpy; void * data; int backend_id; int slot; };
+    std::vector<held> holding;
 };
 
 static void ggml_backend_sched_stage_run_job(
@@ -2887,6 +2891,9 @@ static ggml_backend_sched_stage * ggml_backend_sched_stage_new(ggml_backend_sche
     auto * stage = new ggml_backend_sched_stage;
     if (const char * e = getenv("GGML_SCHED_STAGE_SLOTS")) {
         stage->n_slots = std::max(1, std::min(GGML_SCHED_STAGE_MAX_SLOTS, atoi(e)));
+    }
+    if (const char * e = getenv("GGML_SCHED_STAGE_REDIRECT")) {
+        stage->redirect = atoi(e) != 0;
     }
     if (const char * e = getenv("GGML_SCHED_STAGE_BOUNCE")) {
         stage->n_bounce = std::min(GGML_SCHED_STAGE_MAX_BOUNCE, atoi(e));
@@ -3104,7 +3111,13 @@ static void ggml_backend_sched_stage_begin(ggml_backend_sched_t sched) {
             if (stage->registrar) {
                 stage->registrar->add(input->buffer);
             }
-            need[split->backend_id] = std::max(need[split->backend_id], ggml_nbytes(input));
+            // with GGML_SCHED_STAGE_REDIRECT a kernel reads the slot as its input tensor, padding included
+            size_t size = ggml_nbytes(input);
+            if (stage->redirect) {
+                size = std::max(size, ggml_backend_buft_get_alloc_size(
+                        ggml_backend_get_default_buffer_type(sched->backends[split->backend_id]), input_cpy));
+            }
+            need[split->backend_id] = std::max(need[split->backend_id], size);
         }
     }
 
@@ -3181,12 +3194,19 @@ static bool ggml_backend_sched_stage_consume(
         // the item waits for a slot that an earlier input of this split read, which is free now
         GGML_ASSERT(stage->n_queued == k && "staging: ring stalled");
         ggml_backend_sched_stage_pump(sched);
-        GGML_ASSERT(stage->items[k].slot >= 0 && "staging: ring stalled");
+        GGML_ASSERT(stage->items[k].slot >= 0 && "staging: ring stalled (with GGML_SCHED_STAGE_REDIRECT, a split needs a slot for each staged input)");
     }
     const ggml_backend_sched_stage_item & item = stage->items[k];
     ggml_backend_sched_stage_ring & ring = stage->rings[item.backend_id];
     ggml_backend_sched_stage_wait_issued(stage->workers[item.backend_id].get(), item.seq);
     ggml_backend_event_wait(split_backend, ring.done[item.slot]);
+    if (stage->redirect && sched->callback_eval == nullptr) {
+        // the split reads the slot in place; ggml_backend_sched_stage_release frees it after the split's work
+        stage->holding.push_back({ input_cpy, input_cpy->data, item.backend_id, item.slot });
+        input_cpy->data = ggml_backend_buffer_get_base(ring.buffers[item.slot]);
+        stage->n_consumed++;
+        return true;
+    }
     ring.d2d(split_backend, input_cpy->data, ggml_backend_buffer_get_base(ring.buffers[item.slot]), ggml_nbytes(item.input));
     ggml_backend_event_record(ring.free[item.slot], split_backend);
     ring.free_recorded[item.slot] = true;
@@ -3194,6 +3214,23 @@ static bool ggml_backend_sched_stage_consume(
     stage->n_consumed++;
     ggml_backend_sched_stage_pump(sched);
     return true;
+}
+
+// after a split's work is queued: free the slots it reads in place and give its inputs their own memory back
+static void ggml_backend_sched_stage_release(ggml_backend_sched_t sched, ggml_backend_t split_backend) {
+    ggml_backend_sched_stage * stage = sched->stage;
+    if (stage == nullptr || stage->holding.empty()) {
+        return;
+    }
+    for (const auto & h : stage->holding) {
+        ggml_backend_sched_stage_ring & ring = stage->rings[h.backend_id];
+        ggml_backend_event_record(ring.free[h.slot], split_backend);
+        ring.free_recorded[h.slot] = true;
+        ring.busy[h.slot] = false;
+        h.input_cpy->data = h.data;
+    }
+    stage->holding.clear();
+    ggml_backend_sched_stage_pump(sched);
 }
 
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
@@ -3513,6 +3550,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         sched->trace_backend_node_ids, split->graph.n_nodes);
             }
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+            ggml_backend_sched_stage_release(sched, split_backend);
             ggml_exec_trace_backend_end();
             ggml_backend_sched_trace_span_end(
                     sched, compute_start, compute_kind, 0, split_id, split_backend_id,
