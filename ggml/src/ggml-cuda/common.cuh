@@ -1660,6 +1660,28 @@ struct ggml_backend_cuda_context {
 
     ggml_cuda_stream_context concurrent_stream_context;
 
+    // delphi: q8_1 copies of MMVQ activations, reused while their source is unchanged within one graph evaluation.
+    // The buffer is allocated before any stream capture and never moves, so captured graphs may read it.
+    struct q8_1_cache_entry {
+        const void * src = nullptr;
+        size_t       src_bytes = 0;
+        int64_t      ne[4] = {};
+        size_t       nb[4] = {};
+    };
+    static constexpr int    Q8_1_CACHE_SLOTS     = 4;
+    static constexpr size_t Q8_1_CACHE_SLOT_SIZE = 256*1024;
+    q8_1_cache_entry q8_1_cache[Q8_1_CACHE_SLOTS];
+    char * q8_1_cache_buf  = nullptr;
+    int    q8_1_cache_next = 0;
+    bool   q8_1_cache_on   = false; // only inside a graph evaluation and on the main stream
+
+    // start (enable) or stop caching; either way every entry is dropped
+    void q8_1_cache_begin(bool enable);
+    // a hit returns true with *ptr at the cached copy; a miss returns false with *ptr at a slot to fill, or null
+    bool q8_1_cache_get(const ggml_tensor * src, size_t q8_bytes, char ** ptr);
+    // drop the entries whose source overlaps what t writes
+    void q8_1_cache_invalidate(const ggml_tensor * t);
+
     ~ggml_backend_cuda_context();
 
     cudaStream_t stream(int device, int stream) {
