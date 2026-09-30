@@ -364,8 +364,9 @@ ggml_tensor * llama_model_glm5next::graph::build_kda_layer(
 
     ggml_tensor * out = build_recurrent_attn(inp_rs, ssm_states_all, Qcur, Kcur, Vcur, g, beta, state, il);
 
-    // the fallbacks return a permuted view, the fused op a contiguous one
-    ggml_tensor * o = ggml_cont_3d(ctx0, out, head_dim, n_head, n_tokens);
+    // the fallbacks return a permuted view, the fused op a contiguous one (no copy needed)
+    ggml_tensor * o = ggml_is_contiguous(out) ? ggml_reshape_3d(ctx0, out, head_dim, n_head, n_tokens)
+                                              : ggml_cont_3d(ctx0, out, head_dim, n_head, n_tokens);
     cb(o, "kda_scan_out", il);
 
     ggml_tensor * gate = ggml_mul_mat(ctx0, layer.ssm_g_b, ggml_mul_mat(ctx0, layer.ssm_g_a, inp));
@@ -376,7 +377,7 @@ ggml_tensor * llama_model_glm5next::graph::build_kda_layer(
     ggml_tensor * gated  = ggml_mul(ctx0, normed, ggml_sigmoid(ctx0, gate));
     cb(gated, "kda_normed", il);
 
-    cur = ggml_mul_mat(ctx0, layer.wo, ggml_cont_2d(ctx0, gated, d_inner, n_tokens));
+    cur = ggml_mul_mat(ctx0, layer.wo, ggml_reshape_2d(ctx0, gated, d_inner, n_tokens));
     cb(cur, "kda_out", il);
 
     return cur;
