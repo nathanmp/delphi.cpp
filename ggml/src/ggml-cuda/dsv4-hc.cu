@@ -145,7 +145,9 @@ static __global__ void dsv4_hc_pre_f32(
     dst[i0*sd0 + it*sd1] = scale * sum;
 }
 
-template <bool has_comb>
+// fused_w: post holds the raw injection and the kernel applies the preceding SCALE -> SIGMOID -> SCALE chain
+// (w = ws1*sigmoid(ws0*p + wb0) + wb1) with the same fp32 expressions as scale_unary_kernel
+template <bool has_comb, bool fused_w = false>
 static __global__ void dsv4_hc_post_f32(
         const float * x,
         const float * residual,
@@ -167,7 +169,11 @@ static __global__ void dsv4_hc_post_f32(
         int64_t sc2,
         int64_t sd0,
         int64_t sd1,
-        int64_t sd2) {
+        int64_t sd2,
+        float ws0 = 1.0f,
+        float wb0 = 0.0f,
+        float ws1 = 1.0f,
+        float wb1 = 0.0f) {
     ggml_cuda_pdl_lc();
     const int64_t ir = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     const int64_t nr = n_embd * hc * n_tokens;
@@ -182,7 +188,12 @@ static __global__ void dsv4_hc_post_f32(
     const int64_t idst = (ir / n_embd) % hc;
     const int64_t it   = ir / (n_embd * hc);
 
-    float sum = x[i0*sx0 + it*sx1] * post[idst*sp0 + it*sp1];
+    float w = post[idst*sp0 + it*sp1];
+    if constexpr (fused_w) {
+        const float t = ws0 * w + wb0;
+        w = ws1 * (1.0f / (1.0f + expf(-t))) + wb1;
+    }
+    float sum = x[i0*sx0 + it*sx1] * w;
     if constexpr (has_comb) {
         for (int64_t isrc = 0; isrc < hc; ++isrc) {
             sum += residual[i0*sr0 + isrc*sr1 + it*sr2] * comb[idst*sc0 + isrc*sc1 + it*sc2];
@@ -272,10 +283,10 @@ void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             scale);
 }
 
-void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+static void dsv4_hc_post_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_tensor * post,
+        const bool fused_w, const float ws0, const float wb0, const float ws1, const float wb1) {
     const ggml_tensor * x        = dst->src[0];
     const ggml_tensor * residual = dst->src[1];
-    const ggml_tensor * post     = dst->src[2];
     const ggml_tensor * comb     = dst->src[3];
 
     GGML_ASSERT(x->type == GGML_TYPE_F32);
@@ -303,7 +314,8 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     const dim3 grid_dims((nr + block_size - 1) / block_size, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
 
-    auto kernel = comb ? dsv4_hc_post_f32<true> : dsv4_hc_post_f32<false>;
+    auto kernel = comb ? (fused_w ? dsv4_hc_post_f32<true, true>  : dsv4_hc_post_f32<true, false>)
+                       : (fused_w ? dsv4_hc_post_f32<false, true> : dsv4_hc_post_f32<false, false>);
     ggml_cuda_kernel_launch(kernel, launch_params,
             (const float *) x->data, (const float *) residual->data,
             (const float *) post->data, comb ? (const float *) comb->data : nullptr, (float *) dst->data,
@@ -312,5 +324,17 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
             nbr0 / sizeof(float), nbr1 / sizeof(float), nbr2 / sizeof(float),
             nbp0 / sizeof(float), nbp1 / sizeof(float),
             nbc0 / sizeof(float), nbc1 / sizeof(float), nbc2 / sizeof(float),
-            nbd0 / sizeof(float), nbd1 / sizeof(float), nbd2 / sizeof(float));
+            nbd0 / sizeof(float), nbd1 / sizeof(float), nbd2 / sizeof(float),
+            ws0, wb0, ws1, wb1);
+}
+
+void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    dsv4_hc_post_launch(ctx, dst, dst->src[2], false, 1.0f, 0.0f, 1.0f, 0.0f);
+}
+
+void ggml_cuda_op_dsv4_hc_post_fused_w(ggml_backend_cuda_context & ctx, const ggml_tensor * scale0,
+        const ggml_tensor * scale1, ggml_tensor * dst) {
+    dsv4_hc_post_launch(ctx, dst, scale0->src[0], true,
+            ggml_get_op_params_f32(scale0, 0), ggml_get_op_params_f32(scale0, 1),
+            ggml_get_op_params_f32(scale1, 0), ggml_get_op_params_f32(scale1, 1));
 }
