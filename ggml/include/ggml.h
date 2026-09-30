@@ -597,6 +597,7 @@ extern "C" {
         GGML_OP_GATED_DELTA_NET,
         GGML_OP_LIGHTNING_INDEXER,
         GGML_OP_KPOOL_EXPAND,
+        GGML_OP_INTERVAL_MASK,
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
@@ -2729,6 +2730,18 @@ extern "C" {
             struct ggml_tensor  * tail_cells,
             struct ggml_tensor  * tail_mask,
             int32_t               kpool);
+
+    // Attention-style mask from per-key and per-query scalars:
+    //   dst[j, i, 0, s] = (cells[j, 0, 0, s] <= queries[i, 0, 0, s] &&
+    //                      cells[j, 1, 0, s] >= queries[i, 1, 0, s]) ? 0 : -INFINITY
+    // cells: F32 [n_kv, 2, 1, n_stream], queries: F32 [n_q, 2, 1, n_stream] (rows may be strided views)
+    // dst:   type (F16 or F32) [n_kv, n_q, 1, n_stream]
+    // Lets a backend build O(n_kv*n_q) masks from O(n_kv + n_q) uploaded data.
+    GGML_API struct ggml_tensor * ggml_interval_mask(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * cells,
+            struct ggml_tensor  * queries,
+            enum ggml_type        type);
 
     // DeepSeek V4 hyper-connections (ref. https://arxiv.org/pdf/2512.24880)
     // In short these operations are replacements for the original residual connection (x = transformer(x) + x)

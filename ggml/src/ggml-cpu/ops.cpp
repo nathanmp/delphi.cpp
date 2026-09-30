@@ -12404,3 +12404,50 @@ void ggml_compute_forward_kpool_expand(
         }
     }
 }
+
+// ggml_compute_forward_interval_mask
+
+void ggml_compute_forward_interval_mask(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * cells   = dst->src[0];
+    const ggml_tensor * queries = dst->src[1];
+
+    const int64_t n_kv = dst->ne[0];
+    const int64_t n_q  = dst->ne[1];
+    const int64_t n_rows = n_q*dst->ne[3];
+
+    const int64_t dr  = (n_rows + params->nth - 1)/params->nth;
+    const int64_t ir0 = dr*params->ith;
+    const int64_t ir1 = MIN(ir0 + dr, n_rows);
+
+    const bool out_f16 = dst->type == GGML_TYPE_F16;
+    const ggml_fp16_t zero_f16 = GGML_CPU_FP32_TO_FP16(0.0f);
+    const ggml_fp16_t ninf_f16 = GGML_CPU_FP32_TO_FP16(-INFINITY);
+
+    for (int64_t row = ir0; row < ir1; ++row) {
+        const int64_t s = row/n_q;
+        const int64_t i = row%n_q;
+
+        const char  * q  = (const char *) queries->data + s*queries->nb[3];
+        const float   hi = ((const float *) q)[i];
+        const float   lo = ((const float *) (q + queries->nb[1]))[i];
+
+        const char  * c = (const char *) cells->data + s*cells->nb[3];
+        const float * a = (const float *) c;
+        const float * b = (const float *) (c + cells->nb[1]);
+
+        char * out = (char *) dst->data + i*dst->nb[1] + s*dst->nb[3];
+        if (out_f16) {
+            ggml_fp16_t * o = (ggml_fp16_t *) out;
+            for (int64_t j = 0; j < n_kv; ++j) {
+                o[j] = a[j] <= hi && b[j] >= lo ? zero_f16 : ninf_f16;
+            }
+        } else {
+            float * o = (float *) out;
+            for (int64_t j = 0; j < n_kv; ++j) {
+                o[j] = a[j] <= hi && b[j] >= lo ? 0.0f : -INFINITY;
+            }
+        }
+    }
+}

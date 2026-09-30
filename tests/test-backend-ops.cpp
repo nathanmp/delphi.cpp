@@ -8919,6 +8919,55 @@ struct test_lightning_indexer : public test_case {
     }
 };
 
+// GGML_OP_INTERVAL_MASK
+struct test_interval_mask : public test_case {
+    const ggml_type type;
+    const int64_t n_kv;
+    const int64_t n_q;
+    const int64_t n_stream;
+
+    std::string vars() override {
+        return VARS_TO_STR4(type, n_kv, n_q, n_stream);
+    }
+
+    double max_err() override {
+        return 0.0;
+    }
+
+    test_interval_mask(ggml_type type = GGML_TYPE_F16, int64_t n_kv = 300, int64_t n_q = 7, int64_t n_stream = 2)
+        : type(type), n_kv(n_kv), n_q(n_q), n_stream(n_stream) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        // three cell rows and four query rows, consumed through strided two-row views
+        ggml_tensor * cells   = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_kv, 3, 1, n_stream);
+        ggml_tensor * queries = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_q,  4, 1, n_stream);
+        ggml_set_name(cells, "cells");
+        ggml_set_name(queries, "queries");
+
+        ggml_tensor * c = ggml_view_4d(ctx, cells, n_kv, 2, 1, n_stream, cells->nb[1], cells->nb[2], cells->nb[3], cells->nb[1]);
+        ggml_tensor * q = ggml_view_4d(ctx, queries, n_q, 2, 1, n_stream, queries->nb[1], queries->nb[2], queries->nb[3], 2*queries->nb[1]);
+
+        ggml_tensor * out = ggml_interval_mask(ctx, c, q, type);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(1234);
+        std::uniform_int_distribution<int> pos(0, (int) n_kv);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "cells") == 0 || strcmp(t->name, "queries") == 0) {
+                std::vector<float> values(ggml_nelements(t));
+                for (size_t i = 0; i < values.size(); ++i) {
+                    const int r = pos(rng);
+                    values[i] = r % 11 == 0 ? 1e30f : r % 13 == 0 ? -1e30f : (float) r;
+                }
+                ggml_backend_tensor_set(t, values.data(), 0, ggml_nbytes(t));
+            }
+        }
+    }
+};
+
 // GGML_OP_KPOOL_EXPAND
 struct test_kpool_expand : public test_case {
     const int64_t kpool;
@@ -11896,6 +11945,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_lightning_indexer(128, 32, 257, 7, 4, 1, GGML_TYPE_F32));
 
     test_cases.emplace_back(new test_kpool_expand(4, 7, 3, 4, 1, 1));
+    test_cases.emplace_back(new test_interval_mask(GGML_TYPE_F16, 300, 7, 2));
+    test_cases.emplace_back(new test_interval_mask(GGML_TYPE_F32, 1000, 33, 1));
     test_cases.emplace_back(new test_kpool_expand(8, 11, 5, 7, 3, 2));
 
     return test_cases;
