@@ -3532,6 +3532,30 @@ static bool ggml_cuda_match_moe_down_reduction(
 }
 
 
+// MUL -> VIEW -> ADD -> SIGMOID -> SCALE at node_idx: the pre/post weight chain of dsv4_hc_affine (deepseek4.cpp), a
+// [hc, n_tokens] view of the mixes times a one-element hc_scale view plus a [hc] hc_base view (the VIEW node)
+static bool ggml_cuda_is_dsv4_hc_wchain(const struct ggml_cgraph * cgraph, int node_idx) {
+    if (node_idx + 5 > cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * mul  = cgraph->nodes[node_idx];
+    const ggml_tensor * view = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * add  = cgraph->nodes[node_idx + 2];
+    const ggml_tensor * u    = cgraph->nodes[node_idx + 3];
+    const ggml_tensor * s    = cgraph->nodes[node_idx + 4];
+    if (mul->op != GGML_OP_MUL || view->op != GGML_OP_VIEW || add->op != GGML_OP_ADD || u->op != GGML_OP_UNARY ||
+            s->op != GGML_OP_SCALE || ggml_get_unary_op(u) != GGML_UNARY_OP_SIGMOID) {
+        return false;
+    }
+    const ggml_tensor * x = mul->src[0];
+    return add->src[0] == mul && add->src[1] == view && u->src[0] == add && s->src[0] == u &&
+        x->type == GGML_TYPE_F32 && mul->src[1]->type == GGML_TYPE_F32 && ggml_nelements(mul->src[1]) == 1 &&
+        view->type == GGML_TYPE_F32 && view->ne[0] == x->ne[0] && ggml_nrows(view) == 1 &&
+        x->ne[2] == 1 && x->ne[3] == 1 && ggml_are_same_shape(x, s) &&
+        mul->type == GGML_TYPE_F32 && add->type == GGML_TYPE_F32 && u->type == GGML_TYPE_F32 && s->type == GGML_TYPE_F32 &&
+        ggml_is_contiguous(s);
+}
+
 static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
                                int                                       node_idx,
                                std::initializer_list<enum ggml_op>       ops,
@@ -3621,6 +3645,57 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
             int out_nodes[] = { node_idx + 2 };
             return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int)ops.size(), out_nodes, 1);
         }
+    }
+
+    // the MUL -> VIEW -> ADD -> SIGMOID -> SCALE weight chain, on its own, into DSV4_HC_PRE, or with the DSV4_HC_COMB
+    // between it and DSV4_HC_POST (the comb kernel runs first, the post kernel applies the chain per weight)
+    if (ops.size() >= 5 && ops.begin()[0] == GGML_OP_MUL && ops.begin()[1] == GGML_OP_VIEW &&
+            unary_ops.size() == 1 && unary_ops.begin()[0] == GGML_UNARY_OP_SIGMOID) {
+        const std::initializer_list<enum ggml_op> wchain_ops      = { GGML_OP_MUL, GGML_OP_VIEW, GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_SCALE };
+        const std::initializer_list<enum ggml_op> wchain_pre_ops  = { GGML_OP_MUL, GGML_OP_VIEW, GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_SCALE,
+                                                                      GGML_OP_DSV4_HC_PRE };
+        const std::initializer_list<enum ggml_op> wchain_post_ops = { GGML_OP_MUL, GGML_OP_VIEW, GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_SCALE,
+                                                                      GGML_OP_DSV4_HC_COMB, GGML_OP_DSV4_HC_POST };
+        if (!ggml_cuda_is_dsv4_hc_wchain(cgraph, node_idx)) {
+            return false;
+        }
+        const ggml_tensor * s = cgraph->nodes[node_idx + 4];
+        const auto in_chain = [&](const ggml_tensor * t) {
+            for (int k = 0; k < 5; ++k) {
+                if (t == cgraph->nodes[node_idx + k]) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        if (is_equal(wchain_ops, ops)) {
+            int out_nodes[] = { node_idx + 4 };
+            return ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 4 }) &&
+                ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int) ops.size(), out_nodes, 1);
+        }
+        if (is_equal(wchain_pre_ops, ops)) {
+            const ggml_tensor * pre = cgraph->nodes[node_idx + 5];
+            if (pre->op != GGML_OP_DSV4_HC_PRE || pre->src[1] != s || in_chain(pre->src[0]) ||
+                    ggml_get_op_params_i32(pre, 1) != 0) {
+                return false;
+            }
+            int out_nodes[] = { node_idx + 5 };
+            return ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 5 }) &&
+                ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int) ops.size(), out_nodes, 1);
+        }
+        if (is_equal(wchain_post_ops, ops)) {
+            const ggml_tensor * comb = cgraph->nodes[node_idx + 5];
+            const ggml_tensor * post = cgraph->nodes[node_idx + 6];
+            if (comb->op != GGML_OP_DSV4_HC_COMB || post->op != GGML_OP_DSV4_HC_POST || post->src[2] != s || post->src[3] != comb ||
+                    in_chain(post->src[0]) || in_chain(post->src[1]) ||
+                    in_chain(comb->src[0]) || in_chain(comb->src[1]) || in_chain(comb->src[2])) {
+                return false;
+            }
+            int out_nodes[] = { node_idx + 5, node_idx + 6 };
+            return ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 5, node_idx + 6 }) &&
+                ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int) ops.size(), out_nodes, 2);
+        }
+        return false;
     }
 
     // SCALE -> SIGMOID -> SCALE -> DSV4_HC_POST (post weights): the post kernel applies the chain per weight
@@ -4636,8 +4711,27 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST },
                 { GGML_UNARY_OP_SIGMOID })) {
-        ggml_cuda_op_dsv4_hc_post_fused_w(*cuda_ctx, node, cgraph->nodes[i + 2], cgraph->nodes[i + 3]);
+        ggml_cuda_op_dsv4_hc_post_fused_w(*cuda_ctx, node, nullptr, cgraph->nodes[i + 2], cgraph->nodes[i + 3]);
         return 3;
+    }
+
+    if (node->op == GGML_OP_MUL) {
+        if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_MUL, GGML_OP_VIEW, GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_SCALE,
+                        GGML_OP_DSV4_HC_COMB, GGML_OP_DSV4_HC_POST }, { GGML_UNARY_OP_SIGMOID })) {
+            ggml_cuda_op_dsv4_hc_comb(*cuda_ctx, cgraph->nodes[i + 5]);
+            ggml_cuda_op_dsv4_hc_post_fused_w(*cuda_ctx, node, cgraph->nodes[i + 2], cgraph->nodes[i + 4], cgraph->nodes[i + 6]);
+            return 6;
+        }
+        if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_MUL, GGML_OP_VIEW, GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_SCALE,
+                        GGML_OP_DSV4_HC_PRE }, { GGML_UNARY_OP_SIGMOID })) {
+            ggml_cuda_op_dsv4_hc_pre_fused_w(*cuda_ctx, node, cgraph->nodes[i + 2], cgraph->nodes[i + 4], cgraph->nodes[i + 5]);
+            return 5;
+        }
+        if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_MUL, GGML_OP_VIEW, GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_SCALE },
+                    { GGML_UNARY_OP_SIGMOID })) {
+            ggml_cuda_op_dsv4_hc_wchain(*cuda_ctx, node, cgraph->nodes[i + 2], cgraph->nodes[i + 4]);
+            return 4;
+        }
     }
 
     for (const ggml_unary_op uop : { GGML_UNARY_OP_SIGMOID, GGML_UNARY_OP_SILU }) {

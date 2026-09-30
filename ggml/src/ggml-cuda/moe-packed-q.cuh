@@ -155,8 +155,12 @@ static __device__ __forceinline__ uint32_t moe_iq3s_sign_mask(const uint32_t x) 
 // q8_1 block of the sub-block. Row 16*mg + 8*h + g holds its 8 grid groups l in the bytes h + 2*(l/4) of the Q words of lanes
 // 4*g + l%4, so one 16 B load gives the codes of both rows. The integer codes, the scale and the float operations of each row are
 // those of vec_dot_iq3_s_q8_1.
+// grid: iq3s_grid, or (grid_m1) a shared memory copy of iq3s_grid - 0x01010101, whose 16 lookups per call hit fewer banks than
+// L1 lines. The grid bytes g are odd, so (g - 1) | 1 = g and ~(g - 1) | 1 = -g: two instructions instead of the emulated __vsub4.
+template <bool grid_m1 = false>
 static __device__ __forceinline__ float2 vec_dot_iq3s_packed_q8_1(
-        const char * __restrict__ sb, const int mg, const int g, const int ib, const block_q8_1 * __restrict__ bq8_1) {
+        const char * __restrict__ sb, const int mg, const int g, const int ib, const block_q8_1 * __restrict__ bq8_1,
+        const uint32_t * __restrict__ grid) {
     const int ks = ib % 4;
 
     const char * ch = sb + (ib/4)*MOE_PACKED_IQ3S_CHUNK;
@@ -178,8 +182,8 @@ static __device__ __forceinline__ float2 vec_dot_iq3s_packed_q8_1(
             const int j    = h + 2*(l/4);
             const int idx  = __byte_perm(qw[t], 0, 0x4440 | j) | (((hw[t] >> (4*ks + j)) & 1) << 8);
             const int sgn  = moe_iq3s_sign_mask(sw[t] << (4*(ks % 2) + j));
-            const int grid = __vsub4(iq3s_grid[idx] ^ sgn, sgn);
-            sumi[h] = ggml_cuda_dp4a(grid, u, sumi[h]);
+            const int gv   = grid_m1 ? (grid[idx] ^ sgn) | 0x01010101 : __vsub4(grid[idx] ^ sgn, sgn);
+            sumi[h] = ggml_cuda_dp4a(gv, u, sumi[h]);
         }
     }
 
@@ -1184,7 +1188,12 @@ template <> struct moe_packed_q<GGML_CUDA_MOE_PACKED_IQ3S> {
 
     static __device__ __forceinline__ float2 vec_dot2(
             const char * sb, const int mg, const int g, const int p, const block_q8_1 * y) {
-        return vec_dot_iq3s_packed_q8_1(sb, mg, g, p, y + p);
+        return vec_dot_iq3s_packed_q8_1(sb, mg, g, p, y + p, iq3s_grid);
+    }
+
+    static __device__ __forceinline__ float2 vec_dot2_grid(
+            const char * sb, const int mg, const int g, const int p, const block_q8_1 * y, const uint32_t * grid) {
+        return vec_dot_iq3s_packed_q8_1<true>(sb, mg, g, p, y + p, grid);
     }
 };
 

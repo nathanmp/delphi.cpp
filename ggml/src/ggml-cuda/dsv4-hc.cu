@@ -4,6 +4,55 @@
 
 static constexpr int DSV4_HC = 4;
 
+// delphi: the chain that produces the pre/post weights, evaluated by the kernel that reads them:
+//   DSV4_HC_WCHAIN_SCALE:   SCALE -> SIGMOID -> SCALE        t = s0*w + b0
+//   DSV4_HC_WCHAIN_MUL_ADD: MUL -> ADD -> SIGMOID -> SCALE   t = w*mul[0] + add[ih]  (dsv4_hc_affine of deepseek4.cpp)
+// then w = s1*sigmoid(t) + b1. Every step rounds like its separate kernel, so the result does not change.
+enum dsv4_hc_wchain_mode {
+    DSV4_HC_WCHAIN_NONE    = 0,
+    DSV4_HC_WCHAIN_SCALE   = 1,
+    DSV4_HC_WCHAIN_MUL_ADD = 2,
+};
+
+struct dsv4_hc_wchain {
+    const float * mul;
+    const float * add;
+    int64_t       add_s;
+    float         s0;
+    float         b0;
+    float         s1;
+    float         b1;
+};
+
+template <int mode>
+static __device__ __forceinline__ float dsv4_hc_wchain_apply(const dsv4_hc_wchain & c, const float w, const int64_t ih) {
+    if constexpr (mode == DSV4_HC_WCHAIN_NONE) {
+        return w;
+    } else {
+        float t;
+        if constexpr (mode == DSV4_HC_WCHAIN_SCALE) {
+            t = c.s0 * w + c.b0;
+        } else {
+            t = __fadd_rn(__fmul_rn(w, c.mul[0]), c.add[ih*c.add_s]);
+        }
+        return c.s1 * (1.0f / (1.0f + expf(-t))) + c.b1;
+    }
+}
+
+// the chain on its own, for weights that the next node does not read
+static __global__ void dsv4_hc_wchain_f32(const float * x, float * dst, const dsv4_hc_wchain c,
+        const int64_t ne0, const int64_t n, const int64_t sx0, const int64_t sx1) {
+    ggml_cuda_pdl_lc();
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    ggml_cuda_pdl_sync();
+    const int64_t i0 = i % ne0;
+    const int64_t i1 = i / ne0;
+    dst[i] = dsv4_hc_wchain_apply<DSV4_HC_WCHAIN_MUL_ADD>(c, x[i0*sx0 + i1*sx1], i0);
+}
+
 
 static __device__ void dsv4_hc_comb_norm_cols(float * comb, float eps) {
     for (int idst = 0; idst < DSV4_HC; ++idst) {
@@ -100,7 +149,7 @@ static __global__ void dsv4_hc_comb_f32(
     }
 }
 
-template <bool gated>
+template <bool gated, int wmode = DSV4_HC_WCHAIN_NONE>
 static __global__ void dsv4_hc_pre_f32(
         const float * x,
         const float * weights,
@@ -116,7 +165,8 @@ static __global__ void dsv4_hc_pre_f32(
         int64_t sw2,
         int64_t sd0,
         int64_t sd1,
-        float   scale) {
+        float   scale,
+        const dsv4_hc_wchain wc) {
     ggml_cuda_pdl_lc();
     const int64_t ir = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     const int64_t nr = n_embd * n_tokens;
@@ -137,7 +187,7 @@ static __global__ void dsv4_hc_pre_f32(
         if constexpr (gated) {
             wv = 1.0f / (1.0f + expf(-weights[i0*sw0 + ih*sw1 + it*sw2]));
         } else {
-            wv = weights[ih*sw0 + it*sw1];
+            wv = dsv4_hc_wchain_apply<wmode>(wc, weights[ih*sw0 + it*sw1], ih);
         }
         sum += xv * wv;
     }
@@ -145,9 +195,8 @@ static __global__ void dsv4_hc_pre_f32(
     dst[i0*sd0 + it*sd1] = scale * sum;
 }
 
-// fused_w: post holds the raw injection and the kernel applies the preceding SCALE -> SIGMOID -> SCALE chain
-// (w = ws1*sigmoid(ws0*p + wb0) + wb1) with the same fp32 expressions as scale_unary_kernel
-template <bool has_comb, bool fused_w = false>
+// wmode: post holds the raw input of the weight chain, which the kernel applies per weight
+template <bool has_comb, int wmode = DSV4_HC_WCHAIN_NONE>
 static __global__ void dsv4_hc_post_f32(
         const float * x,
         const float * residual,
@@ -170,10 +219,7 @@ static __global__ void dsv4_hc_post_f32(
         int64_t sd0,
         int64_t sd1,
         int64_t sd2,
-        float ws0 = 1.0f,
-        float wb0 = 0.0f,
-        float ws1 = 1.0f,
-        float wb1 = 0.0f) {
+        const dsv4_hc_wchain wc) {
     ggml_cuda_pdl_lc();
     const int64_t ir = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     const int64_t nr = n_embd * hc * n_tokens;
@@ -188,11 +234,7 @@ static __global__ void dsv4_hc_post_f32(
     const int64_t idst = (ir / n_embd) % hc;
     const int64_t it   = ir / (n_embd * hc);
 
-    float w = post[idst*sp0 + it*sp1];
-    if constexpr (fused_w) {
-        const float t = ws0 * w + wb0;
-        w = ws1 * (1.0f / (1.0f + expf(-t))) + wb1;
-    }
+    const float w = dsv4_hc_wchain_apply<wmode>(wc, post[idst*sp0 + it*sp1], idst);
     float sum = x[i0*sx0 + it*sx1] * w;
     if constexpr (has_comb) {
         for (int64_t isrc = 0; isrc < hc; ++isrc) {
@@ -248,9 +290,9 @@ void ggml_cuda_op_dsv4_hc_comb(ggml_backend_cuda_context & ctx, ggml_tensor * ds
             eps, n_iter);
 }
 
-void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    const ggml_tensor * x       = dst->src[0];
-    const ggml_tensor * weights = dst->src[1];
+static void dsv4_hc_pre_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_tensor * weights,
+        const int wmode, const dsv4_hc_wchain & wc) {
+    const ggml_tensor * x = dst->src[0];
 
     GGML_ASSERT(x->type == GGML_TYPE_F32);
     GGML_ASSERT(weights->type == GGML_TYPE_F32);
@@ -266,6 +308,7 @@ void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 
     const float scale = ggml_get_op_params_f32(dst, 0);
     const bool  gated = ggml_get_op_params_i32(dst, 1) != 0;
+    GGML_ASSERT(!gated || wmode == DSV4_HC_WCHAIN_NONE);
 
     const int block_size = 256;
     const int64_t nr = n_embd * n_tokens;
@@ -273,18 +316,24 @@ void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const dim3 grid_dims((nr + block_size - 1) / block_size, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
 
-    auto kernel = gated ? dsv4_hc_pre_f32<true> : dsv4_hc_pre_f32<false>;
+    auto kernel = gated ? dsv4_hc_pre_f32<true> :
+        wmode == DSV4_HC_WCHAIN_SCALE   ? dsv4_hc_pre_f32<false, DSV4_HC_WCHAIN_SCALE> :
+        wmode == DSV4_HC_WCHAIN_MUL_ADD ? dsv4_hc_pre_f32<false, DSV4_HC_WCHAIN_MUL_ADD> : dsv4_hc_pre_f32<false>;
     ggml_cuda_kernel_launch(kernel, launch_params,
             (const float *) x->data, (const float *) weights->data, (float *) dst->data,
             n_embd, hc, n_tokens,
             nbx0 / sizeof(float), nbx1 / sizeof(float), nbx2 / sizeof(float),
             nbw0 / sizeof(float), nbw1 / sizeof(float), nbw2 / sizeof(float),
             nbd0 / sizeof(float), nbd1 / sizeof(float),
-            scale);
+            scale, wc);
+}
+
+void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    dsv4_hc_pre_launch(ctx, dst, dst->src[1], DSV4_HC_WCHAIN_NONE, dsv4_hc_wchain{});
 }
 
 static void dsv4_hc_post_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_tensor * post,
-        const bool fused_w, const float ws0, const float wb0, const float ws1, const float wb1) {
+        const int wmode, const dsv4_hc_wchain & wc) {
     const ggml_tensor * x        = dst->src[0];
     const ggml_tensor * residual = dst->src[1];
     const ggml_tensor * comb     = dst->src[3];
@@ -314,8 +363,10 @@ static void dsv4_hc_post_launch(ggml_backend_cuda_context & ctx, ggml_tensor * d
     const dim3 grid_dims((nr + block_size - 1) / block_size, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
 
-    auto kernel = comb ? (fused_w ? dsv4_hc_post_f32<true, true>  : dsv4_hc_post_f32<true, false>)
-                       : (fused_w ? dsv4_hc_post_f32<false, true> : dsv4_hc_post_f32<false, false>);
+    auto kernel =
+        wmode == DSV4_HC_WCHAIN_SCALE   ? (comb ? dsv4_hc_post_f32<true, DSV4_HC_WCHAIN_SCALE>   : dsv4_hc_post_f32<false, DSV4_HC_WCHAIN_SCALE>) :
+        wmode == DSV4_HC_WCHAIN_MUL_ADD ? (comb ? dsv4_hc_post_f32<true, DSV4_HC_WCHAIN_MUL_ADD> : dsv4_hc_post_f32<false, DSV4_HC_WCHAIN_MUL_ADD>) :
+                                          (comb ? dsv4_hc_post_f32<true>                         : dsv4_hc_post_f32<false>);
     ggml_cuda_kernel_launch(kernel, launch_params,
             (const float *) x->data, (const float *) residual->data,
             (const float *) post->data, comb ? (const float *) comb->data : nullptr, (float *) dst->data,
@@ -325,16 +376,57 @@ static void dsv4_hc_post_launch(ggml_backend_cuda_context & ctx, ggml_tensor * d
             nbp0 / sizeof(float), nbp1 / sizeof(float),
             nbc0 / sizeof(float), nbc1 / sizeof(float), nbc2 / sizeof(float),
             nbd0 / sizeof(float), nbd1 / sizeof(float), nbd2 / sizeof(float),
-            ws0, wb0, ws1, wb1);
+            wc);
 }
 
 void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    dsv4_hc_post_launch(ctx, dst, dst->src[2], false, 1.0f, 0.0f, 1.0f, 0.0f);
+    dsv4_hc_post_launch(ctx, dst, dst->src[2], DSV4_HC_WCHAIN_NONE, dsv4_hc_wchain{});
 }
 
-void ggml_cuda_op_dsv4_hc_post_fused_w(ggml_backend_cuda_context & ctx, const ggml_tensor * scale0,
-        const ggml_tensor * scale1, ggml_tensor * dst) {
-    dsv4_hc_post_launch(ctx, dst, scale0->src[0], true,
-            ggml_get_op_params_f32(scale0, 0), ggml_get_op_params_f32(scale0, 1),
-            ggml_get_op_params_f32(scale1, 0), ggml_get_op_params_f32(scale1, 1));
+// first is the SCALE or MUL that starts the chain, add the ADD of a MUL chain (nullptr for SCALE), last the final SCALE
+static dsv4_hc_wchain dsv4_hc_wchain_make(const ggml_tensor * first, const ggml_tensor * add, const ggml_tensor * last, int & mode) {
+    dsv4_hc_wchain c = {};
+    if (first->op == GGML_OP_SCALE) {
+        mode = DSV4_HC_WCHAIN_SCALE;
+        c.s0 = ggml_get_op_params_f32(first, 0);
+        c.b0 = ggml_get_op_params_f32(first, 1);
+    } else {
+        GGML_ASSERT(first->op == GGML_OP_MUL && add && add->op == GGML_OP_ADD);
+        mode    = DSV4_HC_WCHAIN_MUL_ADD;
+        c.mul   = (const float *) first->src[1]->data;
+        c.add   = (const float *) add->src[1]->data;
+        c.add_s = add->src[1]->nb[0] / sizeof(float);
+    }
+    c.s1 = ggml_get_op_params_f32(last, 0);
+    c.b1 = ggml_get_op_params_f32(last, 1);
+    return c;
+}
+
+void ggml_cuda_op_dsv4_hc_wchain(ggml_backend_cuda_context & ctx, const ggml_tensor * mul, const ggml_tensor * add,
+        ggml_tensor * last) {
+    int mode = DSV4_HC_WCHAIN_NONE;
+    const dsv4_hc_wchain c = dsv4_hc_wchain_make(mul, add, last, mode);
+    GGML_ASSERT(mode == DSV4_HC_WCHAIN_MUL_ADD);
+
+    const ggml_tensor * x = mul->src[0];
+    const int64_t n = ggml_nelements(last);
+    const int block_size = 256;
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(
+            dim3((n + block_size - 1) / block_size, 1, 1), dim3(block_size, 1, 1), 0, ctx.stream());
+    ggml_cuda_kernel_launch(dsv4_hc_wchain_f32, launch_params, (const float *) x->data, (float *) last->data, c,
+            x->ne[0], n, (int64_t) (x->nb[0] / sizeof(float)), (int64_t) (x->nb[1] / sizeof(float)));
+}
+
+void ggml_cuda_op_dsv4_hc_pre_fused_w(ggml_backend_cuda_context & ctx, const ggml_tensor * first, const ggml_tensor * add,
+        const ggml_tensor * last, ggml_tensor * dst) {
+    int mode = DSV4_HC_WCHAIN_NONE;
+    const dsv4_hc_wchain c = dsv4_hc_wchain_make(first, add, last, mode);
+    dsv4_hc_pre_launch(ctx, dst, first->src[0], mode, c);
+}
+
+void ggml_cuda_op_dsv4_hc_post_fused_w(ggml_backend_cuda_context & ctx, const ggml_tensor * first, const ggml_tensor * add,
+        const ggml_tensor * last, ggml_tensor * dst) {
+    int mode = DSV4_HC_WCHAIN_NONE;
+    const dsv4_hc_wchain c = dsv4_hc_wchain_make(first, add, last, mode);
+    dsv4_hc_post_launch(ctx, dst, first->src[0], mode, c);
 }

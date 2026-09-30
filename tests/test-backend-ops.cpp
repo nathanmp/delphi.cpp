@@ -4413,6 +4413,69 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
 };
 
 
+// MUL -> ADD -> SIGMOID -> SCALE, the pre/post weight chain of dsv4_hc_affine (deepseek4.cpp), with hc_scale and hc_base as
+// weights: on its own (mode 0), into DSV4_HC_PRE (1), or with DSV4_HC_COMB before DSV4_HC_POST (2). The CUDA backend fuses them.
+struct test_dsv4_hc_wchain : public test_dsv4_hc {
+    const int64_t n_embd;
+    const int64_t n_tokens;
+    const int     mode;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DSV4_HC_WCHAIN";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_embd, n_tokens, mode);
+    }
+
+    bool run_whole_graph() override { return true; }
+    bool use_weight_context() override { return true; }
+
+    test_dsv4_hc_wchain(int64_t n_embd = 31, int64_t n_tokens = 17, int mode = 0)
+        : n_embd(n_embd), n_tokens(n_tokens), mode(mode) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        GGML_UNUSED(ctx);
+        GGML_ABORT("needs the weight context");
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        const int64_t mix_dim = (2 + hc)*hc;
+        const bool    post    = mode == 2;
+
+        ggml_tensor * mixes = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, mix_dim, n_tokens);
+        ggml_set_name(mixes, "mixes");
+        ggml_tensor * scale = ggml_new_tensor_1d(ctx_weights, GGML_TYPE_F32, 3);
+        ggml_set_name(scale, "scale");
+        ggml_tensor * base = ggml_new_tensor_1d(ctx_weights, GGML_TYPE_F32, mix_dim);
+        ggml_set_name(base, "base");
+
+        ggml_tensor * w = ggml_view_2d(ctx, mixes, hc, n_tokens, mixes->nb[1], (post ? hc : 0)*sizeof(float));
+        w = ggml_mul(ctx, w, ggml_view_1d(ctx, scale, 1, (post ? 1 : 0)*sizeof(float)));
+        w = ggml_add(ctx, w, ggml_view_1d(ctx, base, hc, (post ? hc : 0)*sizeof(float)));
+        w = ggml_sigmoid(ctx, w);
+        w = post ? ggml_scale(ctx, w, 2.0f) : ggml_scale_bias(ctx, w, 1.0f, 1e-6f);
+
+        if (mode == 0) {
+            out = w;
+        } else if (mode == 1) {
+            ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+            ggml_set_name(x, "x");
+            out = ggml_dsv4_hc_pre(ctx, x, w);
+        } else {
+            ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+            ggml_set_name(x, "x");
+            ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+            ggml_set_name(residual, "residual");
+            ggml_tensor * comb = ggml_dsv4_hc_comb(ctx, mixes, scale, base, 1e-6f, 20);
+            out = ggml_dsv4_hc_post(ctx, x, residual, w, comb);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_SSM_CONV
 struct test_ssm_conv : public test_case {
     const ggml_type type;
@@ -9711,6 +9774,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, true, true));
     test_cases.emplace_back(new test_dsv4_hc_post(2560, 1, true, true));
     test_cases.emplace_back(new test_dsv4_hc_post(2560, 5, false, true));
+    for (int mode : { 0, 1, 2 }) {
+        test_cases.emplace_back(new test_dsv4_hc_wchain(31, 17, mode));
+        test_cases.emplace_back(new test_dsv4_hc_wchain(4096, 1, mode));
+        test_cases.emplace_back(new test_dsv4_hc_wchain(4096, 5, mode));
+    }
 
     // glu ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
@@ -11839,6 +11907,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // GLM-5.3 routed gate+up at decode and verify widths: 288 experts, top-8, broadcast activations
+    for (ggml_type type : {GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS}) {
+        for (int n_tokens : {1, 3, 5}) {
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, n_tokens, 2048, 4096, true, 288, 8, true));
+        }
+    }
 
     for (ggml_type type : {
             GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K,
