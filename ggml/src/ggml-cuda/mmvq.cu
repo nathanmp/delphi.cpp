@@ -1729,6 +1729,18 @@ static void mul_mat_vec_q_switch_type(
 
 #define MMVQ_PACKED_WARPS_1 4 // warps per thread block of the one-token kernel (the fastest of 1 to 32 for OLMoE gate/up on SM80)
 #define MMVQ_PACKED_WARPS   8 // warps per thread block of the other kernels
+#ifndef MMVQ_PACKED_MINB_MOE
+#define MMVQ_PACKED_MINB_MOE  3 // min blocks per SM of mul_mat_vec_q_packed_moe for IQ3S / IQ4XS
+#endif
+#ifndef MMVQ_PACKED_MINB_DOWN
+#define MMVQ_PACKED_MINB_DOWN 3 // min blocks per SM of moe_down_q_reduction_packed for IQ3S / IQ4XS
+#endif
+
+// The multi-token packed kernels are latency bound: capping the registers of IQ3S / IQ4XS for more resident blocks costs no spills
+// (IQ3S 95 -> 74 registers, 2 -> 3 blocks of 256 threads per SM on SM80).
+static constexpr __host__ __device__ int mmvq_packed_min_blocks(const int fmt, const int minb) {
+    return fmt == GGML_CUDA_MOE_PACKED_IQ3S || fmt == GGML_CUDA_MOE_PACKED_IQ4XS ? minb : 1;
+}
 
 static __device__ __forceinline__ float mmvq_packed_glu(const float x, const float gate, const ggml_glu_op op, const float limit) {
     switch (op) {
@@ -1907,7 +1919,7 @@ static __global__ void mul_mat_vec_q_packed(
 
 // blockDim: (warp_size, MMVQ_PACKED_WARPS), gridDim: (nrows/16, nchannels_dst). mul_mat_vec_q_moe has one warp per row and token.
 template <int fmt, bool has_fusion>
-__launch_bounds__(MMVQ_PACKED_WARPS*ggml_cuda_get_physical_warp_size(), 1)
+__launch_bounds__(MMVQ_PACKED_WARPS*ggml_cuda_get_physical_warp_size(), mmvq_packed_min_blocks(fmt, MMVQ_PACKED_MINB_MOE))
 static __global__ void mul_mat_vec_q_packed_moe(
         const char * __restrict__ vx, const void * __restrict__ vy, const int32_t * __restrict__ ids,
         const ggml_cuda_mm_fusion_args_device fusion, float * __restrict__ dst,
@@ -2141,7 +2153,7 @@ static void mul_mat_vec_q_packed_switch_fmt(
 // moe_down_q_reduction on weights packed in place: its partial sums, and its reductions in its order. mul_mat_vec_q_moe has one
 // warp per row and expert slot. blockDim: (warp_size, MMVQ_PACKED_WARPS), gridDim: nrows/16.
 template <int fmt>
-__launch_bounds__(MMVQ_PACKED_WARPS*ggml_cuda_get_physical_warp_size(), 1)
+__launch_bounds__(MMVQ_PACKED_WARPS*ggml_cuda_get_physical_warp_size(), mmvq_packed_min_blocks(fmt, MMVQ_PACKED_MINB_DOWN))
 static __global__ void moe_down_q_reduction_packed(
         const char * __restrict__ vx, const block_q8_1 * __restrict__ vy, const int32_t * __restrict__ ids,
         const float * __restrict__ weights, float * __restrict__ dst, const uint32_t ncols_x, const uint32_t nrows_x, const int64_t stride_channel_x,
