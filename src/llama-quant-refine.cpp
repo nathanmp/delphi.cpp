@@ -21,6 +21,11 @@ static scalar_format format(ggml_type type) {
     return {0, 0, 0, 0};
 }
 
+static bool is_k_type(ggml_type type) {
+    return type == GGML_TYPE_Q2_K || type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q4_K ||
+           type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K;
+}
+
 static uint64_t random_next(uint64_t & state) {
     state += 0x9e3779b97f4a7c15ULL;
     uint64_t x = state;
@@ -171,12 +176,14 @@ bool llama_quant_refine_row(ggml_type type, const float * src, void * dst, int64
                             const float * second, const float * mean,
                             bool feedback, int gsq_steps, uint64_t seed) {
     const scalar_format f = format(type);
-    if (f.block == 0 || n <= 0 || n % f.block != 0 || !second || !mean) { return false; }
+    const bool k_type = is_k_type(type);
+    const int block_size = f.block > 0 ? f.block : k_type ? ggml_blck_size(type) : 0;
+    if (block_size == 0 || (gsq_steps > 0 && f.block == 0) || n <= 0 || n % block_size != 0 || !second || !mean) { return false; }
     const auto * traits = ggml_get_type_traits(type);
     if (!traits || !traits->to_float) { return false; }
 
     const size_t row_bytes = ggml_row_size(type, n);
-    const size_t block_bytes = ggml_row_size(type, f.block);
+    const size_t block_bytes = ggml_row_size(type, block_size);
     std::vector<uint8_t> original(row_bytes);
     std::memcpy(original.data(), dst, row_bytes);
     std::vector<float> adjusted(n);
@@ -189,10 +196,10 @@ bool llama_quant_refine_row(ggml_type type, const float * src, void * dst, int64
     }
 
     uint8_t * bytes = (uint8_t *) dst;
-    for (int64_t start = 0; start < n; start += f.block) {
-        uint8_t * block = bytes + (start/f.block)*block_bytes;
+    for (int64_t start = 0; start < n; start += block_size) {
+        uint8_t * block = bytes + (start/block_size)*block_bytes;
         if (feedback) {
-            for (int i = 0; i < f.block; ++i) {
+            for (int i = 0; i < block_size; ++i) {
                 const int64_t col = start + i;
                 const double d = std::max((double) second[col] - (double) mean[col]*mean[col],
                                           1e-8*(double) std::max(second[col], 1.0f));
@@ -200,27 +207,36 @@ bool llama_quant_refine_row(ggml_type type, const float * src, void * dst, int64
             }
         }
         float max_correction = 0.0f;
-        for (int i = 0; i < f.block; ++i) {
+        for (int i = 0; i < block_size; ++i) {
             const int64_t col = start + i;
             const double d = std::max((double) second[col] - (double) mean[col]*mean[col], 1e-8*(double) std::max(second[col], 1.0f));
             adjusted[col] = feedback ? (float) (src[col] + (mean[col]/d)*past/(1.0 + std::max(0.0, future))) : src[col];
             max_correction = std::max(max_correction, std::abs(adjusted[col] - src[col]));
         }
         if (feedback && max_correction > 0.0f) {
-            const float limit = 0.5f*std::abs(scale_of(block));
+            float limit = k_type ? 0.0f : 0.5f*std::abs(scale_of(block));
+            if (k_type) {
+                traits->to_float(block, decoded.data() + start, block_size);
+                limit = 0.0f;
+                for (int i = 0; i < block_size; ++i) {
+                    limit = std::max(limit, std::abs(src[start + i] - decoded[start + i]));
+                }
+            }
             const float gain = std::min(1.0f, limit/max_correction);
-            for (int i = 0; i < f.block; ++i) {
+            for (int i = 0; i < block_size; ++i) {
                 const int64_t col = start + i;
                 adjusted[col] = src[col] + gain*(adjusted[col] - src[col]);
             }
         }
         if (feedback) {
-            ggml_quantize_chunk(type, adjusted.data() + start, block, 0, 1, f.block, second + start);
+            ggml_quantize_chunk(type, adjusted.data() + start, block, 0, 1, block_size, second + start);
         }
-        refine_block(block, f, adjusted.data() + start, second + start, mean + start, gsq_steps, seed);
+        if (gsq_steps > 0) {
+            refine_block(block, f, adjusted.data() + start, second + start, mean + start, gsq_steps, seed);
+        }
         if (feedback) {
-            traits->to_float(block, decoded.data() + start, f.block);
-            for (int i = 0; i < f.block; ++i) {
+            traits->to_float(block, decoded.data() + start, block_size);
+            for (int i = 0; i < block_size; ++i) {
                 const int64_t col = start + i;
                 past += mean[col] * (src[col] - decoded[col]);
             }

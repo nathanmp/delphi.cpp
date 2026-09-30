@@ -1132,6 +1132,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     }
     const bool refine_enabled = params->gptq_feedback || params->gsq_steps > 0;
     const std::regex refine_re(params->refine_pattern ? params->refine_pattern : ".*");
+    bool warned_gsq_k = false;
     const std::unordered_map<std::string, std::vector<float>> * imatrix_data = nullptr;
     if (params->imatrix) {
         for (const llama_model_imatrix_data * p = params->imatrix; p->name != nullptr; p++) {
@@ -1447,8 +1448,17 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                     throw std::runtime_error(format("Missing importance matrix for tensor %s in a very low-bit quantization", tensor->name));
                 }
 
-                const bool refine_tensor = refine_enabled && std::regex_search(tensor->name, refine_re) &&
-                    (new_type == GGML_TYPE_Q2_0 || new_type == GGML_TYPE_Q4_0);
+                const bool scalar_refine_type = new_type == GGML_TYPE_Q2_0 || new_type == GGML_TYPE_Q4_0;
+                const bool k_refine_type = new_type == GGML_TYPE_Q2_K || new_type == GGML_TYPE_Q3_K ||
+                    new_type == GGML_TYPE_Q4_K || new_type == GGML_TYPE_Q5_K || new_type == GGML_TYPE_Q6_K;
+                const bool refine_match = refine_enabled && std::regex_search(tensor->name, refine_re);
+                const bool refine_feedback = refine_match && params->gptq_feedback && (scalar_refine_type || k_refine_type);
+                const int refine_gsq_steps = refine_match && scalar_refine_type ? params->gsq_steps : 0;
+                const bool refine_tensor = refine_feedback || refine_gsq_steps > 0;
+                if (refine_match && k_refine_type && params->gsq_steps > 0 && !warned_gsq_k) {
+                    LLAMA_LOG_WARN("%s: local GSQ supports only Q2_0/Q4_0; skipping it for K types\n", __func__);
+                    warned_gsq_k = true;
+                }
                 if (refine_tensor) {
                     const auto mean_it = mean_data.find(tm.remapped_imatrix_name);
                     if (!imatrix || mean_it == mean_data.end() || mean_it->second.size() != (size_t) (tensor->ne[0]*tensor->ne[2])) {
@@ -1461,8 +1471,8 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                         }
                     }
                     LLAMA_LOG_INFO("%s: refining %s with %s%s\n", __func__, tensor->name,
-                                   params->gptq_feedback ? "block feedback" : "",
-                                   params->gsq_steps > 0 ? " local GSQ" : "");
+                                   refine_feedback ? "block feedback" : "",
+                                   refine_gsq_steps > 0 ? " local GSQ" : "");
                 }
 
                 if (ggml_is_quantized(tensor->type) && !params->allow_requantize) {
@@ -1513,7 +1523,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                     const int64_t nthread_use = nthread > 1 ? std::max((int64_t)1, std::min((int64_t)nthread, nchunk)) : 1;
 
                     const size_t size_cur = llama_tensor_quantize_impl(new_type, f32_data, work.data(), chunk_size, ir, nrows_cur, nrows_per_expert, n_per_row, imatrix, means,
-                                                                        refine_tensor && params->gptq_feedback, refine_tensor ? params->gsq_steps : 0, workers, nthread_use);
+                                                                        refine_feedback, refine_gsq_steps, workers, nthread_use);
 
                     fout.write((const char *) work.data(), size_cur);
                     new_size += size_cur;

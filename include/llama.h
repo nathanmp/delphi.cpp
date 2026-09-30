@@ -466,7 +466,7 @@ extern "C" {
         const int32_t * prune_layers;                               // pointer to layer indices to prune
         size_t max_buf_size;                                        // max bytes of tensor rows kept in memory at once, 0 = default (8 GiB)
         const struct llama_model_imatrix_data * imatrix_means;      // optional mean activations from the same imatrix
-        bool gptq_feedback;                                        // enable block error feedback for supported scalar types
+        bool gptq_feedback;                                        // enable block error feedback for supported scalar and K types
         int32_t gsq_steps;                                         // local Gumbel-softmax refinement steps, 0 disables it
         const char * refine_pattern;                               // optional regex selecting tensors for refinement
     } llama_model_quantize_params;

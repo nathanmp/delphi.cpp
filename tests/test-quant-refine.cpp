@@ -64,8 +64,49 @@ static void check_type(ggml_type type, int64_t n) {
     assert(repeat == baseline);
 }
 
+static bool check_k_type(ggml_type type) {
+    constexpr int64_t n = 512;
+    std::vector<float> src(n), second(n, 1.0f), mean(n), decoded(n), baseline_decoded(n);
+    for (int64_t i = 0; i < n; ++i) {
+        src[i] = 0.11f*std::sin(0.17f*i) + 0.02f*std::cos(0.43f*i);
+    }
+    const size_t bytes = ggml_row_size(type, n);
+    std::vector<uint8_t> baseline(bytes), feedback(bytes), repeat(bytes);
+    const auto * traits = ggml_get_type_traits(type);
+    ggml_quantize_chunk(type, src.data(), baseline.data(), 0, 1, n, second.data());
+    traits->to_float(baseline.data(), baseline_decoded.data(), n);
+    for (int64_t i = 0; i < n; ++i) {
+        mean[i] = 5.0f*(baseline_decoded[i] - src[i]);
+        second[i] = mean[i]*mean[i] + 0.0001f;
+    }
+    ggml_quantize_chunk(type, src.data(), baseline.data(), 0, 1, n, second.data());
+    traits->to_float(baseline.data(), baseline_decoded.data(), n);
+    feedback = baseline;
+    repeat = baseline;
+
+    assert(llama_quant_refine_row(type, src.data(), feedback.data(), n, second.data(), mean.data(), true, 0, 17));
+    assert(llama_quant_refine_row(type, src.data(), repeat.data(), n, second.data(), mean.data(), true, 0, 17));
+    assert(feedback == repeat);
+    const double base_damage = damage(src, baseline_decoded, second, mean);
+    traits->to_float(feedback.data(), decoded.data(), n);
+    assert(damage(src, decoded, second, mean) <= base_damage + 1e-10);
+
+    std::fill(mean.begin(), mean.end(), 0.0f);
+    repeat = baseline;
+    assert(llama_quant_refine_row(type, src.data(), repeat.data(), n, second.data(), mean.data(), true, 0, 17));
+    assert(repeat == baseline);
+    return feedback != baseline;
+}
+
 int main() {
     check_type(GGML_TYPE_Q2_0, 128);
     check_type(GGML_TYPE_Q4_0, 96);
+    bool changed = false;
+    changed |= check_k_type(GGML_TYPE_Q2_K);
+    changed |= check_k_type(GGML_TYPE_Q3_K);
+    changed |= check_k_type(GGML_TYPE_Q4_K);
+    changed |= check_k_type(GGML_TYPE_Q5_K);
+    changed |= check_k_type(GGML_TYPE_Q6_K);
+    assert(changed);
     return 0;
 }

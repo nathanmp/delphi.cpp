@@ -146,8 +146,8 @@ static void usage(const char * executable) {
     printf("                                      disable k-quant mixtures and quantize all tensors to the same type\n");
     printf("  --imatrix file_name\n");
     printf("                                      use data in file_name as importance matrix for quant optimizations\n");
-    printf("  --gptq-feedback                    use activation-mean error feedback on supported scalar qtypes\n");
-    printf("  --gsq-steps N                      run N bounded Gumbel-softmax refinement steps (experimental)\n");
+    printf("  --gptq-feedback                    use activation-mean error feedback on Q2_0, Q4_0 and Q2_K-Q6_K\n");
+    printf("  --gsq-steps N                      run N bounded Gumbel-softmax steps on Q2_0/Q4_0 (experimental)\n");
     printf("  --refine-tensor REGEX              apply feedback/refinement only to matching tensor names\n");
     printf("  --include-weights tensor_name\n");
     printf("                                      use importance matrix for this/these tensor(s)\n");
