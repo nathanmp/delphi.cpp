@@ -320,8 +320,8 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
         case GGML_TYPE_Q3_K:    return 4;
         case GGML_TYPE_Q4_0:    return 7;
         case GGML_TYPE_Q4_1:    return 7;
-        case GGML_TYPE_Q4_K:    return 4;
-        case GGML_TYPE_Q5_0:    return 7;
+        case GGML_TYPE_Q4_K:    return 8;
+        case GGML_TYPE_Q5_0:    return 8;
         case GGML_TYPE_Q5_1:    return 7;
         case GGML_TYPE_Q5_K:    return 5;
         case GGML_TYPE_Q6_K:    return 5;
