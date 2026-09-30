@@ -1749,14 +1749,34 @@ static constexpr __device__ int mmvq_packed_threads() {
     return T;
 }
 
+// IQ3S reads its grid from a shared memory copy of iq3s_grid - 0x01010101 (vec_dot_iq3s_packed_q8_1), filled before the first vec_dot
+template <int fmt>
+static __device__ __forceinline__ const uint32_t * mmvq_packed_grid(uint32_t * grid_smem) {
+    if constexpr (fmt == GGML_CUDA_MOE_PACKED_IQ3S) {
+        const int tid = threadIdx.y*blockDim.x + threadIdx.x;
+        for (int i = tid; i < 512; i += blockDim.x*blockDim.y) {
+            grid_smem[i] = iq3s_grid[i] - 0x01010101;
+        }
+        __syncthreads();
+        return grid_smem;
+    } else {
+        GGML_UNUSED(grid_smem);
+        return nullptr;
+    }
+}
+
 template <int fmt>
 static __device__ __forceinline__ float2 mmvq_packed_vec_dot(const char * sb, const char * row_meta, const int mg, const int g,
-        const int p, const block_q8_1 * y) {
+        const int p, const block_q8_1 * y, const uint32_t * grid) {
     using pq = moe_packed_q<fmt>;
-    if constexpr (moe_packed_row_meta_bytes<fmt>() != 0) {
+    if constexpr (fmt == GGML_CUDA_MOE_PACKED_IQ3S) {
+        GGML_UNUSED(row_meta);
+        return pq::vec_dot2_grid(sb, mg, g, p, y, grid);
+    } else if constexpr (moe_packed_row_meta_bytes<fmt>() != 0) {
+        GGML_UNUSED(grid);
         return pq::vec_dot2_row_meta(sb, row_meta, mg, g, p, y); // IQ*_KS keeps its row scale outside the packed superblocks.
     } else {
-        GGML_UNUSED(row_meta);
+        GGML_UNUSED_VARS(row_meta, grid);
         return pq::vec_dot2(sb, mg, g, p, y);
     }
 }
@@ -1779,12 +1799,12 @@ static __device__ __forceinline__ const char * mmvq_packed_row_meta(const char *
 template <int fmt, int nvq>
 static __device__ __forceinline__ float2 mmvq_packed_partial(
         const char * __restrict__ x, const char * __restrict__ row_meta, const block_q8_1 * __restrict__ y, const int blocks_per_row_x, const int mg, const int g,
-        const int p, const int vq) {
+        const int p, const int vq, const uint32_t * __restrict__ grid) {
     using pq = moe_packed_q<fmt>;
 
     float2 sum = make_float2(0.0f, 0.0f);
     for (int kbx = vq; kbx < blocks_per_row_x; kbx += nvq) {
-        const float2 v = mmvq_packed_vec_dot<fmt>(x + (int64_t) kbx*pq::sb_bytes, row_meta, mg, g, p, y + kbx*(QK_K/QK8_1));
+        const float2 v = mmvq_packed_vec_dot<fmt>(x + (int64_t) kbx*pq::sb_bytes, row_meta, mg, g, p, y + kbx*(QK_K/QK8_1), grid);
         sum.x += v.x;
         sum.y += v.y;
     }
@@ -1827,16 +1847,18 @@ static __global__ void mul_mat_vec_q_packed(
 
     // [row][upstream thread], 4 floats of padding per row: the lanes of a warp write to 32 different banks
     __shared__ float part[16][nthreads + 4];
+    [[maybe_unused]] __shared__ uint32_t grid_smem[fmt == GGML_CUDA_MOE_PACKED_IQ3S ? 512 : 1];
+    const uint32_t * grid = mmvq_packed_grid<fmt>(grid_smem);
     [[maybe_unused]] __shared__ float part_gate[has_fusion ? 16 : 1][nthreads + 4];
     for (int a = threadIdx.y; a < nthreads/4; a += MMVQ_PACKED_WARPS_1) {
         const int p = 4*(a % (T/4)) + ks;
         const int v = T*(a/(T/4)) + p;
-        const float2 sum = mmvq_packed_partial<fmt, nvq>(x, row_meta, y, blocks_per_row_x, mg, g, p, a/(T/4));
+        const float2 sum = mmvq_packed_partial<fmt, nvq>(x, row_meta, y, blocks_per_row_x, mg, g, p, a/(T/4), grid);
         part[g][v]     = sum.x;
         part[g + 8][v] = sum.y;
         if constexpr (has_fusion) {
             if (gate) {
-                const float2 sum_gate = mmvq_packed_partial<fmt, nvq>(gate, row_meta_gate, y, blocks_per_row_x, mg, g, p, a/(T/4));
+                const float2 sum_gate = mmvq_packed_partial<fmt, nvq>(gate, row_meta_gate, y, blocks_per_row_x, mg, g, p, a/(T/4), grid);
                 part_gate[g][v]     = sum_gate.x;
                 part_gate[g + 8][v] = sum_gate.y;
             }
@@ -1910,6 +1932,8 @@ static __global__ void mul_mat_vec_q_packed_moe(
     const uint32_t channel_y   = fastmodulo(channel_dst, nchannels_y);
 
     __shared__ float part[max_batch][16][warp_size + 4];
+    [[maybe_unused]] __shared__ uint32_t grid_smem[fmt == GGML_CUDA_MOE_PACKED_IQ3S ? 512 : 1];
+    const uint32_t * grid = mmvq_packed_grid<fmt>(grid_smem);
     [[maybe_unused]] __shared__ float part_gate[has_fusion ? max_batch : 1][16][warp_size + 4];
     for (int it = threadIdx.y; it < (int) ncols_dst*(warp_size/4); it += MMVQ_PACKED_WARPS) {
         const int t = it / (warp_size/4);
@@ -1920,14 +1944,14 @@ static __global__ void mul_mat_vec_q_packed_moe(
         const int64_t off = channel_x*stride_channel_x + off_tile;
         const block_q8_1 * y = (const block_q8_1 *) vy + channel_y*stride_channel_y + t*stride_col_y;
         const char * row_meta = mmvq_packed_row_meta<fmt>(vx, stride_channel_x, nrows_x, channel_x, row_tile);
-        const float2 sum = mmvq_packed_partial<fmt, nvq>(vx + off, row_meta, y, blocks_per_row_x, mg, g, p, a/(T/4));
+        const float2 sum = mmvq_packed_partial<fmt, nvq>(vx + off, row_meta, y, blocks_per_row_x, mg, g, p, a/(T/4), grid);
         part[t][g][v]     = sum.x;
         part[t][g + 8][v] = sum.y;
         if constexpr (has_fusion) {
             if (fusion.gate) {
                 const char * row_meta_gate = mmvq_packed_row_meta<fmt>((const char *) fusion.gate, stride_channel_x, nrows_x, channel_x, row_tile);
                 const float2 sum_gate = mmvq_packed_partial<fmt, nvq>((const char *) fusion.gate + off, row_meta_gate, y, blocks_per_row_x, mg, g,
-                    p, a/(T/4));
+                    p, a/(T/4), grid);
                 part_gate[t][g][v]     = sum_gate.x;
                 part_gate[t][g + 8][v] = sum_gate.y;
             }
@@ -2136,6 +2160,8 @@ static __global__ void moe_down_q_reduction_packed(
     const int64_t off_tile = (int64_t) row_tile*blocks_per_row_x*pq::sb_bytes;
 
     __shared__ float part[MMVQ_MAX_BATCH_SIZE][16][warp_size + 4];
+    [[maybe_unused]] __shared__ uint32_t grid_smem[fmt == GGML_CUDA_MOE_PACKED_IQ3S ? 512 : 1];
+    const uint32_t * grid = mmvq_packed_grid<fmt>(grid_smem);
     __shared__ float expert_values[MMVQ_MAX_BATCH_SIZE][16];
     for (int it = threadIdx.y; it < MMVQ_MAX_BATCH_SIZE*(warp_size/4); it += MMVQ_PACKED_WARPS) {
         const int e = it / (warp_size/4);
@@ -2145,7 +2171,7 @@ static __global__ void moe_down_q_reduction_packed(
         const int channel_x = ids[e];
         const char * row_meta = mmvq_packed_row_meta<fmt>(vx, stride_channel_x, nrows_x, channel_x, row_tile);
         const float2 sum = mmvq_packed_partial<fmt, nvq>(vx + channel_x*stride_channel_x + off_tile, row_meta, vy + e*stride_channel_y,
-            blocks_per_row_x, mg, g, p, a/(T/4));
+            blocks_per_row_x, mg, g, p, a/(T/4), grid);
         part[e][g][v]     = sum.x;
         part[e][g + 8][v] = sum.y;
     }
