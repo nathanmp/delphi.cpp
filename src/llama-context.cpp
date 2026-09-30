@@ -1004,11 +1004,21 @@ void llama_context::reserve_max_prefill(
     }
 
     const uint32_t n_tokens_max  = std::min(cparams.n_ctx, cparams.n_ubatch);
-    const uint32_t n_outputs_max = std::min(n_tokens_max, cparams.n_outputs_max);
+
+    // Reserve with this ubatch's own output count. The output rows change the
+    // graph topology (and backend sampling adds per-output nodes), so a
+    // reservation with a different count does not match the ubatches that
+    // follow: the first of them then re-reserves for its own, still short, KV
+    // length and every later ubatch reallocates again as n_kv grows. MTP
+    // targets cap n_outputs_max at the draft length, which exposed this.
+    uint32_t n_outputs = 0;
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        n_outputs += ubatch.output[i] != 0;
+    }
 
     LLAMA_LOG_INFO("%s: pre-recording max prefill reservation for %u ubatch tokens\n", __func__, n_tokens_max);
 
-    if (!graph_reserve(n_tokens_max, 1, n_outputs_max, mctx_max.get())) {
+    if (!graph_reserve(n_tokens_max, 1, n_outputs, mctx_max.get())) {
         LLAMA_LOG_WARN("%s: failed to reserve max prefill graph\n", __func__);
     }
 }
