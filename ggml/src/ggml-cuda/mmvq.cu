@@ -644,7 +644,13 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
     return 1;
 }
 
+// delphi: on the generic table the small_k kernels of 1-4 columns double as wide-row kernels (4 rows per block) for matrices with
+// enough rows (use_wide_rows in mul_mat_vec_q_switch_type). The rows of a block share its y loads, and each row keeps its threads,
+// partial sums and reduction, so the results are bitwise those of the narrow kernels.
 static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
+    if (table_id == MMVQ_PARAMETERS_GENERIC && small_k && ncols_dst >= 2 && ncols_dst <= 4) {
+        return 4;
+    }
     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
         switch (ncols_dst) {
             case 1:
@@ -1307,6 +1313,12 @@ static void moe_down_q_reduction_launch(
         vx, vy, ids, weights, dst, ncols_x, nrows_x, stride_row_x, stride_channel_x, stride_channel_y);
 }
 
+// GGML_CUDA_MMVQ_NO_WIDE_ROWS=1 keeps the narrow row blocks (for comparison)
+static bool mmvq_no_wide_rows() {
+    static const bool v = getenv("GGML_CUDA_MMVQ_NO_WIDE_ROWS") != nullptr && atoi(getenv("GGML_CUDA_MMVQ_NO_WIDE_ROWS")) != 0;
+    return v;
+}
+
 template <ggml_type type>
 static void mul_mat_vec_q_switch_ncols_dst(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
@@ -1422,6 +1434,19 @@ static void mul_mat_vec_q_switch_ncols_dst(
         return;
     }
 
+    // wide rows (generic table only): 4 rows per block for 1-4 columns while the grid keeps >= 4 blocks per SM
+    const bool use_wide_rows = table_id == MMVQ_PARAMETERS_GENERIC && ncols_dst <= 4 && nrows_x % 4 == 0 &&
+        nrows_x >= 16*ggml_cuda_info().devices[ggml_cuda_get_device()].nsm && !mmvq_no_wide_rows();
+    const auto launch_n = [&](auto ncols_tag, auto wide_tag) {
+        constexpr int  c_ncols = decltype(ncols_tag)::value;
+        constexpr bool c_wide  = decltype(wide_tag)::value;
+        const std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id, c_wide);
+        mul_mat_vec_q_switch_fusion<type, c_ncols, c_wide>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+             channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+             sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
+             dims.first, dims.second, 0, ids_stride, nrows_x, stream);
+    };
+
     // spec-invariant: 2-8 columns reduce each column exactly as the 1-column kernel does
     const auto launch_inv = [&](auto ncols_tag, auto small_k_tag) {
         constexpr int  c_ncols   = decltype(ncols_tag)::value;
@@ -1469,7 +1494,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
                     nrows_x, stream);
             };
 
-            if (should_use_small_k(c_ncols_dst)) {
+            if (should_use_small_k(c_ncols_dst) || use_wide_rows) {
                 launch(std::true_type{},  std::false_type{});
             } else if (should_halve_iters()) {
                 launch(std::false_type{}, std::true_type{});
@@ -1479,27 +1504,18 @@ static void mul_mat_vec_q_switch_ncols_dst(
         } break;
         case 2: {
             constexpr int c_ncols_dst = 2;
-            std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
-            mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
-                 channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
-                 dims.first, dims.second, 0, ids_stride, nrows_x, stream);
+            use_wide_rows ? launch_n(std::integral_constant<int, c_ncols_dst>{}, std::true_type{}) :
+                            launch_n(std::integral_constant<int, c_ncols_dst>{}, std::false_type{});
         } break;
         case 3: {
             constexpr int c_ncols_dst = 3;
-            std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
-            mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
-                 channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
-                 dims.first, dims.second, 0, ids_stride, nrows_x, stream);
+            use_wide_rows ? launch_n(std::integral_constant<int, c_ncols_dst>{}, std::true_type{}) :
+                            launch_n(std::integral_constant<int, c_ncols_dst>{}, std::false_type{});
         } break;
         case 4: {
             constexpr int c_ncols_dst = 4;
-            std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
-            mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
-                 channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
-                 dims.first, dims.second, 0, ids_stride, nrows_x, stream);
+            use_wide_rows ? launch_n(std::integral_constant<int, c_ncols_dst>{}, std::true_type{}) :
+                            launch_n(std::integral_constant<int, c_ncols_dst>{}, std::false_type{});
         } break;
         case 5: {
             constexpr int c_ncols_dst = 5;
