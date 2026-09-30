@@ -1425,7 +1425,8 @@ struct llm_graph_context {
             ggml_tensor * sel_mask,  // F16/F32 [n_kv, n_batch, 1, n_stream]
             ggml_tensor * cand_mask, // F16/F32 [n_kv, n_batch, 1, n_stream]
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+                   bool   kq_in_cand = false) const; // cand_mask already excludes what kq_mask masks
 
     //
     // pooling

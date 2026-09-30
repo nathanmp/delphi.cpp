@@ -138,6 +138,11 @@ uint32_t llama_kpool_select_k(uint32_t n_pools, uint32_t indexer_top_k, uint32_t
 // Mode 0 uses dense attention, mode 1 selects by KV and batch size, and mode 2 forces indexed attention.
 bool llama_kpool_indexed_attn_enabled(int64_t n_kv, int64_t n_tps);
 
+// Build the dense sparse-attention masks on the device (ggml_interval_mask) from
+// per-cell and per-query scalars instead of uploading two O(n_kv*n_tps) host masks
+// to every device. LLAMA_GLM5_DEVICE_MASKS=0 restores the host masks.
+bool llama_kpool_device_masks_enabled();
+
 // `kv` must be the ATTENTION (MLA) cache; the indexer cache shares its slot layout.
 //   cell_pool  I32 [n_kv, n_stream]                 per-cell view, optional, unused here
 //   pool_cells I32 [kpool*n_pools, n_stream]        pool member -> cell, 0 if not resident
@@ -168,7 +173,9 @@ void llama_kv_cache_set_input_kpool(
               ggml_tensor    * pool_update_cells  = nullptr,
               ggml_tensor    * pool_update_dst    = nullptr,
               bool             rebuild_pool_cache = false,
-              uint32_t         stream0            = 0);
+              uint32_t         stream0            = 0,
+              ggml_tensor    * mask_cells         = nullptr,
+              ggml_tensor    * mask_queries       = nullptr);
 
 // One pooling map per ubatch; rebuilding it per indexer layer costs O(n_kv * n_tokens)
 // host writes and dominates prefill. sharing is valid only while every indexer layer sees
@@ -206,6 +213,17 @@ public:
 
     ggml_tensor * sel_mask   = nullptr;   // F16 [n_kv, n_batch, 1, n_stream]
     ggml_tensor * cand_mask  = nullptr;   // F16 [n_kv, n_batch, 1, n_stream]
+
+    // Device-built replacement for sel_mask/cand_mask (one sequence per stream).
+    // Cell rows: pos, pos, (complete pool ? BIG : pos); BIG for cells outside the
+    // stream's sequence. Query rows: q, tail_start. With ggml_interval_mask,
+    // rows (0, 1) give sel (tail_start <= pos <= q) and rows (1, 2) give cand
+    // (pos <= q && (pooled || pos >= tail_start)), which implies the causal KQ mask.
+    ggml_tensor * mask_cells   = nullptr; // F32 [n_kv, 3, 1, n_stream]
+    ggml_tensor * mask_queries = nullptr; // F32 [n_tps, 2, 1, n_stream]
+
+    // graph-build cache: one (sel, cand) pair per device that runs sparse attention
+    std::map<ggml_backend_dev_t, std::pair<ggml_tensor *, ggml_tensor *>> dev_masks;
 
     // The direct compact-attention suffix: the real incomplete tail followed by
     // masked cell-zero padding up to the CUDA FA stride. Shared by every layer.

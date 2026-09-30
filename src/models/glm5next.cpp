@@ -702,11 +702,41 @@ ggml_tensor * llama_model_glm5next::graph::build_dsa_layer(
     cb(k, "dsa_kv_latent", il);
 
     if (top_k) {
+        ggml_tensor * sel_mask  = inp_kp->sel_mask;
+        ggml_tensor * cand_mask = inp_kp->cand_mask;
+        if (inp_kp->mask_cells != nullptr) {
+            // One mask pair per device, pinned there: only the O(n_kv + n_tps)
+            // inputs cross PCIe. The layer's output weight identifies its device.
+            ggml_backend_dev_t dev = layer.wo->buffer ?
+                    ggml_backend_buft_get_device(ggml_backend_buffer_get_type(layer.wo->buffer)) : nullptr;
+            auto it = inp_kp->dev_masks.find(dev);
+            if (it == inp_kp->dev_masks.end()) {
+                ggml_tensor * c = inp_kp->mask_cells;
+                ggml_tensor * qm = inp_kp->mask_queries;
+                ggml_tensor * c_sel  = ggml_view_4d(ctx0, c, c->ne[0], 2, 1, c->ne[3], c->nb[1], c->nb[2], c->nb[3], 0);
+                ggml_tensor * c_cand = ggml_view_4d(ctx0, c, c->ne[0], 2, 1, c->ne[3], c->nb[1], c->nb[2], c->nb[3], c->nb[1]);
+                ggml_tensor * sel  = ggml_interval_mask(ctx0, c_sel,  qm, GGML_TYPE_F16);
+                ggml_tensor * cand = ggml_interval_mask(ctx0, c_cand, qm, GGML_TYPE_F16);
+                cb(sel,  "kpool_dev_sel_mask",  il);
+                cb(cand, "kpool_dev_cand_mask", il);
+                for (int ib = 0; dev != nullptr && ib < ggml_backend_sched_get_n_backends(sched); ++ib) {
+                    ggml_backend_t backend = ggml_backend_sched_get_backend(sched, ib);
+                    if (ggml_backend_get_device(backend) == dev && ggml_backend_supports_op(backend, sel)) {
+                        ggml_backend_sched_set_tensor_backend(sched, sel,  backend);
+                        ggml_backend_sched_set_tensor_backend(sched, cand, backend);
+                        break;
+                    }
+                }
+                it = inp_kp->dev_masks.emplace(dev, std::make_pair(sel, cand)).first;
+            }
+            sel_mask  = it->second.first;
+            cand_mask = it->second.second;
+        }
         cur = build_attn_sparse(inp_attn,
                 layer.wo, nullptr, nullptr,
                 q, k, k, nullptr, nullptr, layer.wv_b,
                 top_k, top_k_mask, inp_kp->compact_tail_cells, inp_kp->compact_tail_mask,
-                inp_kp->sel_mask, inp_kp->cand_mask, kq_scale, il);
+                sel_mask, cand_mask, kq_scale, il, inp_kp->mask_cells != nullptr);
     } else {
         cur = build_attn(inp_attn,
                 layer.wo, nullptr, nullptr,
