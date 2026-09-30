@@ -93,7 +93,7 @@ static void refine_block(uint8_t * block, const scalar_format & f, const float *
         nchoices[i] = high - low + 1;
         for (int k = 0; k < nchoices[i]; ++k) {
             choices[i][k] = low + k;
-            logits[i][k] = choices[i][k] == base ? 2.0f : 0.0f;
+            logits[i][k] = choices[i][k] == base ? 0.5f : 0.0f;
         }
     }
 
@@ -132,8 +132,9 @@ static void refine_block(uint8_t * block, const scalar_format & f, const float *
             scale_grad += grad*expected;
             scale_norm += d*expected*expected;
             for (int k = 0; k < nchoices[i]; ++k) {
-                const float delta = (float) (grad * scale * prob[i][k] * ((choices[i][k] - f.zero) - expected) / temp);
-                logits[i][k] = std::clamp(logits[i][k] - 0.05f * std::tanh(delta), -12.0f, 12.0f);
+                const float signed_grad = grad*scale > 0.0 ? 1.0f : -1.0f;
+                const float delta = signed_grad * prob[i][k] * ((choices[i][k] - f.zero) - expected) / temp;
+                logits[i][k] = std::clamp(logits[i][k] - 0.4f*delta, -12.0f, 12.0f);
             }
         }
         scale = std::clamp((float) (scale - 0.05*scale_grad/scale_norm),
@@ -189,6 +190,7 @@ bool llama_quant_refine_row(ggml_type type, const float * src, void * dst, int64
 
     uint8_t * bytes = (uint8_t *) dst;
     for (int64_t start = 0; start < n; start += f.block) {
+        uint8_t * block = bytes + (start/f.block)*block_bytes;
         if (feedback) {
             for (int i = 0; i < f.block; ++i) {
                 const int64_t col = start + i;
@@ -197,12 +199,21 @@ bool llama_quant_refine_row(ggml_type type, const float * src, void * dst, int64
                 future -= (double) mean[col]*mean[col] / d;
             }
         }
+        float max_correction = 0.0f;
         for (int i = 0; i < f.block; ++i) {
             const int64_t col = start + i;
             const double d = std::max((double) second[col] - (double) mean[col]*mean[col], 1e-8*(double) std::max(second[col], 1.0f));
             adjusted[col] = feedback ? (float) (src[col] + (mean[col]/d)*past/(1.0 + std::max(0.0, future))) : src[col];
+            max_correction = std::max(max_correction, std::abs(adjusted[col] - src[col]));
         }
-        uint8_t * block = bytes + (start/f.block)*block_bytes;
+        if (feedback && max_correction > 0.0f) {
+            const float limit = 0.5f*std::abs(scale_of(block));
+            const float gain = std::min(1.0f, limit/max_correction);
+            for (int i = 0; i < f.block; ++i) {
+                const int64_t col = start + i;
+                adjusted[col] = src[col] + gain*(adjusted[col] - src[col]);
+            }
+        }
         if (feedback) {
             ggml_quantize_chunk(type, adjusted.data() + start, block, 0, 1, f.block, second + start);
         }
