@@ -135,7 +135,26 @@ static __global__ void mul_mat_vec_f(
             }
         }
 
-        for (int col2 = tid; col2 < ncols2; col2 += block_size) {
+        // 16-byte loads when the row, the activations and the column stride allow them: short F32 rows (router gates)
+        // otherwise leave too few bytes in flight per thread to reach the memory bandwidth
+        const bool vec4 = !use_gate && (ncols2 % 2 == 0) && (stride_col_y2 % 2 == 0) &&
+            (reinterpret_cast<uintptr_t>(x) % 16 == 0) && (reinterpret_cast<uintptr_t>(y) % 16 == 0);
+        if (vec4) {
+            const float4 * x4 = (const float4 *) x;
+            const float4 * y4 = (const float4 *) y;
+            for (int col4 = tid; col4 < ncols2/2; col4 += block_size) {
+                const float4 tmpx = x4[col4];
+#pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) {
+                    const float4 tmpy = y4[j*(stride_col_y2/2) + col4];
+                    ggml_cuda_mad(sumf[j], tmpx.x, tmpy.x);
+                    ggml_cuda_mad(sumf[j], tmpx.y, tmpy.y);
+                    ggml_cuda_mad(sumf[j], tmpx.z, tmpy.z);
+                    ggml_cuda_mad(sumf[j], tmpx.w, tmpy.w);
+                }
+            }
+        }
+        for (int col2 = vec4 ? ncols2 : tid; col2 < ncols2; col2 += block_size) {
             const float2 tmpx = x2[col2];
             float2 tmpx_gate = make_float2(0.0f, 0.0f);
             if constexpr (has_fusion) {
@@ -440,6 +459,16 @@ void launch_mul_mat_vec_f_cuda(
     int64_t max_block_size  = 256;
     if(ggml_cuda_info().devices[device].cc > GGML_CUDA_CC_OFFSET_AMD && ggml_cuda_info().devices[device].cc < GGML_CUDA_CC_RDNA1) {
         max_block_size = 128;
+    }
+    // On RDNA4, 192- and 256-thread blocks hit the same wave-count resonance as MMVQ (see mmvq.cu) for many
+    // row counts: F32/F16/BF16 2560x512 (router gates, indexer projections) take ~26 us instead of ~7 us.
+    // 96 threads measured best or equal for every grid above 256 blocks (gfx1201, n=1..8); smaller grids keep
+    // the wider blocks, which fill the machine better. Set GGML_CUDA_MMVF_NO_RDNA4_CAP to restore the old choice.
+    if (GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[device].cc) && nrows*nchannels_dst*nsamples_or_ntokens > 256) {
+        static const bool no_cap = getenv("GGML_CUDA_MMVF_NO_RDNA4_CAP") != nullptr;
+        if (!no_cap) {
+            max_block_size = 96;
+        }
     }
     for (int64_t block_size = 2*warp_size; block_size <= max_block_size; block_size += warp_size) {
         const int64_t niter = (ncols + 2*block_size - 1) / (2*block_size);
