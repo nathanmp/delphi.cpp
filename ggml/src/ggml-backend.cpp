@@ -853,6 +853,10 @@ struct ggml_backend_sched {
     int cur_copy;
     int next_copy;
     ggml_backend_event_t events[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_COPIES];
+    // recorded once per graph, after its last split on the backend: the end of the previous use of copy slot c on b.
+    // events[b][c] is re-recorded after every split, so within a graph it marks an earlier split of the same graph,
+    // which with pipeline parallelism sits behind the previous ubatch on b.
+    ggml_backend_event_t slot_events[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_COPIES];
     // without pipeline parallelism (one input copy): lets a device-to-device input copy wait on the device for the
     // destination to finish with its previous contents, instead of synchronizing the destination on the host
     ggml_backend_event_t xdev_events[GGML_SCHED_MAX_BACKENDS];
@@ -3380,10 +3384,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             } else if (ggml_backend_sched_stage_consume(sched, split_id, split_backend, input_cpy)) {
                 // uploaded ahead by the staging ring; the device-to-device copy is ordered on the compute stream
             } else {
-                // wait for the split backend to finish using the input before overwriting it
+                // wait for the split backend to finish using the input before overwriting it. The slot event states
+                // exactly that; a backend may queue the copy outside its compute stream after this wait (CUDA without
+                // peer access uploads on a copy stream), so a later event would delay the copy for nothing
                 ggml_backend_dev_t input_dev = ggml_backend_get_device(input_backend);
-                if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                    ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
+                if (sched->slot_events[split_backend_id][sched->cur_copy] != NULL) {
+                    ggml_backend_event_wait(split_backend, sched->slot_events[split_backend_id][sched->cur_copy]);
                 } else if (xdev_ev != NULL && input_backend != split_backend &&
                         input_dev != nullptr && ggml_backend_dev_type(input_dev) != GGML_BACKEND_DEVICE_TYPE_CPU &&
                         input_backend->iface.event_wait != NULL && split_backend->iface.cpy_tensor_async != NULL) {
@@ -3656,6 +3662,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         prev_backend_id = split_backend_id;
     }
 
+    // mark the end of this graph's use of copy slot cur_copy on every backend that ran a split of it
+    bool slot_recorded[GGML_SCHED_MAX_BACKENDS] = { false };
+    for (int split_id = 0; split_id < sched->n_splits; split_id++) {
+        const int b = splits[split_id].backend_id;
+        if (!slot_recorded[b] && sched->slot_events[b][sched->cur_copy] != NULL) {
+            ggml_backend_event_record(sched->slot_events[b][sched->cur_copy], sched->backends[b]);
+            slot_recorded[b] = true;
+        }
+    }
+
     return GGML_STATUS_SUCCESS;
 }
 
@@ -3744,6 +3760,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
         if (sched->n_copies > 1) {
             for (int c = 0; c < sched->n_copies; c++) {
                 sched->events[b][c] = ggml_backend_event_new(backends[b]->device);
+                sched->slot_events[b][c] = ggml_backend_event_new(backends[b]->device);
             }
         }
     }
@@ -3775,6 +3792,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
             ggml_backend_event_free(sched->events[b][c]);
+            ggml_backend_event_free(sched->slot_events[b][c]);
         }
         if (sched->xdev_events[b] != NULL) {
             ggml_backend_event_free(sched->xdev_events[b]);
