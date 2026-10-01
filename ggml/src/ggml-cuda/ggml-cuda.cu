@@ -5952,7 +5952,24 @@ static bool ggml_backend_cuda_get_op_cost(
             auto found = cuda_ctx->offload_calibrations.find(numa_node);
             if (found == cuda_ctx->offload_calibrations.end()) {
                 ggml_cuda_offload_calibration node_calibration;
-                if (!ggml_backend_cuda_calibrate_offload(cuda_ctx, numa_node, &node_calibration)) {
+                // keyed by the PCI bus id, so that the stored rates follow the card rather than the device index
+                char pci_bus_id[32] = {};
+                CUDA_CHECK(cudaDeviceGetPCIBusId(pci_bus_id, sizeof(pci_bus_id), ggml_cuda_info().devices[cuda_ctx->device].physical_device));
+                char key_h2d[128];
+                char key_d2h[128];
+                char key_dev[128];
+                snprintf(key_h2d, sizeof(key_h2d), "gpu %s numa=%d h2d bytes/s",    pci_bus_id, numa_node);
+                snprintf(key_d2h, sizeof(key_d2h), "gpu %s numa=%d d2h bytes/s",    pci_bus_id, numa_node);
+                snprintf(key_dev, sizeof(key_dev), "gpu %s numa=%d device bytes/s", pci_bus_id, numa_node);
+                if (ggml_backend_offload_calibration_load(key_h2d, &node_calibration.h2d_bytes_per_second) &&
+                        ggml_backend_offload_calibration_load(key_d2h, &node_calibration.d2h_bytes_per_second) &&
+                        ggml_backend_offload_calibration_load(key_dev, &node_calibration.device_bytes_per_second)) {
+                    node_calibration.numa_node = numa_node;
+                } else if (ggml_backend_cuda_calibrate_offload(cuda_ctx, numa_node, &node_calibration)) {
+                    ggml_backend_offload_calibration_store(key_h2d, node_calibration.h2d_bytes_per_second);
+                    ggml_backend_offload_calibration_store(key_d2h, node_calibration.d2h_bytes_per_second);
+                    ggml_backend_offload_calibration_store(key_dev, node_calibration.device_bytes_per_second);
+                } else {
                     return false;
                 }
                 found = cuda_ctx->offload_calibrations.emplace(numa_node, node_calibration).first;

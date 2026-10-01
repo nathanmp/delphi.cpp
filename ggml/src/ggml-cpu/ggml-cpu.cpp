@@ -495,9 +495,10 @@ static double ggml_backend_cpu_measure_mul_mat_id_throughput(
         return 0.0;
     }
 
+    // the fastest of three: a slower repetition was disturbed, and the result decides placements for the whole run
     const uint64_t operations = 2*(uint64_t) weight->ne[0]*weight->ne[1]*top_k*n_tokens;
-    double longest_seconds = 0.0;
-    for (int repetition = 0; repetition < 2; ++repetition) {
+    double fastest_seconds = 0.0;
+    for (int repetition = 0; repetition < 3; ++repetition) {
         const auto before = std::chrono::steady_clock::now();
         const enum ggml_status status = ggml_graph_compute(graph, &plan);
         const auto after = std::chrono::steady_clock::now();
@@ -506,12 +507,13 @@ static double ggml_backend_cpu_measure_mul_mat_id_throughput(
             ggml_free(ctx);
             return 0.0;
         }
-        longest_seconds = std::max(longest_seconds, std::chrono::duration<double>(after - before).count());
+        const double seconds = std::chrono::duration<double>(after - before).count();
+        fastest_seconds = repetition == 0 ? seconds : std::min(fastest_seconds, seconds);
     }
 
     ggml_backend_buffer_free(buffer);
     ggml_free(ctx);
-    const double throughput = longest_seconds > 0.0 ? operations/longest_seconds : 0.0;
+    const double throughput = fastest_seconds > 0.0 ? operations/fastest_seconds : 0.0;
     return throughput;
 }
 
@@ -529,15 +531,28 @@ static bool ggml_backend_cpu_get_op_cost(
     {
         std::lock_guard<std::mutex> lock(cpu_ctx->offload_cost_mutex);
         if (cpu_ctx->offload_cost_threads != n_threads || cpu_ctx->offload_memory_bytes_per_second <= 0.0) {
-            cpu_ctx->offload_memory_bytes_per_second = ggml_backend_cpu_measure_memory_bandwidth(n_threads);
+            char key[128];
+            snprintf(key, sizeof(key), "cpu memory bytes/s threads=%d", n_threads);
+            if (!ggml_backend_offload_calibration_load(key, &cpu_ctx->offload_memory_bytes_per_second)) {
+                cpu_ctx->offload_memory_bytes_per_second = ggml_backend_cpu_measure_memory_bandwidth(n_threads);
+                ggml_backend_offload_calibration_store(key, cpu_ctx->offload_memory_bytes_per_second);
+            }
             cpu_ctx->offload_cost_threads = n_threads;
             cpu_ctx->offload_mul_mat_id_operations_per_second.clear();
             GGML_LOG_INFO("CPU offload calibration: threads = %d, memory = %.2f GB/s\n",
                     n_threads, cpu_ctx->offload_memory_bytes_per_second/1.0e9);
         }
         if (cpu_ctx->offload_dot_operations_per_second[weight->type] <= 0.0) {
-            cpu_ctx->offload_dot_operations_per_second[weight->type] =
-                    ggml_backend_cpu_measure_dot_throughput(weight->type);
+            char key[128];
+            snprintf(key, sizeof(key), "cpu vec_dot ops/s type=%s", ggml_type_name(weight->type));
+            double measured = 0.0;
+            if (!ggml_backend_offload_calibration_load(key, &measured)) {
+                measured = ggml_backend_cpu_measure_dot_throughput(weight->type);
+                if (measured > 0.0) {
+                    ggml_backend_offload_calibration_store(key, measured);
+                }
+            }
+            cpu_ctx->offload_dot_operations_per_second[weight->type] = measured;
             GGML_LOG_INFO("CPU offload calibration: type = %s, vector dot = %.2f GOPS/thread\n",
                     ggml_type_name(weight->type),
                     cpu_ctx->offload_dot_operations_per_second[weight->type]/1.0e9);
@@ -554,7 +569,17 @@ static bool ggml_backend_cpu_get_op_cost(
             if (it != cpu_ctx->offload_mul_mat_id_operations_per_second.end()) {
                 mul_mat_id_operations_per_second = it->second;
             } else {
-                const double measured = ggml_backend_cpu_measure_mul_mat_id_throughput(backend, cpu_ctx, op, weight, shape.tokens);
+                char key[192];
+                snprintf(key, sizeof(key), "cpu mul_mat_id ops/s type=%s rows=%lld cols=%lld top_k=%lld tokens=%lld threads=%d",
+                        ggml_type_name(weight->type), (long long) shape.rows, (long long) shape.cols,
+                        (long long) shape.top_k, (long long) shape.tokens, n_threads);
+                double measured = 0.0;
+                if (!ggml_backend_offload_calibration_load(key, &measured)) {
+                    measured = ggml_backend_cpu_measure_mul_mat_id_throughput(backend, cpu_ctx, op, weight, shape.tokens);
+                    if (measured > 0.0) {
+                        ggml_backend_offload_calibration_store(key, measured);
+                    }
+                }
                 // A lazy weight that is not resident yet measures 0; do not cache that so a
                 // later call with resident data can still calibrate.
                 if (measured > 0.0) {

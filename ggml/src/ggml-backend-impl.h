@@ -127,6 +127,13 @@ extern "C" {
         uint32_t calibrated;
     };
 
+    // delphi: persistent offload calibration. With GGML_OFFLOAD_CALIBRATION=<file>, the measured rates that the
+    // scheduler's host-weight placement uses are read from and appended to that file, so that one machine makes the
+    // same placement decisions in every run instead of re-timing them (a timing hiccup can flip a decision, and a
+    // flipped decision changes the outputs). Without the variable, load returns false and store does nothing.
+    GGML_API bool ggml_backend_offload_calibration_load (const char * key, double * value);
+    GGML_API void ggml_backend_offload_calibration_store(const char * key, double value);
+
     typedef bool (*ggml_backend_get_op_cost_t)(
             ggml_backend_t backend, const struct ggml_tensor * op, const struct ggml_tensor * weight,
             uint64_t operations, uint64_t active_weight_bytes, struct ggml_backend_op_cost * cost);
