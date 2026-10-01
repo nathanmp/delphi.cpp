@@ -704,6 +704,7 @@ void llama_context::sched_reserve() {
     // the alternate scheduler holds graphs of the old reservation
     graph_alt_reset();
     sched_alt.reset();
+    max_prefill_sched = nullptr;
     for (auto & res : gf_res_prev) {
         res.reset();
     }
@@ -1016,10 +1017,22 @@ void llama_context::reserve_max_prefill(
         n_outputs += ubatch.output[i] != 0;
     }
 
+    // An earlier logical batch of this prompt (or an earlier prompt) left the reservation in place. Reserving again
+    // would synchronize every backend and drain the ubatches still in flight from the previous llama_decode call.
+    ggml_backend_sched_t sched_main = sched_alt_live ? sched_alt.get() : sched.get();
+    if (sched_main == max_prefill_sched && ggml_backend_sched_get_n_reserves(sched_main) == max_prefill_reserves) {
+        return;
+    }
+
     LLAMA_LOG_INFO("%s: pre-recording max prefill reservation for %u ubatch tokens\n", __func__, n_tokens_max);
 
     if (!graph_reserve(n_tokens_max, 1, n_outputs, mctx_max.get())) {
         LLAMA_LOG_WARN("%s: failed to reserve max prefill graph\n", __func__);
+        max_prefill_sched = nullptr;
+    } else {
+        // graph_reserve reserved on the main scheduler, which is `sched` again now
+        max_prefill_sched    = sched.get();
+        max_prefill_reserves = ggml_backend_sched_get_n_reserves(sched.get());
     }
 }
 

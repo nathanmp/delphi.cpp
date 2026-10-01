@@ -884,6 +884,7 @@ struct ggml_backend_sched {
     // input (GGML_SCHED_COPY_REUSE_WAIT=1 waits for every input)
     bool copy_reuse_wait_all;
     bool copy_slot_prewait; // GGML_SCHED_COPY_SLOT_PREWAIT=0 disables the copy-slot proof taken before the split loop
+    uint64_t n_reserves;
 
     // delphi: copy the inputs of a split in the graph order of their producers (GGML_SCHED_INPUT_ORDER=0 disables)
     bool input_order;
@@ -2500,6 +2501,7 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
         }
 
         ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids);
+        sched->n_reserves++;
         if (!ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
             GGML_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             return false;
@@ -3858,10 +3860,16 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
     if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
         return false;
     }
+    sched->n_reserves++;
 
     ggml_backend_sched_reset(sched);
 
     return true;
+}
+
+uint64_t ggml_backend_sched_get_n_reserves(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    return sched->n_reserves;
 }
 
 bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
