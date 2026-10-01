@@ -39,8 +39,83 @@
 #ifdef __linux__
 #include <pthread.h>
 #include <sched.h>
+#include <sys/file.h>
 #endif
 
+
+// persistent offload calibration (see ggml_backend_offload_calibration_load)
+
+struct ggml_backend_offload_calibration_file {
+    bool loaded = false;
+    std::string path;
+    std::unordered_map<std::string, double> values;
+};
+
+static std::mutex ggml_backend_offload_calibration_mutex;
+
+// call with ggml_backend_offload_calibration_mutex held
+static ggml_backend_offload_calibration_file & ggml_backend_offload_calibration_get_file() {
+    static ggml_backend_offload_calibration_file file;
+    if (!file.loaded) {
+        file.loaded = true;
+        const char * path = getenv("GGML_OFFLOAD_CALIBRATION");
+        if (path != nullptr && path[0] != '\0') {
+            file.path = path;
+            if (FILE * f = fopen(path, "r")) {
+                char line[512];
+                while (fgets(line, sizeof(line), f)) {
+                    // "<key> = <value>", the key may contain spaces
+                    char * eq = strrchr(line, '=');
+                    if (eq == nullptr || eq == line) {
+                        continue;
+                    }
+                    char * end = eq;
+                    while (end > line && end[-1] == ' ') {
+                        end--;
+                    }
+                    file.values[std::string(line, end - line)] = strtod(eq + 1, nullptr);
+                }
+                fclose(f);
+            }
+            GGML_LOG_INFO("%s: %zu offload calibration values from %s\n", __func__, file.values.size(), path);
+        }
+    }
+    return file;
+}
+
+bool ggml_backend_offload_calibration_load(const char * key, double * value) {
+    std::lock_guard<std::mutex> lock(ggml_backend_offload_calibration_mutex);
+    ggml_backend_offload_calibration_file & file = ggml_backend_offload_calibration_get_file();
+    auto it = file.values.find(key);
+    if (it == file.values.end()) {
+        return false;
+    }
+    *value = it->second;
+    return true;
+}
+
+void ggml_backend_offload_calibration_store(const char * key, double value) {
+    std::lock_guard<std::mutex> lock(ggml_backend_offload_calibration_mutex);
+    ggml_backend_offload_calibration_file & file = ggml_backend_offload_calibration_get_file();
+    if (file.path.empty() || file.values.count(key) != 0) {
+        return;
+    }
+    file.values[key] = value;
+    // one line per value; several processes may append at once
+    if (FILE * f = fopen(file.path.c_str(), "a")) {
+#ifdef __linux__
+        flock(fileno(f), LOCK_EX);
+#endif
+        fprintf(f, "%s = %.17g\n", key, value);
+        fflush(f);
+#ifdef __linux__
+        flock(fileno(f), LOCK_UN);
+#endif
+        fclose(f);
+    } else {
+        GGML_LOG_WARN("%s: cannot append to %s\n", __func__, file.path.c_str());
+    }
+}
 
 // backend buffer type
 
