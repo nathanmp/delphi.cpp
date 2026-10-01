@@ -1554,6 +1554,13 @@ struct ggml_backend_cuda_context {
     std::string name;
     cudaEvent_t copy_event = nullptr;
     cudaStream_t stage_stream = nullptr; // delphi: host-to-device uploads of the scheduler staging ring
+    // delphi: host-staged copies to devices without peer access, indexed by destination device; owned by this context
+    struct ggml_cuda_xdev_stage * xdev_stage[GGML_CUDA_MAX_DEVICES] = { nullptr };
+    // delphi: uploads of host-staged copies into this device, and the event the scheduler made the compute stream wait
+    // for right before the copy (the end of the previous use of the destination): the upload needs only that, not the
+    // rest of the work queued on the compute stream. Cleared whenever other work is queued on the compute stream.
+    cudaStream_t xdev_upload_stream = nullptr;
+    cudaEvent_t  xdev_copy_after    = nullptr;
     // null unless GGML_EXEC_TRACE_GPU_TIMING is active; owned by this context
     ggml_cuda_exec_trace_timer * exec_trace_timer = nullptr;
 
