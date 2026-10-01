@@ -1527,6 +1527,122 @@ void llama_context::set_embeddings_nextn_host(bool value) {
     embd_nextn_host = value;
 }
 
+void llama_context::set_feature_handoff(bool enable) {
+    std::lock_guard<std::mutex> lock(handoff_mutex);
+    handoff_enabled = enable;
+}
+
+void llama_context::feature_handoff_acquire() {
+    std::unique_lock<std::mutex> lock(handoff_mutex);
+
+    // a claimed set stays untouched until released; a decode after two claimed calls waits here
+    if (handoff_slots[handoff_cur].taken) {
+        handoff_cur ^= 1;
+    }
+    handoff_cv.wait(lock, [&] { return !handoff_slots[handoff_cur].taken; });
+
+    auto & slot = handoff_slots[handoff_cur];
+
+    const size_t align = 256;
+    auto padded = [&](size_t n_floats) { return GGML_PAD(n_floats*sizeof(float), align); };
+
+    size_t need = padded(embd_nextn.size);
+    for (const auto & v : embd_layer_inp) {
+        need += padded(v.size);
+    }
+    if (need == 0) {
+        return;
+    }
+
+    if (!slot.buf || ggml_backend_buffer_get_size(slot.buf.get()) < need) {
+        auto * buft = ggml_backend_cpu_buffer_type();
+        auto * output_dev = model.dev_output();
+        auto * output_dev_host_buft = output_dev ? ggml_backend_dev_host_buffer_type(output_dev) : nullptr;
+        if (output_dev_host_buft) {
+            buft = output_dev_host_buft;
+        }
+        slot.buf.reset(ggml_backend_buft_alloc_buffer(buft, need));
+        GGML_ASSERT(slot.buf && "failed to allocate the feature hand-off buffer");
+    }
+
+    uint8_t * base = (uint8_t *) ggml_backend_buffer_get_base(slot.buf.get());
+    size_t offset = 0;
+
+    slot.nextn = embd_nextn.size > 0 ? (float *) (base + offset) : nullptr;
+    offset += padded(embd_nextn.size);
+    if (embd_nextn.size > 0) {
+        embd_nextn.data = slot.nextn;
+    }
+
+    slot.layer_inp.assign(embd_layer_inp.size(), nullptr);
+    for (size_t il = 0; il < embd_layer_inp.size(); ++il) {
+        if (embd_layer_inp[il].size > 0) {
+            slot.layer_inp[il] = (float *) (base + offset);
+            embd_layer_inp[il].data = slot.layer_inp[il];
+            offset += padded(embd_layer_inp[il].size);
+        }
+    }
+}
+
+int32_t llama_context::feature_handoff_take() {
+    std::lock_guard<std::mutex> lock(handoff_mutex);
+
+    auto & slot = handoff_slots[handoff_cur];
+    if (!handoff_enabled || slot.taken || !slot.buf) {
+        return -1;
+    }
+
+    // the feature copies of the last decode are queued on the backend streams; mark their end
+    if (slot.events.empty()) {
+        slot.events.resize(backends.size());
+        for (size_t i = 0; i < backends.size(); ++i) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(backends[i].get());
+            slot.events[i].reset(dev ? ggml_backend_event_new(dev) : nullptr);
+        }
+    }
+    for (size_t i = 0; i < backends.size(); ++i) {
+        if (slot.events[i]) {
+            ggml_backend_event_record(slot.events[i].get(), backends[i].get());
+        }
+    }
+
+    slot.taken = true;
+    return handoff_cur;
+}
+
+const float * llama_context::feature_handoff_nextn(int32_t ticket) {
+    GGML_ASSERT(ticket == 0 || ticket == 1);
+    auto & slot = handoff_slots[ticket];
+    GGML_ASSERT(slot.taken);
+    for (auto & ev : slot.events) {
+        if (ev) {
+            ggml_backend_event_synchronize(ev.get());
+        }
+    }
+    return slot.nextn;
+}
+
+const float * llama_context::feature_handoff_layer_inp(int32_t ticket, uint32_t lid) {
+    GGML_ASSERT(ticket == 0 || ticket == 1);
+    auto & slot = handoff_slots[ticket];
+    GGML_ASSERT(slot.taken && lid < slot.layer_inp.size() && slot.layer_inp[lid] != nullptr);
+    for (auto & ev : slot.events) {
+        if (ev) {
+            ggml_backend_event_synchronize(ev.get());
+        }
+    }
+    return slot.layer_inp[lid];
+}
+
+void llama_context::feature_handoff_release(int32_t ticket) {
+    GGML_ASSERT(ticket == 0 || ticket == 1);
+    {
+        std::lock_guard<std::mutex> lock(handoff_mutex);
+        handoff_slots[ticket].taken = false;
+    }
+    handoff_cv.notify_all();
+}
+
 void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
     LLAMA_LOG_DEBUG("%s: lid = %d, enable = %d\n", __func__, lid, enable);
 
@@ -2339,6 +2455,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
         return -2;
     };
+
+    if (handoff_enabled) {
+        feature_handoff_acquire();
+    }
 
     // start a new sampling transaction for this logical batch
     for (const auto & entry : sampling.samplers) {
@@ -4717,6 +4837,26 @@ float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {
     ctx->synchronize();
 
     return ctx->get_embeddings_layer_inp(lid);
+}
+
+void llama_set_feature_handoff(llama_context * ctx, bool enable) {
+    ctx->set_feature_handoff(enable);
+}
+
+int32_t llama_feature_handoff_take(llama_context * ctx) {
+    return ctx->feature_handoff_take();
+}
+
+const float * llama_feature_handoff_nextn(llama_context * ctx, int32_t ticket) {
+    return ctx->feature_handoff_nextn(ticket);
+}
+
+const float * llama_feature_handoff_layer_inp(llama_context * ctx, int32_t ticket, uint32_t lid) {
+    return ctx->feature_handoff_layer_inp(ticket, lid);
+}
+
+void llama_feature_handoff_release(llama_context * ctx, int32_t ticket) {
+    ctx->feature_handoff_release(ticket);
 }
 
 bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler * smpl) {

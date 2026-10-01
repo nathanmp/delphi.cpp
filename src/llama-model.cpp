@@ -3275,6 +3275,23 @@ int32_t llama_model_n_devices(const struct llama_model * model) {
     return (int32_t)model->devices.size();
 }
 
+double llama_model_cpu_expert_fraction(const struct llama_model * model) {
+    size_t total = 0;
+    size_t cpu   = 0;
+    for (const auto & [name, t] : model->tensors_by_name) {
+        if (name.find("_exps") == std::string::npos || t->buffer == nullptr) {
+            continue;
+        }
+        const size_t size = ggml_nbytes(t);
+        total += size;
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(t->buffer));
+        if (dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            cpu += size;
+        }
+    }
+    return total > 0 ? (double) cpu / total : 0.0;
+}
+
 ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i) {
     if (i < 0 || i >= (int)model->devices.size()) {
         return nullptr;

@@ -12,6 +12,8 @@
 #include "ggml-opt.h"
 
 #include <array>
+#include <condition_variable>
+#include <mutex>
 #include <map>
 #include <vector>
 
@@ -123,6 +125,13 @@ struct llama_context {
     void set_embeddings (bool value);
     void set_embeddings_nextn(bool value, bool masked);
     void set_embeddings_nextn_host(bool value);
+
+    // delphi: asynchronous hand-off of the feature outputs (see llama_set_feature_handoff)
+    void          set_feature_handoff(bool enable);
+    int32_t       feature_handoff_take();
+    const float * feature_handoff_nextn(int32_t ticket);
+    const float * feature_handoff_layer_inp(int32_t ticket, uint32_t lid);
+    void          feature_handoff_release(int32_t ticket);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
     void set_mtp_index_reuse(bool reuse);
@@ -432,6 +441,22 @@ private:
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
+
+    // two pinned sets of the feature outputs; the current set backs embd_nextn / embd_layer_inp during a decode
+    struct feature_handoff_slot {
+        ggml_backend_buffer_ptr             buf;
+        float *                             nextn = nullptr;
+        std::vector<float *>                layer_inp;
+        std::vector<ggml_backend_event_ptr> events; // per entry of `backends`, null where unsupported
+        bool                                taken = false;
+    };
+    void feature_handoff_acquire(); // in decode, after output_reserve
+
+    bool                    handoff_enabled = false;
+    int                     handoff_cur     = 0;
+    feature_handoff_slot    handoff_slots[2];
+    std::mutex              handoff_mutex;
+    std::condition_variable handoff_cv;
 
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
