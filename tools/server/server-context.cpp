@@ -319,6 +319,8 @@ struct server_slot {
             return false;
         }
 
+        common_speculative_wait_ctx(ctx_dft);
+
         const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
 
@@ -341,6 +343,8 @@ struct server_slot {
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
+        common_speculative_wait_ctx(ctx_dft);
+
         bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
@@ -3081,6 +3085,7 @@ private:
                     ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                 }
 
+                common_speculative_wait_ctx(ctx_dft);
                 if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, ckpt.pos_max + 1, -1)) {
                     GGML_ABORT("failed to remove sequence %d\n", slot.id);
                 }
@@ -3769,7 +3774,10 @@ private:
             queue_tasks.yield_to_queue([&]() {
                 const auto phase = has_prompt ? GGML_EXEC_TRACE_PHASE_PROMPT : GGML_EXEC_TRACE_PHASE_GENERATION_DRAFT;
                 server_exec_trace_phase_scope trace_phase(phase);
-                ok = common_speculative_process(spec.get(), batch_view);
+                // an intermediate prompt batch: the draft ingests it while the next target batch runs
+                ok = has_prompt && !has_output ?
+                    common_speculative_process_async(spec.get(), batch_view) :
+                    common_speculative_process(spec.get(), batch_view);
             });
 
             if (!ok) {

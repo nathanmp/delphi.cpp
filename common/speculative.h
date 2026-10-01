@@ -79,6 +79,10 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
 // process the batch and update the internal state of the speculative context
 bool common_speculative_process(common_speculative * spec, const llama_batch & batch);
 
+// like common_speculative_process, for a batch without outputs whose features nobody else reads (an intermediate
+// prompt batch): the draft ingests it on a worker thread while the caller continues with the next target decode
+bool common_speculative_process_async(common_speculative * spec, const llama_batch & batch);
+
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);
 
