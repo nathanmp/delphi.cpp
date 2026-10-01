@@ -8,6 +8,7 @@
 #include "ggml.h"
 #include "llama.h"
 
+#include <functional>
 #include <list>
 #include <set>
 #include <sstream>
@@ -1011,6 +1012,14 @@ enum common_context_seq_rm_type {
 // check if the llama_context can remove sequences
 // note: clears the memory of the context
 common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx);
+
+// wait until the asynchronous speculative ingest that uses `ctx` as its draft context is idle (no-op otherwise);
+// call before touching such a context outside common_speculative (defined in speculative.cpp)
+void common_speculative_wait_ctx(const llama_context * ctx);
+
+// run `fn`, which modifies such a draft context, after the pending asynchronous ingest instead of waiting for it
+// (inline when the ingest is idle or `ctx` has none)
+void common_speculative_run_ctx(const llama_context * ctx, std::function<void()> fn);
 
 struct common_memory {
     llama_context * ctx_tgt = nullptr;

@@ -3,6 +3,7 @@
 #include "common.h"
 #include "ggml.h"
 #include "ggml-cpp.h"
+#include "ggml-exec-trace.h"
 #include "llama.h"
 #include "log.h"
 #include "ngram-cache.h"
@@ -14,6 +15,12 @@
 
 #include <algorithm>
 #include <cassert>
+#include <condition_variable>
+#include <deque>
+#include <functional>
+#include <mutex>
+#include <thread>
+#include <unordered_map>
 #include <cmath>
 #include <cstring>
 #include <iomanip>
@@ -135,6 +142,25 @@ using common_speculative_draft_params_vec = std::vector<common_speculative_draft
 //
 // each implementation has a unique type and a state that is implementation-specific
 // in a subclass of common_speculative_impl
+// Where process() reads the target's feature outputs (nextn rows, layer inputs) for its batch: the live outputs
+// of the last target decode, which synchronizes the target context, or a set claimed with
+// llama_feature_handoff_take() for asynchronous ingest on the worker thread (common_speculative_process_async).
+struct common_speculative_tgt_features {
+    llama_context * ctx    = nullptr;
+    int32_t         ticket = -1;
+
+    const float * nextn() const {
+        return ticket < 0 ? llama_get_embeddings_nextn(ctx) : llama_feature_handoff_nextn(ctx, ticket);
+    }
+    // unmasked rows only on the hand-off path
+    const float * nextn_ith(int32_t i, int32_t n_embd) const {
+        return ticket < 0 ? llama_get_embeddings_nextn_ith(ctx, i) : llama_feature_handoff_nextn(ctx, ticket) + (size_t) i*n_embd;
+    }
+    const float * layer_inp(uint32_t lid) const {
+        return ticket < 0 ? llama_get_embeddings_layer_inp(ctx, lid) : llama_feature_handoff_layer_inp(ctx, ticket, lid);
+    }
+};
+
 struct common_speculative_impl {
     const common_speculative_type type;
 
@@ -165,7 +191,8 @@ struct common_speculative_impl {
 
     virtual void begin(llama_seq_id seq_id, const llama_tokens & prompt) = 0;
 
-    virtual bool process(const llama_batch & batch) = 0;
+    // `tgt` reads the target's feature outputs for `batch` (see common_speculative_tgt_features)
+    virtual bool process(const llama_batch & batch, const common_speculative_tgt_features & tgt) = 0;
 
     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
 
@@ -259,7 +286,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
         // noop
     }
 
-    bool process(const llama_batch & batch) override {
+    bool process(const llama_batch & batch, const common_speculative_tgt_features & /*tgt*/) override {
         auto * ctx_dft = params.ctx_dft;
 
         llama_batch batch_dft = batch;
@@ -569,7 +596,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         }
     }
 
-    bool process(const llama_batch & batch_in) override {
+    bool process(const llama_batch & batch_in, const common_speculative_tgt_features & tgt) override {
         if (batch_in.n_tokens <= 0) {
             return true;
         }
@@ -597,7 +624,6 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
             }
         }
 
-        auto * ctx_tgt = this->params.ctx_tgt;
         auto * ctx_dft = this->params.ctx_dft;
 
         // Interleave each extract_layer's hidden state into a contiguous buffer of
@@ -607,8 +633,8 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
 
         for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
             const float * layer = target_layer_ids[k] < n_layer_tgt
-                ? llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k])
-                : llama_get_embeddings_nextn(ctx_tgt);
+                ? tgt.layer_inp((uint32_t) target_layer_ids[k])
+                : tgt.nextn();
             if (!layer) {
                 GGML_ABORT("EAGLE3: target layer %d input not extracted.", target_layer_ids[k]);
             }
@@ -1087,7 +1113,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
     }
 
-    bool process(const llama_batch & batch_in) override {
+    bool process(const llama_batch & batch_in, const common_speculative_tgt_features & tgt) override {
         if (batch_in.n_tokens <= 0) {
             return true;
         }
@@ -1119,7 +1145,6 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
         }
 
-        auto * ctx_tgt = this->params.ctx_tgt;
         auto * ctx_dft = this->params.ctx_dft;
 
         const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
@@ -1144,7 +1169,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 // injects them into the K/V cache at the target positions
                 batch_inject.n_tokens = n_chunk;
                 for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
-                    const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
+                    const float * layer = tgt.layer_inp((uint32_t) target_layer_ids[k]);
                     if (!layer) {
                         GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
                     }
@@ -1488,7 +1513,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
     }
 
-    bool process(const llama_batch & batch_in) override {
+    bool process(const llama_batch & batch_in, const common_speculative_tgt_features & tgt) override {
         if (batch_in.n_tokens <= 0) {
             return true;
         }
@@ -1517,7 +1542,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
-        auto * ctx_tgt = this->params.ctx_tgt;
         auto * ctx_dft = this->params.ctx_dft;
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
@@ -1536,7 +1560,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             //                                                       ^--- this is a problem
             // TODO:this is generally true, but would be nice to assert it
             {
-                const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+                const float * h_tgt = tgt.nextn();
                 std::memcpy(batch.embd_h + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
             }
 
@@ -1595,7 +1619,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             verify_h[seq_id].resize((size_t) n_rows * n_embd);
 
             for (int32_t i = 0; i < n_rows; ++i) {
-                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
+                const float * h = tgt.nextn_ith(i_batch_beg[seq_id] + i, n_embd);
                 std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
             }
 
@@ -1796,7 +1820,7 @@ struct common_speculative_impl_ngram_simple : public common_speculative_impl {
         // noop
     }
 
-    bool process(const llama_batch & /*batch*/) override {
+    bool process(const llama_batch & /*batch*/, const common_speculative_tgt_features & /*tgt*/) override {
         // TODO: implement
         return true;
     }
@@ -1844,7 +1868,7 @@ struct common_speculative_impl_ngram_map_k : public common_speculative_impl {
         common_ngram_map_begin(config[seq_id], prompt);
     }
 
-    bool process(const llama_batch & /*batch*/) override {
+    bool process(const llama_batch & /*batch*/, const common_speculative_tgt_features & /*tgt*/) override {
         // TODO: implement
         return true;
     }
@@ -2002,7 +2026,7 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         sinfo.n_draft_last = result.size();
     }
 
-    bool process(const llama_batch & /*batch*/) override {
+    bool process(const llama_batch & /*batch*/, const common_speculative_tgt_features & /*tgt*/) override {
         // TODO: implement
         return true;
     }
@@ -2164,7 +2188,7 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
         }
     }
 
-    bool process(const llama_batch & /*batch*/) override {
+    bool process(const llama_batch & /*batch*/, const common_speculative_tgt_features & /*tgt*/) override {
         // TODO: implement
         return true;
     }
@@ -2197,7 +2221,94 @@ struct common_speculative {
     std::vector<common_speculative_impl *> impl_last;
 
     std::vector<double> synth_probs;
+
+    // Asynchronous ingest of intermediate prompt batches (common_speculative_process_async): a worker thread runs
+    // process() on target feature sets claimed with llama_feature_handoff_take(), so the draft's catch-up decode of
+    // batch k overlaps the target decode of batch k+1. Every other entry point, and every common helper that
+    // touches ctx_dft (common_speculative_wait_ctx), waits for the worker first.
+    llama_context *         ctx_tgt      = nullptr;
+    llama_context *         ctx_dft      = nullptr;
+    bool                    async_ingest = false;
+    std::thread             worker;
+    std::mutex              mtx;
+    std::condition_variable cv;
+    std::deque<std::function<bool()>> jobs; // ingest jobs and deferred ctx_dft memory operations, in order
+    bool                    busy   = false;
+    bool                    stop   = false;
+    bool                    failed = false;
 };
+
+static std::mutex                                                g_spec_ctx_mtx;
+static std::unordered_map<const llama_context *, common_speculative *> g_spec_ctx;
+
+static bool common_speculative_process_impl(
+        common_speculative * spec, const llama_batch & batch, const common_speculative_tgt_features & tgt) {
+    bool result = true;
+
+    for (auto & impl : spec->impls) {
+        result = result && impl->process(batch, tgt);
+    }
+
+    return result;
+}
+
+static void common_speculative_worker_loop(common_speculative * spec) {
+    // the worker only ingests prompt batches; the trace phase is thread-local
+    ggml_exec_trace_set_execution_phase(GGML_EXEC_TRACE_PHASE_PROMPT);
+
+    std::unique_lock<std::mutex> lock(spec->mtx);
+    while (true) {
+        spec->cv.wait(lock, [&] { return spec->stop || !spec->jobs.empty(); });
+        if (spec->jobs.empty()) {
+            break;
+        }
+
+        auto job = std::move(spec->jobs.front());
+        spec->jobs.pop_front();
+        spec->busy = true;
+        lock.unlock();
+
+        const bool ok = job();
+
+        lock.lock();
+        spec->busy = false;
+        if (!ok) {
+            LOG_ERR("%s: asynchronous speculative ingest failed\n", __func__);
+            spec->failed = true;
+        }
+        spec->cv.notify_all();
+    }
+}
+
+// returns false if an asynchronous ingest failed since the last call
+static bool common_speculative_wait(common_speculative * spec) {
+    if (spec == nullptr || !spec->async_ingest) {
+        return true;
+    }
+
+    std::unique_lock<std::mutex> lock(spec->mtx);
+    spec->cv.wait(lock, [&] { return spec->jobs.empty() && !spec->busy; });
+
+    const bool ok = !spec->failed;
+    spec->failed = false;
+    return ok;
+}
+
+void common_speculative_wait_ctx(const llama_context * ctx) {
+    if (ctx == nullptr) {
+        return;
+    }
+
+    common_speculative * spec = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_spec_ctx_mtx);
+        auto it = g_spec_ctx.find(ctx);
+        if (it != g_spec_ctx.end()) {
+            spec = it->second;
+        }
+    }
+    common_speculative_wait(spec);
+}
 
 static common_ngram_map get_common_ngram_map(
         common_speculative_type type,
@@ -2776,12 +2887,45 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                 rates.size(), acceptance_length, string_join(rates_str, ", ").c_str());
     }
 
+    // Asynchronous ingest of prompt batches needs a draft context. By default it is skipped for targets with
+    // CPU-resident routed experts (--cpu-moe): their large-batch prefill streams those weights to the GPU, and draft
+    // work on that GPU disrupts the stream far beyond its own length (DeepSeek V4.1 Flash with DSpark: -16% prefill,
+    // for an ingest that costs <2% synchronously). LLAMA_SPEC_ASYNC_INGEST=1/0 forces it on/off.
+    result->ctx_tgt = params.draft.ctx_tgt;
+    result->ctx_dft = params.draft.ctx_dft;
+    if (params.draft.ctx_tgt != nullptr && params.draft.ctx_dft != nullptr) {
+        const char * env = getenv("LLAMA_SPEC_ASYNC_INGEST");
+        const double cpu_frac = llama_model_cpu_expert_fraction(llama_get_model(params.draft.ctx_tgt));
+        const bool enable = env != nullptr ? atoi(env) != 0 : cpu_frac < 0.25;
+        SPC_INF("asynchronous prompt ingest: %s (target routed experts on CPU: %.0f%%)\n", enable ? "on" : "off", 100.0*cpu_frac);
+        if (enable) {
+            result->async_ingest = true;
+            llama_set_feature_handoff(result->ctx_tgt, true);
+
+            std::lock_guard<std::mutex> lock(g_spec_ctx_mtx);
+            g_spec_ctx[result->ctx_dft] = result.get();
+        }
+    }
+
     return result.release();
 }
 
 void common_speculative_free(common_speculative * spec) {
     if (spec == nullptr) {
         return;
+    }
+
+    if (spec->worker.joinable()) {
+        {
+            std::lock_guard<std::mutex> lock(spec->mtx);
+            spec->stop = true;
+        }
+        spec->cv.notify_all();
+        spec->worker.join();
+    }
+    if (spec->async_ingest) {
+        std::lock_guard<std::mutex> lock(g_spec_ctx_mtx);
+        g_spec_ctx.erase(spec->ctx_dft);
     }
 
     delete spec;
@@ -2801,6 +2945,8 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
         return;
     }
 
+    common_speculative_wait(spec);
+
     for (auto & impl : spec->impls) {
         common_time_meas tm(impl->t_begin_us, !impl->gen_perf);
         impl->begin(seq_id, prompt);
@@ -2809,23 +2955,92 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
 }
 
 bool common_speculative_process(common_speculative * spec, const llama_batch & batch) {
-    bool result = true;
-
     if (spec == nullptr) {
-        return result;
+        return true;
     }
 
-    for (auto & impl : spec->impls) {
-        result = result && impl->process(batch);
+    const bool ok = common_speculative_wait(spec);
+
+    const common_speculative_tgt_features tgt = { spec->ctx_tgt, -1 };
+    return common_speculative_process_impl(spec, batch, tgt) && ok;
+}
+
+bool common_speculative_process_async(common_speculative * spec, const llama_batch & batch) {
+    if (spec == nullptr) {
+        return true;
+    }
+    if (!spec->async_ingest || batch.token == nullptr || batch.embd != nullptr) {
+        return common_speculative_process(spec, batch);
     }
 
-    return result;
+    const int32_t ticket = llama_feature_handoff_take(spec->ctx_tgt);
+    if (ticket < 0) {
+        return common_speculative_process(spec, batch);
+    }
+
+    int32_t n_seq_max = 1;
+    for (int32_t i = 0; i < batch.n_tokens; ++i) {
+        n_seq_max = std::max(n_seq_max, batch.n_seq_id[i]);
+    }
+    llama_batch copy = llama_batch_init(batch.n_tokens, 0, n_seq_max);
+    copy.n_tokens = batch.n_tokens;
+    std::memcpy(copy.token,    batch.token,    sizeof(llama_token)*batch.n_tokens);
+    std::memcpy(copy.pos,      batch.pos,      sizeof(llama_pos)*batch.n_tokens);
+    std::memcpy(copy.n_seq_id, batch.n_seq_id, sizeof(int32_t)*batch.n_tokens);
+    for (int32_t i = 0; i < batch.n_tokens; ++i) {
+        std::memcpy(copy.seq_id[i], batch.seq_id[i], sizeof(llama_seq_id)*batch.n_seq_id[i]);
+        copy.logits[i] = batch.logits ? batch.logits[i] : 0;
+    }
+
+    auto job = [spec, copy, ticket]() {
+        const common_speculative_tgt_features tgt = { spec->ctx_tgt, ticket };
+        const bool ok = common_speculative_process_impl(spec, copy, tgt);
+        llama_feature_handoff_release(spec->ctx_tgt, ticket);
+        llama_batch_free(copy);
+        return ok;
+    };
+
+    bool ok;
+    {
+        std::lock_guard<std::mutex> lock(spec->mtx);
+        if (!spec->worker.joinable()) {
+            spec->worker = std::thread(common_speculative_worker_loop, spec);
+        }
+        spec->jobs.emplace_back(std::move(job));
+        ok = !spec->failed;
+    }
+    spec->cv.notify_all();
+
+    return ok;
+}
+
+void common_speculative_run_ctx(const llama_context * ctx, std::function<void()> fn) {
+    common_speculative * spec = nullptr;
+    if (ctx != nullptr) {
+        std::lock_guard<std::mutex> lock(g_spec_ctx_mtx);
+        auto it = g_spec_ctx.find(ctx);
+        if (it != g_spec_ctx.end()) {
+            spec = it->second;
+        }
+    }
+    if (spec != nullptr) {
+        std::unique_lock<std::mutex> lock(spec->mtx);
+        if (spec->busy || !spec->jobs.empty()) {
+            spec->jobs.emplace_back([fn = std::move(fn)]() { fn(); return true; });
+            lock.unlock();
+            spec->cv.notify_all();
+            return;
+        }
+    }
+    fn();
 }
 
 void common_speculative_draft(common_speculative * spec) {
     if (spec == nullptr) {
         return;
     }
+
+    common_speculative_wait(spec);
 
     auto & dparams = spec->dparams;
 
@@ -2908,6 +3123,8 @@ void common_speculative_draft(common_speculative * spec) {
 }
 
 void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted) {
+    common_speculative_wait(spec);
+
     common_speculative_impl * impl = spec->impl_last[seq_id];
 
     if (impl == nullptr) {
@@ -2949,6 +3166,8 @@ bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id
         return false;
     }
 
+    common_speculative_wait(spec);
+
     for (auto & impl : spec->impls) {
         if (impl->get_state(seq_id, data)) {
             return true;
@@ -2963,6 +3182,8 @@ void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id
         return;
     }
 
+    common_speculative_wait(spec);
+
     for (auto & impl : spec->impls) {
         impl->set_state(seq_id, data);
     }
@@ -2972,6 +3193,8 @@ void common_speculative_print_stats(const common_speculative * spec) {
     if (spec == nullptr) {
         return;
     }
+
+    common_speculative_wait(const_cast<common_speculative *>(spec));
 
     for (const auto & impl : spec->impls) {
         std::string str_perf;

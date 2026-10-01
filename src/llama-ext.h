@@ -89,6 +89,9 @@ using llama_memory_breakdown = std::map<ggml_backend_buffer_type_t, llama_memory
 LLAMA_API int32_t llama_model_n_expert (const struct llama_model * model);
 LLAMA_API int32_t llama_model_n_devices(const struct llama_model * model);
 
+// fraction of the routed-expert weight bytes (*_exps tensors) in CPU buffer types, e.g. with --cpu-moe; 0 without experts
+LLAMA_API double  llama_model_cpu_expert_fraction(const struct llama_model * model);
+
 LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);
 
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
@@ -100,6 +103,18 @@ LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value
 
 // Control the host copy of nextn embeddings. Backend output remains available.
 LLAMA_API void llama_set_embeddings_nextn_host(struct llama_context * ctx, bool value);
+
+// Asynchronous hand-off of the per-token feature outputs (host nextn rows and layer inputs) of a decode call,
+// so a consumer on another thread can read them without synchronizing the context. With the hand-off enabled,
+// llama_feature_handoff_take() right after llama_decode() claims that call's feature buffers without waiting
+// for the device; the next decode writes a second set, and a decode after that blocks until the claimed set is
+// released. Only unmasked rows of batches without outputs are supported. take() returns -1 if nothing can be
+// claimed; the accessors wait for the claimed call's copies and may be called from any thread.
+LLAMA_API void          llama_set_feature_handoff(struct llama_context * ctx, bool enable);
+LLAMA_API int32_t       llama_feature_handoff_take(struct llama_context * ctx);
+LLAMA_API const float * llama_feature_handoff_nextn(struct llama_context * ctx, int32_t ticket);
+LLAMA_API const float * llama_feature_handoff_layer_inp(struct llama_context * ctx, int32_t ticket, uint32_t lid);
+LLAMA_API void          llama_feature_handoff_release(struct llama_context * ctx, int32_t ticket);
 
 // Select which appended NextN block the DECODER_MTP graph runs (offset past
 // the trunk: il = n_layer() + offset). Used by the speculative NextN driver to
