@@ -954,8 +954,9 @@ void llama_context::reserve_max_prefill(
         return;
     }
     // Only the first ubatch of a multi-ubatch single-sequence prefill: later
-    // ubatches are already covered, and a single ubatch cannot grow.
-    if (n_tokens_prev != 0 || n_tokens_all <= cparams.n_ubatch) {
+    // ubatches are already covered, and a single ubatch cannot grow. A later
+    // ubatch that switches the attention variant (below) is the exception.
+    if (n_tokens_all <= cparams.n_ubatch) {
         return;
     }
     if (ubatch.n_tokens != cparams.n_ubatch || ubatch.n_seq_tokens != cparams.n_ubatch) {
@@ -996,8 +997,32 @@ void llama_context::reserve_max_prefill(
     // use: the single-stream warm pool-cache shape for plain hybrid memory; the
     // worst-case full cache for everything else, including the derived hybrid-idx
     // context type and non-hybrid memories (whose init_full_n_seq defaults here)
+    // GLM-5 kpool memory: prefill ubatches use dense masked attention below the indexed-attention crossover and
+    // indexed attention above it (llama_kpool_indexed_attn_enabled), two graph topologies. A reservation of one
+    // fits no ubatch of the other, so each of those reallocated, and every reallocation synchronizes all devices,
+    // which serializes a pipeline-parallel prefill: a 49K-token prompt at -c 53248 reallocated on every ubatch
+    // below 32K (the full-cache reservation is indexed). Reserve the largest graph of the variant this ubatch
+    // uses, and reserve again when a later ubatch switches variant (once per crossing).
+    int variant = -1;
+    uint32_t n_kv_max = cparams.n_ctx_seq;
+    if (mctx_hyb != nullptr && !is_hyb_idx && mctx_hyb->get_kpool_cache() != nullptr && ubatch.n_tokens > 0) {
+        const uint32_t pad = 256;
+        const int64_t n_tps = ubatch.n_seq_tokens;
+        const int64_t n_kv_ubatch = GGML_PAD((int64_t) ubatch.pos[ubatch.n_tokens - 1] + 1, pad);
+        variant = llama_kpool_indexed_attn_enabled(n_kv_ubatch, n_tps) ? 1 : 0;
+        if (variant == 0) {
+            // the largest padded KV length that stays dense
+            while (n_kv_max > pad && llama_kpool_indexed_attn_enabled(n_kv_max, n_tps)) {
+                n_kv_max = (n_kv_max - 1)/pad*pad;
+            }
+        }
+    }
+    if (n_tokens_prev != 0 && variant == max_prefill_variant) {
+        return;
+    }
+
     auto mctx_max = (mctx_hyb != nullptr && !is_hyb_idx)
-            ? memory->init_full_n_seq(1, cparams.n_ctx_seq, false)
+            ? memory->init_full_n_seq(1, n_kv_max, false)
             : memory->init_full();
     if (!mctx_max) {
         LLAMA_LOG_WARN("%s: failed to initialize max-prefill memory module\n", __func__);
@@ -1020,19 +1045,22 @@ void llama_context::reserve_max_prefill(
     // An earlier logical batch of this prompt (or an earlier prompt) left the reservation in place. Reserving again
     // would synchronize every backend and drain the ubatches still in flight from the previous llama_decode call.
     ggml_backend_sched_t sched_main = sched_alt_live ? sched_alt.get() : sched.get();
-    if (sched_main == max_prefill_sched && ggml_backend_sched_get_n_reserves(sched_main) == max_prefill_reserves) {
+    if (sched_main == max_prefill_sched && ggml_backend_sched_get_n_reserves(sched_main) == max_prefill_reserves &&
+            variant == max_prefill_variant) {
         return;
     }
 
-    LLAMA_LOG_INFO("%s: pre-recording max prefill reservation for %u ubatch tokens\n", __func__, n_tokens_max);
+    LLAMA_LOG_INFO("%s: pre-recording max prefill reservation for %u ubatch tokens (KV length %u)\n", __func__, n_tokens_max, n_kv_max);
 
     if (!graph_reserve(n_tokens_max, 1, n_outputs, mctx_max.get())) {
         LLAMA_LOG_WARN("%s: failed to reserve max prefill graph\n", __func__);
-        max_prefill_sched = nullptr;
+        max_prefill_sched   = nullptr;
+        max_prefill_variant = variant; // do not retry for every later ubatch
     } else {
         // graph_reserve reserved on the main scheduler, which is `sched` again now
         max_prefill_sched    = sched.get();
         max_prefill_reserves = ggml_backend_sched_get_n_reserves(sched.get());
+        max_prefill_variant  = variant;
     }
 }
 

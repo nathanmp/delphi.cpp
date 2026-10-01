@@ -431,6 +431,8 @@ private:
     // prefill reservation is in effect and a later logical batch does not need (or synchronize for) another one
     ggml_backend_sched_t                max_prefill_sched    = nullptr;
     uint64_t                            max_prefill_reserves = 0;
+    // the attention variant of that reservation for GLM-5 kpool memory (0 dense, 1 indexed), -1 without variants
+    int                                 max_prefill_variant  = -1;
 
     // env: LLAMA_GRAPH_ALT_MAX_TOKENS, largest ubatch that may use the alternate scheduler (0 disables it)
     uint32_t graph_alt_max_tokens = 32;
