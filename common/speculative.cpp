@@ -2855,12 +2855,10 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         return nullptr;
     }
 
-    common_speculative_ptr result(new common_speculative {
-        /* .dparams     = */ common_speculative_draft_params_vec(n_seq),
-        /* .impls       = */ std::move(impls),
-        /* .impl_last   = */ std::vector<common_speculative_impl *>(n_seq, nullptr),
-        /* .synth_probs = */ {},
-    });
+    common_speculative_ptr result(new common_speculative());
+    result->dparams   = common_speculative_draft_params_vec(n_seq);
+    result->impls     = std::move(impls);
+    result->impl_last = std::vector<common_speculative_impl *>(n_seq, nullptr);
 
     const int32_t n_max_configured = common_speculative_n_max(&params);
     const int32_t n_max_effective  = common_speculative_n_max(result.get());
