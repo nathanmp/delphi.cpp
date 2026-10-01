@@ -2525,6 +2525,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_kpool_expand(params, tensor);
             } break;
+        case GGML_OP_INTERVAL_MASK:
+            {
+                ggml_compute_forward_interval_mask(params, tensor);
+            } break;
         case GGML_OP_DSV4_HC_COMB:
             {
                 ggml_compute_forward_dsv4_hc_comb(params, tensor);
@@ -2895,6 +2899,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_SSM_SCAN:
         case GGML_OP_LIGHTNING_INDEXER:
         case GGML_OP_KPOOL_EXPAND:
+        case GGML_OP_INTERVAL_MASK:
             {
                 n_tasks = n_threads;
             } break;

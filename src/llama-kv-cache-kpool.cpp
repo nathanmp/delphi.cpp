@@ -48,6 +48,17 @@ bool llama_kpool_indexed_attn_enabled(int64_t n_kv, int64_t n_tps) {
     return mode >= 2 || (mode == 1 && n_kv >= 32768);
 }
 
+bool llama_kpool_device_masks_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("LLAMA_GLM5_DEVICE_MASKS");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+// larger than any position, and exact in f32 comparisons against positions
+static constexpr float k_kpool_mask_big = 1e30f;
+
 struct llama_kpool_cache::impl {
     struct pool_id_hash {
         size_t operator()(const pool_id & id) const {
@@ -546,7 +557,9 @@ void llama_kv_cache_set_input_kpool(
               ggml_tensor    * pool_update_cells,
               ggml_tensor    * pool_update_dst,
               bool             rebuild_pool_cache,
-              uint32_t         stream0) {
+              uint32_t         stream0,
+              ggml_tensor    * mask_cells,
+              ggml_tensor    * mask_queries) {
     GGML_ASSERT(kv != nullptr);
     GGML_ASSERT(kpool > 0);
 
@@ -693,9 +706,17 @@ void llama_kv_cache_set_input_kpool(
     int32_t * dst_update_cells = pool_update_cells ? (int32_t *) pool_update_cells->data : nullptr;
     int32_t * dst_update_dst   = pool_update_dst   ? (int32_t *) pool_update_dst  ->data : nullptr;
 
-    const ggml_type mask_type = sel_mask ? sel_mask->type : compact_tail_mask->type;
+    const ggml_type mask_type = sel_mask ? sel_mask->type : compact_tail_mask ? compact_tail_mask->type : GGML_TYPE_F16;
     const bool   mask_f16 = mask_type == GGML_TYPE_F16;
     const size_t mask_ts  = ggml_type_size(mask_type);
+
+    GGML_ASSERT((mask_cells == nullptr) == (mask_queries == nullptr));
+    GGML_ASSERT(mask_cells == nullptr || sel_mask == nullptr);
+    GGML_ASSERT(mask_cells == nullptr || (mask_cells->ne[0] == n_kv && mask_cells->ne[1] == 3 && ggml_is_contiguous(mask_cells)));
+    GGML_ASSERT(mask_cells == nullptr || n_ps == 1);
+    GGML_ASSERT(mask_cells == nullptr || (ggml_backend_buffer_is_host(mask_cells->buffer) && ggml_backend_buffer_is_host(mask_queries->buffer)));
+    float * dst_mask_cells   = mask_cells   ? (float *) mask_cells  ->data : nullptr;
+    float * dst_mask_queries = mask_queries ? (float *) mask_queries->data : nullptr;
 
     int32_t * dst_tail_cells = compact_tail_cells ? (int32_t *) compact_tail_cells->data : nullptr;
     char    * dst_tail_mask  = compact_tail_mask  ? (char    *) compact_tail_mask ->data : nullptr;
@@ -863,6 +884,16 @@ void llama_kv_cache_set_input_kpool(
                 }
             }
 
+            if (dst_mask_cells) {
+                float * cur = dst_mask_cells + s*3*n_kv;
+                for (int64_t j = 0; j < n_kv; ++j) {
+                    const float pv = pos_at[j] < 0 ? k_kpool_mask_big : (float) pos_at[j];
+                    cur[j]          = pv;
+                    cur[n_kv + j]   = pv;
+                    cur[2*n_kv + j] = pool_of[j] >= 0 ? k_kpool_mask_big : pv;
+                }
+            }
+
             if (pool_cache != nullptr) {
                 for (int64_t p = 0; p < n_run; ++p) {
                     if (filled[p] != (int32_t) r) {
@@ -906,7 +937,15 @@ void llama_kv_cache_set_input_kpool(
                 char * cur_tail_mask = dst_tail_mask ?
                         dst_tail_mask + (s*n_tps + ii)*n_tail_pad*mask_ts : nullptr;
 
-                if (mask_f16) {
+                if (dst_mask_queries) {
+                    float * cur = dst_mask_queries + s*2*n_tps;
+                    cur[ii]         = (float) q;
+                    cur[n_tps + ii] = (float) tail_start;
+                }
+
+                if (!cur_sel && !cur_cand && !cur_tail_cells) {
+                    // nothing per cell to write (device-built masks)
+                } else if (mask_f16) {
                     kpool_mask_row((ggml_fp16_t *) cur_sel, (ggml_fp16_t *) cur_cand,
                             cur_tail_cells, (ggml_fp16_t *) cur_tail_mask,
                             pos_at.data(), pool_of.data(), n_kv, n_tail_pad, q, tail_start, bo_vis);
@@ -1069,7 +1108,9 @@ void llm_graph_input_kpool::set_input(const llama_ubatch * ubatch) {
             active_pool_cache ? pool_update_cells : nullptr,
             active_pool_cache ? pool_update_dst   : nullptr,
             active_pool_cache ? rebuild_pool_cache : false,
-            mctx_idx->get_stream_base());
+            mctx_idx->get_stream_base(),
+            mask_cells   && mask_cells  ->buffer ? mask_cells   : nullptr,
+            mask_queries && mask_queries->buffer ? mask_queries : nullptr);
 }
 
 bool llm_graph_input_kpool::can_reuse(const llm_graph_params & params) {
@@ -1125,10 +1166,16 @@ bool llm_graph_input_kpool::can_reuse(const llm_graph_params & params) {
         res &= shape(pool_bias_f16, n_pools, n_tps, 1, n_stream);
     }
 
-    res &= dense_masks == (sel_mask != nullptr && cand_mask != nullptr);
-    if (dense_masks) {
+    const bool device_masks = dense_masks && n_ps == 1 && llama_kpool_device_masks_enabled();
+    res &= (dense_masks && !device_masks) == (sel_mask != nullptr && cand_mask != nullptr);
+    res &= device_masks == (mask_cells != nullptr && mask_queries != nullptr);
+    if (dense_masks && !device_masks) {
         res &= shape(sel_mask, n_kv, n_tps, 1, n_stream);
         res &= shape(cand_mask, n_kv, n_tps, 1, n_stream);
+    }
+    if (device_masks) {
+        res &= shape(mask_cells, n_kv, 3, 1, n_stream);
+        res &= shape(mask_queries, n_tps, 2, 1, n_stream);
     }
 
     const bool rebuild = cache != nullptr && cache->needs_rebuild(stream0, n_stream);

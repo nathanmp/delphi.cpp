@@ -3983,7 +3983,16 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
                 n_selected + hparams.indexer_kpool - 1, k_fa_pad);
         const bool compact_decode = n_tps == 1 && n_kv >= n_compact;
 
-        if (!indexed_attn && !compact_decode) {
+        if (!indexed_attn && !compact_decode && n_ps == 1 && llama_kpool_device_masks_enabled()) {
+            // the dense masks are built per device from these (see llm_graph_input_kpool)
+            inp->mask_cells = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_kv, 3, 1, n_stream);
+            ggml_set_input(inp->mask_cells);
+            ggml_set_name(inp->mask_cells, "kpool_mask_cells");
+
+            inp->mask_queries = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_tps, 2, 1, n_stream);
+            ggml_set_input(inp->mask_queries);
+            ggml_set_name(inp->mask_queries, "kpool_mask_queries");
+        } else if (!indexed_attn && !compact_decode) {
             // Dense compatibility/decode mask. Indexed CUDA attention needs only
             // the compact validity mask below and avoids this O(n_kv*n_tps)
             // host input entirely.
@@ -4034,7 +4043,8 @@ ggml_tensor * llm_graph_context::build_attn_sparse(
         ggml_tensor * sel_mask,
         ggml_tensor * cand_mask,
             float     kq_scale,
-            int       il) const {
+            int       il,
+            bool      kq_in_cand) const {
     ggml_build_forward_expand(gf, q_cur);
     ggml_build_forward_expand(gf, v_cur);
     ggml_build_forward_expand(gf, k_cur);
@@ -4108,7 +4118,9 @@ ggml_tensor * llm_graph_context::build_attn_sparse(
         if (result->type == GGML_TYPE_F32 && kq_mask->type == GGML_TYPE_F16) {
             result = ggml_cast(ctx0, result, GGML_TYPE_F16);
         }
-        result = ggml_add(ctx0, result, kq_mask);
+        if (!kq_in_cand) {
+            result = ggml_add(ctx0, result, kq_mask);
+        }
         cb(result, "kpool_kq_mask", il);
         return result;
     };

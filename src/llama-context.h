@@ -418,6 +418,11 @@ private:
     int                                 gf_res_prev_threads_alt = 0;
     bool                                sched_alt_live = false; // `sched` is the alternate scheduler
 
+    // the main scheduler and its reservation count right after reserve_max_prefill; while both still match, the max
+    // prefill reservation is in effect and a later logical batch does not need (or synchronize for) another one
+    ggml_backend_sched_t                max_prefill_sched    = nullptr;
+    uint64_t                            max_prefill_reserves = 0;
+
     // env: LLAMA_GRAPH_ALT_MAX_TOKENS, largest ubatch that may use the alternate scheduler (0 disables it)
     uint32_t graph_alt_max_tokens = 32;
 

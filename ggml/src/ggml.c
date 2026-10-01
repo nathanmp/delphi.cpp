@@ -1160,6 +1160,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GATED_DELTA_NET",
     "LIGHTNING_INDEXER",
     "KPOOL_EXPAND",
+    "INTERVAL_MASK",
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
@@ -1181,7 +1182,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1277,6 +1278,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "gated_delta_net(q, k, v, g, beta, s)",
     "lightning_indexer(q, k, weights, mask)",
     "kpool_expand(selected, pool_cells, pool_bias, tail_cells, tail_mask)",
+    "interval_mask(cells, queries)",
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
@@ -1298,7 +1300,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6640,6 +6642,29 @@ struct ggml_tensor * ggml_kpool_expand(
     result->src[2] = pool_bias;
     result->src[3] = tail_cells;
     result->src[4] = tail_mask;
+
+    return result;
+}
+
+// ggml_interval_mask
+
+struct ggml_tensor * ggml_interval_mask(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * cells,
+        struct ggml_tensor  * queries,
+        enum ggml_type        type) {
+    GGML_ASSERT(cells->type == GGML_TYPE_F32 && queries->type == GGML_TYPE_F32);
+    GGML_ASSERT(type == GGML_TYPE_F16 || type == GGML_TYPE_F32);
+    GGML_ASSERT(cells->ne[1] == 2 && queries->ne[1] == 2);
+    GGML_ASSERT(cells->ne[2] == 1 && queries->ne[2] == 1);
+    GGML_ASSERT(cells->ne[3] == queries->ne[3]);
+    GGML_ASSERT(cells->nb[0] == sizeof(float) && queries->nb[0] == sizeof(float));
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, type, cells->ne[0], queries->ne[0], 1, cells->ne[3]);
+
+    result->op     = GGML_OP_INTERVAL_MASK;
+    result->src[0] = cells;
+    result->src[1] = queries;
 
     return result;
 }

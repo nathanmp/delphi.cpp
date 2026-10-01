@@ -883,6 +883,8 @@ struct ggml_backend_sched {
     // delphi: wait on the host once per graph and backend for the previous use of the copy slot, not once per split
     // input (GGML_SCHED_COPY_REUSE_WAIT=1 waits for every input)
     bool copy_reuse_wait_all;
+    bool copy_slot_prewait; // GGML_SCHED_COPY_SLOT_PREWAIT=0 disables the copy-slot proof taken before the split loop
+    uint64_t n_reserves;
 
     // delphi: copy the inputs of a split in the graph order of their producers (GGML_SCHED_INPUT_ORDER=0 disables)
     bool input_order;
@@ -2499,6 +2501,7 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
         }
 
         ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids);
+        sched->n_reserves++;
         if (!ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
             GGML_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             return false;
@@ -3253,6 +3256,34 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     // which with pipeline parallelism sit behind the previous ubatch, and would serialize the ubatches.
     bool copy_slot_free[GGML_SCHED_MAX_BACKENDS] = { false };
 
+    // Take that proof before the first event record of this graph. A backend whose first host-side input belongs to a
+    // later split (CUDA1 running a split before the one that reads a user input, for example) would otherwise wait for
+    // its own earlier split of this graph, i.e. for the previous device's part of this ubatch, with the host blocked.
+    // Here the event still marks the slot's previous graph, which with n_copies > 1 has normally ended long ago.
+    if (!sched->copy_reuse_wait_all && sched->copy_slot_prewait) {
+        for (int split_id = 0; split_id < sched->n_splits; split_id++) {
+            const struct ggml_backend_sched_split * split = &splits[split_id];
+            const int b = split->backend_id;
+            ggml_backend_event_t ev = sched->events[b][sched->cur_copy];
+            if (copy_slot_free[b] || ev == NULL) {
+                continue;
+            }
+            for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+                const struct ggml_tensor * input = split->inputs[input_id];
+                if ((input->flags & GGML_TENSOR_FLAG_INPUT) || (input->buffer && ggml_backend_buffer_is_host(input->buffer))) {
+                    const uint64_t wait_start = ggml_backend_sched_trace_detail_span_begin();
+                    ggml_backend_event_synchronize(ev);
+                    ggml_backend_sched_trace_span_end(
+                            sched, wait_start, GGML_EXEC_TRACE_EVENT_BACKEND_WAIT,
+                            GGML_EXEC_TRACE_WAIT_COPY_DST_REUSE, split_id, b, GGML_EXEC_TRACE_ID_NONE,
+                            GGML_EXEC_TRACE_WAIT_API_EVENT_SYNCHRONIZE);
+                    copy_slot_free[b] = true;
+                    break;
+                }
+            }
+        }
+    }
+
     if (sched->stage != nullptr) {
         ggml_backend_sched_stage_begin(sched);
     }
@@ -3657,6 +3688,8 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->prev_split_wait_all = GGML_SCHED_PREV_SPLIT_WAIT ? atoi(GGML_SCHED_PREV_SPLIT_WAIT) != 0 : false;
     const char * GGML_SCHED_COPY_REUSE_WAIT = getenv("GGML_SCHED_COPY_REUSE_WAIT");
     sched->copy_reuse_wait_all = GGML_SCHED_COPY_REUSE_WAIT ? atoi(GGML_SCHED_COPY_REUSE_WAIT) != 0 : false;
+    const char * GGML_SCHED_COPY_SLOT_PREWAIT = getenv("GGML_SCHED_COPY_SLOT_PREWAIT");
+    sched->copy_slot_prewait = GGML_SCHED_COPY_SLOT_PREWAIT ? atoi(GGML_SCHED_COPY_SLOT_PREWAIT) != 0 : true;
     const char * GGML_SCHED_INPUT_ORDER = getenv("GGML_SCHED_INPUT_ORDER");
     sched->input_order = GGML_SCHED_INPUT_ORDER ? atoi(GGML_SCHED_INPUT_ORDER) != 0 : true;
 
@@ -3827,10 +3860,16 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
     if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
         return false;
     }
+    sched->n_reserves++;
 
     ggml_backend_sched_reset(sched);
 
     return true;
+}
+
+uint64_t ggml_backend_sched_get_n_reserves(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    return sched->n_reserves;
 }
 
 bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
