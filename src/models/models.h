@@ -1540,16 +1540,19 @@ struct llama_model_glm5next : public llama_model_base {
                 ggml_tensor * cur,
                 int il);
 
-        // `scoring` false keeps the dense path, the same function below n_select
+        // `scoring` false keeps the dense path, the same function below n_select. `state_only` builds only the
+        // persistent writes (indexer key/gate, pooled keys, latent KV) and returns nullptr
         ggml_tensor * build_dsa_layer(
                 const llama_layer & layer,
                 llm_graph_input_attn_k * inp_attn,
                 llm_graph_input_kpool * inp_kp,
                 bool scoring,
                 ggml_tensor * cur,
-                int il) const;
+                int il,
+                bool state_only = false) const;
 
-        // always stores the key and gate; when `scoring`, returns the selected CELL indices
+        // always stores the key and gate; when `scoring`, returns the selected CELL indices. `state_only` stops after
+        // the pooled-key cache update and returns nullptr
         ggml_tensor * build_indexer(
                 const llama_layer & layer,
                 llm_graph_input_kpool * inp_kp,
@@ -1557,7 +1560,8 @@ struct llama_model_glm5next : public llama_model_base {
                 ggml_tensor * qr,
                 ggml_tensor ** top_k_mask,
                 bool scoring,
-                int il) const;
+                int il,
+                bool state_only = false) const;
 
         ggml_tensor * build_layer_ffn(
                 const llama_model & model,
