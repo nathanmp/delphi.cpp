@@ -3166,6 +3166,14 @@ bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id
 
     common_speculative_wait(spec);
 
+    return common_speculative_get_state_now(spec, seq_id, data);
+}
+
+bool common_speculative_get_state_now(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data) {
+    if (spec == nullptr) {
+        return false;
+    }
+
     for (auto & impl : spec->impls) {
         if (impl->get_state(seq_id, data)) {
             return true;

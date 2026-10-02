@@ -910,6 +910,27 @@ private:
     llama_model   * model_dft = nullptr;
     llama_context * ctx_dft   = nullptr;
 
+    // Prompt checkpoints copy the state asynchronously, behind the batches already submitted, so creating one does
+    // not drain a pipeline-parallel prefill. The copies land at the next synchronization of the contexts; until
+    // then the newest checkpoints must not be read, copied or freed. env LLAMA_CKPT_ASYNC=0 copies synchronously.
+    bool ckpt_async = [] {
+        const char * env = getenv("LLAMA_CKPT_ASYNC");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    bool ckpt_async_pending = false;
+
+    void ckpt_async_sync() {
+        if (ckpt_async_pending) {
+            llama_synchronize(ctx_tgt);
+            if (ctx_dft) {
+                // the draft context may be ingesting on the speculative worker
+                common_speculative_wait_ctx(ctx_dft);
+                llama_synchronize(ctx_dft);
+            }
+            ckpt_async_pending = false;
+        }
+    }
+
     common_speculative_init_result_ptr spec_init;
 
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
@@ -2354,6 +2375,10 @@ private:
             // make room for the new checkpoint, if needed
             const auto & cur = slot.prompt.checkpoints.front();
 
+            if (cur.id_task == id_task) {
+                ckpt_async_sync();
+            }
+
             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                     cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
 
@@ -2366,6 +2391,9 @@ private:
             for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
                 if (it->n_tokens == n_tokens_new) {
                     SLT_TRC(slot, "superseding context checkpoint at n_tokens = %" PRId64 "\n", it->n_tokens);
+                    if (it->id_task == id_task) {
+                        ckpt_async_sync();
+                    }
                     it = slot.prompt.checkpoints.erase(it);
                 } else {
                     ++it;
@@ -2382,15 +2410,33 @@ private:
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
-        cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-        cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-        // stash the draft's speculative state with the checkpoint
-        common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
+        const llama_state_seq_flags flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | (ckpt_async ? LLAMA_STATE_SEQ_FLAGS_ASYNC : 0);
+        cur.update_tgt(ctx_tgt, slot.id, flags);
+        if (ckpt_async && ctx_dft) {
+            // The draft context ingests prompt batches on the speculative worker, behind the target's last ubatch.
+            // Waiting for it would drain the target's pipeline, so the draft and speculative states are taken on the
+            // worker, after the batches queued so far. They are complete after ckpt_async_sync().
+            common_prompt_checkpoint * pcur = &cur;
+            const llama_seq_id seq_id = slot.id;
+            common_speculative_run_ctx(ctx_dft, [this, pcur, seq_id]() {
+                const size_t n = llama_state_seq_get_size_ext(ctx_dft, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                pcur->data_dft.resize(n);
+                if (llama_state_seq_get_data_ext(ctx_dft, pcur->data_dft.data(), n, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != n) {
+                    GGML_ABORT("checkpoint size mismatch\n");
+                }
+                common_speculative_get_state_now(spec.get(), seq_id, pcur->data_spec);
+            });
+        } else {
+            cur.update_dft(ctx_dft, slot.id, flags);
+            // stash the draft's speculative state with the checkpoint
+            common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
+        }
+        ckpt_async_pending = ckpt_async_pending || ckpt_async;
 
         SLT_TRC(slot,
-                "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", target size = %.3f MiB)\n",
                 (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
-                cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+                cur.pos_max, cur.n_tokens, (float) cur.data_tgt.size() / 1024 / 1024);
     }
 
     // returns false to decline the task, it is offered again after the decode is done
@@ -2399,6 +2445,11 @@ private:
         if (is_yielding && task.type != SERVER_TASK_TYPE_METRICS && task.type != SERVER_TASK_TYPE_SLOT_GET) {
             SRV_DBG("decoding, decline task, id_task = %d\n", task.id);
             return false;
+        }
+
+        // the task may read, copy or drop the slots' checkpoints
+        if (!is_yielding) {
+            ckpt_async_sync();
         }
 
         switch (task.type) {
