@@ -941,6 +941,9 @@ public:
     // return true if the graph was updated and can be reused
     bool can_reuse(const llm_graph_params & params);
 
+    // the graph was built for parameters of the same topology; its inputs may no longer match them
+    bool same_topology(const llm_graph_params & params) const { return this->params.allow_reuse(params); }
+
     llm_graph_input_i * add_input(llm_graph_input_ptr input);
 
     void add_fused_node(llm_graph_fused_node result);
