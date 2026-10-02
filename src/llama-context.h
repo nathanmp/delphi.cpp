@@ -463,6 +463,27 @@ private:
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
 
+public:
+    // LLAMA_STATE_SEQ_FLAGS_ASYNC: device tensors are copied into pinned staging buffers on their backends' streams,
+    // and from there into the caller's memory at the next synchronize()
+    struct state_async_copy {
+        const uint8_t * src;
+        uint8_t       * dst;
+        size_t          size;
+    };
+
+    // a free pinned staging buffer of at least size bytes (nullptr without a pinned host buffer type)
+    uint8_t * state_async_staging(size_t size);
+    // the backend whose stream writes tensors of this buffer type (nullptr if none)
+    ggml_backend_t state_async_backend(ggml_backend_buffer_type_t buft) const;
+    void state_async_finish();
+
+    std::vector<state_async_copy> state_async_pending;
+
+private:
+    std::vector<ggml_backend_buffer_ptr> state_async_bufs;
+    std::vector<bool>                    state_async_busy;
+
     bool has_evaluated_once = false;
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
