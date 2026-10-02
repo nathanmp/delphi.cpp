@@ -6,7 +6,9 @@
 - the busy time of each device, and of any device;
 - the CPU compute time.
 
-`llama_decode` can return before the device work ends, so host time in the call is not the cost of an execution. The tool therefore measures one speculative cycle (the draft executions of a verify pass plus the pass) from the start of one verify pass to the next. It also gives the device busy time per cycle, the share of the cycle when every device is idle (host-side work such as sampling and draft control, or waits), and the CPU compute per cycle. Devices that process a verify pass one after the other (a layer split) add up in the any-device time.
+`llama_decode` can return before the device work ends, so host time in the call is not the cost of an execution. The tool therefore measures one speculative cycle (the draft executions of a verify pass plus the pass) from the start of one verify pass to the next. It also gives the device busy time per cycle, the share of the cycle when every device is idle (host-side work such as sampling and draft control, or waits), and the CPU compute per cycle.
+
+Device spans are placed at the earliest start the host clock allows. With a layer split the host submits every stage of a verify pass before the first one ends, so a later stage can start up to the whole pass later than placed. When the median placement uncertainty is more than 5% of the cycle, the tool does not report the any-device time and the idle share. It gives the sum of the device busy times instead, which is the critical path when the devices run one after another.
 
 ## Synopsis
 

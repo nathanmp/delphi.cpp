@@ -994,8 +994,12 @@ def _render_speculative(lines: list[str], summary: Mapping[str, Any] | None, *, 
     lines.append(f"Speculative cycle (exec-trace-spec, decode requests only): {cycle['verify_passes']} verify passes, {cycle['draft_executions_per_verify']:.2f} draft executions per verify; {cycle['cycle_wall_ms']:.2f} ms from verify to verify (median {cycle['cycle_wall_ms_median']:.2f}){accepted}.")
     if cycle["device_busy_ms_per_cycle"]:
         device = ", ".join(f"{name} {ms:.2f}" for name, ms in cycle["device_busy_ms_per_cycle"].items())
-        idle = 100.0 * (1.0 - cycle["any_device_busy_ms_per_cycle"] / cycle["cycle_wall_ms"])
-        lines.append(f"Per cycle (D): device busy {device}; any device {cycle['any_device_busy_ms_per_cycle']:.2f} ms, so every device is idle {idle:.0f}% of the cycle. CPU compute (H): {cycle['cpu_compute_ms_per_cycle']:.2f} ms. Host time in llama_decode (H): draft {cycle['host_ms_in_decode_per_cycle']['draft']:.2f} ms, verify {cycle['host_ms_in_decode_per_cycle']['verify']:.2f} ms.")
+        any_device = cycle.get("any_device_busy_ms_per_cycle")
+        if any_device is not None:
+            overlap = f"any device {any_device:.2f} ms, so every device is idle {100.0 * (1.0 - any_device / cycle['cycle_wall_ms']):.0f}% of the cycle"
+        else:
+            overlap = f"sum {cycle['device_busy_sum_ms_per_cycle']:.2f} ms, the critical path if the devices run one after another (device overlap unknown: median placement uncertainty {cycle['placement_uncertainty_ms_median']:.2f} ms)"
+        lines.append(f"Per cycle (D): device busy {device}; {overlap}. CPU compute (H): {cycle['cpu_compute_ms_per_cycle']:.2f} ms. Host time in llama_decode (H): draft {cycle['host_ms_in_decode_per_cycle']['draft']:.2f} ms, verify {cycle['host_ms_in_decode_per_cycle']['verify']:.2f} ms.")
     lines.extend(("", "| phase | tokens | executions | host ms in llama_decode (H) | CPU compute ms (H) | device busy ms (D) |", "| --- | ---: | ---: | ---: | ---: | --- |"))
     for group in summary["groups"]:
         device = ", ".join(f"{name} {ms:.2f}" for name, ms in group["device_busy_ms_mean"].items()) or "n/a"

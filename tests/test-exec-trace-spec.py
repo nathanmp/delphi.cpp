@@ -28,11 +28,11 @@ def execution(execution_id, start, end, tokens, phase):
             event(T.K_EXECUTION_END, end, execution_id)]
 
 
-def gpu_span(execution_id, epoch, start, duration, backend_id, scope=1, node_id=0):
-    # resolved DEVICE_EVENT span placed at `start` by an epoch anchored at `start`
+def gpu_span(execution_id, epoch, start, duration, backend_id, scope=1, node_id=0, slack=0):
+    # resolved DEVICE_EVENT span placed at `start` by an epoch anchored at `start`; completion seen `slack` ns late
     flags = scope | (1 << 8) | (2 << 16)
     return [event(T.K_GPU_TIMING, start, execution_id, (start, 0, duration, epoch << 32), flags, backend_id, node_id),
-            event(T.K_GPU_TIMING_EPOCH, start, execution_id, (start + duration, epoch, 1, 1), 0, backend_id)]
+            event(T.K_GPU_TIMING_EPOCH, start, execution_id, (start + duration + slack, epoch, 1, 1), 0, backend_id)]
 
 
 class TestExecTraceSpec(unittest.TestCase):
@@ -91,6 +91,17 @@ class TestExecTraceSpec(unittest.TestCase):
         text = exec_trace_spec.render(result, accepted=2.0)
         self.assertIn("9.00 ms verify to verify", text)
         self.assertIn("3.00 ms per output token", text)
+
+    def test_uncertain_placement_withholds_device_overlap(self):
+        events = []
+        for xid, start in ((1, 0), (2, 10_000_000)):
+            events += execution(xid, start, start + 1_000_000, 3, TARGET)
+            events += gpu_span(xid, 2 * xid, start, 2_000_000, 1)
+            events += gpu_span(xid, 2 * xid + 1, start, 3_000_000, 2, slack=5_000_000)
+        cycle = exec_trace_spec.summarize(self.trace(events), top=4, node_pattern=None)["cycle"]
+        self.assertIsNone(cycle["any_device_busy_ms_per_cycle"])
+        self.assertAlmostEqual(cycle["device_busy_sum_ms_per_cycle"], 5.0)
+        self.assertIn("overlap unknown", exec_trace_spec.render({"groups": [], "cycle": cycle}, accepted=None))
 
     def test_windows_select_executions(self):
         events = []
