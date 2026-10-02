@@ -941,6 +941,12 @@ extern "C" {
 // Getting the state for a seq_id with this flag invalidates all prior states gotten for that seq_id with this flag.
 #define LLAMA_STATE_SEQ_FLAGS_ON_DEVICE 2
 
+// llama_state_seq_get_data_ext only: do not wait for the work already submitted to the backends. The device data is
+// copied in stream order behind that work, so the state is the one after the last llama_decode call, and lands in dst
+// at the next synchronization of the context (llama_synchronize, or any call that reads outputs or state). dst must
+// stay valid and must not be read until then.
+#define LLAMA_STATE_SEQ_FLAGS_ASYNC 4
+
     typedef uint32_t llama_state_seq_flags;
 
     LLAMA_API size_t llama_state_seq_get_size_ext(
