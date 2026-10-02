@@ -340,6 +340,8 @@ if (LLAMA_TEST_PYTHON)
     llama_test_cmd(${LLAMA_TEST_PYTHON} NAME test-exec-trace-gpu-activity ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-exec-trace-gpu-activity.py)
     llama_test_cmd(${LLAMA_TEST_PYTHON} NAME test-exec-trace-rocm ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-exec-trace-rocm.py)
     llama_test_cmd(${LLAMA_TEST_PYTHON} NAME test-exec-trace-perfetto ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-exec-trace-perfetto.py)
+    llama_test_cmd(${LLAMA_TEST_PYTHON} NAME test-exec-trace-spec ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-exec-trace-spec.py)
+    llama_test_cmd(${LLAMA_TEST_PYTHON} NAME test-exec-trace-pipeline ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-exec-trace-pipeline.py)
 endif()
 
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")

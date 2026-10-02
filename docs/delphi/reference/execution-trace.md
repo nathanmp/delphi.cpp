@@ -11,6 +11,8 @@ This page explains what the profiler is and which tool to reach for. The Recordi
 | Decide whether a trace is production-representative | `tools/exec-trace/exec-trace-integrity.py`; see `../usage/exec-trace-integrity.md` |
 | Align vendor profiler data with a trace | `tools/exec-trace/exec-trace-gpu-activity.py` plus a provider adapter (`exec-trace-rocm.py` for ROCprofiler-SDK); see `../usage/exec-trace-gpu-activity.md` |
 | View a unified host plus GPU timeline | `tools/exec-trace/exec-trace-perfetto.py`; see `../usage/exec-trace-perfetto.md` |
+| Break down speculative decoding: verify passes, draft steps, cost per cycle | `tools/exec-trace/exec-trace-spec.py`; see `../usage/exec-trace-spec.md` |
+| See how prefill ubatches flow through pipeline stages | `tools/exec-trace/exec-trace-pipeline.py`; see `../usage/exec-trace-pipeline.md` |
 
 ## What gets recorded
 
@@ -66,7 +68,7 @@ The raw file uses schema `ggml-exec-trace-v4`: a 96-byte header, fixed-size 80-b
 
 ## Tests
 
-`tests/test-exec-trace.cpp` covers disabled, enabled, detailed, truncation, integrity, and GPU-timing modes. Each offline script has a Python test (`tests/test-exec-trace-dump.py`, `test-exec-trace-integrity.py`, `test-exec-trace-gpu-activity.py`, `test-exec-trace-rocm.py`, `test-exec-trace-perfetto.py`). All run under ctest.
+`tests/test-exec-trace.cpp` covers disabled, enabled, detailed, truncation, integrity, and GPU-timing modes. Each offline script has a Python test (`tests/test-exec-trace-dump.py`, `test-exec-trace-integrity.py`, `test-exec-trace-gpu-activity.py`, `test-exec-trace-rocm.py`, `test-exec-trace-perfetto.py`, `test-exec-trace-spec.py`, `test-exec-trace-pipeline.py`). All run under ctest.
 
 ## Provenance
 
