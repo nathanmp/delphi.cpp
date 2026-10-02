@@ -396,7 +396,8 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
         ggml_tensor * qr,
         ggml_tensor ** top_k_mask,
         bool scoring,
-        int il) const {
+        int il,
+        bool state_only) const {
     const int64_t d_idx   = hparams.indexer_head_size;
     const int64_t n_ihead = hparams.indexer_n_head;
     const int64_t r       = hparams.indexer_kpool;
@@ -451,7 +452,7 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
             ggml_reshape_3d(ctx0, gate, d_idx, 1, n_tokens), 1);
     ggml_build_forward_expand(gf, mctx_idx->cpy_k(ctx0, packed, inp_kp->k_idxs, il));
 
-    if (!scoring) {
+    if (!scoring || (state_only && inp_kp->pool_cache == nullptr)) {
         *top_k_mask = nullptr;
         return nullptr;
     }
@@ -512,6 +513,11 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
         ggml_tensor * store_values = ggml_get_rows(ctx0, rebuilt, inp_kp->pool_store_src);
         ggml_tensor * cache_write = inp_kp->pool_cache->store(ctx0, store_values, inp_kp->pool_store_dst,
                 il, mctx_idx->get_stream_base(), n_stream);
+        if (state_only) {
+            ggml_build_forward_expand(gf, cache_write);
+            *top_k_mask = nullptr;
+            return nullptr;
+        }
         pool_k = ggml_get_rows(ctx0, cache_write, inp_kp->pool_cache_slots);
     } else {
         // Recompress only pools completed by this decode/prefill batch. The
@@ -523,6 +529,11 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
         ggml_tensor * update = compress_members(members, n_update);
         ggml_tensor * cache_write = inp_kp->pool_cache->store(ctx0, update, inp_kp->pool_update_dst,
                 il, mctx_idx->get_stream_base(), n_stream);
+        if (state_only) {
+            ggml_build_forward_expand(gf, cache_write);
+            *top_k_mask = nullptr;
+            return nullptr;
+        }
         pool_k = ggml_get_rows(ctx0, cache_write, inp_kp->pool_cache_slots);
     }
 
@@ -662,7 +673,8 @@ ggml_tensor * llama_model_glm5next::graph::build_dsa_layer(
         llm_graph_input_kpool * inp_kp,
         bool scoring,
         ggml_tensor * cur,
-        int il) const {
+        int il,
+        bool state_only) const {
     const int64_t qk_head_dim  = hparams.n_embd_head_k_mla();
     const int64_t kv_lora_rank = hparams.n_lora_kv;
 
@@ -670,6 +682,21 @@ ggml_tensor * llama_model_glm5next::graph::build_dsa_layer(
 
     // scale is over the MLA head size, as in the reference, not the absorbed width
     const float kq_scale = 1.0f/sqrtf(float(qk_head_dim));
+
+    if (state_only) {
+        // Only what later batches read: the indexer key/gate and pooled keys, and the latent KV row. The queries,
+        // indexer scores and attention feed this batch's outputs alone.
+        ggml_tensor * top_k_mask = nullptr;
+        if (inp_kp) {
+            build_indexer(layer, inp_kp, cur, nullptr, &top_k_mask, scoring, il, true);
+        }
+        ggml_tensor * kv = ggml_mul_mat(ctx0, layer.wkv_a_mqa, cur);
+        kv = build_norm(kv, layer.attn_kv_a_norm, nullptr, LLM_NORM_RMS, il);
+        ggml_tensor * k = ggml_reshape_3d(ctx0, kv, kv_lora_rank, 1, n_tokens);
+        cb(k, "dsa_kv_latent", il);
+        ggml_build_forward_expand(gf, inp_attn->mctx->cpy_k(ctx0, k, inp_attn->get_k_idxs(), il));
+        return nullptr;
+    }
 
     ggml_tensor * qr = ggml_mul_mat(ctx0, layer.wq_a, cur);
     qr = build_norm(qr, layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
@@ -986,7 +1013,18 @@ llama_model_glm5next::graph_mtp::graph_mtp(const llama_model & model, const llm_
     }
     cb(tok_embd, "mtp_tok_embd", il);
 
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    // A prompt-ingest batch has no outputs and only has to leave the layer's state for later batches: the indexer
+    // key/gate, the pooled keys and the latent KV. Attention, the FFN and the head are skipped. Short batches keep the
+    // full graph: single tokens also store the top-k hint and the shared MTP selection, and the decode catch-up
+    // batches (a few tokens) would otherwise alternate graph shapes with the draft steps, and every change of node
+    // count reallocates the compute graph. env LLAMA_MTP_STATE_ONLY=0 disables it.
+    static const bool state_only_enabled = [] {
+        const char * env = getenv("LLAMA_MTP_STATE_ONLY");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    const bool state_only = state_only_enabled && n_outputs == 0 && n_tokens >= 32;
+
+    ggml_tensor * inp_out_ids = state_only ? nullptr : build_inp_out_ids();
     auto * inp_mem = build_inp_mem_hybrid_k();
 
     llm_graph_input_kpool * inp_kp = nullptr;
@@ -1014,6 +1052,17 @@ llama_model_glm5next::graph_mtp::graph_mtp(const llama_model & model, const llm_
     ggml_tensor * residual = cur;
     cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
     cb(cur, "mtp_attn_norm", il);
+
+    if (state_only) {
+        build_dsa_layer(layer, inp_mem->get_attn(), inp_kp, indexer_scoring, cur, il, true);
+        // small host-filled inputs that the pruned scoring path read; keep them allocated for set_input
+        for (ggml_tensor * t : { inp_kp->pool_cells, inp_kp->pool_cache_slots }) {
+            if (t != nullptr) {
+                ggml_build_forward_expand(gf, t);
+            }
+        }
+        return;
+    }
 
     cur = build_dsa_layer(layer, inp_mem->get_attn(), inp_kp, indexer_scoring, cur, il);
     cur = ggml_add(ctx0, cur, residual);

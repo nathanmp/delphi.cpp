@@ -564,10 +564,11 @@ void llama_kv_cache_set_input_kpool(
     GGML_ASSERT(kpool > 0);
 
     GGML_ASSERT(pool_cells->buffer && "pool_cells input was not allocated");
-    GGML_ASSERT(pool_bias ->buffer && "pool_bias input was not allocated");
+    // pool_bias is null when a state-only MTP graph prunes the scoring that reads it
+    GGML_ASSERT(pool_bias == nullptr || (pool_bias->buffer && "pool_bias input was not allocated"));
     GGML_ASSERT((sel_mask == nullptr) == (cand_mask == nullptr));
     GGML_ASSERT(ggml_backend_buffer_is_host(pool_cells->buffer));
-    GGML_ASSERT(ggml_backend_buffer_is_host(pool_bias ->buffer));
+    GGML_ASSERT(pool_bias == nullptr || ggml_backend_buffer_is_host(pool_bias ->buffer));
     if (sel_mask != nullptr) {
         GGML_ASSERT(sel_mask->buffer && cand_mask->buffer && "dense sparse masks were not allocated");
         GGML_ASSERT(ggml_backend_buffer_is_host(sel_mask ->buffer));
@@ -575,7 +576,7 @@ void llama_kv_cache_set_input_kpool(
     }
 
     GGML_ASSERT(pool_cells->type == GGML_TYPE_I32);
-    GGML_ASSERT(pool_bias ->type == GGML_TYPE_F32);
+    GGML_ASSERT(pool_bias == nullptr || pool_bias ->type == GGML_TYPE_F32);
     if (sel_mask != nullptr) {
         GGML_ASSERT((sel_mask->type == GGML_TYPE_F16 || sel_mask->type == GGML_TYPE_F32) &&
                 "sel_mask must be f16 or f32");
@@ -592,7 +593,7 @@ void llama_kv_cache_set_input_kpool(
     }
 
     GGML_ASSERT(ggml_is_contiguous(pool_cells));
-    GGML_ASSERT(ggml_is_contiguous(pool_bias));
+    GGML_ASSERT(pool_bias == nullptr || ggml_is_contiguous(pool_bias));
     GGML_ASSERT(sel_mask == nullptr || ggml_is_contiguous(sel_mask));
     GGML_ASSERT(cand_mask == nullptr || ggml_is_contiguous(cand_mask));
 
@@ -646,14 +647,14 @@ void llama_kv_cache_set_input_kpool(
     GGML_ASSERT(pool_cells->ne[1] == n_ns);
     GGML_ASSERT(sel_mask == nullptr || sel_mask->ne[2] == 1);
     GGML_ASSERT(sel_mask == nullptr || ggml_are_same_shape(cand_mask, sel_mask));
-    GGML_ASSERT(pool_bias->ne[0] == n_pools && pool_bias->ne[2] == n_ns);
+    GGML_ASSERT(pool_bias == nullptr || (pool_bias->ne[0] == n_pools && pool_bias->ne[2] == n_ns));
     GGML_ASSERT(n_tokens % n_ns == 0);
 
     const int64_t n_tps      = n_tokens/n_ns;
     const int64_t n_padq     = sel_mask ? sel_mask->ne[1] : n_tps;
     const int64_t n_tail_pad = compact_tail_cells ? compact_tail_cells->ne[0] : 0;
 
-    GGML_ASSERT(pool_bias->ne[1] == n_tps);
+    GGML_ASSERT(pool_bias == nullptr || pool_bias->ne[1] == n_tps);
     GGML_ASSERT(n_padq >= n_tps);
 
     if (compact_tail_cells != nullptr) {
@@ -696,7 +697,7 @@ void llama_kv_cache_set_input_kpool(
     int32_t * dst_cell_pool  = cell_pool ? (int32_t *) cell_pool->data : nullptr;
     int32_t * dst_pool_cells = (int32_t *) pool_cells->data;
     float   * dst_bias       = bias ? (float *) bias->data : nullptr;
-    float   * dst_pool_bias  = (float   *) pool_bias ->data;
+    float   * dst_pool_bias  = pool_bias ? (float *) pool_bias->data : nullptr;
     char    * dst_sel_mask   = sel_mask  ? (char *) sel_mask ->data : nullptr;
     char    * dst_cand_mask  = cand_mask ? (char *) cand_mask->data : nullptr;
 
@@ -746,7 +747,7 @@ void llama_kv_cache_set_input_kpool(
         int32_t * cur_pool_cells = dst_pool_cells + s*(r*n_pools);
         char    * cur_sel_mask   = dst_sel_mask  ? dst_sel_mask  + s*(n_padq*n_kv)*mask_ts : nullptr;
         char    * cur_cand_mask  = dst_cand_mask ? dst_cand_mask + s*(n_padq*n_kv)*mask_ts : nullptr;
-        float   * cur_pool_bias  = dst_pool_bias  + s*(n_tps*n_pools);
+        float   * cur_pool_bias  = dst_pool_bias ? dst_pool_bias + s*(n_tps*n_pools) : nullptr;
 
         struct valid_pool {
             llama_kpool_cache::pool_id id;
@@ -756,7 +757,9 @@ void llama_kv_cache_set_input_kpool(
         std::vector<valid_pool> valid_pools;
 
         std::fill(cur_pool_cells, cur_pool_cells + r*n_pools, 0);
-        std::fill(cur_pool_bias,  cur_pool_bias  + n_tps*n_pools, -INFINITY);
+        if (cur_pool_bias != nullptr) {
+            std::fill(cur_pool_bias, cur_pool_bias + n_tps*n_pools, -INFINITY);
+        }
 
         // the token loop writes rows < n_tps in full; only the padding rows need clearing
         if (cur_sel_mask != nullptr && mask_f16) {
@@ -966,9 +969,9 @@ void llama_kv_cache_set_input_kpool(
 
                 // the query's own sequence run only; every other slot keeps the -INFINITY
                 // of the fill above, which is what keeps a foreign pool out of the budget
-                float * q_pool_bias = cur_pool_bias + ii*n_pools + run_off[ps];
+                float * q_pool_bias = cur_pool_bias ? cur_pool_bias + ii*n_pools + run_off[ps] : nullptr;
 
-                for (int64_t p = 0; p < n_run; ++p) {
+                for (int64_t p = 0; q_pool_bias != nullptr && p < n_run; ++p) {
                     const bool valid   = filled[p] == (int32_t) r;
                     const bool visible = p < bo_vis;
 
@@ -1099,8 +1102,10 @@ void llm_graph_input_kpool::set_input(const llama_ubatch * ubatch) {
 
     llama_kv_cache_set_input_kpool(
             mctx_attn->get_kv(),
-            /* cell_pool */ nullptr, pool_cells, /* bias */ nullptr, pool_bias,
-            sel_mask, cand_mask, ubatch, kpool, mctx_attn->get_n_kv(), tail_cells, tail_mask,
+            /* cell_pool */ nullptr, pool_cells, /* bias */ nullptr, pool_bias && pool_bias->buffer ? pool_bias : nullptr,
+            // a state-only MTP graph prunes the masks along with attention
+            sel_mask && sel_mask->buffer ? sel_mask : nullptr, cand_mask && cand_mask->buffer ? cand_mask : nullptr,
+            ubatch, kpool, mctx_attn->get_n_kv(), tail_cells, tail_mask,
             active_pool_cache,
             active_pool_cache ? pool_cache_slots  : nullptr,
             active_pool_cache ? pool_store_src    : nullptr,
