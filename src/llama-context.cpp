@@ -1041,6 +1041,13 @@ void llama_context::reserve_max_prefill(
     for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
         n_outputs += ubatch.output[i] != 0;
     }
+    // Without backend samplers, a ubatch with no outputs builds the same nodes as one with a single output, only
+    // with empty output tensors, so it fits a single-output reservation. The last ubatch of a prompt carries the one
+    // output: against a no-output reservation its out_ids (and logits) outgrew the recorded sizes, and the
+    // reallocation synchronized every backend, draining the pipeline ahead of the prompt's last ubatch.
+    if (n_outputs == 0 && sampling.samplers.empty()) {
+        n_outputs = 1;
+    }
 
     // An earlier logical batch of this prompt (or an earlier prompt) left the reservation in place. Reserving again
     // would synchronize every backend and drain the ubatches still in flight from the previous llama_decode call.
