@@ -1129,9 +1129,12 @@ bool llm_graph_input_kpool::can_reuse(const llm_graph_params & params) {
         cache = nullptr;
     }
 
+    // the memory contexts are new objects for every ubatch: set_input reads the current ones (comparing their
+    // addresses only matched when the allocator happened to return the same ones)
+    mctx_attn = attn;
+    mctx_idx  = idx;
+
     bool res = true;
-    res &= attn == mctx_attn;
-    res &= idx == mctx_idx;
     res &= cache == pool_cache;
     res &= idx->get_stream_base() == stream0;
     res &= k_idxs->ne[0] == params.ubatch.n_tokens;
