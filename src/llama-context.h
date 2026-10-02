@@ -417,15 +417,21 @@ private:
     llm_graph_result * gf_res_prev_active = nullptr;
     int                gf_res_prev_threads = 0; // backend_n_threads the active graph was built with
 
-    // A second scheduler for small ubatches keeps a second graph allocated, so decode loops that alternate
-    // between two shapes (MTP: draft-model update, then single-token drafts; target: prompt chunk, then verify)
-    // reuse both graphs instead of rebuilding on every switch. The live pair is always `sched`/`gf_res_prev`;
-    // graph_alt_swap exchanges it with the stored one. Its compute buffers only grow to the small graphs it runs.
-    ggml_backend_sched_ptr              sched_alt;
-    std::array<llm_graph_result_ptr, 2> gf_res_prev_alt;
-    llm_graph_result *                  gf_res_prev_active_alt  = nullptr;
-    int                                 gf_res_prev_threads_alt = 0;
-    bool                                sched_alt_live = false; // `sched` is the alternate scheduler
+    // Extra schedulers for small ubatches keep more graphs allocated, so decode loops that cycle through a few shapes
+    // (MTP: draft-model update, then single-token drafts; target: prompt chunk, then verify passes whose width follows
+    // the draft length) reuse their graphs instead of rebuilding on every switch. The live slot is always
+    // `sched`/`gf_res_prev`; graph_slot_activate exchanges it with a stored one. Slot 0 is the main scheduler, reserved
+    // for large ubatches; the others' compute buffers only grow to the small graphs they run.
+    struct graph_slot {
+        ggml_backend_sched_ptr              sched;
+        std::array<llm_graph_result_ptr, 2> gf_res_prev;
+        llm_graph_result *                  gf_res_prev_active  = nullptr;
+        int                                 gf_res_prev_threads = 0;
+        uint64_t                            last_use            = 0; // stays with the slot index
+    };
+    std::vector<graph_slot> graph_slots;         // graph_slots[graph_slot_live] holds nothing: its contents are live
+    int                     graph_slot_live  = 0;
+    uint64_t                graph_slot_clock = 0;
 
     // the main scheduler and its reservation count right after reserve_max_prefill; while both still match, the max
     // prefill reservation is in effect and a later logical batch does not need (or synchronize for) another one
@@ -434,11 +440,16 @@ private:
     // the attention variant of that reservation for GLM-5 kpool memory (0 dense, 1 indexed), -1 without variants
     int                                 max_prefill_variant  = -1;
 
-    // env: LLAMA_GRAPH_ALT_MAX_TOKENS, largest ubatch that may use the alternate scheduler (0 disables it)
+    // env: LLAMA_GRAPH_ALT_MAX_TOKENS, largest ubatch that may use an alternate scheduler (0 disables them)
     uint32_t graph_alt_max_tokens = 32;
+    // env: LLAMA_GRAPH_ALT_SLOTS, number of alternate schedulers
+    uint32_t graph_alt_slots = 4;
 
-    void graph_alt_swap();
-    // make the main scheduler live and forget the graphs of both
+    // make slot `id` live, creating its scheduler on first use
+    void graph_slot_activate(int id);
+    // the main scheduler, live or stored
+    ggml_backend_sched_t graph_sched_main() const;
+    // make the main scheduler live and forget the graphs of every slot
     void graph_alt_reset();
 
     // host buffer for the model output (logits and embeddings)
