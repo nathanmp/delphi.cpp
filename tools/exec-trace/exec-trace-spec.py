@@ -74,6 +74,7 @@ def summarize(trace, top, node_pattern, windows_ns=()):
         if event["kind"] == T.K_EXECUTION_END and event["execution_id"] in executions:
             executions[event["execution_id"]]["end_ns"] = event["timestamp_ns"]
 
+    uncertainty = defaultdict(list)                    # execution -> placement uncertainty of its device spans (ns)
     submit = defaultdict(lambda: defaultdict(list))   # execution -> backend -> device intervals of submits / graphs
     ops = defaultdict(lambda: defaultdict(list))      # execution -> backend -> device intervals of single operations
     op_ns = defaultdict(Counter)                       # execution -> "backend / op" -> device ns
@@ -87,6 +88,7 @@ def summarize(trace, top, node_pattern, windows_ns=()):
             continue
         interval = (span["device_start_ns"], span["device_end_ns"])
         name = backend_name(event)
+        uncertainty[execution_id].append(span.get("placement_uncertainty_ns") or 0)
         if span["scope"] in ("eager_submit", "graph_launch"):
             submit[execution_id][name].append(interval)
         elif span["scope"] == "eager_op":
@@ -155,6 +157,10 @@ def summarize(trace, top, node_pattern, windows_ns=()):
         backends = sorted({name for i in all_ids for name in (*submit[i], *ops[i])})
         device = {name: sum(union_ns(submit[i][name] or ops[i][name]) for i in all_ids) / len(verify_ids) / 1e6 for name in backends}
         any_device = union_ns([iv for i in all_ids for name in backends for iv in (submit[i][name] or ops[i][name])])
+        # Device spans are placed at the earliest start the host clock allows. A stage that the host submits before the
+        # previous stage finishes (layer split) can start much later than placed, so the overlap between devices, and
+        # with it the any-device time, is only known when that uncertainty is small against the cycle.
+        placement_ms = (median([u for i in all_ids for u in uncertainty[i]]) or 0) / 1e6
         host = {phase: sum(executions[i]["end_ns"] - executions[i]["begin_ns"]
                            for (p, _), ids in groups.items() if p == phase for i in ids) / len(verify_ids) / 1e6 for phase in PHASES}
         n_draft = sum(len(ids) for (phase, _), ids in groups.items() if phase == "generation_draft")
@@ -164,7 +170,10 @@ def summarize(trace, top, node_pattern, windows_ns=()):
             "cycle_wall_ms": spans_ns / n_cycles / 1e6 if n_cycles else None,
             "cycle_wall_ms_median": median(deltas) / 1e6 if deltas else None,
             "device_busy_ms_per_cycle": device,
-            "any_device_busy_ms_per_cycle": any_device / len(verify_ids) / 1e6,
+            "device_busy_sum_ms_per_cycle": sum(device.values()),
+            "placement_uncertainty_ms_median": placement_ms,
+            "any_device_busy_ms_per_cycle": (any_device / len(verify_ids) / 1e6
+                                             if n_cycles and placement_ms <= 0.05 * spans_ns / n_cycles / 1e6 else None),
             "cpu_compute_ms_per_cycle": sum(cpu_ns[i] for i in all_ids) / len(verify_ids) / 1e6,
             "host_ms_in_decode_per_cycle": {"draft": host["generation_draft"], "verify": host["generation_target"]},
         }
@@ -183,11 +192,15 @@ def render(result, accepted):
     cycle = result["cycle"]
     if cycle and cycle["cycle_wall_ms"]:
         device = ", ".join(f"{name} {ms:.2f}" for name, ms in cycle["device_busy_ms_per_cycle"].items()) or "no device timing"
-        idle = 100.0 * (1.0 - cycle["any_device_busy_ms_per_cycle"] / cycle["cycle_wall_ms"]) if cycle["device_busy_ms_per_cycle"] else None
+        any_device = cycle["any_device_busy_ms_per_cycle"]
+        if any_device is not None:
+            overlap = f"any {any_device:.2f} ms, all devices idle {100.0 * (1.0 - any_device / cycle['cycle_wall_ms']):.0f}% of the cycle"
+        else:
+            overlap = (f"sum {cycle['device_busy_sum_ms_per_cycle']:.2f} ms, the critical path if the devices run one after another; "
+                       f"overlap unknown, median placement uncertainty {cycle['placement_uncertainty_ms_median']:.2f} ms")
         lines.append(f"cycle: {cycle['verify_passes']} verify passes, {cycle['draft_executions_per_verify']:.2f} draft executions per verify; "
                      f"{cycle['cycle_wall_ms']:.2f} ms verify to verify (median {cycle['cycle_wall_ms_median']:.2f})")
-        lines.append(f"  per cycle: device busy {device} (any {cycle['any_device_busy_ms_per_cycle']:.2f} ms"
-                     + (f", all devices idle {idle:.0f}% of the cycle)" if idle is not None else ")")
+        lines.append(f"  per cycle: device busy {device} ({overlap})"
                      + f"; CPU compute {cycle['cpu_compute_ms_per_cycle']:.2f} ms"
                      + f"; host time in llama_decode: draft {cycle['host_ms_in_decode_per_cycle']['draft']:.2f} ms, "
                      f"verify {cycle['host_ms_in_decode_per_cycle']['verify']:.2f} ms")
