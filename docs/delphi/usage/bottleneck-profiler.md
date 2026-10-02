@@ -77,6 +77,8 @@ Use the same server workload for a plain arm and a speculative arm. For executio
 
 The server tags each traced execution as prompt, target generation, or draft generation. SPEED-Bench records each request's `CLOCK_MONOTONIC_RAW` window. The runner sums all target and draft work in that window and divides by emitted client tokens, so speculative batches with several tokens are part of decode rather than being mistaken for prefill. Legacy traces without phase tags retain the older safeguard that withholds a clearly partial speculative breakdown.
 
+For speculative arms the summary adds a speculative-cycle section from `tools/exec-trace/exec-trace-spec.py` (see `exec-trace-spec.md`), limited to the decode requests: verify passes and draft executions by token count, the wall time from one verify pass to the next, the accepted draft tokens per verify (from the server's `draft_n_accepted`), the time per output token, the device busy time per cycle, and the share of the cycle when every device is idle. Operation-diagnostic arms also list the top operations of each group.
+
 The decode trace states the summed `llama_decode` host-wall coverage relative to TG wall. It need not reach 100%: asynchronous device completion, sampling, and server/speculative control work can occur outside those host calls. Operation and device intervals can also exceed the host-call wall because they are non-additive. Use the end-to-end TG wall, not traced host-call wall, as the denominator for speedup screening.
 
 ## Interpretation

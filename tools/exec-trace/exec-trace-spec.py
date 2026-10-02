@@ -3,8 +3,9 @@
 
 Speculative decode executions are grouped by phase (generation_target: verify passes; generation_draft: draft steps, including the
 draft context's catch-up decodes) and token count. For each group the summary gives the number of executions, the host
-wall time per execution, the busy time of each device and the CPU compute time, and the cost of one speculative cycle
-(the draft executions per verify pass plus one verify pass). With operation timing (GGML_EXEC_TRACE_GPU_TIMING=op, or
+time in llama_decode per execution (llama_decode can return before the device work ends), the busy time of each device
+and the CPU compute time. One speculative cycle (the draft executions of a verify pass plus the pass) is measured from
+one verify pass to the next, with the device busy time per cycle and the share of the cycle when every device is idle. With operation timing (GGML_EXEC_TRACE_GPU_TIMING=op, or
 CPU node timing), it also ranks the operations of each group.
 
 Acceptance is not in the trace. Divide the cycle time by the tokens accepted per verify pass (plus one), from the
@@ -51,7 +52,9 @@ def median(values):
     return T.median(values) if values else None
 
 
-def summarize(trace, top, node_pattern):
+def summarize(trace, top, node_pattern, windows_ns=()):
+    """windows_ns: optional (start, end) raw-clock windows, e.g. the client's request windows; executions that begin
+    outside every window are left out."""
     events = trace["events"]
     strings = trace["strings"]
     backend_name = T.build_backend_names(events, strings)
@@ -62,6 +65,8 @@ def summarize(trace, top, node_pattern):
         # executions of more than one token are recorded as prefill; the phase tells speculative work apart
         if event["kind"] == T.K_EXECUTION_BEGIN:
             phase = T.execution_phase(event)
+            if windows_ns and not any(lo <= event["timestamp_ns"] <= hi for lo, hi in windows_ns):
+                continue
             if phase in PHASES:
                 executions[event["execution_id"]] = {"phase": phase, "tokens": event["args"][0],
                                                      "begin_ns": event["timestamp_ns"], "end_ns": None}
@@ -134,17 +139,34 @@ def summarize(trace, top, node_pattern):
             "ops_ms_mean": [{"op": op, "ms": ns / n / 1e6} for op, ns in ranked.most_common(top)],
         })
 
-    n_verify = sum(len(ids) for (phase, _), ids in groups.items() if phase == "generation_target")
-    if n_verify:
-        wall = {phase: sum(executions[i]["end_ns"] - executions[i]["begin_ns"]
-                           for (p, _), ids in groups.items() if p == phase for i in ids) / 1e6 for phase in PHASES}
+    verify_ids = [i for (phase, _), ids in groups.items() if phase == "generation_target" for i in ids]
+    if len(verify_ids) >= 2:
+        # llama_decode returns before the device work ends, so the cycle is measured from one verify pass to the next,
+        # within one request window (or the whole trace without windows)
+        starts = defaultdict(list)
+        for i in verify_ids:
+            begin_ns = executions[i]["begin_ns"]
+            window = next((w for w, (lo, hi) in enumerate(windows_ns) if lo <= begin_ns <= hi), 0)
+            starts[window].append(begin_ns)
+        deltas = [b - a for values in starts.values() for a, b in zip(sorted(values), sorted(values)[1:])]
+        spans_ns = sum(max(values) - min(values) for values in starts.values())
+        n_cycles = len(deltas)
+        all_ids = [i for ids in groups.values() for i in ids]
+        backends = sorted({name for i in all_ids for name in (*submit[i], *ops[i])})
+        device = {name: sum(union_ns(submit[i][name] or ops[i][name]) for i in all_ids) / len(verify_ids) / 1e6 for name in backends}
+        any_device = union_ns([iv for i in all_ids for name in backends for iv in (submit[i][name] or ops[i][name])])
+        host = {phase: sum(executions[i]["end_ns"] - executions[i]["begin_ns"]
+                           for (p, _), ids in groups.items() if p == phase for i in ids) / len(verify_ids) / 1e6 for phase in PHASES}
         n_draft = sum(len(ids) for (phase, _), ids in groups.items() if phase == "generation_draft")
         result["cycle"] = {
-            "verify_passes": n_verify,
-            "draft_executions_per_verify": n_draft / n_verify,
-            "draft_wall_ms_per_cycle": wall["generation_draft"] / n_verify,
-            "verify_wall_ms_per_cycle": wall["generation_target"] / n_verify,
-            "cycle_wall_ms": (wall["generation_draft"] + wall["generation_target"]) / n_verify,
+            "verify_passes": len(verify_ids),
+            "draft_executions_per_verify": n_draft / len(verify_ids),
+            "cycle_wall_ms": spans_ns / n_cycles / 1e6 if n_cycles else None,
+            "cycle_wall_ms_median": median(deltas) / 1e6 if deltas else None,
+            "device_busy_ms_per_cycle": device,
+            "any_device_busy_ms_per_cycle": any_device / len(verify_ids) / 1e6,
+            "cpu_compute_ms_per_cycle": sum(cpu_ns[i] for i in all_ids) / len(verify_ids) / 1e6,
+            "host_ms_in_decode_per_cycle": {"draft": host["generation_draft"], "verify": host["generation_target"]},
         }
     return result
 
@@ -153,23 +175,29 @@ def render(result, accepted):
     lines = []
     for group in result["groups"]:
         device = ", ".join(f"{name} {ms:.2f}" for name, ms in group["device_busy_ms_mean"].items()) or "no device timing"
-        lines.append(f"{group['phase']:17s} {group['tokens']:5d} tokens x {group['executions']:5d}: host wall "
+        lines.append(f"{group['phase']:17s} {group['tokens']:5d} tokens x {group['executions']:5d}: host in llama_decode "
                      f"{group['host_wall_ms_mean']:.2f} ms (median {group['host_wall_ms_median']:.2f}), CPU compute "
                      f"{group['cpu_compute_ms_mean']:.2f} ms, device busy {device} (any {group['any_device_busy_ms_mean']:.2f}) ms")
         for item in group["ops_ms_mean"]:
             lines.append(f"    {item['ms']:8.3f} ms  {item['op']}")
     cycle = result["cycle"]
-    if cycle:
-        lines.append(f"cycle: {cycle['verify_passes']} verify passes, {cycle['draft_executions_per_verify']:.2f} draft executions "
-                     f"per verify; {cycle['cycle_wall_ms']:.2f} ms per cycle (draft {cycle['draft_wall_ms_per_cycle']:.2f}, "
-                     f"verify {cycle['verify_wall_ms_per_cycle']:.2f}).")
+    if cycle and cycle["cycle_wall_ms"]:
+        device = ", ".join(f"{name} {ms:.2f}" for name, ms in cycle["device_busy_ms_per_cycle"].items()) or "no device timing"
+        idle = 100.0 * (1.0 - cycle["any_device_busy_ms_per_cycle"] / cycle["cycle_wall_ms"]) if cycle["device_busy_ms_per_cycle"] else None
+        lines.append(f"cycle: {cycle['verify_passes']} verify passes, {cycle['draft_executions_per_verify']:.2f} draft executions per verify; "
+                     f"{cycle['cycle_wall_ms']:.2f} ms verify to verify (median {cycle['cycle_wall_ms_median']:.2f})")
+        lines.append(f"  per cycle: device busy {device} (any {cycle['any_device_busy_ms_per_cycle']:.2f} ms"
+                     + (f", all devices idle {idle:.0f}% of the cycle)" if idle is not None else ")")
+                     + f"; CPU compute {cycle['cpu_compute_ms_per_cycle']:.2f} ms"
+                     + f"; host time in llama_decode: draft {cycle['host_ms_in_decode_per_cycle']['draft']:.2f} ms, "
+                     f"verify {cycle['host_ms_in_decode_per_cycle']['verify']:.2f} ms")
         if accepted is not None:
             lines.append(f"with {accepted:.2f} accepted draft tokens per verify: {cycle['cycle_wall_ms'] / (accepted + 1):.2f} ms per "
                          f"output token ({1000 * (accepted + 1) / cycle['cycle_wall_ms']:.1f} t/s)")
         else:
             lines.append("time per output token = cycle / (accepted draft tokens per verify + 1); see --accepted-per-verify")
     else:
-        lines.append("no verify passes (generation_target executions) in this trace")
+        lines.append("fewer than two verify passes (generation_target executions) in this trace")
     return "\n".join(lines)
 
 

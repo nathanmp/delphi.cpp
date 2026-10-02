@@ -2,11 +2,11 @@
 
 `tools/exec-trace/exec-trace-spec.py` summarizes the speculative decoding in an execution trace. It groups the executions tagged `generation_target` (verify passes) and `generation_draft` (draft steps, and the draft context's catch-up decodes of the verified tokens) by token count. For each group it reports:
 - the number of executions;
-- the host wall time per execution;
+- the host time in `llama_decode` per execution;
 - the busy time of each device, and of any device;
 - the CPU compute time.
 
-It then gives the wall time of one speculative cycle: the draft executions per verify pass plus one verify pass.
+`llama_decode` can return before the device work ends, so host time in the call is not the cost of an execution. The tool therefore measures one speculative cycle (the draft executions of a verify pass plus the pass) from the start of one verify pass to the next. It also gives the device busy time per cycle, the share of the cycle when every device is idle (host-side work such as sampling and draft control, or waits), and the CPU compute per cycle. Devices that process a verify pass one after the other (a layer split) add up in the any-device time.
 
 ## Synopsis
 
@@ -29,13 +29,15 @@ Acceptance is not in the trace. The server reports `draft_n` and `draft_n_accept
 
 ## Example
 
+GLM-5.3 Flash, MTP with two draft tokens, production timing (`submit`), whole trace:
+
 ```text
-generation_draft      1 tokens x   528: host wall 1.78 ms (median 1.22), CPU compute 0.20 ms, device busy CUDA2 2.31 (any 2.31) ms
-generation_draft      5 tokens x   130: host wall 1.51 ms (median 1.43), CPU compute 0.04 ms, device busy CUDA2 2.63 (any 2.63) ms
-generation_target     5 tokens x   130: host wall 104.43 ms (median 103.18), CPU compute 0.15 ms, device busy CUDA0 37.15, CUDA1 37.92, CUDA2 31.15 (any 106.18) ms
-      10.178 ms  CUDA1 / MUL_MAT_ID
-       9.365 ms  CUDA0 / MUL_MAT
-cycle: 132 verify passes, 5.00 draft executions per verify; 113.11 ms per cycle (draft 8.66, verify 104.45).
+generation_draft      1 tokens x   781: host in llama_decode 1.01 ms (median 1.17), CPU compute 0.13 ms, device busy CUDA2 1.48 (any 1.48) ms
+generation_draft      3 tokens x   390: host in llama_decode 0.44 ms (median 0.40), CPU compute 0.02 ms, device busy CUDA2 1.35 (any 1.35) ms
+generation_target     3 tokens x   390: host in llama_decode 3.02 ms (median 1.69), CPU compute 0.20 ms, device busy CUDA0 13.44, CUDA1 14.22, CUDA2 12.91 (any 40.54) ms
+cycle: 391 verify passes, 2.99 draft executions per verify; 61.80 ms verify to verify (median 49.26)
+  per cycle: device busy CUDA0 13.45, CUDA1 14.22, CUDA2 17.21 (any 44.85 ms, all devices idle 27% of the cycle); CPU compute 0.47 ms; host time in llama_decode: draft 2.46 ms, verify 3.18 ms
+with 1.65 accepted draft tokens per verify: 23.32 ms per output token (42.9 t/s)
 ```
 
-Here a width-5 verify costs 104 ms and the four 1-token draft steps plus the catch-up decode cost 9 ms per cycle. With three accepted tokens per pass, the time per output token is 113.11 / 4 = 28.3 ms.
+Without request windows, the mean cycle includes the gaps between requests; the median (49.26 ms, or 18.6 ms per output token) matches the measured decode rate. The bottleneck profiler passes the client's request windows, so its cycle excludes those gaps.

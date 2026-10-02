@@ -62,13 +62,27 @@ class TestBottleneckProfile(unittest.TestCase):
     def test_speed_bench_parser_uses_saved_json_field_names(self):
         metrics = profile._speed_bench_metrics({"completed_samples": 1, "failed_samples": 0, "summary": [{
             "category": "overall", "avg_prompt_t_s": 100.0, "avg_pred_t_s": 20.0, "avg_latency": 3.0, "accept_rate": 0.75,
-        }], "results": [{"ok": True, "prompt_tokens": 56, "completion_tokens": 1024, "prompt_ms": 500.0, "predicted_ms": 2000.0, "request_windows_raw_ns": [[100, 200]]}]})
+        }], "results": [{"ok": True, "prompt_tokens": 56, "completion_tokens": 1024, "prompt_ms": 500.0, "predicted_ms": 2000.0, "request_windows_raw_ns": [[100, 200]], "draft_n": 40, "draft_n_accepted": 30}]})
         self.assertEqual(metrics["prompt_t_s"], 100.0)
         self.assertEqual(metrics["predicted_t_s"], 20.0)
         self.assertEqual(metrics["accept_rate"], 0.75)
         self.assertEqual(metrics["prompt_tokens"], 56)
         self.assertEqual(metrics["completion_tokens"], 1024)
         self.assertEqual(metrics["request_windows_raw_ns"], [[100, 200]])
+        self.assertEqual((metrics["draft_n"], metrics["draft_n_accepted"]), (40, 30))
+
+    def test_speculative_section_reports_cycle_and_idle_share(self):
+        summary = {"groups": [{"phase": "generation_target", "tokens": 4, "executions": 10, "host_wall_ms_mean": 2.0,
+                               "cpu_compute_ms_mean": 0.1, "device_busy_ms_mean": {"GPU0": 15.0}, "ops_ms_mean": []}],
+                   "cycle": {"verify_passes": 10, "draft_executions_per_verify": 3.0, "cycle_wall_ms": 20.0, "cycle_wall_ms_median": 19.0,
+                             "device_busy_ms_per_cycle": {"GPU0": 15.0}, "any_device_busy_ms_per_cycle": 15.0, "cpu_compute_ms_per_cycle": 1.0,
+                             "host_ms_in_decode_per_cycle": {"draft": 1.0, "verify": 2.0}, "accepted_per_verify": 3.0, "wall_ms_per_output_token": 5.0}}
+        lines = []
+        profile._render_speculative(lines, summary, ops=False)
+        text = "\n".join(lines)
+        self.assertIn("20.00 ms from verify to verify (median 19.00); 3.00 accepted per verify -> 5.00 ms/output token", text)
+        self.assertIn("every device is idle 25% of the cycle", text)
+        self.assertIn("| target | 4 | 10 | 2.00 | 0.10 | GPU0 15.00 |", text)
 
     def test_prefill_parser_keeps_requested_and_realized_lengths(self):
         metrics = profile._prefill_metrics({

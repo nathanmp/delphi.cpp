@@ -82,10 +82,23 @@ class TestExecTraceSpec(unittest.TestCase):
         cycle = result["cycle"]
         self.assertEqual(cycle["verify_passes"], 2)
         self.assertAlmostEqual(cycle["draft_executions_per_verify"], 3.0)
-        self.assertAlmostEqual(cycle["cycle_wall_ms"], 9.0)
+        self.assertAlmostEqual(cycle["cycle_wall_ms"], 9.0)                    # verify start to verify start
+        self.assertAlmostEqual(cycle["device_busy_ms_per_cycle"]["GPU0"], 2.0)
+        self.assertAlmostEqual(cycle["device_busy_ms_per_cycle"]["GPU1"], 4.5)
+        self.assertAlmostEqual(cycle["any_device_busy_ms_per_cycle"], 6.5)
+        self.assertAlmostEqual(cycle["host_ms_in_decode_per_cycle"]["draft"], 3.0)
+        self.assertAlmostEqual(cycle["cpu_compute_ms_per_cycle"], 0.5)
         text = exec_trace_spec.render(result, accepted=2.0)
-        self.assertIn("9.00 ms per cycle", text)
+        self.assertIn("9.00 ms verify to verify", text)
         self.assertIn("3.00 ms per output token", text)
+
+    def test_windows_select_executions(self):
+        events = []
+        for xid, start in ((1, 0), (2, 10_000_000), (3, 100_000_000)):
+            events += execution(xid, start, start + 2_000_000, 3, TARGET)
+        result = exec_trace_spec.summarize(self.trace(events), top=4, node_pattern=None, windows_ns=[(0, 50_000_000)])
+        self.assertEqual(result["cycle"]["verify_passes"], 2)
+        self.assertAlmostEqual(result["cycle"]["cycle_wall_ms"], 10.0)
 
     def test_node_pattern_groups_operations(self):
         import re
@@ -96,7 +109,7 @@ class TestExecTraceSpec(unittest.TestCase):
     def test_no_verify_passes(self):
         result = exec_trace_spec.summarize(self.trace(execution(1, 0, 1_000_000, 512, PROMPT)), top=4, node_pattern=None)
         self.assertIsNone(result["cycle"])
-        self.assertIn("no verify passes", exec_trace_spec.render(result, accepted=None))
+        self.assertIn("fewer than two verify passes", exec_trace_spec.render(result, accepted=None))
 
 
 if __name__ == "__main__":

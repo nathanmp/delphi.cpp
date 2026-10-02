@@ -136,6 +136,19 @@ def _load_trace_dump():
 TRACE = _load_trace_dump()
 
 
+def _load_trace_spec():
+    path = TRACE_DUMP_PATH.with_name("exec-trace-spec.py")
+    spec = importlib.util.spec_from_file_location("delphi_exec_trace_spec", path)
+    if not spec or not spec.loader:
+        raise ProfileError(f"cannot load speculative-decoding summary: {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+TRACE_SPEC = _load_trace_spec()
+
+
 def _stable_node_name(name: str) -> str:
     name = re.sub(r"\bblk\.\d+\.", "blk.*.", name)
     name = re.sub(r"\b(?:layer|layers)\.\d+\.", lambda match: match.group(0).split(".")[0] + ".*.", name)
@@ -375,6 +388,8 @@ def _speed_bench_metrics(payload: Any) -> dict[str, Any]:
         "predicted_t_s": overall.get("avg_pred_t_s"),
         "latency_s": overall.get("avg_latency"),
         "accept_rate": overall.get("accept_rate"),
+        "draft_n": sum(item.get("draft_n") or 0 for item in results),
+        "draft_n_accepted": sum(item.get("draft_n_accepted") or 0 for item in results),
         "prompt_tokens": sum(item.get("prompt_tokens") or 0 for item in results),
         "completion_tokens": sum(item.get("completion_tokens") or 0 for item in results),
         "prompt_ms": sum(item.get("prompt_ms") or 0 for item in results),
@@ -949,8 +964,47 @@ def _run_server_arm(arm: ServerArm, artifacts: Path, common_env: Mapping[str, st
         }
         result["pipeline_parallelism"] = _merge_pipeline_parallelism(
             result["pipeline_parallelism"], result["trace"]["analysis"].get("pipeline_parallel"))
+        if "--spec-type" in arm.server_command:
+            result["trace"]["speculative"] = _speculative_summary(trace_path, decode_metrics)
     return result
 
+
+def _speculative_summary(trace_path: Path, decode_metrics: Mapping[str, Any]) -> dict[str, Any]:
+    """Verify and draft executions within the client's decode requests (tools/exec-trace/exec-trace-spec.py)."""
+    windows = [tuple(window) for window in decode_metrics.get("request_windows_raw_ns", ())]
+    summary = TRACE_SPEC.summarize(TRACE.read_trace(trace_path), 8, None, windows)
+    cycle = summary.get("cycle")
+    accepted = decode_metrics.get("draft_n_accepted")
+    if cycle and cycle.get("cycle_wall_ms") and isinstance(accepted, int) and decode_metrics.get("draft_n"):
+        cycle["accepted_per_verify"] = accepted / cycle["verify_passes"]
+        cycle["wall_ms_per_output_token"] = cycle["cycle_wall_ms"] / (cycle["accepted_per_verify"] + 1)
+    return summary
+
+
+def _render_speculative(lines: list[str], summary: Mapping[str, Any] | None, *, ops: bool) -> None:
+    if not summary:
+        return
+    cycle = summary.get("cycle")
+    lines.append("")
+    if not cycle or not cycle.get("cycle_wall_ms"):
+        lines.append("Speculative cycle: fewer than two verify passes in the decode requests.")
+        return
+    per_token = cycle.get("wall_ms_per_output_token")
+    accepted = f"; {cycle['accepted_per_verify']:.2f} accepted per verify -> {per_token:.2f} ms/output token" if per_token else ""
+    lines.append(f"Speculative cycle (exec-trace-spec, decode requests only): {cycle['verify_passes']} verify passes, {cycle['draft_executions_per_verify']:.2f} draft executions per verify; {cycle['cycle_wall_ms']:.2f} ms from verify to verify (median {cycle['cycle_wall_ms_median']:.2f}){accepted}.")
+    if cycle["device_busy_ms_per_cycle"]:
+        device = ", ".join(f"{name} {ms:.2f}" for name, ms in cycle["device_busy_ms_per_cycle"].items())
+        idle = 100.0 * (1.0 - cycle["any_device_busy_ms_per_cycle"] / cycle["cycle_wall_ms"])
+        lines.append(f"Per cycle (D): device busy {device}; any device {cycle['any_device_busy_ms_per_cycle']:.2f} ms, so every device is idle {idle:.0f}% of the cycle. CPU compute (H): {cycle['cpu_compute_ms_per_cycle']:.2f} ms. Host time in llama_decode (H): draft {cycle['host_ms_in_decode_per_cycle']['draft']:.2f} ms, verify {cycle['host_ms_in_decode_per_cycle']['verify']:.2f} ms.")
+    lines.extend(("", "| phase | tokens | executions | host ms in llama_decode (H) | CPU compute ms (H) | device busy ms (D) |", "| --- | ---: | ---: | ---: | ---: | --- |"))
+    for group in summary["groups"]:
+        device = ", ".join(f"{name} {ms:.2f}" for name, ms in group["device_busy_ms_mean"].items()) or "n/a"
+        lines.append(f"| {group['phase'].replace('generation_', '')} | {group['tokens']} | {group['executions']} | {group['host_wall_ms_mean']:.2f} | {group['cpu_compute_ms_mean']:.2f} | {device} |")
+    if ops:
+        for group in summary["groups"]:
+            if group["ops_ms_mean"] and group["executions"] >= 10:
+                top = ", ".join(f"{item['op']} {item['ms']:.2f}" for item in group["ops_ms_mean"][:6])
+                lines.append(f"Top operations, {group['phase'].replace('generation_', '')} x {group['tokens']} tokens (ms per execution, diagnostic): {top}")
 
 def run_recipe(recipe: Recipe, artifacts: Path, *, arm_names: Sequence[str] = (), environment: Mapping[str, str] | None = None) -> dict[str, Any]:
     """Run selected recipe arms and return JSON-safe normalized measurement data."""
@@ -1233,6 +1287,7 @@ def render_summary(result: Mapping[str, Any]) -> str:
             _render_detail_rows(lines, detail, wall_for_ceiling, unit="ms/output token" if decode_aggregate else "ms/trace token")
             _render_resource_table(lines, decode_aggregate or decode, wall_for_ceiling, unit="ms/output token" if decode_aggregate else "ms/trace token")
             _render_counters(lines, decode_aggregate or decode, unit="output token" if decode_aggregate else "trace token")
+        _render_speculative(lines, trace.get("speculative"), ops=False)
         prefill = trace["analysis"].get("prefill")
         if prefill and prefill["executions"]:
             prefill_metric = next((item["metrics"] for item in arm.get("extra_measurements", ()) if item["metrics"].get("kind") == "prefill"), None)
@@ -1281,6 +1336,7 @@ def render_summary(result: Mapping[str, Any]) -> str:
         prefill_t_s = base_prefill.get("prompt_t_s")
         prefill_wall_ms = 1000.0 / prefill_t_s if prefill_t_s and prefill_t_s > 0 else None
         analysis = arm["trace"]["analysis"]
+        _render_speculative(lines, arm["trace"].get("speculative"), ops=True)
         statuses = analysis.get("gpu_timing_status_counts", {})
         if any(count for status, count in statuses.items() if status != "resolved"):
             lines.append("Some device events were unresolved; per-op times are incomplete, so conditional ceilings are suppressed.")
