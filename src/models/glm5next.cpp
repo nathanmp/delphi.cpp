@@ -284,6 +284,18 @@ void llama_model_glm5next::load_arch_tensors(llama_model_loader & ml) {
             // absent in the checkpoint: NextN shares the trunk's embeddings and lm_head
             layer.nextn.embed_tokens     = create_tensor(tn(LLM_TENSOR_NEXTN_EMBED_TOKENS,     "weight", il), {n_embd, n_vocab}, flags | TENSOR_NOT_REQUIRED);
             layer.nextn.shared_head_head = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "weight", il), {n_embd, n_vocab}, flags | TENSOR_NOT_REQUIRED);
+
+            // The trunk's token_embd stays in host memory (input layer), so every MTP step would look its token up
+            // on the CPU, and the device-resident draft loop would sync with the host at each step. A copy on the
+            // output device, where the head and the output live, keeps the lookup there. env LLAMA_MTP_EMBD_DEVICE=0
+            // disables it.
+            static const bool embd_device = [] {
+                const char * env = std::getenv("LLAMA_MTP_EMBD_DEVICE");
+                return env == nullptr || std::atoi(env) != 0;
+            }();
+            if (embd_device && !layer.nextn.embed_tokens && layer.nextn.eh_proj && !(flags & TENSOR_SKIP)) {
+                layer.nextn.embed_tokens = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, TENSOR_DUPLICATED);
+            }
         }
     }
 }
