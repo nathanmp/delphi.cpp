@@ -7426,7 +7426,7 @@ struct test_moe_down_q_reduction : public test_case {
     test_moe_down_q_reduction(ggml_type type, int64_t n_ff = 2048, int64_t n_embd = 4096, int64_t n_mats = 16)
         : type(type), n_ff(n_ff), n_embd(n_embd), n_mats(n_mats) {
         GGML_ASSERT(type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K ||
-                    type == GGML_TYPE_Q6_K || type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_IQ3_XXS);
+                    type == GGML_TYPE_Q6_K || type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_MXFP4);
         GGML_ASSERT(n_ff > 0 && n_ff % ggml_blck_size(type) == 0 && n_embd > 0);
     }
 
@@ -11822,9 +11822,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             false, 16, 8, false, false, true, false, { 1, 1 }));
     }
 
+    // delphi: routed matmuls at shapes that the packed in-place layout takes (rows % 128, k % 256): packed MMVQ and the stream kernel,
+    // with repeated experts across the tokens of a batch
+    for (ggml_type type : {GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL, GGML_TYPE_MXFP4}) {
+        for (int64_t m_batch : {1, 2, 3, 5, 8}) {
+            for (bool b : {false, true}) {
+                test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, m_batch, 256, 512,
+                    true, 16, 8, b, false, false, false, {1, 1}));
+            }
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, m_batch, 256, 512,
+                true, 16, 8, true, false, true, false, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU_CLAMP, m_batch, 256, 512,
+                true, 16, 8, true, true, true, false, {1, 1}));
+        }
+    }
+
     for (ggml_type type : {
             GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K,
-            GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_XXS}) {
+            GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_XXS, GGML_TYPE_MXFP4}) {
         test_cases.emplace_back(new test_moe_down_q_reduction(type,  768, 2048));
         test_cases.emplace_back(new test_moe_down_q_reduction(type, 2048, 4096));
         test_cases.emplace_back(new test_moe_down_q_reduction(type, 2048, 6144));
@@ -11968,7 +11983,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     for (ggml_type type : {
             GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K,
-            GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_XXS}) {
+            GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_XXS, GGML_TYPE_MXFP4}) {
         test_cases.emplace_back(new test_moe_down_q_reduction(type,  768, 2048));
         test_cases.emplace_back(new test_moe_down_q_reduction(type, 2048, 4096));
         test_cases.emplace_back(new test_moe_down_q_reduction(type, 2048, 6144));
