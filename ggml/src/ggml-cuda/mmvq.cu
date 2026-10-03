@@ -2261,6 +2261,7 @@ static bool moe_down_q_reduction_packed_fmt_supported(const int fmt) {
         case GGML_CUDA_MOE_PACKED_IQ4KS:
         case GGML_CUDA_MOE_PACKED_IQ5KS:
         case GGML_CUDA_MOE_PACKED_IQ4XS:
+        case GGML_CUDA_MOE_PACKED_MXFP4:
         case GGML_CUDA_MOE_PACKED_Q4K:
         case GGML_CUDA_MOE_PACKED_Q6K:
             return true;
@@ -2298,6 +2299,10 @@ static void moe_down_q_reduction_packed_switch_fmt(
             break;
         case GGML_CUDA_MOE_PACKED_IQ4XS:
             moe_down_q_reduction_packed<GGML_CUDA_MOE_PACKED_IQ4XS><<<blocks, threads, 0, stream>>>
+                (vx, vy, ids, weights, dst, ncols_x, nrows_x, stride_channel_x, stride_channel_y);
+            break;
+        case GGML_CUDA_MOE_PACKED_MXFP4:
+            moe_down_q_reduction_packed<GGML_CUDA_MOE_PACKED_MXFP4><<<blocks, threads, 0, stream>>>
                 (vx, vy, ids, weights, dst, ncols_x, nrows_x, stride_channel_x, stride_channel_y);
             break;
         case GGML_CUDA_MOE_PACKED_Q4K:
@@ -2507,7 +2512,8 @@ bool ggml_cuda_moe_down_q_reduction_supported(
     // batch sizes, and architectures continue through the generic MMVQ path.
     return (src0->type == GGML_TYPE_Q3_K || src0->type == GGML_TYPE_Q4_K ||
             src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K ||
-            src0->type == GGML_TYPE_IQ4_XS || src0->type == GGML_TYPE_IQ3_XXS) &&
+            src0->type == GGML_TYPE_IQ4_XS || src0->type == GGML_TYPE_IQ3_XXS ||
+            src0->type == GGML_TYPE_MXFP4) &&
         src1->type == GGML_TYPE_F32 &&
         ids->type == GGML_TYPE_I32 && weights->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
         src0->ne[0] >= 768 && src0->ne[0] <= 2048 && src0->ne[0] % QK_K == 0 &&
@@ -2563,6 +2569,7 @@ void ggml_cuda_moe_down_q_reduction(
         MOE_DOWN_Q_REDUCTION_CASE(GGML_TYPE_Q6_K);
         MOE_DOWN_Q_REDUCTION_CASE(GGML_TYPE_IQ4_XS);
         MOE_DOWN_Q_REDUCTION_CASE(GGML_TYPE_IQ3_XXS);
+        MOE_DOWN_Q_REDUCTION_CASE(GGML_TYPE_MXFP4);
         default: GGML_ABORT("unsupported fused MoE down type: %s", ggml_type_name(src0->type));
     }
 
