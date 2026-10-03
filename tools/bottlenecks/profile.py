@@ -19,6 +19,7 @@ import signal
 import statistics
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -31,6 +32,12 @@ from typing import Any, Iterable, Mapping, Sequence
 ROOT = Path(__file__).resolve().parents[2]
 TRACE_DUMP_PATH = ROOT / "tools" / "exec-trace" / "exec-trace-dump.py"
 ENV_PREFIXES = ("GGML_", "LLAMA_", "CUDA_", "HIP_", "HSA_", "ROCR_", "OMP_")
+DRM_ROOT = Path("/sys/class/drm")
+GPU_SAMPLE_INTERVAL_S = 2.0
+# a sample counts as busy at or above this utilization; idle samples say nothing about the clocks a workload gets
+GPU_BUSY_PERCENT = 50.0
+NVIDIA_QUERY = ("index", "pci.bus_id", "pstate", "clocks.sm", "clocks.mem", "clocks.max.sm", "power.limit", "power.draw",
+                "utilization.gpu", "clocks_event_reasons.active", "name")
 
 
 @dataclass(frozen=True)
@@ -305,6 +312,223 @@ def _version(binary: str, env: Mapping[str, str]) -> str | None:
     if completed.returncode:
         return None
     return completed.stdout.strip() or completed.stderr.strip() or None
+
+
+def _read_text(path: Path) -> str | None:
+    try:
+        return path.read_text().strip()
+    except OSError:
+        return None
+
+
+def _read_number(path: Path, scale: float = 1.0) -> float | None:
+    text = _read_text(path)
+    try:
+        return float(text) / scale if text is not None else None
+    except ValueError:
+        return None
+
+
+def _amd_power_profile(text: str | None) -> str | None:
+    """The active entry of pp_power_profile_mode, which amdgpu marks with '*'."""
+    for line in (text or "").splitlines():
+        match = re.match(r"\s*\d+\s+([A-Za-z0-9_]+)\s*\*", line)
+        if match:
+            return match.group(1)
+    return None
+
+
+def _amd_gpus(root: Path = DRM_ROOT) -> list[dict[str, Any]]:
+    """amdgpu cards: forced performance level, power profile and cap, and the current clocks, power and utilization."""
+    result = []
+    seen = set()
+    for device in sorted(root.glob("card[0-9]*/device")):
+        level = _read_text(device / "power_dpm_force_performance_level")
+        if level is None or device.resolve() in seen:
+            continue
+        seen.add(device.resolve())
+        uevent = _read_text(device / "uevent") or ""
+        pci = next((line.split("=", 1)[1] for line in uevent.splitlines() if line.startswith("PCI_SLOT_NAME=")), device.resolve().name)
+        item: dict[str, Any] = {
+            "vendor": "amd",
+            "pci": pci.lower(),
+            "card": device.parent.name,
+            "performance_level": level,
+            "power_profile": _amd_power_profile(_read_text(device / "pp_power_profile_mode")),
+            "busy_percent": _read_number(device / "gpu_busy_percent"),
+        }
+        hwmon = next(iter(sorted(device.glob("hwmon/hwmon*"))), None)
+        if hwmon is not None:
+            item["power_cap_w"] = _read_number(hwmon / "power1_cap", 1e6)
+            item["power_w"] = _read_number(hwmon / "power1_average", 1e6)
+            item["clock_mhz"] = _read_number(hwmon / "freq1_input", 1e6)
+            item["memory_clock_mhz"] = _read_number(hwmon / "freq2_input", 1e6)
+        result.append(item)
+    return result
+
+
+def _parse_nvidia(text: str) -> list[dict[str, Any]]:
+    def number(value: str) -> float | None:
+        try:
+            return float(value)
+        except ValueError:
+            return None
+
+    result = []
+    for line in text.splitlines():
+        # the name is queried last, so a comma inside it cannot shift the other fields
+        fields = [field.strip() for field in line.split(",", len(NVIDIA_QUERY) - 1)]
+        if len(fields) != len(NVIDIA_QUERY):
+            continue
+        raw = dict(zip(NVIDIA_QUERY, fields))
+        bus = raw["pci.bus_id"].lower()
+        result.append({
+            "vendor": "nvidia",
+            "pci": bus[4:] if len(bus) == 16 else bus,  # 00000000:21:00.0 -> 0000:21:00.0, the sysfs form
+            "index": int(raw["index"]) if raw["index"].isdigit() else raw["index"],
+            "name": raw["name"],
+            "pstate": raw["pstate"],
+            "power_limit_w": number(raw["power.limit"]),
+            "max_clock_mhz": number(raw["clocks.max.sm"]),
+            "power_w": number(raw["power.draw"]),
+            "clock_mhz": number(raw["clocks.sm"]),
+            "memory_clock_mhz": number(raw["clocks.mem"]),
+            "busy_percent": number(raw["utilization.gpu"]),
+            "clock_event_reasons": raw["clocks_event_reasons.active"],
+        })
+    return result
+
+
+def _nvidia_gpus(command: Sequence[str] = ("nvidia-smi",)) -> list[dict[str, Any]]:
+    try:
+        completed = subprocess.run((*command, f"--query-gpu={','.join(NVIDIA_QUERY)}", "--format=csv,noheader,nounits"),
+                                   text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    return _parse_nvidia(completed.stdout) if completed.returncode == 0 else []
+
+
+def _gpu_state() -> dict[str, Any]:
+    return {"captured_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "gpus": _amd_gpus() + _nvidia_gpus()}
+
+
+# settings that hold for a whole arm; the power profile is sampled instead, since amdgpu switches it under compute load
+GPU_SETTING_KEYS = ("performance_level", "power_cap_w", "power_limit_w", "max_clock_mhz")
+
+
+def _summarize_gpu_samples(start: Mapping[str, Any], end: Mapping[str, Any], samples: Sequence[Sequence[Mapping[str, Any]]],
+                           interval_s: float) -> dict[str, Any]:
+    """Per GPU: the settings at the start and end of an arm, and the clocks, power and profile of the busy samples."""
+    def settings(gpu: Mapping[str, Any]) -> dict[str, Any]:
+        return {key: gpu[key] for key in GPU_SETTING_KEYS if gpu.get(key) is not None}
+
+    end_by_pci = {gpu["pci"]: gpu for gpu in end.get("gpus", ())}
+    per_gpu = []
+    for gpu in start.get("gpus", ()):
+        seen = [item for sample in samples for item in sample if item["pci"] == gpu["pci"]]
+        busy = [item for item in seen if (item.get("busy_percent") or 0.0) >= GPU_BUSY_PERCENT]
+        entry: dict[str, Any] = {
+            "vendor": gpu["vendor"],
+            "pci": gpu["pci"],
+            "label": gpu.get("card") or f"index {gpu.get('index')}",
+            "settings_start": settings(gpu),
+            "settings_end": settings(end_by_pci.get(gpu["pci"], {})),
+            "samples": len(seen),
+            "busy_samples": len(busy),
+            # busy before the arm launched anything: another workload, or a counter that reads busy at idle (an amdgpu
+            # card at profile_peak reports 100% with no process on it)
+            "busy_at_start": (gpu.get("busy_percent") or 0.0) >= GPU_BUSY_PERCENT,
+        }
+        for key in ("clock_mhz", "memory_clock_mhz", "power_w"):
+            values = [item[key] for item in busy if item.get(key) is not None]
+            if values:
+                entry[f"busy_{key}"] = {"mean": statistics.fmean(values), "min": min(values), "max": max(values)}
+        for key in ("power_profile", "pstate", "clock_event_reasons"):
+            values = Counter(item[key] for item in busy if item.get(key) is not None)
+            if values:
+                entry[f"busy_{key}"] = dict(values.most_common())
+        per_gpu.append(entry)
+    return {"interval_s": interval_s, "busy_percent_threshold": GPU_BUSY_PERCENT, "start": dict(start), "end": dict(end), "per_gpu": per_gpu}
+
+
+class GpuClockSampler:
+    """Record GPU clock settings around an arm and sample the clocks in a background thread while it runs.
+
+    A forced AMD performance level, power profile, power cap or NVIDIA power limit can move results by tens of percent
+    without any change to the build, so every arm keeps the state it actually ran under. interval_s <= 0 keeps only the
+    start and end snapshots."""
+
+    def __init__(self, interval_s: float = GPU_SAMPLE_INTERVAL_S) -> None:
+        self.interval_s = interval_s
+        self.samples: list[list[dict[str, Any]]] = []
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._start: dict[str, Any] = {}
+        self._end: dict[str, Any] = {}
+
+    def __enter__(self) -> "GpuClockSampler":
+        self._start = _gpu_state()
+        if self.interval_s > 0 and self._start["gpus"]:
+            self._thread = threading.Thread(target=self._loop, name="gpu-clock-sampler", daemon=True)
+            self._thread.start()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join()
+        self._end = _gpu_state()
+
+    def _loop(self) -> None:
+        while not self._stop.wait(self.interval_s):
+            self.samples.append(_gpu_state()["gpus"])
+
+    def summary(self) -> dict[str, Any]:
+        return _summarize_gpu_samples(self._start, self._end, self.samples, self.interval_s)
+
+
+def _gpu_clock_text(info: Mapping[str, Any] | None) -> str | None:
+    """One line: busy GPUs with their settings and sampled clocks, then the settings of the idle ones."""
+    if not info or not info.get("per_gpu"):
+        return None
+
+    def setting_text(gpu: Mapping[str, Any]) -> str:
+        start, end = gpu["settings_start"], gpu["settings_end"]
+        parts = []
+        for key, label, unit in (("performance_level", "level ", ""), ("power_cap_w", "cap ", " W"), ("power_limit_w", "limit ", " W")):
+            if key in start:
+                value = f"{start[key]:.0f}" if isinstance(start[key], float) else str(start[key])
+                changed = end.get(key, start[key]) != start[key]
+                parts.append(f"{label}{value}{unit}" + (f" (changed to {end[key]} during the arm)" if changed else ""))
+        return ", ".join(parts)
+
+    busy, idle = [], []
+    for gpu in info["per_gpu"]:
+        name = f"{gpu['vendor'].upper()} {gpu['pci']}"
+        if gpu["busy_samples"]:
+            parts = [setting_text(gpu)]
+            if "busy_power_profile" in gpu:
+                parts.append("profile " + "/".join(gpu["busy_power_profile"]))
+            clock = gpu.get("busy_clock_mhz")
+            if clock:
+                parts.append(f"clock {clock['mean']:.0f} MHz ({clock['min']:.0f}-{clock['max']:.0f})")
+            memory = gpu.get("busy_memory_clock_mhz")
+            if memory:
+                parts.append(f"memory {memory['mean']:.0f} MHz")
+            power = gpu.get("busy_power_w")
+            if power:
+                parts.append(f"{power['mean']:.0f} W")
+            parts.append(f"{gpu['busy_samples']}/{gpu['samples']} samples busy")
+            if gpu.get("busy_at_start"):
+                parts.append("already busy before the arm started (another workload, or a utilization counter that reads busy at idle)")
+            busy.append(f"{name} " + ", ".join(part for part in parts if part))
+        else:
+            idle.append(f"{name} {setting_text(gpu)}".rstrip())
+    text = f"GPU clocks (sampled every {info['interval_s']:g} s; busy = utilization >= {info['busy_percent_threshold']:g}%): "
+    text += "; ".join(busy) if busy else "no busy samples"
+    if idle:
+        text += ". Idle: " + "; ".join(idle)
+    return text + "."
 
 
 def _model_identity(paths: Sequence[str]) -> list[dict[str, Any]]:
@@ -801,7 +1025,7 @@ def _arm_trace_path(artifacts: Path, arm: Arm) -> Path:
     return artifacts / arm.name / "execution.trace"
 
 
-def _run_bench_arm(arm: BenchArm, artifacts: Path, common_env: Mapping[str, str]) -> dict[str, Any]:
+def _run_bench_arm(arm: BenchArm, artifacts: Path, common_env: Mapping[str, str], gpu_sample_interval_s: float = GPU_SAMPLE_INTERVAL_S) -> dict[str, Any]:
     arm_dir = artifacts / arm.name
     arm_dir.mkdir(parents=True, exist_ok=True)
     trace_path = _arm_trace_path(artifacts, arm)
@@ -809,7 +1033,8 @@ def _run_bench_arm(arm: BenchArm, artifacts: Path, common_env: Mapping[str, str]
     env.update(arm.env)
     env.update(_trace_env(trace_path, arm.trace_mode, arm.trace_max_events, arm.trace_event_capacity))
     command = _ensure_llama_bench_json(arm.command)
-    completed = _run(command, env)
+    with GpuClockSampler(gpu_sample_interval_s) as gpu_clocks:
+        completed = _run(command, env)
     (arm_dir / "stdout.json").write_text(completed.stdout)
     (arm_dir / "stderr.log").write_text(completed.stderr)
     if completed.returncode:
@@ -824,6 +1049,7 @@ def _run_bench_arm(arm: BenchArm, artifacts: Path, common_env: Mapping[str, str]
         "models": _model_identity(arm.model_paths),
         "metrics": _bench_metrics(_parse_json_output(completed.stdout, arm.name)),
         "pipeline_parallelism": _pipeline_parallelism(arm_dir / "stderr.log"),
+        "gpu_clocks": gpu_clocks.summary(),
         "notes": list(arm.notes),
     }
     if arm.trace_mode != "off":
@@ -873,7 +1099,7 @@ def _stop_server(process: subprocess.Popen[str]) -> None:
             process.wait()
 
 
-def _run_server_arm(arm: ServerArm, artifacts: Path, common_env: Mapping[str, str]) -> dict[str, Any]:
+def _run_server_arm(arm: ServerArm, artifacts: Path, common_env: Mapping[str, str], gpu_sample_interval_s: float = GPU_SAMPLE_INTERVAL_S) -> dict[str, Any]:
     arm_dir = artifacts / arm.name
     arm_dir.mkdir(parents=True, exist_ok=True)
     trace_path = _arm_trace_path(artifacts, arm)
@@ -886,7 +1112,8 @@ def _run_server_arm(arm: ServerArm, artifacts: Path, common_env: Mapping[str, st
     server_command = _render(arm.server_command, values)
     complete_env = os.environ.copy()
     complete_env.update(env)
-    with (arm_dir / "server.stdout.log").open("w") as stdout, (arm_dir / "server.stderr.log").open("w") as stderr:
+    with GpuClockSampler(gpu_sample_interval_s) as gpu_clocks, \
+            (arm_dir / "server.stdout.log").open("w") as stdout, (arm_dir / "server.stderr.log").open("w") as stderr:
         process = subprocess.Popen(server_command, cwd=ROOT, env=complete_env, text=True, stdout=stdout, stderr=stderr)
         try:
             _wait_for_server(url, process, arm.ready_timeout_s)
@@ -938,6 +1165,7 @@ def _run_server_arm(arm: ServerArm, artifacts: Path, common_env: Mapping[str, st
         "metrics": _speed_bench_metrics(_parse_json_output(output_path.read_text(), arm.name)),
         "extra_measurements": extra_measurements,
         "pipeline_parallelism": _pipeline_parallelism(arm_dir / "server.stderr.log"),
+        "gpu_clocks": gpu_clocks.summary(),
         "notes": list(arm.notes),
     }
     if arm.trace_mode != "off":
@@ -1010,7 +1238,8 @@ def _render_speculative(lines: list[str], summary: Mapping[str, Any] | None, *, 
                 top = ", ".join(f"{item['op']} {item['ms']:.2f}" for item in group["ops_ms_mean"][:6])
                 lines.append(f"Top operations, {group['phase'].replace('generation_', '')} x {group['tokens']} tokens (ms per execution, diagnostic): {top}")
 
-def run_recipe(recipe: Recipe, artifacts: Path, *, arm_names: Sequence[str] = (), environment: Mapping[str, str] | None = None) -> dict[str, Any]:
+def run_recipe(recipe: Recipe, artifacts: Path, *, arm_names: Sequence[str] = (), environment: Mapping[str, str] | None = None,
+               gpu_sample_interval_s: float = GPU_SAMPLE_INTERVAL_S) -> dict[str, Any]:
     """Run selected recipe arms and return JSON-safe normalized measurement data."""
     artifacts.mkdir(parents=True, exist_ok=True)
     chosen = [arm for arm in recipe.arms if not arm_names or arm.name in arm_names]
@@ -1024,9 +1253,9 @@ def run_recipe(recipe: Recipe, artifacts: Path, *, arm_names: Sequence[str] = ()
     arms = []
     for arm in chosen:
         if isinstance(arm, BenchArm):
-            arms.append(_run_bench_arm(arm, artifacts, common_env))
+            arms.append(_run_bench_arm(arm, artifacts, common_env, gpu_sample_interval_s))
         elif isinstance(arm, ServerArm):
-            arms.append(_run_server_arm(arm, artifacts, common_env))
+            arms.append(_run_server_arm(arm, artifacts, common_env, gpu_sample_interval_s))
         else:
             raise ProfileError(f"unsupported arm type: {type(arm).__name__}")
     return {
@@ -1228,6 +1457,9 @@ def render_summary(result: Mapping[str, Any]) -> str:
         pp_info = arm.get("pipeline_parallelism")
         if pp_info and pp_info.get("state") != "unknown":
             lines.append(_pipeline_parallelism_text(pp_info))
+        gpu_text = _gpu_clock_text(arm.get("gpu_clocks"))
+        if gpu_text:
+            lines.append(gpu_text)
         metrics = arm["metrics"]
         end_to_end_wall_ms = None
         if metrics["kind"] == "speed-bench":
@@ -1331,6 +1563,9 @@ def render_summary(result: Mapping[str, Any]) -> str:
         binary_version = arm.get("binary_version")
         if binary_version:
             lines.append(f"Binary: {binary_version.splitlines()[0]}")
+        gpu_text = _gpu_clock_text(arm.get("gpu_clocks"))
+        if gpu_text:
+            lines.append(gpu_text)
         if not base or not arm.get("trace"):
             lines.append("No matched production arm or trace was collected.")
             continue
@@ -1387,6 +1622,9 @@ def main() -> int:
     parser.add_argument("--set", action="append", default=[], metavar="ARM.OPTION=VALUE", help="replace or add a server/bench option")
     parser.add_argument("--env", action="append", default=[], metavar="NAME=VALUE", help="set a runtime environment variable for every arm")
     parser.add_argument("--print-summary", action="store_true", help="also print a terse Markdown result")
+    parser.add_argument("--gpu-sample-interval", type=float, default=GPU_SAMPLE_INTERVAL_S, metavar="SECONDS",
+                        help=f"sample GPU clocks, power and utilization this often while an arm runs; 0 records only the "
+                             f"settings at the start and end of each arm (default {GPU_SAMPLE_INTERVAL_S:g})")
     args = parser.parse_args()
     try:
         recipe = load_recipe(args.recipe)
@@ -1395,7 +1633,7 @@ def main() -> int:
         environment = dict(_parse_assignment(value, "--env") for value in args.env)
         recipe = apply_overrides(recipe, settings, environment)
         artifacts = args.artifacts or args.output.with_name(args.output.stem + "-artifacts")
-        result = run_recipe(recipe, artifacts, arm_names=args.arm)
+        result = run_recipe(recipe, artifacts, arm_names=args.arm, gpu_sample_interval_s=args.gpu_sample_interval)
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(result, indent=2) + "\n")
         if args.print_summary:

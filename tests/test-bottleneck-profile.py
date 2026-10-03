@@ -294,5 +294,60 @@ class TestBottleneckProfile(unittest.TestCase):
         self.assertIn("aggregate ms/client token", summary)
 
 
+    def test_amd_gpu_state_reads_sysfs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            device = Path(tmp) / "card1" / "device"
+            hwmon = device / "hwmon" / "hwmon3"
+            hwmon.mkdir(parents=True)
+            (device / "power_dpm_force_performance_level").write_text("auto\n")
+            (device / "pp_power_profile_mode").write_text(
+                "PROFILE_INDEX(NAME) CLOCK_TYPE(NAME) FPS\n 0 BOOTUP_DEFAULT :\n 5        COMPUTE*:\n 6         CUSTOM :\n")
+            (device / "gpu_busy_percent").write_text("97\n")
+            (device / "uevent").write_text("DRIVER=amdgpu\nPCI_SLOT_NAME=0000:43:00.0\n")
+            (hwmon / "power1_cap").write_text("240000000\n")
+            (hwmon / "power1_average").write_text("201000000\n")
+            (hwmon / "freq1_input").write_text("2350000000\n")
+            (hwmon / "freq2_input").write_text("1258000000\n")
+            (Path(tmp) / "card0" / "device").mkdir(parents=True)  # not an amdgpu card: no performance level file
+            gpus = profile._amd_gpus(Path(tmp))
+        self.assertEqual(len(gpus), 1)
+        gpu = gpus[0]
+        self.assertEqual((gpu["pci"], gpu["performance_level"], gpu["power_profile"]), ("0000:43:00.0", "auto", "COMPUTE"))
+        self.assertEqual((gpu["power_cap_w"], gpu["clock_mhz"], gpu["memory_clock_mhz"], gpu["busy_percent"]), (240.0, 2350.0, 1258.0, 97.0))
+
+    def test_nvidia_query_parse_normalizes_bus_id(self):
+        gpus = profile._parse_nvidia("0, 00000000:21:00.0, P0, 1695, 1728, 1695, 250.00, 180.5, 99, 0x0000000000000000, NVIDIA Graphics Device\n")
+        self.assertEqual(len(gpus), 1)
+        self.assertEqual((gpus[0]["pci"], gpus[0]["power_limit_w"], gpus[0]["clock_mhz"], gpus[0]["busy_percent"]), ("0000:21:00.0", 250.0, 1695.0, 99.0))
+
+    def test_gpu_clock_summary_uses_busy_samples_and_reports_changes(self):
+        def amd(level, busy, clock, profile_name="COMPUTE", pci="0000:43:00.0"):
+            return {"vendor": "amd", "pci": pci, "card": "card1", "performance_level": level, "power_cap_w": 300.0,
+                    "power_profile": profile_name, "busy_percent": busy, "clock_mhz": clock, "memory_clock_mhz": 1258.0, "power_w": 200.0}
+        start = {"gpus": [amd("auto", 0.0, 500.0), amd("profile_peak", 100.0, 2316.0, "BOOTUP_DEFAULT", "0000:03:00.0")]}
+        end = {"gpus": [amd("profile_peak", 0.0, 500.0), amd("profile_peak", 100.0, 2316.0, "BOOTUP_DEFAULT", "0000:03:00.0")]}
+        samples = [[amd("auto", 100.0, 2400.0)], [amd("auto", 99.0, 2200.0)], [amd("auto", 3.0, 600.0)]]
+        info = profile._summarize_gpu_samples(start, end, samples, 2.0)
+        first = info["per_gpu"][0]
+        self.assertEqual((first["samples"], first["busy_samples"]), (3, 2))
+        self.assertEqual(first["busy_clock_mhz"], {"mean": 2300.0, "min": 2200.0, "max": 2400.0})
+        self.assertEqual(first["busy_power_profile"], {"COMPUTE": 2})
+        self.assertFalse(first["busy_at_start"])
+        self.assertTrue(info["per_gpu"][1]["busy_at_start"])
+        text = profile._gpu_clock_text(info)
+        self.assertIn("AMD 0000:43:00.0 level auto (changed to profile_peak during the arm), cap 300 W, profile COMPUTE, clock 2300 MHz (2200-2400)", text)
+        self.assertIn("2/3 samples busy", text)
+        self.assertIn("Idle: AMD 0000:03:00.0 level profile_peak, cap 300 W", text)
+
+    def test_summary_renders_gpu_clock_line(self):
+        gpu_clocks = {"interval_s": 2.0, "busy_percent_threshold": 50.0, "per_gpu": [{
+            "vendor": "nvidia", "pci": "0000:21:00.0", "label": "index 0", "settings_start": {"power_limit_w": 250.0},
+            "settings_end": {"power_limit_w": 250.0}, "samples": 10, "busy_samples": 8, "busy_at_start": False,
+            "busy_clock_mhz": {"mean": 1695.0, "min": 1695.0, "max": 1695.0}}]}
+        result = {"recipe": "example", "created_utc": "2026-10-02T00:00:00Z", "repository": {"commit": "abc", "tree": "clean"}, "arms": [{
+            "name": "plain", "type": "llama-bench", "metrics": {"kind": "llama-bench", "tests": []}, "gpu_clocks": gpu_clocks}]}
+        self.assertIn("NVIDIA 0000:21:00.0 limit 250 W, clock 1695 MHz (1695-1695), 8/10 samples busy", profile.render_summary(result))
+
+
 if __name__ == "__main__":
     unittest.main()
