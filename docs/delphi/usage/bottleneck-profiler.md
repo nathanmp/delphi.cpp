@@ -53,6 +53,15 @@ python3 tools/bottlenecks/profile.py \
 
 The JSON records the complete command, selected environment, binary version, model file size and modification time, Git identity, raw benchmark output, and trace-derived data. Point the recipe at an alternate binary when a comparison needs a different build. The profiler does not build binaries itself.
 
+Each arm also records the GPU clock state it ran under (`gpu_clocks`), because a GPU setting can move results by tens of percent with no change to the build:
+
+- At the start and end of the arm: each amdgpu card's forced performance level (`power_dpm_force_performance_level`) and power cap, and each NVIDIA GPU's power limit and maximum SM clock. A setting that changes during the arm is marked in the summary.
+- While the arm runs, every `--gpu-sample-interval` seconds (default 2; `0` keeps only the start and end snapshots): clocks, memory clock, power and utilization, plus the active amdgpu power profile (`pp_power_profile_mode`) and the NVIDIA P-state and clock-event reasons.
+- The summary averages only busy samples (utilization of at least 50%). Idle samples would report the idle clock, not what the workload got. GPUs without busy samples are listed with their settings only.
+- A GPU that is already busy before the arm launches anything is flagged. Either another workload shares it, or its utilization counter reads busy at idle; an amdgpu card at `profile_peak` reports 100% with no process on it.
+
+The NVIDIA values come from `nvidia-smi`; the amdgpu values come from sysfs and hwmon. Neither needs root.
+
 ## Server and speculative recipes
 
 Use `ServerArm` for one `llama-server` load and one SPEED-Bench client invocation. Its `server_command` and `client_command` can contain `{port}`, `{url}`, `{output}`, and `{artifact_dir}`. The runner waits for `/health`, runs the optional warmup command, invokes the client, and stops the server with `SIGINT` so the trace is finalized.

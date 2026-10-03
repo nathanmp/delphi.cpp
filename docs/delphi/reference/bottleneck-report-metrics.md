@@ -89,6 +89,12 @@ The span rows are category totals. The detail rows below them break each total i
 
 **What it means.** `enabled and kept` means the scheduler can overlap work across devices. `enabled, then disabled after a compute buffer allocation failure` means a larger compute buffer could not be reserved, so the scheduler fell back to a serial schedule without any command-line change. `not enabled` means one of the enable conditions did not hold, commonly a single device or a tensor override. The enable path logs at info level, which many server configurations suppress, so the trace metadata is the reliable source. Compare this line between arms before attributing a throughput difference to a kernel.
 
+### GPU clocks
+
+**What it is.** A line above the workload tables lists each GPU that was busy during the arm. For each one it gives the settings at the start of the arm (amdgpu performance level and power cap, NVIDIA power limit), the power profile, and the mean and range of the GPU clock over busy samples, with the memory clock, power and the number of busy samples. GPUs that were idle throughout are listed with their settings only. See `../usage/bottleneck-profiler.md` for the sampling rules.
+
+**What it means.** Compare this line before comparing two reports. If the clock, memory clock or a setting differs between them, attribute nothing to the build until the GPU state matches. Every operation moving by the same percentage between two runs of the same binary points to this line, not to code. A setting that changed during the arm, or a GPU already busy before the arm started, makes that arm's numbers suspect.
+
 ## Resource utilization
 
 After each workload's detail table, a resource table shows how busy the CPU and each device were. It is derived from the same host spans and device events.
