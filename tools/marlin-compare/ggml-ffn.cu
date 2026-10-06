@@ -177,10 +177,13 @@ static void session_create(session & s, ggml_backend_dev_t dev, bank & b, int wi
     // Persistent GPU inputs keep direct replay independent of scheduler copies.
     s.inputs = ggml_init(params);
     s.x   = ggml_new_tensor_3d(s.inputs, GGML_TYPE_F32, k_hidden, 1, width);
-    s.ids = ggml_new_tensor_2d(s.inputs, GGML_TYPE_I32, k_topk, width);
+    // DELPHI_COMPARE_IDS_VIEW: the ids are the first 8 columns of rows of 288, as the view of an argsort result in build_moe_ffn
+    const bool ids_view = std::getenv("DELPHI_COMPARE_IDS_VIEW") != nullptr;
+    ggml_tensor * ids_full = ids_view ? ggml_new_tensor_2d(s.inputs, GGML_TYPE_I32, k_experts, width) : nullptr;
+    s.ids = ids_view ? ggml_view_2d(s.inputs, ids_full, k_topk, width, ids_full->nb[1], 0) : ggml_new_tensor_2d(s.inputs, GGML_TYPE_I32, k_topk, width);
     s.rw  = ggml_new_tensor_3d(s.inputs, GGML_TYPE_F32, 1, k_topk, width);
     ggml_set_name(s.x, "fixture-input"); ggml_set_input(s.x);
-    ggml_set_name(s.ids, "fixture-ids"); ggml_set_input(s.ids);
+    ggml_set_name(ids_view ? ids_full : s.ids, "fixture-ids"); ggml_set_input(ids_view ? ids_full : s.ids);
     ggml_set_name(s.rw, "fixture-router-weights"); ggml_set_input(s.rw);
     s.ib = ggml_backend_alloc_ctx_tensors(s.inputs, s.backend);
     require(s.ib != nullptr, "input allocation failed");
@@ -224,7 +227,13 @@ static void session_create(session & s, ggml_backend_dev_t dev, bank & b, int wi
     s.sched = ggml_backend_sched_new(backends, nullptr, 2, 256, false, true);
     require(ggml_backend_sched_alloc_graph(s.sched, s.graph), "graph allocation failed");
     load_bytes(dir + "/input.f32", 0, s.x);
-    load_bytes(dir + "/ids.i32", 0, s.ids);
+    if (ids_view) {
+        std::vector<int32_t> rows;
+        require(read_file(dir + "/ids.i32", size_t(k_topk) * width, rows), "ids.i32 missing or short");
+        for (int t = 0; t < width; ++t) { ggml_backend_tensor_set(ids_full, rows.data() + t * k_topk, t * ids_full->nb[1], k_topk * sizeof(int32_t)); }
+    } else {
+        load_bytes(dir + "/ids.i32", 0, s.ids);
+    }
     load_bytes(dir + "/router.f32", 0, s.rw);
 }
 
@@ -239,8 +248,10 @@ static std::vector<float> session_output(session & s) {
 // binary's source and build flags.
 static void session_warm(session & s) {
     s.cuda_ctx = static_cast<ggml_backend_cuda_context *>(s.backend->context);
+    std::vector<float> eager;
     for (int i = 0; i < 8; ++i) {
         require(ggml_backend_sched_graph_compute(s.sched, s.graph) == GGML_STATUS_SUCCESS, "warmup failed");
+        if (i == 0) { eager = session_output(s); } // the first execution is not captured
     }
     ggml_cuda_graph * captured = nullptr;
     int added = 0;
@@ -259,6 +270,7 @@ static void session_warm(session & s) {
     CUDA_CHECK(cudaGraphLaunch(s.exec, s.stream));
     CUDA_CHECK(cudaStreamSynchronize(s.stream));
     require(result == session_output(s), "direct replay differs from backend replay");
+    require(result == eager, "captured replay differs from the eager execution");
 }
 
 static void session_replay(session & s, int n) {
