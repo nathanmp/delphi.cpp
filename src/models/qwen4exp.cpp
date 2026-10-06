@@ -1055,45 +1055,78 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
 
     ggml_tensor * kq_mask = inp->get_kq_mask();
 
-    // prepare new kq mask - starts filled with -INFINITY
-    ggml_tensor * kq_mask_all = ggml_fill(ctx0, kq_mask, -INFINITY);
-
-    // reshape KQ mask into tensor with rows of size 1:
-    // [n_kv, n_batch, 1, n_stream] -> [1, n_kv, n_batch, n_stream]
-    kq_mask_all = ggml_view_4d(ctx0, kq_mask_all, 1, kq_mask_all->ne[0], kq_mask_all->ne[1], kq_mask_all->ne[3], kq_mask_all->nb[0], kq_mask_all->nb[1], kq_mask_all->nb[2], 0);
-
-    // reshape top_k indices: [n_top_k, n_batch, 1, n_stream] -> [n_top_k, n_batch, n_stream, 1]
-    ggml_tensor * top_k_3d = ggml_view_4d(ctx0, top_k, top_k->ne[0], top_k->ne[1], top_k->ne[3], 1, top_k->nb[1], top_k->nb[2], top_k->ne[3]*top_k->nb[3], 0);
-
-    // prepare zero-filled tensor with rows of size 1: [1, n_top_k, n_batch, n_stream]
-    // this will be our source of zero values for unmasking top k mask elements
-    ggml_tensor * zeros = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, top_k_3d->ne[0], top_k_3d->ne[1], top_k_3d->ne[2]);
-    zeros = ggml_fill(ctx0, zeros, 0.0f);
-
-    // modify KQ mask by unmasking elements that are in top_k indices
-    // ggml_set_rows([1, n_kv, n_batch, n_stream], [1, n_top_k, n_batch, n_stream], [n_top_k, n_batch, n_stream, 1])
-    ggml_tensor * kq_mask_top_k = ggml_set_rows(ctx0, kq_mask_all, zeros, top_k_3d);
-
-    // reshape to restore the original shape of KQ mask:
-    // [1, n_kv, n_batch, n_stream] -> [n_kv, n_batch, 1, n_stream]
-    kq_mask_top_k = ggml_view_4d(ctx0, kq_mask_top_k, kq_mask_top_k->ne[1], kq_mask_top_k->ne[2], 1, kq_mask_top_k->ne[3], kq_mask_top_k->nb[2], kq_mask_top_k->nb[3], kq_mask_top_k->nb[3], 0);
-
-    // combine with the original kq mask
-    kq_mask_top_k = ggml_add(ctx0, kq_mask_top_k, kq_mask);
-
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    // The mask unmasks only cells named by top_k, so a row has at most top_k->ne[0] finite entries.
-    // That bound lets a backend with a physical sparse kernel (RDNA4 WMMA) skip the other cells.
-    // A backend without one runs the dense masked attention. LLAMA_QWEN4EXP_SPARSE_ATTN=0 forces the dense path.
-    // ref: https://github.com/ggml-org/llama.cpp/pull/27970
-    static const bool sparse_attn = [] {
+    // The attention is restricted to the cells that top_k names. Two encodings exist:
+    // bake top_k into the mask for backends that treat the mask as the only source of
+    // truth, or hand top_k to flash attention as KV indices and pass the plain
+    // causal/visibility mask. With indices the sparse kernel gathers K/V rows and mask
+    // cells directly, so the O(n_kv) fill/set_rows/add and the mask-compaction kernel
+    // disappear. Backends that ignore indices (Metal, Vulkan) reject the op and ggml
+    // moves it to the CPU, which reads a full-width mask through the index. Keep the
+    // mask-backed graph for shapes whose GPU sparse kernel will not fire anyway, so
+    // those still run dense on the GPU.
+    // LLAMA_QWEN4EXP_SPARSE_ATTN: 0 dense, 1 mask-backed hint, 2 indices when the sparse
+    // kernel will take them, otherwise mask-backed. Default 2.
+    static const int sparse_mode = [] {
         const char * env = getenv("LLAMA_QWEN4EXP_SPARSE_ATTN");
-        return env == nullptr || atoi(env) != 0;
+        const int m = env ? atoi(env) : 2;
+        return m < 0 ? 0 : (m > 2 ? 2 : m);
     }();
-    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, sparse_attn ? top_k->ne[0] : 0, kq_scale, il);
+
+    // mirrors the RDNA4 WMMA sparse gate: one stream, width 1..8, GQA 12, F16 cache,
+    // and the cache several times wider than the selection
+    const int64_t n_sel = top_k->ne[0];
+    const bool direct_indices = sparse_mode == 2 &&
+        n_sel < kq_mask->ne[0] && kq_mask->ne[0] >= 4*n_sel &&
+        kq_mask->ne[1] <= 8 && kq_mask->ne[3] == 1 &&
+        k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 &&
+        hparams.n_head(il) == 12*hparams.n_head_kv(il);
+
+    ggml_tensor * cur;
+
+    if (direct_indices) {
+        // [n_sel, n_tps, 1, n_stream] -> [n_sel, n_tps, n_stream], no copies
+        ggml_tensor * kv_indices = ggml_reshape_3d(ctx0, top_k, n_sel, kq_mask->ne[1], kq_mask->ne[3]);
+        cb(kv_indices, "kq_indices", il);
+        cur = build_attn_mha(q, k, v, nullptr, kq_mask, nullptr, nullptr, 0, kq_scale, il, kv_indices);
+    }
+    else {
+        // prepare new kq mask - starts filled with -INFINITY
+        ggml_tensor * kq_mask_all = ggml_fill(ctx0, kq_mask, -INFINITY);
+
+        // reshape KQ mask into tensor with rows of size 1:
+        // [n_kv, n_batch, 1, n_stream] -> [1, n_kv, n_batch, n_stream]
+        kq_mask_all = ggml_view_4d(ctx0, kq_mask_all, 1, kq_mask_all->ne[0], kq_mask_all->ne[1], kq_mask_all->ne[3], kq_mask_all->nb[0], kq_mask_all->nb[1], kq_mask_all->nb[2], 0);
+
+        // reshape top_k indices: [n_top_k, n_batch, 1, n_stream] -> [n_top_k, n_batch, n_stream, 1]
+        ggml_tensor * top_k_3d = ggml_view_4d(ctx0, top_k, top_k->ne[0], top_k->ne[1], top_k->ne[3], 1, top_k->nb[1], top_k->nb[2], top_k->ne[3]*top_k->nb[3], 0);
+
+        // prepare zero-filled tensor with rows of size 1: [1, n_top_k, n_batch, n_stream]
+        // this will be our source of zero values for unmasking top k mask elements
+        ggml_tensor * zeros = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, top_k_3d->ne[0], top_k_3d->ne[1], top_k_3d->ne[2]);
+        zeros = ggml_fill(ctx0, zeros, 0.0f);
+
+        // modify KQ mask by unmasking elements that are in top_k indices
+        // ggml_set_rows([1, n_kv, n_batch, n_stream], [1, n_top_k, n_batch, n_stream], [n_top_k, n_batch, n_stream, 1])
+        ggml_tensor * kq_mask_top_k = ggml_set_rows(ctx0, kq_mask_all, zeros, top_k_3d);
+
+        // reshape to restore the original shape of KQ mask:
+        // [1, n_kv, n_batch, n_stream] -> [n_kv, n_batch, 1, n_stream]
+        kq_mask_top_k = ggml_view_4d(ctx0, kq_mask_top_k, kq_mask_top_k->ne[1], kq_mask_top_k->ne[2], 1, kq_mask_top_k->ne[3], kq_mask_top_k->nb[2], kq_mask_top_k->nb[3], kq_mask_top_k->nb[3], 0);
+
+        // combine with the original kq mask
+        kq_mask_top_k = ggml_add(ctx0, kq_mask_top_k, kq_mask);
+
+        // The mask unmasks only cells named by top_k, so a row has at most top_k->ne[0] finite entries.
+        // That bound lets a backend with a physical sparse kernel (RDNA4 WMMA) skip the other cells.
+        // A backend without one runs the dense masked attention.
+        // ref: https://github.com/ggml-org/llama.cpp/pull/27970
+        cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, sparse_mode != 0 ? n_sel : 0, kq_scale, il);
+    }
+
     cb(cur, "kqv_out", il);
 
     // the rotation is its own inverse, so undo it on the value side of the output
