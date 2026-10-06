@@ -77,6 +77,7 @@
 #include "ggml-cuda/lightning-indexer.cuh"
 #include "ggml-cuda/kpool-expand.cuh"
 #include "ggml-cuda/interval-mask.cuh"
+#include "ggml-cuda/moe-int4-decode.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -1056,6 +1057,7 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
     delete exec_trace_timer;
+    ggml_cuda_moe_int4_free_scratch(this);
     if (q8_1_cache_buf != nullptr) {
         ggml_cuda_set_device(device);
         CUDA_CHECK(cudaFree(q8_1_cache_buf));
@@ -1112,6 +1114,7 @@ static void ggml_backend_cuda_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
     // delphi: the packed MoE weights are keyed by the tensor address, which a later buffer can reuse
     ggml_cuda_moe_packed_forget(ctx->device, ctx->dev_ptr, buffer->size);
+    ggml_cuda_moe_int4_forget(ctx->device, ctx->dev_ptr, buffer->size);
     delete ctx;
 }
 
@@ -3821,6 +3824,63 @@ static bool ggml_cuda_match_moe_down_reduction(
     return true;
 }
 
+// delphi: one complete routed FFN for the INT4 path (moe-int4-decode.cuh): the gate and up MUL_MAT_ID in either order, the
+// SWIGLU_CLAMP, the down MUL_MAT_ID and the weighted slot reduction (MUL, views, adds). This only recognizes the structure; the
+// tensor types, shapes and weights are checked by ggml_cuda_moe_int4_prepare and ggml_cuda_moe_int4_ready.
+static bool ggml_cuda_match_moe_int4_ffn(
+        const ggml_cgraph * cgraph,
+        int node_idx,
+        ggml_cuda_moe_int4_ffn & ffn,
+        int & node_count) {
+    if (!ggml_cuda_moe_int4_enabled() || node_idx + 4 >= cgraph->n_nodes) {
+        return false;
+    }
+
+    ggml_tensor * first  = cgraph->nodes[node_idx];
+    ggml_tensor * second = cgraph->nodes[node_idx + 1];
+    ggml_tensor * glu    = cgraph->nodes[node_idx + 2];
+    ggml_tensor * down   = cgraph->nodes[node_idx + 3];
+    if (first->op != GGML_OP_MUL_MAT_ID || second->op != GGML_OP_MUL_MAT_ID || glu->op != GGML_OP_GLU ||
+            down->op != GGML_OP_MUL_MAT_ID || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU_CLAMP ||
+            ggml_get_op_params_i32(glu, 1) != 0 /* not swapped */ ||
+            !((glu->src[0] == first && glu->src[1] == second) || (glu->src[0] == second && glu->src[1] == first)) ||
+            down->src[1] != glu || first->type != GGML_TYPE_F32 || second->type != GGML_TYPE_F32 || glu->type != GGML_TYPE_F32 ||
+            down->type != GGML_TYPE_F32 || ggml_mul_mat_id_is_partial(first) || ggml_mul_mat_id_is_partial(second) ||
+            ggml_mul_mat_id_is_partial(down)) {
+        return false;
+    }
+    if (first->src[1] != second->src[1] || first->src[2] != second->src[2] || first->src[2] != down->src[2]) {
+        return false;
+    }
+
+    ggml_cuda_moe_weighted_reduction_match reduction;
+    if (!ggml_cuda_match_moe_weighted_reduction(cgraph, node_idx + 4, reduction, true) || reduction.experts != down ||
+            reduction.expert_scale != nullptr) {
+        return false;
+    }
+
+    const int count      = reduction.node_count + 4;
+    const int output_idx = node_idx + count - 1;
+    std::vector<ggml_op> ops(count);
+    for (int i = 0; i < count; ++i) {
+        ops[i] = cgraph->nodes[node_idx + i]->op;
+    }
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, count, ops.data(), &output_idx, 1)) {
+        return false;
+    }
+
+    ffn.gate    = glu->src[0]->src[0];
+    ffn.up      = glu->src[1]->src[0];
+    ffn.down    = down->src[0];
+    ffn.x       = first->src[1];
+    ffn.ids     = first->src[2];
+    ffn.weights = reduction.weights;
+    ffn.dst     = reduction.dst;
+    ffn.limit   = ggml_get_op_params_f32(glu, 3);
+    node_count  = count;
+    return true;
+}
+
 
 // MUL -> VIEW -> ADD -> SIGMOID -> SCALE at node_idx: the pre/post weight chain of dsv4_hc_affine (deepseek4.cpp), a
 // [hc, n_tokens] view of the mixes times a one-element hc_scale view plus a [hc] hc_base view (the VIEW node)
@@ -4221,6 +4281,22 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         ggml_exec_trace_set_node(node_index);
         ggml_exec_trace_dispatch(op, implementation, GGML_EXEC_TRACE_DISPATCH_VARIANT_FUSED, device.cc, device.warp_size);
     };
+
+    if (node->op == GGML_OP_MUL_MAT_ID) {
+        // delphi: the whole routed FFN as INT4 kernels (moe-int4-decode.cuh); the weights were prepared before capture
+        ggml_cuda_moe_int4_ffn ffn;
+        int ffn_nodes = 0;
+        if (ggml_cuda_match_moe_int4_ffn(cgraph, i, ffn, ffn_nodes)) {
+            const int output_idx = i + ffn_nodes - 1;
+            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, ffn_nodes, &output_idx, 1) &&
+                    ggml_cuda_moe_int4_ready(*cuda_ctx, ffn)) {
+                // the trace has no dispatch value for the INT4 kernels: record the fusion without naming an implementation
+                trace_fused_mul_mat(i, node->op, GGML_EXEC_TRACE_DISPATCH_UNKNOWN);
+                ggml_cuda_moe_int4_run(*cuda_ctx, ffn);
+                return ffn_nodes - 1;
+            }
+        }
+    }
 
     if (node->op == GGML_OP_MUL_MAT_ID) {
         ggml_cuda_moe_down_reduction_match match;
@@ -5369,6 +5445,18 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     // delphi: build packed MoE weights before a CUDA graph can capture a MUL_MAT_ID that reads them (moe-packed.cuh)
     ggml_cuda_moe_packed_prepare(*cuda_ctx, cgraph);
 
+    // delphi: INT4 copies of the expert weights of the routed FFN regions of this graph (moe-int4-decode.cuh), likewise before capture
+    if (ggml_cuda_moe_int4_enabled()) {
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            ggml_cuda_moe_int4_ffn ffn;
+            int ffn_nodes = 0;
+            if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT_ID && ggml_cuda_match_moe_int4_ffn(cgraph, i, ffn, ffn_nodes)) {
+                ggml_cuda_moe_int4_prepare(*cuda_ctx, ffn);
+                i += ffn_nodes - 1;
+            }
+        }
+    }
+
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
     enum ggml_exec_trace_gpu_graph_reason fallback_reason = GGML_EXEC_TRACE_GPU_GRAPH_REASON_DISABLED;
@@ -5516,6 +5604,15 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     if (!disable_fusion) {
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT_ID) {
+                ggml_cuda_moe_int4_ffn ffn;
+                int ffn_nodes = 0;
+                if (ggml_cuda_match_moe_int4_ffn(cgraph, i, ffn, ffn_nodes)) {
+                    params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(ffn.x), ffn.dst);
+                    params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(ffn.ids), ffn.dst);
+                    params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(ffn.weights), ffn.dst);
+                    i += ffn_nodes - 1;
+                    continue;
+                }
                 ggml_cuda_moe_down_reduction_match match;
                 if (ggml_cuda_match_moe_down_reduction(cgraph, i, match)) {
                     params->add_alloc_dep(
@@ -7037,6 +7134,18 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_moe_packed_set_inplace") == 0) {
         return (void *)ggml_backend_cuda_moe_packed_set_inplace;
+    }
+    if (strcmp(name, "ggml_backend_cuda_moe_int4_set_mode") == 0) {
+        return (void *)ggml_backend_cuda_moe_int4_set_mode;
+    }
+    if (strcmp(name, "ggml_backend_cuda_moe_int4_clear") == 0) {
+        return (void *)ggml_backend_cuda_moe_int4_clear;
+    }
+    if (strcmp(name, "ggml_backend_cuda_moe_int4_get_stats") == 0) {
+        return (void *)ggml_backend_cuda_moe_int4_get_stats;
+    }
+    if (strcmp(name, "ggml_backend_cuda_moe_int4_get_pack") == 0) {
+        return (void *)ggml_backend_cuda_moe_int4_get_pack;
     }
     return nullptr;
 }
