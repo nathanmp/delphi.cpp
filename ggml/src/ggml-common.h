@@ -191,6 +191,16 @@ typedef struct {
 } block_q2_0;
 static_assert(sizeof(block_q2_0) == sizeof(ggml_half) + QK2_0 / 4, "wrong q2_0 block size/padding");
 
+// Symmetric INT4 with one BF16 scale per 128 values. The 128 codes are four groups of 32 in the layout of a block_q4_0: byte j of group s
+// holds value 32 s + j in the low nibble and value 32 s + j + 16 in the high nibble; value = (nibble - 8) * d. The scale is a BF16
+// value that is also exact in FP16 (at least 2^-14), so a group converts to four Q4_0 blocks without loss.
+#define QK4_G128 128
+typedef struct {
+    uint16_t d;                // scale (BF16 bits)
+    uint8_t  qs[QK4_G128 / 2]; // nibbles
+} block_q4_g128;
+static_assert(sizeof(block_q4_g128) == sizeof(uint16_t) + QK4_G128 / 2, "wrong q4_g128 block size/padding");
+
 #define QK4_0 32
 typedef struct {
     ggml_half d;           // delta

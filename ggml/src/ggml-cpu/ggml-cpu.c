@@ -247,6 +247,13 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .vec_dot_type             = GGML_TYPE_Q8_0,
         .nrows                    = 1,
     },
+    [GGML_TYPE_Q4_G128] = {
+        // delphi.cpp: weights only, scalar dot product with F32 activations (the INT4 decode path runs on the GPU)
+        .from_float               = quantize_row_q4_g128,
+        .vec_dot                  = ggml_vec_dot_q4_g128_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
     [GGML_TYPE_Q4_0] = {
         .from_float               = quantize_row_q4_0,
         .vec_dot                  = ggml_vec_dot_q4_0_q8_0,

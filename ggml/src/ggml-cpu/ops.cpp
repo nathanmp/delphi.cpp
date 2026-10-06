@@ -6052,6 +6052,7 @@ void ggml_compute_forward_clamp(
         case GGML_TYPE_BF16:
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:
+        case GGML_TYPE_Q4_G128:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
