@@ -5716,7 +5716,10 @@ void ggml_flash_attn_ext_set_indices(
     GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
     GGML_ASSERT(a->src[5] == NULL);
     GGML_ASSERT(indices != NULL && indices->type == GGML_TYPE_I32);
-    GGML_ASSERT(a->src[3] == NULL || a->src[3]->ne[0] == indices->ne[0]);
+    // the mask is either slot-parallel (one entry per selected cell) or full cache width
+    // (one entry per physical cell, read through the indices). consumers tell the two apart
+    // by comparing mask->ne[0] against indices->ne[0]; the second form must match K->ne[1].
+    GGML_ASSERT(a->src[3] == NULL || a->src[3]->ne[0] == indices->ne[0] || a->src[3]->ne[0] == a->src[1]->ne[1]);
     GGML_ASSERT(a->src[3] == NULL || a->src[3]->ne[1] == indices->ne[1]);
     GGML_ASSERT(a->src[3] == NULL || (a->src[3]->ne[2] == 1 && a->src[3]->ne[3] == indices->ne[2]));
     GGML_ASSERT(indices->ne[1] == a->src[0]->ne[1]);
