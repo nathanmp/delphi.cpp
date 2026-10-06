@@ -8846,6 +8846,10 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     GGML_ASSERT((                            q_to_vec_dot) && "fattn: unsupported K-type");
     GGML_ASSERT((v->type == GGML_TYPE_F32 || v_to_float  ) && "fattn: unsupported V-type");
 
+    // a full cache-width mask is looked up through the index, a slot-parallel mask by the slot
+    const bool mask_full_width = indices != NULL && mask != NULL && mask->ne[0] != indices->ne[0];
+    GGML_ASSERT(!mask_full_width || mask->ne[0] == nek1);
+
     int ith = params->ith;
 
     for (int ir = ir0; ir < ir1; ++ir) {
@@ -8891,17 +8895,18 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         // ref: https://arxiv.org/pdf/2112.05682.pdf
 
         for (int64_t ic = ic_start; ic < ic_end; ++ic) {
-            const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
+            const int64_t kc = ip ? ip[ic] : ic;
+            if (kc < 0 || kc >= nek1) {
+                continue;
+            }
+
+            const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[mask_full_width ? kc : ic]) : 0.0f;
             if (mv == -INFINITY) {
                 continue;
             }
 
             float s; // KQ value
 
-            const int64_t kc = ip ? ip[ic] : ic;
-            if (kc < 0 || kc >= nek1) {
-                continue;
-            }
             const char * k_data = (const char *) k->data + (kc*nbk1 + ik2*nbk2 + ik3*nbk3);
             kq_vec_dot(DK, &s, 0, k_data, 0, Q_q, 0, 1);
 

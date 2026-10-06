@@ -2549,8 +2549,12 @@ extern "C" {
 
     // Optional indirect KV addressing for sparse attention.
     // indices: I32 [n_selected, n_queries, n_stream]
-    // When set, mask's first dimension is n_selected and each logical KV
-    // column is read from the physical cache row in indices.
+    // When set, each logical KV column is read from the physical cache row in indices.
+    // mask (if present) is either slot-parallel (ne[0] == n_selected, like the selection)
+    // or full cache width (ne[0] == K->ne[1], looked up through the indices).
+    // If n_selected equals the cache width, the mask is interpreted as slot-parallel.
+    // A backend that ignores indices must not be given the full-width form, because its
+    // mask no longer restricts the attention to the selected cells.
     GGML_API void ggml_flash_attn_ext_set_indices(
             struct ggml_tensor * a,
             struct ggml_tensor * indices);

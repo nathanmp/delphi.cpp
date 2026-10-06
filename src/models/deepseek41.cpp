@@ -981,8 +981,8 @@ static bool dsv41_verify_compact_enabled(
 // Prefill issues far too many queries for one attention call per query. Pass the
 // per-query selections as indices and let FlashAttention dereference the cache rows
 // inside the kernel, like build_attn_sparse does. Only the CUDA/HIP indexed kernel
-// honors indices (the CPU kernel does too); Metal and Vulkan ignore them, so this path
-// is opt-in (mode 4) and stays off by default.
+// honors indices fast (the CPU kernel does too); Metal and Vulkan reject such ops and
+// fall back to the CPU, so this path is opt-in (mode 4) and stays off by default.
 static bool dsv41_prefill_indexed_enabled(
         const llama_hparams & hparams,
         bool flash_attn,

@@ -139,14 +139,43 @@ static bool ggml_cuda_flash_attn_ext_mma_f16_sparse_supported(
         return false;
     }
 
-    // delphi: on RDNA4 the WMMA kernel takes a mask-backed sparse launch for 512-wide heads
-    // (DeepSeek V4.1: a sliding window plus the indexer's top-k, out of thousands of rows)
+    // delphi: on RDNA4 the WMMA kernel takes a sparse launch for 512-wide heads (DeepSeek V4.1:
+    // a sliding window plus the indexer's top-k, out of thousands of rows) backed by a compacted
+    // mask, or, for Qwen QSA decode, directly through the selector's top-k indices
     if (GGML_CUDA_CC_IS_RDNA4(cc)) {
+        if (mask == nullptr || mask->ne[0] != K->ne[1] || mask->ne[1] < Q->ne[1] || mask->ne[2] != 1) {
+            return false;
+        }
+        // Qwen QSA decode and MTP verification: one sequence, few queries, 12 heads share one KV head.
+        // The kernel gathers K/V rows and mask columns through the indices, so the graph needs neither
+        // the O(n_kv) top-k mask fill nor the compaction kernel. The mask is still required: when fewer
+        // than width valid cells exist, top_k also names invisible cells, and the mask lookup excludes
+        // them. Indices are distinct but need not be sorted: slot order is irrelevant to the online
+        // softmax. The kernel's index row-stride arithmetic assumes a single stream.
+        // K->ne[1] must stay a multiple of the batch size or the dispatch would fall through to
+        // a dense specialization that ignores the indices and compute the wrong (dense) attention.
+        if (indices != nullptr) {
+            return Q->ne[0] == 256 && V->ne[0] == 256 && K->ne[2] > 0 && Q->ne[2] == 12*K->ne[2] &&
+                Q->ne[1] <= 8 && Q->ne[3] == 1 && mask->ne[3] == 1 &&
+                K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16 &&
+                K->ne[1] % FATTN_KQ_STRIDE == 0 &&
+                indices->type == GGML_TYPE_I32 && indices->ne[0] > 0 &&
+                indices->ne[1] == Q->ne[1] && indices->ne[2] == Q->ne[3] &&
+                K->ne[1] >= std::max<int64_t>(4096, 4LL*indices->ne[0]);
+        }
         const int32_t n_kv_max = ggml_get_op_params_i32(dst, 4);
-        return indices == nullptr && mask != nullptr && n_kv_max > 0 &&
-            Q->ne[0] == 512 && V->ne[0] == 512 && Q->ne[2] % (16*K->ne[2]) == 0 &&
-            mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1 &&
-            K->ne[1] >= std::max<int64_t>(4096, 2LL*n_kv_max);
+        if (n_kv_max <= 0) {
+            return false;
+        }
+        if (Q->ne[0] == 512 && V->ne[0] == 512) {
+            return Q->ne[2] % (16*K->ne[2]) == 0 && K->ne[1] >= std::max<int64_t>(4096, 2LL*n_kv_max);
+        }
+        // The sparse kernel takes 16 heads per tile and masks the 4 that belong to the next KV head.
+        // Sparse reads only pay off once the cache is several times wider than the selection.
+        return Q->ne[0] == 256 && V->ne[0] == 256 && K->ne[2] > 0 && Q->ne[2] == 12*K->ne[2] &&
+            Q->ne[1] <= 8 && Q->ne[3] == 1 && mask->ne[3] == 1 &&
+            K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16 &&
+            K->ne[1] >= std::max<int64_t>(4096, 4LL*n_kv_max);
     }
 
     if (!GGML_CUDA_CC_IS_NVIDIA(cc) || !turing_mma_available(cc)) {
@@ -274,7 +303,8 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
 #if defined(GGML_USE_HIP)
         // delphi: a sparse launch gathers one query's rows for 16 heads at a time
         if constexpr (ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, 1, 16)) {
-            if (use_gqa_opt && gqa_ratio % 16 == 0 && ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ctx, dst)) {
+            if (use_gqa_opt && (gqa_ratio % 16 == 0 || (DKQ == 256 && gqa_ratio == 12)) &&
+                    ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ctx, dst)) {
                 ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 1, 16>(ctx, dst);
                 return;
             }
@@ -662,6 +692,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     if (mask && mask->ne[2] != 1) {
         return BEST_FATTN_KERNEL_NONE;
+    }
+
+    // delphi: the dense tile kernel serves 256-wide GQA=12 decode; a sparse launch needs the WMMA kernel
+    if (GGML_CUDA_CC_IS_RDNA4(cc) && gqa_opt_applies && K->ne[0] == 256 &&
+            ggml_cuda_flash_attn_ext_mma_f16_sparse_supported(device, dst)) {
+        return BEST_FATTN_KERNEL_MMA_F16;
     }
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:

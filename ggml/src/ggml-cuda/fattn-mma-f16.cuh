@@ -1765,7 +1765,9 @@ static constexpr __host__ __device__ bool ggml_cuda_flash_attn_ext_mma_f16_may_u
         const int DKQ, const int DV, const int ncols1, const int ncols2) {
 #if defined(GGML_USE_HIP)
     // delphi: RDNA WMMA tiles are at least 16 columns wide, so 512-wide heads take 16 heads per query
-    return (DKQ == 512 && DV == 512 && ncols1 == 1 && ncols2 == 16);
+    // 256-wide heads (Qwen QSA, 12 heads per KV head) fill 12 of the 16 columns; the kernel masks the rest
+    return (DKQ == 512 && DV == 512 && ncols1 == 1 && ncols2 == 16) ||
+           (DKQ == 256 && DV == 256 && ncols1 == 1 && ncols2 == 16);
 #else
     return (DKQ == 512 && DV == 512 && ncols1 == 1 && ncols2 == 8) ||
            (DKQ == 576 && DV == 512 && ncols1 == 1 && ncols2 == 16);

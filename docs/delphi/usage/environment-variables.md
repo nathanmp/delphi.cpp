@@ -36,6 +36,20 @@ What each default does:
 
 Validation used a layer split over three NVIDIA GPUs on narrow PCIe links without peer access, with multi-token prediction. Prompt processing rose by 15-29% at `-ub 2048` and by up to 52% with several ubatches per batch. Generation speed and outputs were unchanged. Most of the ub2048 gain comes from the view alias, because each device hand-off moves half as many bytes. The two wait changes and the input order matter when a server batch holds several ubatches: switching all three back cost 25% of prompt throughput at `-ub 512`.
 
+## Qwen selected-row attention
+
+`LLAMA_QWEN4EXP_SPARSE_ATTN` selects how Qwen QSA attends to the indexer's selected cache rows:
+
+| value | effect |
+| --- | --- |
+| `0` | dense attention with the selection encoded in the mask |
+| `1` | mask-backed attention with a selected-row count hint |
+| `2` (default) | direct KV indices when FlashAttention and the layer device support them; otherwise the mask-backed path |
+
+The RDNA4 direct path supports one sequence stream, F16 K/V, 256-wide heads, GQA ratio 12 and up to eight query rows. It requires a cache of at least 4096 rows and at least four times the selected width. Unsupported devices, cache formats and shapes keep masked attention; disabling FlashAttention also retains the selected-row mask.
+
+Passing indices avoids building and compacting a full-width selection mask. A repeated 32K-context decode suffix improved by about 5% on the tested Qwen deployment, with identical greedy tokens. The real-MTP input was repetitive and had full acceptance, so that result does not establish the gain on arbitrary requests. Small contexts and prefill widths keep the existing path. Summation order can change floating-point results.
+
 ## GPU graphs (CUDA and HIP)
 
 | variable | default | effect |
