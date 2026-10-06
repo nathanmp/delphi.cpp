@@ -8446,9 +8446,11 @@ struct test_flash_attn_ext_indexed : public test_case {
     const int64_t n_stream;
     const bool sorted;
     const bool use_mask;
+    const int64_t head;      // q/k/v head size
+    const bool full_mask;    // mask spans the cache and is looked up through the indices
 
     std::string vars() override {
-        return VARS_TO_STR8(kv_type, n_kv, n_selected, n_query, n_head, n_stream, sorted, use_mask);
+        return VARS_TO_STR10(kv_type, n_kv, n_selected, n_query, n_head, n_stream, sorted, use_mask, head, full_mask);
     }
 
     double max_nmse_err() override {
@@ -8458,20 +8460,24 @@ struct test_flash_attn_ext_indexed : public test_case {
     test_flash_attn_ext_indexed(
             ggml_type kv_type, int64_t n_kv, int64_t n_selected,
             int64_t n_query, int64_t n_head, bool sorted, bool use_mask = true,
-            int64_t n_stream = 1)
+            int64_t n_stream = 1, int64_t head = 512, bool full_mask = false)
         : kv_type(kv_type), n_kv(n_kv), n_selected(n_selected),
-          n_query(n_query), n_head(n_head), n_stream(n_stream), sorted(sorted), use_mask(use_mask) {}
+          n_query(n_query), n_head(n_head), n_stream(n_stream), sorted(sorted), use_mask(use_mask),
+          head(head), full_mask(full_mask) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 512, n_query, n_head, n_stream);
-        ggml_tensor * k = ggml_new_tensor_4d(ctx, kv_type, 512, n_kv, 1, n_stream);
-        ggml_tensor * v = ggml_new_tensor_4d(ctx, kv_type, 512, n_kv, 1, n_stream);
-        ggml_tensor * m = use_mask ?
-                ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_selected, n_query, 1, n_stream) : nullptr;
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head, n_query, n_head, n_stream);
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, kv_type, head, n_kv, 1, n_stream);
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, kv_type, head, n_kv, 1, n_stream);
+        ggml_tensor * m = (use_mask || full_mask) ?
+                ggml_new_tensor_4d(ctx, GGML_TYPE_F16, full_mask ? n_kv : n_selected, n_query, 1, n_stream) : nullptr;
+        if (m) {
+            ggml_set_name(m, "mask");
+        }
         ggml_tensor * indices = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, n_selected, n_query, n_stream);
         ggml_set_name(indices, "indices");
 
-        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(512.0f), 0.0f, 0.0f);
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf((float) head), 0.0f, 0.0f);
         ggml_flash_attn_ext_set_indices(out, indices);
         ggml_set_name(out, "out");
         return out;
@@ -8481,12 +8487,27 @@ struct test_flash_attn_ext_indexed : public test_case {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
             if (strcmp(t->name, "indices") == 0) {
                 std::vector<int32_t> values(ggml_nelements(t));
+                // the full-mask cases must reach invisible cache cells too, so the index range spans
+                // the whole cache and a few tail cells per query: they are masked by the causal tail
+                const int64_t n_body  = full_mask ? n_kv - n_query : n_kv;
+                const int64_t n_tail  = full_mask ? std::min<int64_t>(8, n_query) : 0;
                 for (int64_t is = 0; is < n_stream; ++is) {
                     const int64_t n_kv_valid = n_kv - is*n_kv/(2*n_stream);
                     for (int64_t iq = 0; iq < n_query; ++iq) {
                         for (int64_t i = 0; i < n_selected; ++i) {
                             const int64_t offset = (is*n_query + iq)*n_selected + i;
-                            if (n_stream == 1 && !use_mask && i % 127 == 0) {
+                            if (full_mask) {
+                                // slot 0 always names a visible cell, so no row is fully masked
+                                if (i == 0) {
+                                    values[offset] = (int32_t) iq;
+                                } else if (n_tail > 0 && i >= n_selected - n_tail) {
+                                    values[offset] = (int32_t) (n_kv - n_query + (i - (n_selected - n_tail)));
+                                } else if (sorted) {
+                                    values[offset] = (int32_t) (i*n_body/n_selected);
+                                } else {
+                                    values[offset] = (int32_t) ((i*31 + iq*7 + is*13) % n_body);
+                                }
+                            } else if (n_stream == 1 && !use_mask && i % 127 == 0) {
                                 values[offset] = -1;
                             } else if (n_stream > 1 && i % 251 == 0) {
                                 values[offset] = -1;
@@ -8501,6 +8522,18 @@ struct test_flash_attn_ext_indexed : public test_case {
                     }
                 }
                 ggml_backend_tensor_set(t, values.data(), 0, values.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "mask") == 0 && full_mask) {
+                // causal tail: query iq sees the columns up to n_kv - n_query + iq, the rest is -inf
+                std::vector<ggml_fp16_t> values(ggml_nelements(t));
+                for (int64_t is = 0; is < n_stream; ++is) {
+                    for (int64_t iq = 0; iq < n_query; ++iq) {
+                        for (int64_t c = 0; c < n_kv; ++c) {
+                            values[(is*n_query + iq)*n_kv + c] = ggml_fp32_to_fp16(
+                                    c <= n_kv - n_query + iq ? 0.0f : -INFINITY);
+                        }
+                    }
+                }
+                ggml_backend_tensor_set(t, values.data(), 0, values.size()*sizeof(ggml_fp16_t));
             } else {
                 init_tensor_uniform(t);
             }
@@ -11689,6 +11722,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext_indexed(kv_type, 4096, 2048, 2, 2, true, false, 2));
     }
     test_cases.emplace_back(new test_flash_attn_ext_indexed(GGML_TYPE_F16, 8192, 2048, 1, 8, false, false));
+    // Qwen QSA decode shapes: D=256, GQA=12, widths 1..8, one stream, F16. The mask spans the whole
+    // cache (causal tail) and is looked up through unsorted indices that name invisible cells too.
+    // RDNA4 runs these on the sparse WMMA kernel; backends without it move the op to the CPU.
+    test_cases.emplace_back(new test_flash_attn_ext_indexed(GGML_TYPE_F16, 33024, 2051, 1, 12, false, true, 1, 256, true));
+    test_cases.emplace_back(new test_flash_attn_ext_indexed(GGML_TYPE_F16, 33024, 2051, 4, 12, false, true, 1, 256, true));
+    test_cases.emplace_back(new test_flash_attn_ext_indexed(GGML_TYPE_F16, 33024, 2051, 8, 12, false, true, 1, 256, true));
+    test_cases.emplace_back(new test_flash_attn_ext_indexed(GGML_TYPE_F16, 33024, 2051, 5, 12, true, true, 1, 256, true));
+    test_cases.emplace_back(new test_flash_attn_ext_indexed(GGML_TYPE_F16, 8448, 2051, 4, 12, false, true, 1, 256, true));
+    // below the 4x-selection gate no GPU sparse kernel takes the indices: the op goes to the CPU
+    test_cases.emplace_back(new test_flash_attn_ext_indexed(GGML_TYPE_F16, 4096, 2051, 1, 12, false, true, 1, 256, true));
     test_cases.emplace_back(new test_flash_attn_ext(64, 128, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q1_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 64, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q1_0, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 96, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q2_0, GGML_TYPE_Q2_0));
