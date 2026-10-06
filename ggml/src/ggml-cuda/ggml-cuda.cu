@@ -1151,6 +1151,7 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
 static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
+    ggml_cuda_moe_int4_forget(ctx->device, (char *) tensor->data + offset, size); // delphi: new data is row-major again
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemsetAsync((char *) tensor->data + offset, value, size, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
@@ -1159,6 +1160,7 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
 static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
+    ggml_cuda_moe_int4_forget(ctx->device, (char *) tensor->data + offset, size); // delphi: new data is row-major again
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
@@ -1167,6 +1169,7 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
 static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
+    ggml_cuda_moe_int4_check_not_packed(ctx->device, (const char *) tensor->data + offset, size, "get_tensor");
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
@@ -1176,6 +1179,7 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
         size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
+    ggml_cuda_moe_int4_forget(ctx->device, (char *) tensor->data + offset, stride_tensor * n_copies); // delphi: new data is row-major again
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemcpy2DAsync(
         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cudaStreamPerThread));
@@ -1186,6 +1190,7 @@ static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer,
         size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
+    ggml_cuda_moe_int4_check_not_packed(ctx->device, (const char *) tensor->data + offset, stride_tensor * n_copies, "get_tensor_2d");
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemcpy2DAsync(
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cudaStreamPerThread));
@@ -1196,6 +1201,8 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
     if (ggml_backend_buffer_is_cuda(src->buffer)) {
         ggml_backend_cuda_buffer_context * src_ctx = (ggml_backend_cuda_buffer_context *)src->buffer->context;
         ggml_backend_cuda_buffer_context * dst_ctx = (ggml_backend_cuda_buffer_context *)dst->buffer->context;
+        ggml_cuda_moe_int4_check_not_packed(src_ctx->device, src->data, ggml_nbytes(src), "cpy_tensor"); // delphi: a copy would carry the kernel layout
+        ggml_cuda_moe_int4_forget(dst_ctx->device, dst->data, ggml_nbytes(dst));
         // compare the backing physical devices: distinct virtual devices may share one physical GPU,
         // in which case a same-device copy (not a peer copy) is required
         const int src_physical = ggml_cuda_get_physical_device(src_ctx->device);
@@ -1220,6 +1227,7 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
 static void ggml_backend_cuda_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
+    ggml_cuda_moe_int4_forget(ctx->device, ctx->dev_ptr, buffer->size); // delphi: new data is row-major again
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemsetAsync(ctx->dev_ptr, value, buffer->size, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
@@ -2303,14 +2311,16 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int cc) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
+    // delphi: weights of type Q4_G128 run as a Q4_0 conversion (ggml_cuda_moe_int4_shadow)
+    const ggml_type src0_type = ggml_cuda_moe_int4_dispatch_type(src0);
 
     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         return true;
     }
 
     if (dst->ne[2] <= MMVQ_MAX_BATCH_SIZE) {
-        if (ggml_is_quantized(src0->type)) {
-            if (dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc)) {
+        if (ggml_is_quantized(src0_type)) {
+            if (dst->ne[2] <= get_mmvq_mmid_max_batch(src0_type, cc)) {
                 return false;
             }
         } else if (GGML_CUDA_CC_IS_AMD(cc)) {
@@ -2318,11 +2328,11 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
         }
     }
 
-    if (ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[2], /*n_experts=*/src0->ne[2])) {
+    if (ggml_cuda_should_use_mmq(src0_type, cc, src1->ne[2], /*n_experts=*/src0->ne[2])) {
         return false;
     }
 
-    if (ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
+    if (ggml_cuda_should_use_mmf(src0_type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
         return false;
     }
 
@@ -2336,6 +2346,18 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+
+    if (src0->type == GGML_TYPE_Q4_G128) {
+        // delphi: INT4 expert weights (moe-int4-decode.cuh) outside a matched region: every expert is converted to Q4_0 in a temporary
+        // tensor, whatever state the weights are in, and the ordinary path runs on it
+        ggml_cuda_pool_alloc<char> storage(ctx.pool());
+        ggml_tensor src0_q, dst_q;
+        ggml_cuda_moe_int4_shadow(ctx, dst, storage, src0_q, dst_q);
+        ggml_exec_trace_dispatch(dst->op, GGML_EXEC_TRACE_DISPATCH_GPU_MOE_INT4, GGML_EXEC_TRACE_DISPATCH_VARIANT_UNPACKED,
+                ggml_cuda_info().devices[ctx.device].cc, (uint32_t) dst->ne[2]);
+        ggml_cuda_mul_mat_id(ctx, &dst_q);
+        return;
+    }
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -4290,11 +4312,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             const int output_idx = i + ffn_nodes - 1;
             if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, ffn_nodes, &output_idx, 1) &&
                     ggml_cuda_moe_int4_ready(*cuda_ctx, ffn)) {
-                // the trace has no dispatch value for the INT4 kernels: record the fusion without naming an implementation
-                trace_fused_mul_mat(i, node->op, GGML_EXEC_TRACE_DISPATCH_UNKNOWN);
+                trace_fused_mul_mat(i, node->op, GGML_EXEC_TRACE_DISPATCH_GPU_MOE_INT4);
                 ggml_cuda_moe_int4_run(*cuda_ctx, ffn);
                 return ffn_nodes - 1;
             }
+        }
+        if (node->src[0]->type == GGML_TYPE_Q4_G128) {
+            // The fusions below read the weights in the layout of their type, which Q4_G128 weights are not in (PACKED). This node
+            // runs alone, on the Q4_0 conversion of ggml_cuda_mul_mat_id.
+            return 0;
         }
     }
 
@@ -6463,7 +6489,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     return false;
                 }
                 if (ggml_mul_mat_id_is_partial(op) && (b->type != GGML_TYPE_F32 ||
-                        !ggml_cuda_should_use_mmq(a->type, ggml_cuda_info().devices[dev_ctx->device].cc, 1, a->ne[2]) ||
+                        !ggml_cuda_should_use_mmq(ggml_cuda_moe_int4_dispatch_type(a), ggml_cuda_info().devices[dev_ctx->device].cc, 1, a->ne[2]) ||
                         ggml_cuda_moe_packed_inplace_fmt(a) != GGML_CUDA_MOE_PACKED_NONE)) {
                     return false; // see ggml_cuda_mul_mat_id
                 }
@@ -6518,6 +6544,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_IQ5_KS:
                     case GGML_TYPE_BF16:
                         return true;
+#ifdef GGML_CUDA_MOE_INT4_AVAILABLE
+                    case GGML_TYPE_Q4_G128:
+                        // delphi: INT4 expert weights; MUL_MAT_ID only (moe-int4-decode.cuh: matched region or Q4_0 conversion)
+                        return op->op == GGML_OP_MUL_MAT_ID && ggml_cuda_moe_int4_type_supported(dev_ctx->device);
+#endif // GGML_CUDA_MOE_INT4_AVAILABLE
                     default:
                         return false;
                 }
@@ -7137,9 +7168,6 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_moe_int4_set_mode") == 0) {
         return (void *)ggml_backend_cuda_moe_int4_set_mode;
-    }
-    if (strcmp(name, "ggml_backend_cuda_moe_int4_clear") == 0) {
-        return (void *)ggml_backend_cuda_moe_int4_clear;
     }
     if (strcmp(name, "ggml_backend_cuda_moe_int4_get_stats") == 0) {
         return (void *)ggml_backend_cuda_moe_int4_get_stats;

@@ -65,6 +65,7 @@ DISPATCH_NAMES = {
     15: "CPU_FWHT",
     16: "CPU_IQP_VEC_DOT",
     17: "CPU_IQK",
+    18: "GPU_MOE_INT4",
 }
 DISPATCH_VARIANTS = {
     0: "",
@@ -74,6 +75,7 @@ DISPATCH_VARIANTS = {
     4: "fused",
     5: "sorted_fallback",
     6: "per_expert",
+    7: "unpacked",
 }
 GPU_GRAPH_STATES = {1: "capture", 2: "update", 3: "replay", 4: "fallback"}
 GPU_GRAPH_REASONS = {

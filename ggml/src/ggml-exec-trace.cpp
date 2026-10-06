@@ -204,6 +204,7 @@ const char * const DISPATCH_NAMES[GGML_EXEC_TRACE_DISPATCH_COUNT] = {
     "CPU_FWHT",
     "CPU_IQP_VEC_DOT",
     "CPU_IQK",
+    "GPU_MOE_INT4",
 };
 
 const char * const DISPATCH_VARIANT_NAMES[GGML_EXEC_TRACE_DISPATCH_VARIANT_COUNT] = {
@@ -214,6 +215,7 @@ const char * const DISPATCH_VARIANT_NAMES[GGML_EXEC_TRACE_DISPATCH_VARIANT_COUNT
     "fused",
     "sorted_fallback",
     "per_expert",
+    "unpacked",
 };
 
 uint32_t g_dispatch_name_ids[GGML_EXEC_TRACE_DISPATCH_COUNT] = {};
