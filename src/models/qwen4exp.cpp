@@ -1059,15 +1059,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    // The attention is restricted to the cells that top_k names. Two encodings exist:
-    // bake top_k into the mask for backends that treat the mask as the only source of
-    // truth, or hand top_k to flash attention as KV indices and pass the plain
-    // causal/visibility mask. With indices the sparse kernel gathers K/V rows and mask
-    // cells directly, so the O(n_kv) fill/set_rows/add and the mask-compaction kernel
-    // disappear. Backends that ignore indices (Metal, Vulkan) reject the op and ggml
-    // moves it to the CPU, which reads a full-width mask through the index. Keep the
-    // mask-backed graph for shapes whose GPU sparse kernel will not fire anyway, so
-    // those still run dense on the GPU.
+    // Direct indices avoid baking the selection into a full-width mask and compacting
+    // that mask again. Keep the baked mask when the layer device cannot use indices.
     // LLAMA_QWEN4EXP_SPARSE_ATTN: 0 dense, 1 mask-backed hint, 2 indices when the sparse
     // kernel will take them, otherwise mask-backed. Default 2.
     static const int sparse_mode = [] {
@@ -1076,24 +1069,39 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         return m < 0 ? 0 : (m > 2 ? 2 : m);
     }();
 
-    // mirrors the RDNA4 WMMA sparse gate: one stream, width 1..8, GQA 12, F16 cache,
-    // and the cache several times wider than the selection
+    // Probe the layer device before replacing the baked mask. Non-flash attention
+    // ignores kv_indices, and unsupported devices must keep their masked GPU path.
     const int64_t n_sel = top_k->ne[0];
-    const bool direct_indices = sparse_mode == 2 &&
+    bool direct_indices = cparams.flash_attn && sparse_mode == 2 &&
         n_sel < kq_mask->ne[0] && kq_mask->ne[0] >= 4*n_sel &&
         kq_mask->ne[1] <= 8 && kq_mask->ne[3] == 1 &&
+        k->ne[3] == 1 && q->ne[3] == 1 &&
         k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 &&
         hparams.n_head(il) == 12*hparams.n_head_kv(il);
+
+    ggml_tensor * kv_indices = nullptr;
+    if (direct_indices) {
+        kv_indices = ggml_reshape_3d(ctx0, top_k, n_sel, kq_mask->ne[1], kq_mask->ne[3]);
+        auto * q_fa = ggml_permute(ctx0, q, 0, 2, 1, 3);
+        auto * k_fa = ggml_permute(ctx0, k, 0, 2, 1, 3);
+        auto * v_fa = ggml_permute(ctx0, v, 0, 2, 1, 3);
+        if (v->nb[1] > v->nb[2]) {
+            v_fa = ggml_transpose(ctx0, v_fa);
+        }
+        auto * probe = ggml_flash_attn_ext(ctx0, q_fa, k_fa, v_fa, kq_mask, kq_scale,
+                hparams.f_max_alibi_bias, hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+        ggml_flash_attn_ext_set_indices(probe, kv_indices);
+        ggml_prec_set_acc(probe, GGML_PREC_F32);
+        const auto dev = model.dev_layer(il);
+        direct_indices = dev && ggml_backend_dev_supports_op(dev, probe);
+    }
 
     ggml_tensor * cur;
 
     if (direct_indices) {
-        // [n_sel, n_tps, 1, n_stream] -> [n_sel, n_tps, n_stream], no copies
-        ggml_tensor * kv_indices = ggml_reshape_3d(ctx0, top_k, n_sel, kq_mask->ne[1], kq_mask->ne[3]);
         cb(kv_indices, "kq_indices", il);
         cur = build_attn_mha(q, k, v, nullptr, kq_mask, nullptr, nullptr, 0, kq_scale, il, kv_indices);
-    }
-    else {
+    } else {
         // prepare new kq mask - starts filled with -INFINITY
         ggml_tensor * kq_mask_all = ggml_fill(ctx0, kq_mask, -INFINITY);
 
