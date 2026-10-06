@@ -2,14 +2,17 @@
 //
 //   ggml-ffn GGUF FIXTURE_DIR LAYER WIDTH REPEATS ITERATIONS [--manifest]     timing, one JSON line per fixture (--manifest: FIXTURE_DIR is
 //                                                                             a file of "WIDTH DIRECTORY" lines); DELPHI_COMPARE_PACE_US: paced bursts
-//   ggml-ffn --lifecycle GGUF_A LAYER_A FIXTURES_A GGUF_B LAYER_B FIXTURES_B  INT4 path ownership and fallback tests
-//   ggml-ffn --verify-pack GGUF LAYER REFERENCE_DIR EXPERT...                 INT4 packing against the offline packer
+//   ggml-ffn --lifecycle GGUF_A LAYER_A FIXTURES_A GGUF_B LAYER_B FIXTURES_B [Q4_0_GGUF_A]  INT4 path ownership and fallback tests; the
+//                                                                             GGUFs hold Q4_G128 experts, Q4_0_GGUF_A the same values as Q4_0
+//   ggml-ffn --verify-pack GGUF LAYER REFERENCE_DIR EXPERT...                 INT4 in-place packing against the offline packer (Q4_G128 GGUF)
+//   ggml-ffn --shapes                                                         Q4_G128 MUL_MAT_ID of shapes the executor does not take (random weights): the ordinary
+//                                                                             path on a Q4_0 conversion against a host reference
 //
 // The fixture directory holds input.f32 [M, 4096], ids.i32 [M, 8] and router.f32 [M, 8]. Optional: reference-output.f64 (ideal FP64
 // execution of the weights), cmp-orig-output.f32 (the CMP "orig" output on the matched INT4 weights), ggml-output.f32 (the output
 // of the Q4_0 path). Every run reports the error against the files that exist. DELPHI_COMPARE_OUTPUT_DIR: also write the output.
 // The graph is the one of build_moe_ffn (llama-graph.cpp): up, gate, swiglu_clamp, down, router weights, ordered slot reduction.
-// GGML_CUDA_MOE_INT4_DECODE=1 (or --lifecycle) lets the INT4 path take that graph when the weights satisfy its contract.
+// GGML_CUDA_MOE_INT4_DECODE=1 (or --lifecycle) lets the INT4 path take that graph when the weights are Q4_G128.
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -23,6 +26,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
+#include <filesystem>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -344,15 +349,17 @@ static references load_references(const std::string & dir, int width) {
 
 typedef void (*set_mode_fn)(int);
 typedef void (*stats_fn)(int64_t *);
-typedef bool (*pack_fn)(const void *, int, const void **, size_t *);
-typedef void (*clear_fn)(void);
+typedef bool (*pack_fn)(const void *, int, const void **, size_t *, size_t *);
 
 struct int4_hooks {
     set_mode_fn set_mode = nullptr;
     stats_fn    stats    = nullptr;
     pack_fn     pack     = nullptr;
-    clear_fn    clear    = nullptr;
 };
+
+// ggml_backend_cuda_moe_int4_get_stats
+enum { ST_SETS, ST_PACKS, ST_PACK_US, ST_PACKED_BYTES, ST_RUNS, ST_SCRATCH, ST_SHADOWS, ST_SHADOWS_WIDE, ST_REFUSED_ROWS, ST_REFUSED_LAYOUT,
+       ST_REFUSED_WEIGHTS, ST_REFUSED_STATE, ST_PREPARE_REFUSED, ST_COUNT = 16 };
 
 static int4_hooks get_hooks(ggml_backend_dev_t dev) {
     int4_hooks h;
@@ -360,7 +367,6 @@ static int4_hooks get_hooks(ggml_backend_dev_t dev) {
     h.set_mode = (set_mode_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_moe_int4_set_mode");
     h.stats    = (stats_fn)    ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_moe_int4_get_stats");
     h.pack     = (pack_fn)     ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_moe_int4_get_pack");
-    h.clear    = (clear_fn)    ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_moe_int4_clear");
     return h;
 }
 
@@ -471,10 +477,12 @@ static int timing_main(int argc, char ** argv) {
         session_destroy(s);
     }
     if (hooks.stats) {
-        int64_t st[8] = {};
+        int64_t st[ST_COUNT] = {};
         hooks.stats(st);
-        std::cerr << "int4 stats: entries " << st[0] << " usable " << st[1] << " incompatible " << st[2] << " builds " << st[3] << " build_us "
-                  << st[4] << " int4_bytes " << st[5] << " region_runs " << st[6] << " scratch_bytes " << st[7] << "\n";
+        std::cerr << "int4 stats: packed sets " << st[ST_SETS] << " packs " << st[ST_PACKS] << " pack_us " << st[ST_PACK_US] << " packed_bytes "
+                  << st[ST_PACKED_BYTES] << " region_runs " << st[ST_RUNS] << " scratch_bytes " << st[ST_SCRATCH] << " shadow_nodes " << st[ST_SHADOWS]
+                  << " (wide " << st[ST_SHADOWS_WIDE] << ") refused rows/layout/weights/state " << st[ST_REFUSED_ROWS] << "/" << st[ST_REFUSED_LAYOUT]
+                  << "/" << st[ST_REFUSED_WEIGHTS] << "/" << st[ST_REFUSED_STATE] << "\n";
     }
     free_bank(b);
     return 0;
@@ -524,60 +532,116 @@ static std::vector<float> run_case(const std::string & label, session & s, const
     return out;
 }
 
+// Re-uploads the expert weights of a bank from the GGUF into the same buffer (the tensors keep their addresses).
+static void reload_bank(bank & b, const std::string & model, int layer) {
+    auto uf = gguf_init_from_file(model.c_str(), {true, nullptr});
+    require(uf != nullptr, "GGUF metadata load failed");
+    for (int p = 0; p < 3; ++p) {
+        const std::string name = "blk." + std::to_string(layer) + ".ffn_" + projections[p] + "_exps.weight";
+        load_bytes(model, gguf_get_data_offset(uf) + gguf_get_tensor_offset(uf, gguf_find_tensor(uf, name.c_str())), b.weights[p]);
+    }
+    gguf_free(uf);
+}
+
+// A fixture made of the rows of other fixtures (dir, rows): input.f32, ids.i32 and router.f32 of the concatenation. Slots are independent,
+// so the rows of its output equal the rows of the outputs of the parts, on a path that computes every slot on its own.
+static std::string make_wide_fixture(const std::string & out, const std::vector<std::pair<std::string, int>> & parts) {
+    std::vector<float> input, router;
+    std::vector<int32_t> ids;
+    for (const auto & part : parts) {
+        std::vector<float> x, r;
+        std::vector<int32_t> i;
+        require(read_file(part.first + "/input.f32", size_t(part.second) * k_hidden, x) && read_file(part.first + "/router.f32", size_t(part.second) * k_topk, r) &&
+            read_file(part.first + "/ids.i32", size_t(part.second) * k_topk, i), "fixture files missing in " + part.first);
+        input.insert(input.end(), x.begin(), x.end());
+        router.insert(router.end(), r.begin(), r.end());
+        ids.insert(ids.end(), i.begin(), i.end());
+    }
+    std::filesystem::create_directories(out);
+    auto write = [&](const char * name, const void * data, size_t n) { std::ofstream f(out + "/" + name, std::ios::binary); f.write(static_cast<const char *>(data), n); };
+    write("input.f32", input.data(), input.size() * sizeof(float));
+    write("router.f32", router.data(), router.size() * sizeof(float));
+    write("ids.i32", ids.data(), ids.size() * sizeof(int32_t));
+    return out;
+}
+
+static size_t count_diff(const std::vector<char> & a, const std::vector<char> & b) {
+    size_t n = 0;
+    for (size_t j = 0; j < a.size(); ++j) { n += a[j] != b[j]; }
+    return n;
+}
+
+static bool bits_equal(const std::vector<float> & a, const std::vector<float> & b, size_t first = 0, size_t n = SIZE_MAX) {
+    if (a.size() < first || b.size() < n) { return false; }
+    n = std::min(n, a.size() - first);
+    return std::memcmp(a.data() + first, b.data(), n * sizeof(float)) == 0;
+}
+
 static int lifecycle_main(int argc, char ** argv) {
-    require(argc == 8, "usage: ggml-ffn --lifecycle GGUF_A LAYER_A FIXTURES_A GGUF_B LAYER_B FIXTURES_B");
+    require(argc == 8 || argc == 9, "usage: ggml-ffn --lifecycle GGUF_A LAYER_A FIXTURES_A GGUF_B LAYER_B FIXTURES_B [Q4_0_GGUF_A]");
     const std::string gguf_a = argv[2], gguf_b = argv[5], root_a = argv[4], root_b = argv[7];
+    const std::string q40_a = argc == 9 ? argv[8] : "";
     const int layer_a = std::stoi(argv[3]), layer_b = std::stoi(argv[6]);
+    const char * scratch_env = std::getenv("DELPHI_COMPARE_SCRATCH");
+    const std::string scratch = scratch_env ? scratch_env : "/tmp";
     auto dev = init_device();
     const int4_hooks hooks = get_hooks(dev);
     require(hooks.set_mode && hooks.stats && hooks.pack, "INT4 test hooks missing from the CUDA backend");
-    auto stats = [&]() { std::vector<int64_t> v(8); hooks.stats(v.data()); return v; };
+    auto stats = [&]() { std::vector<int64_t> v(ST_COUNT); hooks.stats(v.data()); return v; };
 
-    const case_ref a3 = make_case(root_a, "d00-w3"), a4 = make_case(root_a, "d00-w4"), a8 = make_case(root_a, "d00-w8"), a9 = make_case(root_a, "d00-w9"), as3 = make_case(root_a, "s00-w3");
+    const case_ref a3 = make_case(root_a, "d00-w3"), a4 = make_case(root_a, "d00-w4"), a7 = make_case(root_a, "d00-w7"), a8 = make_case(root_a, "d00-w8"),
+        a9 = make_case(root_a, "d00-w9"), as3 = make_case(root_a, "s00-w3");
     const case_ref b9 = make_case(root_b, "d00-w9");
+    require(!a3.ref.ggml.empty() && !a9.ref.ggml.empty() && !as3.ref.ggml.empty(), "the fixtures lack ggml-output.f32 (the Q4_0 path of the same values)");
 
-    // A. first use: preparation, path, numerics
+    // A. first use: packing in place, path, numerics, no second copy of the weights
     hooks.set_mode(1);
     bank bk = load_bank(dev, gguf_a, layer_a);
+    require(bk.weights[0]->type == GGML_TYPE_Q4_G128, "GGUF_A must hold Q4_G128 experts");
     const void * address_a = bk.weights[0]->data;
-    session s3, s4, s8, s9, ss3;
+    session s3, s4, s7, s8, s9, ss3;
     const size_t vram_start = free_vram();
     session_create(s3, dev, bk, 3, a3.dir);
     session_warm(s3);
     const std::vector<float> first3 = run_case("A first width 3", s3, a3, true);
     auto st = stats();
-    check(st[0] == 1 && st[1] == 1 && st[3] == 1 && st[2] == 0, "A one INT4 copy built, none incompatible (entries " + std::to_string(st[0]) + ", builds " + std::to_string(st[3]) + ")");
+    check(st[ST_SETS] == 1 && st[ST_PACKS] == 1 && st[ST_PREPARE_REFUSED] == 0, "A the weights were packed in place once (sets " + std::to_string(st[ST_SETS]) + ", packs " + std::to_string(st[ST_PACKS]) + ")");
     check(s3.n_kernel_nodes == 5 && s3.n_other_nodes == 0, "A the captured FFN is five kernels: no memcpy, memset or host node");
     std::cout << "INFO A kernels of the INT4 path:"; for (const auto & k : s3.kernels) { std::cout << " " << k.substr(0, 80) << ";"; } std::cout << std::endl;
-    std::cout << "INFO A int4 bytes " << st[5] << " scratch bytes " << st[7] << " build ms " << st[4] / 1000.0 << " free VRAM drop MiB " << (double(vram_start) - double(free_vram())) / 1048576.0 << std::endl;
+    const double vram_drop_mib = (double(vram_start) - double(free_vram())) / 1048576.0;
+    std::cout << "INFO A packed bytes " << st[ST_PACKED_BYTES] << " scratch bytes " << st[ST_SCRATCH] << " pack ms " << st[ST_PACK_US] / 1000.0 << " free VRAM drop MiB " << vram_drop_mib << std::endl;
+    check(vram_drop_mib < 64, "A first use needs scratch memory only, no second copy of the weights");
 
-    // B. repeated replay: same bits, no memory growth, no new builds
+    // B. repeated replay: same bits, no memory growth, no new packing or captures
     const size_t vram_before = free_vram();
     session_replay(s3, 3000);
     CUDA_CHECK(cudaStreamSynchronize(s3.stream));
     check(session_output(s3) == first3, "B 3000 replays: output unchanged bitwise");
     check(free_vram() == vram_before, "B no device memory growth during replay");
     auto st2 = stats();
-    check(st2[3] == st[3] && st2[6] == st[6], "B no new builds or captures during replay");
+    check(st2[ST_PACKS] == st[ST_PACKS] && st2[ST_RUNS] == st[ST_RUNS], "B no new packing or captures during replay");
 
-    // C. several widths on one backend context (distinct widths: same shapes share one captured graph) and the real shallow input on
-    //    its own context; replay all graphs interleaved
+    // C. several widths on one backend context (distinct widths: same shapes share one captured graph), the boundary width 16, and the real
+    //    shallow input on its own context; replay all graphs interleaved
     session_create(s4, dev, bk, 4, a4.dir, s3.backend); session_warm(s4);
+    session_create(s7, dev, bk, 7, a7.dir, s3.backend); session_warm(s7);
     session_create(s8, dev, bk, 8, a8.dir, s3.backend); session_warm(s8);
     session_create(s9, dev, bk, 9, a9.dir, s3.backend); session_warm(s9);
     session_create(ss3, dev, bk, 3, as3.dir); session_warm(ss3); // own context: a width-3 graph on s3's context would share its key
     const std::vector<float> o4 = run_case("C width 4", s4, a4, true);
+    const std::vector<float> o7 = run_case("C width 7", s7, a7, true);
     const std::vector<float> o8 = run_case("C width 8", s8, a8, true);
     const std::vector<float> o9 = run_case("C width 9", s9, a9, true);
     const std::vector<float> os3 = run_case("C actual shallow width 3", ss3, as3, true);
-    check(stats()[3] == 1, "C the widths reuse the one INT4 copy");
-    session * all[] = {&s3, &s4, &s8, &s9, &ss3};
+    check(stats()[ST_PACKS] == 1, "C the widths reuse the packed weights");
+    session * all[] = {&s3, &s4, &s7, &s8, &s9, &ss3};
+    const int n_all = 6;
     for (int round = 0; round < 40; ++round) {
-        for (int i = 0; i < 5; ++i) { session_replay(*all[(i + round) % 5], 1 + (round + i) % 3); }
+        for (int i = 0; i < n_all; ++i) { session_replay(*all[(i + round) % n_all], 1 + (round + i) % 3); }
     }
     for (session * s : all) { CUDA_CHECK(cudaStreamSynchronize(s->stream)); }
-    check(session_output(s3) == first3 && session_output(s4) == o4 && session_output(s8) == o8 && session_output(s9) == o9 && session_output(ss3) == os3,
-        "C interleaved replays of five graphs on one context: every output unchanged bitwise");
+    check(session_output(s3) == first3 && session_output(s4) == o4 && session_output(s7) == o7 && session_output(s8) == o8 && session_output(s9) == o9 && session_output(ss3) == os3,
+        "C interleaved replays of six graphs on one context: every output unchanged bitwise");
     check(std::equal(o4.begin(), o4.begin() + 3 * k_hidden, first3.begin()), "C width-3 rows equal the first rows of the width-4 run (slots are independent)");
 
     // D. two backend contexts on the device replay without synchronisation: scratch is per context
@@ -589,65 +653,84 @@ static int lifecycle_main(int argc, char ** argv) {
     check(session_output(d9) == o9 && session_output(s9) == o9 && session_output(s3) == first3, "D concurrent contexts and graphs: outputs unchanged bitwise");
     session_destroy(d9);
 
-    // E. teardown and reload: the next buffer may take the address of the old one; the INT4 copy must not survive it
-    for (int i = 4; i >= 0; --i) { session_destroy(*all[i]); } // s3 owns the context that s4, s8 and s9 use: it goes last
+    // E. the limit of the INT4 path: 16 rows run on it (rows equal the rows of the runs that they were cut from), 17 rows take the ordinary
+    //    path on a Q4_0 conversion of the experts (equal bitwise to the Q4_0 path of the same values)
+    {
+        const std::string w16 = make_wide_fixture(scratch + "/ggml-ffn-wide16", {{a9.dir, 9}, {a7.dir, 7}});
+        session t16;
+        session_create(t16, dev, bk, 16, w16); session_warm(t16);
+        const std::vector<float> o16 = session_output(t16);
+        check(session_uses(t16, "moe_dec_gemm") && t16.n_kernel_nodes == 5, "E width 16 runs on the INT4 path (5 kernels)");
+        check(bits_equal(o16, o9, 0, 9 * k_hidden) && std::equal(o16.begin() + 9 * k_hidden, o16.end(), o7.begin()), "E width 16: rows equal the rows of the width-9 and width-7 runs they were cut from (bitwise)");
+        session_destroy(t16);
+        const auto before = stats();
+        const std::string w17 = make_wide_fixture(scratch + "/ggml-ffn-wide17", {{a9.dir, 9}, {a8.dir, 8}});
+        session t17;
+        session_create(t17, dev, bk, 17, w17); session_warm(t17);
+        const std::vector<float> o17 = session_output(t17);
+        const auto after = stats();
+        check(!session_uses(t17, "moe_dec_gemm"), "E width 17: the INT4 region is refused, the ordinary path runs (" + std::to_string(t17.n_kernel_nodes) + " kernels)");
+        check(after[ST_REFUSED_ROWS] > before[ST_REFUSED_ROWS] && after[ST_SHADOWS_WIDE] >= before[ST_SHADOWS_WIDE] + 3, "E width 17: counted (refused rows, three wide conversions)");
+        std::cout << "INFO E kernels of width 17:"; for (const auto & k : t17.kernels) { std::cout << " " << k.substr(0, 60) << ";"; } std::cout << std::endl;
+        if (!q40_a.empty()) {
+            bank bq = load_bank(dev, q40_a, layer_a);
+            session q17;
+            session_create(q17, dev, bq, 17, w17); session_warm(q17);
+            check(session_output(q17) == o17, "E width 17: equals the Q4_0 path of the same values bitwise");
+            session_destroy(q17);
+            free_bank(bq);
+        }
+        session_destroy(t17);
+    }
+
+    // F. the INT4 executor off, weights still PACKED: every node converts the packed bytes to Q4_0; the results equal the Q4_0 path bitwise
+    hooks.set_mode(0);
+    for (const case_ref * c : {&a3, &a4, &a8, &a9, &as3}) {
+        session f;
+        session_create(f, dev, bk, c->width, c->dir); session_warm(f);
+        const std::vector<float> fo = session_output(f);
+        const error_stats q = compare_outputs(fo, c->ref.ggml);
+        check(!session_uses(f, "moe_dec_gemm") && session_uses(f, "moe_int4_packed_to_q4_0") && q.nmse <= 1e-10,
+            std::string("F executor off, packed weights, ") + c->dir.substr(c->dir.find_last_of('/') + 1) + ": Q4_0 conversion, equals the Q4_0 path " + describe(q));
+        session_destroy(f);
+    }
+    hooks.set_mode(1);
+
+    // G. a write into the weight buffer forgets the packed state: with the executor off the row-major bytes are converted; with it on the
+    //    weights are packed again
+    for (int i = n_all - 1; i >= 0; --i) { session_destroy(*all[i]); } // s3 owns the context that s4, s7, s8 and s9 use: it goes last
+    reload_bank(bk, gguf_a, layer_a);
+    check(stats()[ST_SETS] == 0, "G a write into the weight buffer forgets the packed set");
+    {
+        hooks.set_mode(0);
+        session g;
+        session_create(g, dev, bk, 3, a3.dir); session_warm(g);
+        const error_stats q = compare_outputs(session_output(g), a3.ref.ggml);
+        check(session_uses(g, "moe_int4_rowmajor_to_q4_0") && q.nmse <= 1e-10, "G row-major weights, executor off: Q4_0 conversion, equals the Q4_0 path " + describe(q));
+        session_destroy(g);
+        hooks.set_mode(1);
+        const auto before = stats();
+        session g2;
+        session_create(g2, dev, bk, 3, a3.dir); session_warm(g2);
+        run_case("G repacked width 3", g2, a3, true);
+        check(stats()[ST_PACKS] == before[ST_PACKS] + 1, "G the weights were packed again");
+        check(session_output(g2) == first3, "G the repacked weights give the first output bitwise");
+        session_destroy(g2);
+    }
+
+    // H. teardown and reload: the next buffer may take the address of the old one; the packed state must not survive it
     free_bank(bk);
-    check(stats()[0] == 0, "E freeing the weight buffer forgets its INT4 copy");
+    check(stats()[ST_SETS] == 0, "H freeing the weight buffer forgets its packed set");
     bank bb = load_bank(dev, gguf_b, layer_b);
-    std::cout << "INFO E second weights at " << bb.weights[0]->data << (bb.weights[0]->data == address_a ? " (the same address as the first)" : " (a different address)") << std::endl;
+    std::cout << "INFO H second weights at " << bb.weights[0]->data << (bb.weights[0]->data == address_a ? " (the same address as the first)" : " (a different address)") << std::endl;
     session t9;
+    const int64_t packs_before = stats()[ST_PACKS];
     session_create(t9, dev, bb, 9, b9.dir); session_warm(t9);
-    const std::vector<float> ob9 = run_case("E reload, other layer, width 9", t9, b9, true);
-    check(compare_outputs(ob9, a9.ref.golden).nmse > 1e-3, "E the reloaded weights give different output than the first weights (no stale INT4 copy)");
-    check(stats()[3] == 2, "E the INT4 copy was rebuilt");
+    const std::vector<float> ob9 = run_case("H reload, other layer, width 9", t9, b9, true);
+    check(compare_outputs(ob9, a9.ref.golden).nmse > 1e-3, "H the reloaded weights give different output than the first weights (no stale packed state)");
+    check(stats()[ST_PACKS] == packs_before + 1, "H the reloaded weights were packed");
     session_destroy(t9);
     free_bank(bb);
-
-    // F. A scale group that breaks the contract keeps the old path
-    struct variant { const char * name; bool equal_but_inexact; };
-    for (const variant & v : {variant{"unequal block scales", false}, variant{"equal but not BF16 scales", true}}) {
-        bank bs = load_bank(dev, gguf_a, layer_a);
-        // gate expert 7, row 3, group of 128 values 5 = Q4_0 blocks 20..23 of that row
-        const ggml_tensor * g = bs.weights[0];
-        const size_t row_off = size_t(7) * g->nb[2] + size_t(3) * g->nb[1];
-        for (int blk = 20; blk < 24; ++blk) {
-            uint16_t d = 0;
-            ggml_backend_tensor_get(bs.weights[0], &d, row_off + blk * 18, 2);
-            if (v.equal_but_inexact) { d = 0x3c01; }                // 1.0009765625 = 1 + 2^-10: not a BF16 value
-            else if (blk == 22) { d = uint16_t(d ^ 0x0400); }      // one of the four differs
-            ggml_backend_tensor_set(bs.weights[0], &d, row_off + blk * 18, 2);
-        }
-        const auto before = stats();
-        session f3, ref3;
-        hooks.set_mode(1);
-        session_create(f3, dev, bs, 3, a3.dir); session_warm(f3);
-        const std::vector<float> fo = session_output(f3);
-        check(!session_uses(f3, "moe_dec_gemm"), std::string("F ") + v.name + ": the old path runs");
-        auto after = stats();
-        check(after[2] == before[2] + 1 && after[3] == before[3], std::string("F ") + v.name + ": counted as incompatible, no INT4 copy built");
-        session_destroy(f3);
-        hooks.set_mode(0);
-        session_create(ref3, dev, bs, 3, a3.dir); session_warm(ref3);
-        check(session_output(ref3) == fo, std::string("F ") + v.name + ": output equals the switch-off output bitwise");
-        session_destroy(ref3);
-        free_bank(bs);
-        hooks.set_mode(1);
-    }
-
-    // G. the switch off restores the previous path: same kernels and bits as the archived Q4_0 output of this graph
-    hooks.set_mode(0);
-    bank bo = load_bank(dev, gguf_a, layer_a);
-    session o3;
-    session_create(o3, dev, bo, 3, a3.dir); session_warm(o3);
-    const std::vector<float> oo3 = session_output(o3);
-    check(!session_uses(o3, "moe_dec_gemm"), "G switch off: no INT4 kernel in the captured graph (" + std::to_string(o3.n_kernel_nodes) + " kernels)");
-    std::cout << "INFO G kernels of the Q4_0 path:"; for (const auto & k : o3.kernels) { std::cout << " " << k.substr(0, 80) << ";"; } std::cout << std::endl;
-    if (!a3.ref.ggml.empty()) {
-        const error_stats q = compare_outputs(oo3, a3.ref.ggml);
-        check(q.nmse <= 1e-10, "G switch off: output equals the archived Q4_0 output of the preceding experiment " + describe(q));
-    }
-    session_destroy(o3);
-    free_bank(bo);
     hooks.set_mode(-1);
     std::cout << (g_failures == 0 ? "ALL PASS" : "FAILURES: " + std::to_string(g_failures)) << std::endl;
     return g_failures == 0 ? 0 : 1;
@@ -656,8 +739,10 @@ static int lifecycle_main(int argc, char ** argv) {
 // ---- packing against the offline packer ------------------------------------------------------------------------------------------------
 
 // REFERENCE_DIR holds w13_e<E>.bin, s13_e<E>.bin, w2_e<E>.bin and s2_e<E>.bin per expert, cut from the marlin-int4.pt of the same
-// layer by tools/cmp-int4-compare/dump-reference-pack.py (the packer of the CMP experiments). DELPHI_COMPARE_FIXTURE: a width-3
-// fixture directory; running it builds the INT4 copy.
+// layer by tools/cmp-int4-compare/dump-reference-pack.py (the packer of the CMP experiments): W13 codes int32 [256][8192] (gate words
+// 0..4095 of a row, up words 4096..8191), W13 scales bf16 [32][4096] (gate columns 0..2047, up 2048..4095), W2 codes [128][8192], W2 scales
+// [16][4096]. Every tensor is packed on its own (one matrix per tensor, codes then scales inside its expert), so the reference is sliced.
+// DELPHI_COMPARE_FIXTURE: a width-3 fixture directory; running it packs the weights.
 static int verify_pack_main(int argc, char ** argv) {
     require(argc >= 6, "usage: ggml-ffn --verify-pack GGUF LAYER REFERENCE_DIR EXPERT...");
     const std::string model = argv[2], refdir = argv[4];
@@ -672,25 +757,34 @@ static int verify_pack_main(int argc, char ** argv) {
     session s;
     session_create(s, dev, b, 3, fixture);
     session_warm(s);
-    const char * names[] = {"w13", "s13", "w2", "s2"};
-    size_t total_bytes[4] = {};
-    const void * base[4] = {};
-    for (int w = 0; w < 4; ++w) {
-        require(hooks.pack(b.weights[0]->data, w, &base[w], &total_bytes[w]), "no INT4 copy was built");
+    const void * codes[3] = {}, * scales[3] = {};
+    size_t codes_bytes = 0, scales_bytes = 0, stride = 0;
+    for (int p = 0; p < 3; ++p) {
+        require(hooks.pack(b.weights[p]->data, 0, &codes[p], &codes_bytes, &stride) && hooks.pack(b.weights[p]->data, 1, &scales[p], &scales_bytes, &stride), "the weights were not packed");
     }
+    require(codes_bytes == 4194304 && scales_bytes == 131072, "unexpected packed sizes");
+    auto device_bytes = [&](const void * base, size_t expert, size_t n) {
+        std::vector<char> v(n);
+        CUDA_CHECK(cudaMemcpy(v.data(), static_cast<const char *>(base) + stride * expert, n, cudaMemcpyDeviceToHost));
+        return v;
+    };
     for (int i = 5; i < argc; ++i) {
         const int expert = std::stoi(argv[i]);
-        for (int w = 0; w < 4; ++w) {
-            const size_t per_expert = total_bytes[w] / k_experts;
-            std::vector<char> ref;
-            require(read_file(refdir + "/" + names[w] + "_e" + std::to_string(expert) + ".bin", per_expert, ref), std::string("reference file missing or short: ") + names[w]);
-            std::vector<char> mine(per_expert);
-            CUDA_CHECK(cudaMemcpy(mine.data(), static_cast<const char *>(base[w]) + per_expert * expert, per_expert, cudaMemcpyDeviceToHost));
-            size_t bad = 0, first_bad = 0;
-            for (size_t j = 0; j < per_expert; ++j) { if (mine[j] != ref[j]) { if (bad++ == 0) { first_bad = j; } } }
-            check(bad == 0, std::string("pack ") + names[w] + " expert " + std::to_string(expert) + ": " + std::to_string(per_expert) + " bytes, " + std::to_string(bad) + " differ" +
-                (bad ? " (first at byte " + std::to_string(first_bad) + ")" : ""));
+        std::vector<char> w13, s13, w2, s2;
+        require(read_file(refdir + "/w13_e" + std::to_string(expert) + ".bin", 256 * 8192 * 4, w13) && read_file(refdir + "/s13_e" + std::to_string(expert) + ".bin", 32 * 4096 * 2, s13) &&
+            read_file(refdir + "/w2_e" + std::to_string(expert) + ".bin", 128 * 8192 * 4, w2) && read_file(refdir + "/s2_e" + std::to_string(expert) + ".bin", 16 * 4096 * 2, s2),
+            "reference files missing or short for expert " + std::to_string(expert));
+        for (int p = 0; p < 2; ++p) { // gate, up: slices of W13
+            std::vector<char> ec(codes_bytes), es(scales_bytes);
+            for (int r = 0; r < 256; ++r) { std::memcpy(ec.data() + size_t(r) * 4096 * 4, w13.data() + (size_t(r) * 8192 + p * 4096) * 4, 4096 * 4); }
+            for (int g = 0; g < 32; ++g) { std::memcpy(es.data() + size_t(g) * 2048 * 2, s13.data() + (size_t(g) * 4096 + p * 2048) * 2, 2048 * 2); }
+            const std::vector<char> mc = device_bytes(codes[p], expert, codes_bytes), ms = device_bytes(scales[p], expert, scales_bytes);
+            const size_t bad_c = count_diff(mc, ec), bad_s = count_diff(ms, es);
+            check(bad_c == 0 && bad_s == 0, std::string("pack ") + projections[p] + " expert " + std::to_string(expert) + ": " + std::to_string(codes_bytes) + " code bytes " + std::to_string(bad_c) + " differ, " + std::to_string(scales_bytes) + " scale bytes " + std::to_string(bad_s) + " differ");
         }
+        const std::vector<char> mc = device_bytes(codes[2], expert, codes_bytes), ms = device_bytes(scales[2], expert, scales_bytes);
+        const size_t bad_c = count_diff(mc, w2), bad_s = count_diff(ms, s2);
+        check(bad_c == 0 && bad_s == 0, "pack down expert " + std::to_string(expert) + ": " + std::to_string(codes_bytes) + " code bytes " + std::to_string(bad_c) + " differ, " + std::to_string(scales_bytes) + " scale bytes " + std::to_string(bad_s) + " differ");
     }
     session_destroy(s);
     free_bank(b);
@@ -698,9 +792,85 @@ static int verify_pack_main(int argc, char ** argv) {
     return g_failures == 0 ? 0 : 1;
 }
 
+// ---- shapes the executor does not take ---------------------------------------------------------------------------------------------------
+// A lone MUL_MAT_ID with Q4_G128 weights (no matched region, other shapes, GLM shapes outside a region) runs on a Q4_0 conversion of the
+// experts, from the row-major state the weights have, and must match the host product of the dequantized weights within the error of the
+// Q8_1 activations of the ordinary kernels.
+static int shapes_main() {
+    auto dev = init_device();
+    const int4_hooks hooks = get_hooks(dev);
+    require(hooks.set_mode && hooks.stats, "INT4 test hooks missing from the CUDA backend");
+    hooks.set_mode(1);
+    ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+    require(backend != nullptr, "backend init failed");
+    struct shape_case { int64_t k, n, e; int m, used; };
+    const shape_case cases[] = {{256, 64, 16, 1, 4}, {384, 128, 8, 5, 2}, {512, 96, 12, 40, 6}, {4096, 2048, 32, 3, 8}, {2048, 4096, 32, 17, 8}, {640, 192, 24, 1, 8}};
+    uint32_t seed = 12345;
+    auto rnd = [&]() { seed = seed * 1664525u + 1013904223u; return (int) (seed >> 8) / 8388608.0f - 1.0f; };
+    for (const auto & c : cases) {
+        int64_t before[ST_COUNT] = {};
+        hooks.stats(before);
+        ggml_init_params params = {16 * 1024 * 1024, nullptr, true};
+        ggml_context * ctx = ggml_init(params);
+        ggml_tensor * w   = ggml_new_tensor_3d(ctx, GGML_TYPE_Q4_G128, c.k, c.n, c.e);
+        ggml_tensor * x   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, c.k, 1, c.m);
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, c.used, c.m);
+        ggml_tensor * out = ggml_mul_mat_id(ctx, w, x, ids);
+        ggml_cgraph * graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, out);
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+        require(buf != nullptr, "allocation failed");
+        // weights: random values, quantized row by row
+        std::vector<float> wf((size_t) c.k * c.n * c.e), xf((size_t) c.k * c.m);
+        for (auto & v : wf) { v = rnd(); }
+        for (auto & v : xf) { v = rnd(); }
+        std::vector<char> wq(ggml_nbytes(w));
+        ggml_quantize_chunk(GGML_TYPE_Q4_G128, wf.data(), wq.data(), 0, c.n * c.e, c.k, nullptr);
+        std::vector<float> wd(wf.size());
+        ggml_get_type_traits(GGML_TYPE_Q4_G128)->to_float(wq.data(), wd.data(), (int64_t) wd.size());
+        std::vector<int32_t> idv((size_t) c.used * c.m);
+        for (int t = 0; t < c.m; ++t) {
+            for (int u = 0; u < c.used; ++u) { idv[(size_t) t * c.used + u] = (int32_t) ((t * 5 + u * 3 + (t % 3)) % c.e); }
+        }
+        ggml_backend_tensor_set(w, wq.data(), 0, wq.size());
+        ggml_backend_tensor_set(x, xf.data(), 0, xf.size() * sizeof(float));
+        ggml_backend_tensor_set(ids, idv.data(), 0, idv.size() * sizeof(int32_t));
+        const bool supported = ggml_backend_supports_op(backend, out);
+        check(supported, "k " + std::to_string(c.k) + " n " + std::to_string(c.n) + " e " + std::to_string(c.e) + " rows " + std::to_string(c.m) + ": MUL_MAT_ID on Q4_G128 weights is supported");
+        if (supported) {
+            require(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "compute failed");
+            std::vector<float> got((size_t) c.n * c.used * c.m);
+            ggml_backend_tensor_get(out, got.data(), 0, got.size() * sizeof(float));
+            double num = 0, den = 0;
+            for (int t = 0; t < c.m; ++t) {
+                for (int u = 0; u < c.used; ++u) {
+                    const float * wp = wd.data() + (size_t) idv[(size_t) t * c.used + u] * c.n * c.k;
+                    for (int64_t r = 0; r < c.n; ++r) {
+                        double acc = 0;
+                        for (int64_t kk = 0; kk < c.k; ++kk) { acc += (double) wp[r * c.k + kk] * xf[(size_t) t * c.k + kk]; }
+                        const double d = got[((size_t) t * c.used + u) * c.n + r] - acc;
+                        num += d * d; den += acc * acc;
+                    }
+                }
+            }
+            const double rel = std::sqrt(num / std::max(den, 1e-30));
+            int64_t after[ST_COUNT] = {};
+            hooks.stats(after);
+            check(rel < 0.03, "  output matches the host product of the dequantized weights: relative L2 " + std::to_string(rel));
+            check(after[ST_SHADOWS] == before[ST_SHADOWS] + 1 && after[ST_PACKS] == before[ST_PACKS] && after[ST_RUNS] == before[ST_RUNS], "  one shadow conversion, no packing, no region");
+        }
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+    }
+    ggml_backend_free(backend);
+    std::cout << (g_failures == 0 ? "ALL PASS" : "FAILURES: " + std::to_string(g_failures)) << std::endl;
+    return g_failures == 0 ? 0 : 1;
+}
+
 int main(int argc, char ** argv) try {
     if (argc >= 2 && std::string(argv[1]) == "--lifecycle") { return lifecycle_main(argc, argv); }
     if (argc >= 2 && std::string(argv[1]) == "--verify-pack") { return verify_pack_main(argc, argv); }
+    if (argc >= 2 && std::string(argv[1]) == "--shapes") { return shapes_main(); }
     return timing_main(argc, argv);
 } catch (const std::exception & ex) {
     std::cerr << ex.what() << '\n'; return 1;
