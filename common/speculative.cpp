@@ -26,6 +26,8 @@
 #include <iomanip>
 #include <map>
 #include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
 
 #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SPC_TRC(fmt, ...) LOG_TRC("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -33,6 +35,111 @@
 #define SPC_WRN(fmt, ...) LOG_WRN("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SPC_ERR(fmt, ...) LOG_ERR("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SPC_CNT(fmt, ...) LOG_CNT(""              fmt,               __VA_ARGS__)
+
+// ---- opt-in cycle ledger (see speculative.h) ----
+
+#include <atomic>
+
+namespace {
+
+struct spec_ledger_rec {
+    uint64_t t0 = 0, t1 = 0, x = 0;
+    int64_t  a = 0, b = 0, c = 0;
+    uint16_t stage = 0;    // span stage, or witness kind
+    uint16_t witness = 0;
+    uint32_t n_ids = 0;
+    int32_t  ids[16] = {};
+};
+
+struct spec_ledger {
+    bool                          on = false;
+    std::string                   path;
+    std::vector<spec_ledger_rec>  recs;
+    std::atomic<uint32_t>         n { 0 };
+
+    spec_ledger() {
+        const char * p = std::getenv("DELPHI_SPEC_LEDGER");
+        if (p && p[0]) {
+            on   = true;
+            path = p;
+            recs.resize(1u << 18);
+        }
+    }
+
+    spec_ledger_rec * next() {
+        const uint32_t i = n.fetch_add(1, std::memory_order_relaxed);
+        return i < recs.size() ? &recs[i] : nullptr;
+    }
+
+    void flush() {
+        if (!on) {
+            return;
+        }
+        FILE * f = std::fopen(path.c_str(), "w");
+        if (!f) {
+            return;
+        }
+        const uint32_t count = std::min<uint32_t>(n.load(), (uint32_t) recs.size());
+        for (uint32_t i = 0; i < count; ++i) {
+            const auto & r = recs[i];
+            if (r.witness) {
+                std::fprintf(f, "{\"w\":%u,\"t\":%" PRIu64 ",\"a\":%" PRId64 ",\"b\":%" PRId64 ",\"c\":%" PRId64 ",\"ids\":[", r.stage, r.t0, r.a, r.b, r.c);
+                for (uint32_t k = 0; k < r.n_ids; ++k) {
+                    std::fprintf(f, k ? ",%d" : "%d", r.ids[k]);
+                }
+                std::fprintf(f, "]}\n");
+            } else {
+                std::fprintf(f, "{\"s\":%u,\"t0\":%" PRIu64 ",\"t1\":%" PRIu64 ",\"a\":%" PRId64 ",\"b\":%" PRId64 ",\"c\":%" PRId64 ",\"x\":%" PRIu64 "}\n",
+                        r.stage, r.t0, r.t1, r.a, r.b, r.c, r.x);
+            }
+        }
+        if (n.load() > recs.size()) {
+            std::fprintf(f, "{\"dropped\":%u}\n", n.load() - (uint32_t) recs.size());
+        }
+        std::fclose(f);
+    }
+
+    ~spec_ledger() { flush(); }
+};
+
+spec_ledger & spec_ledger_get() {
+    static spec_ledger ledger;
+    return ledger;
+}
+
+} // namespace
+
+bool common_spec_ledger_on() {
+    return spec_ledger_get().on;
+}
+
+uint64_t common_spec_ledger_now() {
+    return spec_ledger_get().on ? ggml_exec_trace_now_ns() : 0;
+}
+
+void common_spec_ledger_span(common_spec_ledger_stage stage, uint64_t t0_ns, uint32_t a, uint32_t b, uint32_t c, uint64_t x) {
+    auto & ledger = spec_ledger_get();
+    if (!ledger.on) {
+        return;
+    }
+    if (auto * r = ledger.next()) {
+        r->t0 = t0_ns; r->t1 = ggml_exec_trace_now_ns(); r->stage = stage; r->a = a; r->b = b; r->c = c; r->x = x;
+    }
+}
+
+void common_spec_ledger_witness(common_spec_ledger_witness_kind kind, const int32_t * ids, uint32_t n, int64_t a, int64_t b, int64_t c) {
+    auto & ledger = spec_ledger_get();
+    if (!ledger.on) {
+        return;
+    }
+    if (auto * r = ledger.next()) {
+        r->t0 = ggml_exec_trace_now_ns(); r->stage = kind; r->witness = 1; r->a = a; r->b = b; r->c = c;
+        r->n_ids = std::min<uint32_t>(n, 16);
+        for (uint32_t k = 0; k < r->n_ids; ++k) {
+            r->ids[k] = ids[k];
+        }
+    }
+}
 
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
 #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
@@ -1167,6 +1274,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                 // gather target features per extract layer; the fused decode encodes and
                 // injects them into the K/V cache at the target positions
+                const uint64_t t_gather = common_spec_ledger_now();
                 batch_inject.n_tokens = n_chunk;
                 for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
                     const float * layer = tgt.layer_inp((uint32_t) target_layer_ids[k]);
@@ -1192,7 +1300,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     batch_inject.seq_id[i][0] = seq_id;
                     batch_inject.logits[i]    = false;
                 }
+                common_spec_ledger_span(COMMON_SPEC_LEDGER_FEAT_GATHER, t_gather, n_chunk, target_layer_ids_n, 0,
+                        (uint64_t) n_chunk * n_embd_enc * sizeof(float));
+                const uint64_t t_ingest = common_spec_ledger_now();
                 const int32_t rc = llama_decode(ctx_dft, batch_inject);
+                common_spec_ledger_span(COMMON_SPEC_LEDGER_DFT_INGEST, t_ingest, n_chunk,
+                        (uint32_t) batch_inject.pos[0], (uint32_t) batch_inject.pos[n_chunk - 1]);
                 if (rc != 0) {
                     LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
                             __func__, rc, (int) n_chunk, (int) offset);
@@ -1239,7 +1352,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         // decode all sequence's noise block in a single batch
+        const uint64_t t_block = common_spec_ledger_now();
         int ret = llama_decode(ctx_dft, batch);
+        common_spec_ledger_span(COMMON_SPEC_LEDGER_DFT_BLOCK, t_block, batch.n_tokens, params.n_max);
         if (ret != 0) {
             LOG_WRN("%s: llama_decode returned %d\n", __func__, ret);
             return;
@@ -1259,9 +1374,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             auto & result = *dp.result;
 
             if (is_dflash2) {
+                // the getter synchronizes ctx_dft: it also waits for the ingest and block decodes that precede it
+                const uint64_t t_lattice = common_spec_ledger_now();
                 const float * lattice = llama_get_embeddings_nextn(ctx_dft);
+                common_spec_ledger_span(COMMON_SPEC_LEDGER_DFT_LATTICE, t_lattice, n_block_tokens, 0,
+                        (uint32_t) ((selector_top_k + selector_top_k * selector_top_k) * sizeof(float)),
+                        (uint64_t) batch.n_tokens * n_embd_dec * sizeof(float));
                 GGML_ASSERT(lattice && "DFlash2 selector produced no lattice");
 
+                const uint64_t t_walk = common_spec_ledger_now();
+                int32_t cutoff = 0;
                 int32_t predecessor = 0;
                 for (int32_t i = 1; i < n_block_tokens; ++i) {
                     const float * row = lattice + (size_t) (beg + i) * n_embd_dec;
@@ -1276,10 +1398,18 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                             sum += std::exp(scores[k] - scores[predecessor]);
                         }
                         if (1.0f / sum < params.p_min) {
+                            cutoff = i;
                             break;
                         }
                     }
                     result.push_back((llama_token) row[predecessor]);
+                }
+
+                common_spec_ledger_span(COMMON_SPEC_LEDGER_DFT_WALK, t_walk, (uint32_t) result.size(), n_block_tokens);
+                if (common_spec_ledger_on()) {
+                    std::vector<int32_t> ids(result.begin(), result.end());
+                    common_spec_ledger_witness(COMMON_SPEC_WITNESS_CANDIDATES, ids.data(), (uint32_t) ids.size(),
+                            n_block_tokens, cutoff, (int64_t) (params.p_min * 1e6f));
                 }
 
                 if (result.size() < (size_t) params.n_min) {
@@ -2909,6 +3039,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
 }
 
 void common_speculative_free(common_speculative * spec) {
+    spec_ledger_get().flush();
     if (spec == nullptr) {
         return;
     }
@@ -2957,10 +3088,18 @@ bool common_speculative_process(common_speculative * spec, const llama_batch & b
         return true;
     }
 
+    const uint64_t t_process = common_spec_ledger_now();
     const bool ok = common_speculative_wait(spec);
 
     const common_speculative_tgt_features tgt = { spec->ctx_tgt, -1 };
-    return common_speculative_process_impl(spec, batch, tgt) && ok;
+    const bool result = common_speculative_process_impl(spec, batch, tgt) && ok;
+    common_spec_ledger_span(COMMON_SPEC_LEDGER_PROCESS, t_process, batch.n_tokens);
+    if (common_spec_ledger_on() && spec->ctx_dft) {
+        common_spec_ledger_witness(COMMON_SPEC_WITNESS_KV, nullptr, 0,
+                llama_memory_seq_pos_max(llama_get_memory(spec->ctx_tgt), 0),
+                llama_memory_seq_pos_max(llama_get_memory(spec->ctx_dft), 0), 2);
+    }
+    return result;
 }
 
 bool common_speculative_process_async(common_speculative * spec, const llama_batch & batch) {
@@ -3058,6 +3197,8 @@ void common_speculative_draft(common_speculative * spec) {
         }
     }
 
+    const uint64_t t_draft_total = common_spec_ledger_now();
+
     for (auto & impl : spec->impls) {
         {
             common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
@@ -3117,6 +3258,14 @@ void common_speculative_draft(common_speculative * spec) {
         if (dp.drafting) {
             dp.drafting = false;
         }
+    }
+
+    if (common_spec_ledger_on()) {
+        uint32_t n_cand = 0;
+        for (auto & dp : dparams) {
+            n_cand += dp.result ? (uint32_t) dp.result->size() : 0;
+        }
+        common_spec_ledger_span(COMMON_SPEC_LEDGER_DRAFT, t_draft_total, n_cand);
     }
 }
 
