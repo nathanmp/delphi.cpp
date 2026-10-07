@@ -1118,7 +1118,7 @@ bool ggml_backend_cuda_moe_int4_get_pack(const void * data, int which, const voi
     return true;
 }
 
-#else // GGML_CUDA_MOE_INT4_AVAILABLE
+#elif !defined(GGML_HIP_MOE_INT4_AVAILABLE)
 
 bool ggml_cuda_moe_int4_enabled() {
     return false;
@@ -1182,3 +1182,9 @@ bool ggml_backend_cuda_moe_int4_get_pack(const void * data, int which, const voi
 }
 
 #endif // GGML_CUDA_MOE_INT4_AVAILABLE
+
+#ifndef GGML_HIP_MOE_INT4_AVAILABLE
+void ggml_cuda_moe_int4_before_write(int device, const void * base, size_t size) {
+    ggml_cuda_moe_int4_forget(device, base, size);
+}
+#endif

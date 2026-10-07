@@ -2,10 +2,20 @@
 
 #include "common.cuh"
 
-// The kernels use NVIDIA PTX (mma.sync bf16, cp.async). Elsewhere the INT4 path is never selected and the type is not supported.
+// NVIDIA uses BF16 PTX MMA. HIP has an independent RDNA4 W4A8 implementation in moe-int4-hip.cu.
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 #define GGML_CUDA_MOE_INT4_AVAILABLE
 #endif
+#if defined(GGML_USE_HIP)
+#define GGML_HIP_MOE_INT4_AVAILABLE
+#endif
+
+// HIP: GGML_HIP_MOE_INT4_DECODE=1 selects a complete ordinary/clipped SwiGLU FFN with 2..16 experts per token. K and N must be
+// multiples of 128. Larger batches run in chunks of 16 rows. Input and hidden activations use symmetric Q8 groups of 128;
+// dots, scales, SwiGLU and ordered weighted reduction have F32 boundaries. Unmatched nodes read G128 directly, without a shadow bank.
+// Weights are packed in place per tensor. Readback or writes first restore its canonical bytes; stable device layout flags let
+// captured fallback kernels read either layout. Scratch is owned by backend context, stream and matrix shape, and lives until
+// context destruction. Mode overrides are test-only; use a fresh backend when changing mode after graph capture.
 
 // delphi.cpp: one complete GLM-shaped routed expert FFN (gate/up -> clipped SiLU * up -> down * router weight -> slot sum) with INT4
 // weights and BF16 tensor-core MMA, for any number of rows: the decode kernels for 1..GGML_CUDA_MOE_INT4_MAX_TOKENS rows (and wider batches
@@ -44,10 +54,10 @@ struct ggml_cuda_moe_int4_ffn {
     const ggml_tensor * up      = nullptr; // Q4_G128 [hidden, ff, E]
     const ggml_tensor * down    = nullptr; // Q4_G128 [ff, hidden, E]
     const ggml_tensor * x       = nullptr; // F32  [hidden, 1, M]
-    const ggml_tensor * ids     = nullptr; // I32  [8, M]
+    const ggml_tensor * ids     = nullptr; // I32  [topk, M]
     const ggml_tensor * weights = nullptr; // F32  [1, 8, M], contiguous: the router weights by slot
     ggml_tensor *       dst     = nullptr; // F32  [hidden, M], contiguous
-    float               limit   = 0.0f;    // SwiGLU clamp of the model; the kernel is built for GLM's 10
+    float               limit   = 0.0f;    // 0 for ordinary SwiGLU; NVIDIA requires GLM's clamp
 };
 
 // GGML_CUDA_MOE_INT4_DECODE, or the override of ggml_backend_cuda_moe_int4_set_mode.
@@ -78,10 +88,20 @@ void ggml_cuda_moe_int4_run(ggml_backend_cuda_context & ctx, const ggml_cuda_moe
 void ggml_cuda_moe_int4_shadow(ggml_backend_cuda_context & ctx, const ggml_tensor * dst, ggml_cuda_pool_alloc<char> & storage,
         ggml_tensor & src0_q, ggml_tensor & dst_q);
 
-// A buffer is freed or written ([base, base + size) of the device): forgets the packed sets whose tensors overlap the range.
+// Forget metadata when the owning buffer is freed.
 void ggml_cuda_moe_int4_forget(int device, const void * base, size_t size);
 
-// Aborts if [data, data + size) holds PACKED weights: a read-back of such a tensor would return the kernel layout.
+// Preserve untouched packed bytes before a partial write. HIP retains stable layout metadata for captured fallbacks.
+void ggml_cuda_moe_int4_before_write(int device, const void * base, size_t size);
+
+#ifdef GGML_HIP_MOE_INT4_AVAILABLE
+// Register stable layout flags before capture; unmatched nodes use the direct G128 implementation.
+void ggml_hip_moe_int4_prepare_graph(ggml_backend_cuda_context & ctx, const ggml_cgraph * graph);
+void ggml_hip_moe_int4_note_tensor(const ggml_tensor * tensor);
+void ggml_hip_moe_int4_mul_mat_id(ggml_backend_cuda_context & ctx, const ggml_tensor * dst);
+#endif
+
+// NVIDIA refuses packed readback; HIP restores the canonical layout before readback or a generic copy.
 void ggml_cuda_moe_int4_check_not_packed(int device, const void * data, size_t size, const char * what);
 
 // Frees the scratch of a backend context (called by its destructor).
