@@ -2,10 +2,13 @@
 """Stream MiMo MXFP4 routed experts to uncalibrated G128 and dense weights to Q8_0."""
 import argparse
 import ctypes
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 import logging
 from pathlib import Path
 import re
 import sys
+import tempfile
 
 import numpy as np
 import torch
@@ -54,6 +57,32 @@ class NativeQuantizer:
         return out
 
 
+class ExpertTensor(gguf.LazyChunkedTensor):
+    def __init__(self, chunks, shape, quantizer, workers):
+        super().__init__(chunks, gguf.quant_shape_to_byte_shape(shape, gguf.GGMLQuantizationType.Q4_G128), np.uint8)
+        self.quantizer = quantizer
+        self.workers = workers
+
+    def tofile(self, *args, **kwargs):
+        # Bound lookahead to the worker count; retain output expert order and one canonical weight copy.
+        def convert(load):
+            return self.quantizer(load(), gguf.GGMLQuantizationType.Q4_G128)
+        chunks = iter(self._chunks)
+        written = 0
+        with ThreadPoolExecutor(max_workers=self.workers) as pool:
+            pending = deque(pool.submit(convert, load) for load in [next(chunks) for _ in range(min(self.workers, len(self._chunks)))])
+            while pending:
+                data = pending.popleft().result()
+                data.tofile(*args, **kwargs)
+                written += data.nbytes
+                del data
+                load = next(chunks, None)
+                if load is not None:
+                    pending.append(pool.submit(convert, load))
+        if written != self.nbytes:
+            raise ValueError('Unexpected expert bank output size')
+
+
 class StreamingMimo(MimoV2Model):
     model_arch = gguf.MODEL_ARCH.MIMO2
 
@@ -91,12 +120,12 @@ class StreamingMimo(MimoV2Model):
                 def load():
                     return unpack_mx(LazyTorchTensor.to_eager(w()).numpy(), LazyTorchTensor.to_eager(s()).numpy())
                 return load
-            table = gguf.LazyChunkedTensor([loader(experts[e][0], experts[e][1]) for e in range(n_experts)],
-                                          (n_experts, *shape), np.float32)
+            table = ExpertTensor([loader(experts[e][0], experts[e][1]) for e in range(n_experts)],
+                                 (n_experts, *shape), self.native_quantizer, self.expert_workers)
             name = self.map_tensor_name(f'model.layers.{layer}.mlp.experts.{proj}.weight')
-            self.gguf_writer.add_tensor(name, table.quantize(gguf.GGMLQuantizationType.Q4_G128),
+            self.gguf_writer.add_tensor(name, table,
                                         raw_dtype=gguf.GGMLQuantizationType.Q4_G128)
-        logging.info('Prepared %d G128 routed banks; writing evaluates one expert at a time', len(groups))
+        logging.info('Prepared %d G128 routed banks; at most %d experts in flight', len(groups), self.expert_workers)
 
         # The existing target QKV conversion handles TP4 packing. Apply the same treatment to MTP QKV.
         mtp_qkv = {}
@@ -124,6 +153,13 @@ def check(quant):
     lazy = gguf.LazyNumpyTensor.from_eager(x)
     np.testing.assert_array_equal(gguf.LazyNumpyTensor.to_eager(quant(lazy, gguf.GGMLQuantizationType.Q4_G128)),
                                   quant(x, gguf.GGMLQuantizationType.Q4_G128))
+    chunks = [lambda i=i: x * (i + 1) for i in range(11)]
+    table = ExpertTensor(chunks, (11, *x.shape), quant, 3)
+    with tempfile.TemporaryFile() as out:
+        table.tofile(out)
+        out.seek(0)
+        expected = b''.join(quant(load(), gguf.GGMLQuantizationType.Q4_G128).tobytes() for load in chunks)
+        assert out.read() == expected, 'Parallel writer changed expert order or bytes'
     print('MXFP4 nibble/scale and native quantization checks passed', flush=True)
 
 
@@ -134,12 +170,15 @@ def main():
     p.add_argument('--libggml', type=Path, required=True)
     p.add_argument('--check-only', action='store_true')
     p.add_argument('--dry-run', action='store_true')
+    p.add_argument('--workers', type=int, default=8)
     args = p.parse_args()
     logging.basicConfig(level=logging.INFO)
     torch.set_num_threads(8)
     torch.set_num_interop_threads(1)
     quant = NativeQuantizer(args.libggml.resolve())
     check(quant)
+    if args.workers < 1:
+        p.error('--workers must be positive')
     if args.check_only:
         return
     if args.output.exists():
@@ -152,6 +191,8 @@ def main():
     with torch.inference_mode():
         model = StreamingMimo(args.model, gguf.LlamaFileType.MOSTLY_Q8_0, partial,
                               model_name='MiMo-V2.6-Flash-MOPD G128 experts Q8_0 dense (uncalibrated)', dry_run=args.dry_run)
+        model.native_quantizer = quant
+        model.expert_workers = args.workers
         model.write()
     if not args.dry_run:
         partial.rename(args.output)
