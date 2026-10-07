@@ -6,6 +6,8 @@
 //                                                                             GGUFs hold Q4_G128 experts, Q4_0_GGUF_A the same values as Q4_0
 //   ggml-ffn --verify-pack GGUF LAYER REFERENCE_DIR EXPERT...                 INT4 in-place packing against the offline packer (Q4_G128 GGUF)
 //   ggml-ffn --prefill GGUF LAYER FIXTURE_DIR WIDTH ITERATIONS [OUTPUT.f32]   eager timing of the FFN graph at any width (not captured), the output optionally saved
+//   ggml-ffn --prefill-verify GGUF LAYER FIXTURE_DIR WIDTH                    Q4_G128 GGUF: the output at WIDTH rows (prefill kernels from 64 rows) against the decode
+//                                                                             kernels run on the same rows in chunks of 16, bitwise per row
 //   ggml-ffn --shapes                                                         Q4_G128 MUL_MAT_ID of shapes the executor does not take (random weights): the ordinary
 //                                                                             path on a Q4_0 conversion against a host reference
 //
@@ -360,7 +362,7 @@ struct int4_hooks {
 
 // ggml_backend_cuda_moe_int4_get_stats
 enum { ST_SETS, ST_PACKS, ST_PACK_US, ST_PACKED_BYTES, ST_RUNS, ST_SCRATCH, ST_SHADOWS, ST_SHADOWS_WIDE, ST_REFUSED_ROWS, ST_REFUSED_LAYOUT,
-       ST_REFUSED_WEIGHTS, ST_REFUSED_STATE, ST_PREPARE_REFUSED, ST_COUNT = 16 };
+       ST_REFUSED_WEIGHTS, ST_REFUSED_STATE, ST_PREPARE_REFUSED, ST_PREFILL_RUNS, ST_PREFILL_ROWS, ST_CHUNKED_RUNS, ST_COUNT };
 
 static int4_hooks get_hooks(ggml_backend_dev_t dev) {
     int4_hooks h;
@@ -654,8 +656,8 @@ static int lifecycle_main(int argc, char ** argv) {
     check(session_output(d9) == o9 && session_output(s9) == o9 && session_output(s3) == first3, "D concurrent contexts and graphs: outputs unchanged bitwise");
     session_destroy(d9);
 
-    // E. the limit of the INT4 path: 16 rows run on it (rows equal the rows of the runs that they were cut from), 17 rows take the ordinary
-    //    path on a Q4_0 conversion of the experts (equal bitwise to the Q4_0 path of the same values)
+    // E. widths above 16: 17 rows run on the decode kernels in chunks of 16 and 1 rows, 64 rows on the prefill kernels; every row equals the row of
+    //    the decode run that it was cut from (bitwise), whatever the other rows of the batch are
     {
         const std::string w16 = make_wide_fixture(scratch + "/ggml-ffn-wide16", {{a9.dir, 9}, {a7.dir, 7}});
         session t16;
@@ -670,18 +672,27 @@ static int lifecycle_main(int argc, char ** argv) {
         session_create(t17, dev, bk, 17, w17); session_warm(t17);
         const std::vector<float> o17 = session_output(t17);
         const auto after = stats();
-        check(!session_uses(t17, "moe_dec_gemm"), "E width 17: the INT4 region is refused, the ordinary path runs (" + std::to_string(t17.n_kernel_nodes) + " kernels)");
-        check(after[ST_REFUSED_ROWS] > before[ST_REFUSED_ROWS] && after[ST_SHADOWS_WIDE] >= before[ST_SHADOWS_WIDE] + 3, "E width 17: counted (refused rows, three wide conversions)");
-        std::cout << "INFO E kernels of width 17:"; for (const auto & k : t17.kernels) { std::cout << " " << k.substr(0, 60) << ";"; } std::cout << std::endl;
-        if (!q40_a.empty()) {
-            bank bq = load_bank(dev, q40_a, layer_a);
-            session q17;
-            session_create(q17, dev, bq, 17, w17); session_warm(q17);
-            check(session_output(q17) == o17, "E width 17: equals the Q4_0 path of the same values bitwise");
-            session_destroy(q17);
-            free_bank(bq);
-        }
+        check(session_uses(t17, "moe_dec_gemm") && !session_uses(t17, "pf_w13") && t17.n_kernel_nodes == 10, "E width 17: two decode chunks (16 and 1 rows) run on the INT4 path (10 kernels, " + std::to_string(t17.n_kernel_nodes) + " found)");
+        check(after[ST_CHUNKED_RUNS] > before[ST_CHUNKED_RUNS] && after[ST_SHADOWS_WIDE] == before[ST_SHADOWS_WIDE], "E width 17: counted as chunked runs, no wide conversion");
+        check(bits_equal(o17, o9, 0, 9 * k_hidden) && std::equal(o17.begin() + 9 * k_hidden, o17.end(), o8.begin()), "E width 17: rows equal the rows of the width-9 and width-8 runs they were cut from (bitwise)");
         session_destroy(t17);
+
+        // 64 rows (7 x the 9 rows of a9, then row 0 of a9 again): the prefill kernels
+        std::vector<std::pair<std::string, int>> parts;
+        for (int i = 0; i < 7; ++i) { parts.push_back({a9.dir, 9}); }
+        parts.push_back({a9.dir, 1});
+        const std::string w64 = make_wide_fixture(scratch + "/ggml-ffn-wide64", parts);
+        const auto before64 = stats();
+        session t64;
+        session_create(t64, dev, bk, 64, w64); session_warm(t64);
+        const std::vector<float> o64 = session_output(t64);
+        const auto after64 = stats();
+        check(session_uses(t64, "pf_w13") && session_uses(t64, "pf_w2") && !session_uses(t64, "moe_dec_gemm"), "E width 64: the prefill kernels run (" + std::to_string(t64.n_kernel_nodes) + " kernels)");
+        check(after64[ST_PREFILL_RUNS] > before64[ST_PREFILL_RUNS] && after64[ST_PREFILL_ROWS] >= before64[ST_PREFILL_ROWS] + 64, "E width 64: counted as prefill runs");
+        bool rows_ok = true;
+        for (int i = 0; i < 7; ++i) { rows_ok = rows_ok && bits_equal(o64, o9, (size_t) i * 9 * k_hidden, 9 * k_hidden); }
+        check(rows_ok && std::equal(o64.begin() + 63 * k_hidden, o64.end(), o9.begin()), "E width 64: every row equals the row of the width-9 decode run it was cut from (bitwise)");
+        session_destroy(t64);
     }
 
     // F. the INT4 executor off, weights still PACKED: every node converts the packed bytes to Q4_0; the results equal the Q4_0 path bitwise
@@ -912,11 +923,77 @@ static int prefill_main(int argc, char ** argv) {
     return 0;
 }
 
+static int prefill_verify_main(int argc, char ** argv) {
+    require(argc == 6, "usage: ggml-ffn --prefill-verify GGUF LAYER FIXTURE_DIR WIDTH");
+    const std::string model = argv[2], dir = argv[4];
+    const int layer = std::stoi(argv[3]), width = std::stoi(argv[5]);
+    auto dev = init_device();
+    const int4_hooks hooks = get_hooks(dev);
+    require(hooks.set_mode && hooks.stats, "INT4 test hooks missing from the CUDA backend");
+    hooks.set_mode(1);
+    bank b = load_bank(dev, model, layer);
+    std::vector<float> input, router;
+    std::vector<int32_t> ids;
+    require(read_file(dir + "/input.f32", size_t(width) * k_hidden, input) && read_file(dir + "/router.f32", size_t(width) * k_topk, router) &&
+        read_file(dir + "/ids.i32", size_t(width) * k_topk, ids), "fixture files missing or short in " + dir);
+    int64_t st0[ST_COUNT] = {}, st1[ST_COUNT] = {};
+    hooks.stats(st0);
+    session full;
+    session_create(full, dev, b, width, dir);
+    for (int i = 0; i < 3; ++i) { require(ggml_backend_sched_graph_compute(full.sched, full.graph) == GGML_STATUS_SUCCESS, "full-width compute failed"); }
+    const std::vector<float> out_full = session_output(full);
+    hooks.stats(st1);
+    std::cout << "width " << width << ": prefill runs " << st1[ST_PREFILL_RUNS] - st0[ST_PREFILL_RUNS] << ", chunked runs " << st1[ST_CHUNKED_RUNS] - st0[ST_CHUNKED_RUNS]
+              << ", shadow nodes " << st1[ST_SHADOWS] - st0[ST_SHADOWS] << std::endl;
+
+    std::vector<float> out_chunks(size_t(width) * k_hidden, 0.f);
+    std::vector<session> sessions(17);
+    for (int row0 = 0; row0 < width; row0 += 16) {
+        const int n = std::min(16, width - row0);
+        session & t = sessions[n];
+        if (t.width == 0) { session_create(t, dev, b, n, dir); }
+        ggml_backend_tensor_set(t.x, input.data() + size_t(row0) * k_hidden, 0, size_t(n) * k_hidden * sizeof(float));
+        ggml_backend_tensor_set(t.ids, ids.data() + size_t(row0) * k_topk, 0, size_t(n) * k_topk * sizeof(int32_t));
+        ggml_backend_tensor_set(t.rw, router.data() + size_t(row0) * k_topk, 0, size_t(n) * k_topk * sizeof(float));
+        require(ggml_backend_sched_graph_compute(t.sched, t.graph) == GGML_STATUS_SUCCESS, "chunk compute failed");
+        const std::vector<float> o = session_output(t);
+        std::copy(o.begin(), o.end(), out_chunks.begin() + size_t(row0) * k_hidden);
+    }
+    int64_t st2[ST_COUNT] = {};
+    hooks.stats(st2);
+    std::cout << "chunks: prefill runs " << st2[ST_PREFILL_RUNS] - st1[ST_PREFILL_RUNS] << " (expected 0), region runs " << st2[ST_RUNS] - st1[ST_RUNS] << std::endl;
+    size_t bad_rows = 0, bad_values = 0, first_bad = SIZE_MAX;
+    for (int r = 0; r < width; ++r) {
+        size_t bad = 0;
+        for (int64_t i = 0; i < k_hidden; ++i) {
+            if (std::memcmp(&out_full[size_t(r) * k_hidden + i], &out_chunks[size_t(r) * k_hidden + i], sizeof(float)) != 0) { ++bad; }
+        }
+        if (bad) { ++bad_rows; bad_values += bad; if (first_bad == SIZE_MAX) { first_bad = r; } }
+    }
+    if (bad_rows) {
+        double max_rel = 0, sum_rel = 0; size_t n = 0;
+        for (size_t i = 0; i < out_full.size(); ++i) { const double d = std::fabs(out_full[i] - out_chunks[i]), m = std::max(std::fabs(out_chunks[i]), 1e-6f); max_rel = std::max(max_rel, d / m); sum_rel += d / m; ++n; }
+        std::cout << "row 0, first values: full";
+        for (int i = 0; i < 6; ++i) { std::cout << " " << out_full[i]; }
+        std::cout << " | chunks";
+        for (int i = 0; i < 6; ++i) { std::cout << " " << out_chunks[i]; }
+        std::cout << "\nmean relative difference " << sum_rel / n << ", max " << max_rel << std::endl;
+    }
+    std::cout << (bad_rows == 0 ? "PASS" : "FAIL") << ": " << bad_rows << " of " << width << " rows differ (" << bad_values << " values)";
+    if (bad_rows) { std::cout << ", first row " << first_bad; }
+    std::cout << std::endl;
+    for (auto & t : sessions) { if (t.width != 0) { session_destroy(t); } }
+    session_destroy(full);
+    free_bank(b);
+    return bad_rows == 0 ? 0 : 2;
+}
+
 int main(int argc, char ** argv) try {
     if (argc >= 2 && std::string(argv[1]) == "--lifecycle") { return lifecycle_main(argc, argv); }
     if (argc >= 2 && std::string(argv[1]) == "--verify-pack") { return verify_pack_main(argc, argv); }
     if (argc >= 2 && std::string(argv[1]) == "--shapes") { return shapes_main(); }
     if (argc >= 2 && std::string(argv[1]) == "--prefill") { return prefill_main(argc, argv); }
+    if (argc >= 2 && std::string(argv[1]) == "--prefill-verify") { return prefill_verify_main(argc, argv); }
     return timing_main(argc, argv);
 } catch (const std::exception & ex) {
     std::cerr << ex.what() << '\n'; return 1;
