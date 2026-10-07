@@ -65,6 +65,7 @@ DISPATCH_NAMES = {
     15: "CPU_FWHT",
     16: "CPU_IQP_VEC_DOT",
     17: "CPU_IQK",
+    18: "GPU_MOE_INT4",
 }
 DISPATCH_VARIANTS = {
     0: "",
@@ -74,6 +75,7 @@ DISPATCH_VARIANTS = {
     4: "fused",
     5: "sorted_fallback",
     6: "per_expert",
+    7: "unpacked",
 }
 GPU_GRAPH_STATES = {1: "capture", 2: "update", 3: "replay", 4: "fallback"}
 GPU_GRAPH_REASONS = {
@@ -427,6 +429,29 @@ def dump_dispatches(events, strings, backend_name):
         print(f"    config: {dispatch_config(implementation, variant, config_0, config_1)}")
 
 
+def dump_dispatch_summary(events, strings):
+    """Matrix-multiply dispatch decisions aggregated by the token count of the ubatch: how many graphs of each width ran which implementation."""
+    node_metadata = build_node_metadata(events, strings)
+    ubatch_tokens = {event["ubatch_id"]: event["args"][0] for event in events if event["kind"] == K_UBATCH_BEGIN}
+    graph_tokens = {event["graph_id"]: ubatch_tokens.get(event["ubatch_id"], 0) for event in events if event["kind"] == K_GRAPH}
+    graphs_by_tokens = Counter(graph_tokens.values())
+    counts = Counter()
+    for event in events:
+        if event["kind"] != K_DISPATCH:
+            continue
+        node = node_metadata(event) or {}
+        op = node.get("op", str(event["flags"]))
+        _, implementation, _, variant, _, _ = dispatch_fields(event, strings)
+        if op in ("MUL_MAT", "MUL_MAT_ID") or implementation == "GPU_MOE_INT4":
+            counts[(graph_tokens.get(event["graph_id"], 0), op, implementation, variant or "default")] += 1
+    print("dispatch_summary:")
+    for tokens in sorted(graphs_by_tokens):
+        print(f"  tokens={tokens} graphs={graphs_by_tokens[tokens]}")
+        for (t, op, implementation, variant), count in sorted(counts.items()):
+            if t == tokens:
+                print(f"    {op} {implementation} {variant}: {count} ({count / graphs_by_tokens[tokens]:.2f} per graph)")
+
+
 def dump_gpu_graphs(events, backend_name):
     lifecycle = [event for event in events if event["kind"] == K_GPU_GRAPH]
     groups = defaultdict(lambda: {"counts": Counter(), "reasons": Counter(), "nodes": 0, "event": None})
@@ -777,7 +802,7 @@ def dump_timeline(trace, backend_name):
         print(f"  {offset_ms:12.3f} ms  {' '.join(fields)}")
 
 
-def dump(trace, scheduler_summary=False, timeline=False, dispatches=False, gpu_timing=False, offload_decisions=False):
+def dump(trace, scheduler_summary=False, timeline=False, dispatches=False, gpu_timing=False, offload_decisions=False, dispatch_summary=False):
     events = trace["events"]
     strings = trace["strings"]
     backend_name = build_backend_names(events, strings)
@@ -878,6 +903,8 @@ def dump(trace, scheduler_summary=False, timeline=False, dispatches=False, gpu_t
         dump_dispatches(events, strings, backend_name)
     else:
         print(f"dispatch_count: {sum(event['kind'] == K_DISPATCH for event in events)}")
+    if dispatch_summary:
+        dump_dispatch_summary(events, strings)
     if offload_decisions:
         dump_offload_decisions(events, strings, backend_name)
     else:
@@ -899,6 +926,7 @@ def dump(trace, scheduler_summary=False, timeline=False, dispatches=False, gpu_t
 def main():
     parser = argparse.ArgumentParser(description="Print a summary of a GGML execution trace")
     parser.add_argument("--dispatches", action="store_true", help="print every backend dispatch decision")
+    parser.add_argument("--dispatch-summary", action="store_true", help="count matrix-multiply dispatch decisions per ubatch token count")
     parser.add_argument("--offload-decisions", action="store_true", help="print every transfer-aware offload decision")
     parser.add_argument("--scheduler-summary", action="store_true", help="aggregate host scheduler spans")
     parser.add_argument("--timeline", action="store_true", help="print chronological host span endpoints")
@@ -909,7 +937,7 @@ def main():
     try:
         trace = read_trace(args.trace)
         dump(trace, scheduler_summary=args.scheduler_summary, timeline=args.timeline, dispatches=args.dispatches,
-             gpu_timing=args.gpu_timing, offload_decisions=args.offload_decisions)
+             gpu_timing=args.gpu_timing, offload_decisions=args.offload_decisions, dispatch_summary=args.dispatch_summary)
         if args.gpu_timing_json:
             args.gpu_timing_json.write_text(json.dumps(gpu_timing_summary(trace), indent=2) + "\n")
     except (OSError, TraceError) as error:

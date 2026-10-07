@@ -222,6 +222,41 @@ void ggml_vec_dot_q2_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, c
     *s = sumf;
 }
 
+void quantize_row_q4_g128(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_q4_g128_ref(x, y, k);
+}
+
+// delphi.cpp: weights of type Q4_G128 against F32 activations, scalar. Only for completeness and tests on the CPU backend.
+void ggml_vec_dot_q4_g128_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    const int nb = n / QK4_G128;
+
+    assert(n % QK4_G128 == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_q4_g128 * GGML_RESTRICT x = vx;
+    const float         * GGML_RESTRICT y = vy;
+
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; i++) {
+        const ggml_bf16_t d16 = { x[i].d };
+        float sumi = 0.0f;
+        for (int g = 0; g < QK4_G128 / 32; ++g) {
+            for (int j = 0; j < 16; ++j) {
+                const uint8_t q = x[i].qs[16*g + j];
+                sumi += ((q & 0x0F) - 8) * y[i*QK4_G128 + 32*g + j] + ((q >> 4) - 8) * y[i*QK4_G128 + 32*g + j + 16];
+            }
+        }
+        sumf += GGML_BF16_TO_FP32(d16) * sumi;
+    }
+
+    *s = sumf;
+}
+
 void ggml_vec_dot_q4_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     const int qk = QK8_0;
     const int nb = n / qk;

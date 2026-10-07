@@ -71,6 +71,38 @@ void quantize_row_q1_0_ref(const float * GGML_RESTRICT x, block_q1_0 * GGML_REST
     }
 }
 
+// The scale is rounded to BF16 (RNE) after the floor of 2^-14, the smallest normal FP16 value: every BF16 value from there on is exact
+// in FP16, which the conversion of a group to four Q4_0 blocks relies on. A group of zeros gets the floor and all codes 8.
+void quantize_row_q4_g128_ref(const float * GGML_RESTRICT x, block_q4_g128 * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK4_G128;
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        float amax = 0.0f;
+        for (int j = 0; j < qk; j++) {
+            const float a = fabsf(x[i*qk + j]);
+            if (a > amax) amax = a;
+        }
+        const ggml_bf16_t d16 = GGML_FP32_TO_BF16(fmaxf(amax / 7.0f, 0x1p-14f));
+        const float d = GGML_BF16_TO_FP32(d16);
+
+        y[i].d = d16.bits;
+
+        for (int s = 0; s < qk/32; ++s) {
+            for (int j = 0; j < 16; ++j) {
+                const float x0 = x[i*qk + 32*s + j]      / d;
+                const float x1 = x[i*qk + 32*s + j + 16] / d;
+                const uint8_t q0 = (uint8_t) (fminf(fmaxf(nearbyintf(x0), -8.0f), 7.0f) + 8.0f);
+                const uint8_t q1 = (uint8_t) (fminf(fmaxf(nearbyintf(x1), -8.0f), 7.0f) + 8.0f);
+                y[i].qs[16*s + j] = q0 | (q1 << 4);
+            }
+        }
+    }
+}
+
 void quantize_row_q2_0_ref(const float * GGML_RESTRICT x, block_q2_0 * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK2_0;
 
@@ -432,6 +464,26 @@ void dequantize_row_q1_0(const block_q1_0 * GGML_RESTRICT x, float * GGML_RESTRI
             const int bit_offset = j % 8;
             const uint8_t bit = (x[i].qs[byte_index] >> bit_offset) & 1;
             y[i*qk + j] = bit ? d : neg_d;
+        }
+    }
+}
+
+void dequantize_row_q4_g128(const block_q4_g128 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK4_G128;
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        const ggml_bf16_t d16 = { x[i].d };
+        const float d = GGML_BF16_TO_FP32(d16);
+
+        for (int s = 0; s < qk/32; ++s) {
+            for (int j = 0; j < 16; ++j) {
+                y[i*qk + 32*s + j]      = ((x[i].qs[16*s + j] & 0x0F) - 8) * d;
+                y[i*qk + 32*s + j + 16] = ((x[i].qs[16*s + j] >>   4) - 8) * d;
+            }
         }
     }
 }
@@ -2104,6 +2156,18 @@ size_t quantize_q1_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, 
     char * qrow = (char *)dst;
     for (int64_t row = 0; row < nrow; ++row) {
         quantize_row_q1_0_ref(src, (block_q1_0*)qrow, n_per_row);
+        src += n_per_row;
+        qrow += row_size;
+    }
+    return nrow * row_size;
+}
+
+size_t quantize_q4_g128(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    GGML_UNUSED(quant_weights); // no importance matrix: the scale is the group maximum
+    const size_t row_size = ggml_row_size(GGML_TYPE_Q4_G128, n_per_row);
+    char * qrow = (char *)dst;
+    for (int64_t row = 0; row < nrow; ++row) {
+        quantize_row_q4_g128_ref(src, (block_q4_g128*)qrow, n_per_row);
         src += n_per_row;
         qrow += row_size;
     }
@@ -5543,6 +5607,17 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_Q2_0:
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_q2_0, data, nb);
+            } break;
+        case GGML_TYPE_Q4_G128:
+            {
+                const block_q4_g128 * q = (const block_q4_g128 *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    const ggml_bf16_t d16 = { q[i].d };
+                    if (!isfinite(GGML_BF16_TO_FP32(d16))) {
+                        fprintf(stderr, "%s: found invalid scale in block %zu\n", __func__, i);
+                        return false;
+                    }
+                }
             } break;
         case GGML_TYPE_Q4_0:
             {

@@ -444,7 +444,10 @@ extern "C" {
         GGML_TYPE_IQ2_KS  = 145, // 2.1875 bpw
         GGML_TYPE_IQ5_KS  = 152, // 5.25 bpw
         GGML_TYPE_IQ3_KS  = 156, // 3.1875 bpw
-        GGML_TYPE_COUNT   = 157,
+        // delphi.cpp: symmetric 4-bit weights with one BF16 scale per 128 values (4.125 bpw), the storage of the routed experts of
+        // the INT4 decode path (ggml/src/ggml-cuda/moe-int4-decode.cuh). Not an ik_llama.cpp type: the ID is outside its range.
+        GGML_TYPE_Q4_G128 = 192,
+        GGML_TYPE_COUNT   = 193,
     };
 
     // [TAG_GGML_PREC]

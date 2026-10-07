@@ -5864,6 +5864,7 @@ class GGMLQuantizationType(IntEnum):
     NVFP4   = 40
     Q1_0    = 41
     Q2_0    = 42
+    Q4_G128 = 192  # delphi.cpp: INT4 with one BF16 scale per 128 values
     # IQ*_K quants ported from ik_llama.cpp; the IDs must match ik_llama.cpp
     IQ2_K   = 137
     IQ3_K   = 138
@@ -6078,6 +6079,7 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.NVFP4:   (64, 4 + 32),
     GGMLQuantizationType.Q1_0:    (128, 2 + 16),
     GGMLQuantizationType.Q2_0:    (64, 2 + 16),
+    GGMLQuantizationType.Q4_G128: (128, 2 + 64),
     # IQ*_K (ik_llama.cpp)
     GGMLQuantizationType.IQ2_K:   (256, 2 + 2 + QK_K // 32 + QK_K // 4),                           # d + extra + scales[8]   + qs[64]              =  76
     GGMLQuantizationType.IQ3_K:   (256, 2 + 2 + 2 + QK_K // 32 + QK_K // 4 + QK_K // 8),           # d + extra + scales_h    + scales_l[8] + qs[64] + qh[32] = 110

@@ -254,6 +254,39 @@ class Q4_0(__Quant, qtype=GGMLQuantizationType.Q4_0):
         return (d * qs.astype(np.float32))
 
 
+class Q4_G128(__Quant, qtype=GGMLQuantizationType.Q4_G128):
+    # delphi.cpp: symmetric INT4, one BF16 scale per 128 values; four groups of 32 codes in the layout of Q4_0 blocks
+
+    @classmethod
+    def quantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        n_blocks = blocks.shape[0]
+
+        # the scale: max(absmax / 7, 2^-14) rounded to BF16 (RNE), as quantize_row_q4_g128_ref
+        d = np.maximum(abs(blocks).max(axis=-1, keepdims=True) / np.float32(7), np.float32(2.0 ** -14)).astype(np.float32)
+        bits = d.view(np.uint32)
+        bf16 = ((bits + np.uint32(0x7FFF) + ((bits >> np.uint32(16)) & np.uint32(1))) >> np.uint32(16)).astype(np.uint16)
+        d = (bf16.astype(np.uint32) << np.uint32(16)).view(np.float32)
+
+        qs = (np.clip(np.rint(blocks / d), -8, 7) + 8).astype(np.uint8)
+        qs = qs.reshape((n_blocks, cls.block_size // 32, 2, 16))
+        qs = (qs[..., 0, :] | (qs[..., 1, :] << np.uint8(4))).reshape((n_blocks, cls.block_size // 2))
+
+        return np.concatenate([bf16.view(np.uint8), qs], axis=-1)
+
+    @classmethod
+    def dequantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        n_blocks = blocks.shape[0]
+
+        d, qs = np.hsplit(blocks, [2])
+
+        d = (d.view(np.uint16).astype(np.uint32) << np.uint32(16)).view(np.float32)
+
+        qs = qs.reshape((n_blocks, -1, 1, 16)) >> np.array([0, 4], dtype=np.uint8).reshape((1, 1, 2, 1))
+        qs = (qs & np.uint8(0x0F)).reshape((n_blocks, -1)).astype(np.int8) - np.int8(8)
+
+        return (d * qs.astype(np.float32))
+
+
 class Q4_1(__Quant, qtype=GGMLQuantizationType.Q4_1):
     @classmethod
     def quantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
