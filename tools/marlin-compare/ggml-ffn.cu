@@ -5,6 +5,7 @@
 //   ggml-ffn --lifecycle GGUF_A LAYER_A FIXTURES_A GGUF_B LAYER_B FIXTURES_B [Q4_0_GGUF_A]  INT4 path ownership and fallback tests; the
 //                                                                             GGUFs hold Q4_G128 experts, Q4_0_GGUF_A the same values as Q4_0
 //   ggml-ffn --verify-pack GGUF LAYER REFERENCE_DIR EXPERT...                 INT4 in-place packing against the offline packer (Q4_G128 GGUF)
+//   ggml-ffn --prefill GGUF LAYER FIXTURE_DIR WIDTH ITERATIONS [OUTPUT.f32]   eager timing of the FFN graph at any width (not captured), the output optionally saved
 //   ggml-ffn --shapes                                                         Q4_G128 MUL_MAT_ID of shapes the executor does not take (random weights): the ordinary
 //                                                                             path on a Q4_0 conversion against a host reference
 //
@@ -867,10 +868,55 @@ static int shapes_main() {
     return g_failures == 0 ? 0 : 1;
 }
 
+// ---- eager timing at prefill widths ------------------------------------------------------------------------------------------------------
+static int prefill_main(int argc, char ** argv) {
+    require(argc == 7 || argc == 8, "usage: ggml-ffn --prefill GGUF LAYER FIXTURE_DIR WIDTH ITERATIONS [OUTPUT.f32]");
+    const std::string model = argv[2], dir = argv[4];
+    const int layer = std::stoi(argv[3]), width = std::stoi(argv[5]), iterations = std::stoi(argv[6]);
+    auto dev = init_device();
+    const int4_hooks hooks = get_hooks(dev);
+    bank b = load_bank(dev, model, layer);
+    session s;
+    session_create(s, dev, b, width, dir);
+    s.cuda_ctx = static_cast<ggml_backend_cuda_context *>(s.backend->context);
+    for (int i = 0; i < 3; ++i) { require(ggml_backend_sched_graph_compute(s.sched, s.graph) == GGML_STATUS_SUCCESS, "warmup failed"); }
+    const std::vector<float> result = session_output(s);
+    if (argc == 8) {
+        std::ofstream output(argv[7], std::ios::binary);
+        output.write(reinterpret_cast<const char *>(result.data()), result.size() * sizeof(float));
+    }
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start)); CUDA_CHECK(cudaEventCreate(&stop));
+    std::vector<float> times;
+    for (int i = 0; i < iterations; ++i) {
+        CUDA_CHECK(cudaEventRecord(start, nullptr));
+        require(ggml_backend_sched_graph_compute(s.sched, s.graph) == GGML_STATUS_SUCCESS, "compute failed");
+        ggml_backend_synchronize(s.backend);
+        CUDA_CHECK(cudaEventRecord(stop, nullptr)); CUDA_CHECK(cudaEventSynchronize(stop));
+        float ms = 0; CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
+        times.push_back(ms);
+    }
+    std::sort(times.begin(), times.end());
+    const references ref = load_references(dir, width);
+    std::cout << "{\"width\":" << width << ",\"weight_type\":\"" << ggml_type_name(b.weights[0]->type) << "\",\"median_ms\":" << times[times.size() / 2]
+              << ",\"min_ms\":" << times.front() << ",\"max_ms\":" << times.back() << ",\"error_ideal\":" << error_json(compare_outputs(result, ref.ideal))
+              << ",\"error_q4_0_path\":" << error_json(compare_outputs(result, ref.ggml)) << "}\n";
+    if (hooks.stats) {
+        int64_t st[ST_COUNT] = {};
+        hooks.stats(st);
+        std::cerr << "int4 stats: packs " << st[ST_PACKS] << " region_runs " << st[ST_RUNS] << " shadow_nodes " << st[ST_SHADOWS] << " (wide " << st[ST_SHADOWS_WIDE]
+                  << ") refused rows/layout/weights/state " << st[ST_REFUSED_ROWS] << "/" << st[ST_REFUSED_LAYOUT] << "/" << st[ST_REFUSED_WEIGHTS] << "/" << st[ST_REFUSED_STATE] << "\n";
+    }
+    session_destroy(s);
+    free_bank(b);
+    return 0;
+}
+
 int main(int argc, char ** argv) try {
     if (argc >= 2 && std::string(argv[1]) == "--lifecycle") { return lifecycle_main(argc, argv); }
     if (argc >= 2 && std::string(argv[1]) == "--verify-pack") { return verify_pack_main(argc, argv); }
     if (argc >= 2 && std::string(argv[1]) == "--shapes") { return shapes_main(); }
+    if (argc >= 2 && std::string(argv[1]) == "--prefill") { return prefill_main(argc, argv); }
     return timing_main(argc, argv);
 } catch (const std::exception & ex) {
     std::cerr << ex.what() << '\n'; return 1;
