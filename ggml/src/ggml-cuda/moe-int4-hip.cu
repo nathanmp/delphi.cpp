@@ -130,8 +130,11 @@ __global__ void unpack_groups(const char * src, char * dst, size_t stride, int k
 // The first occurrence owns a group. Split repeated IDs into tiles of 16, including duplicate IDs within a token.
 __global__ void group_routes(const int * ids, routes * r, int slots, int group_rows, int topk, int ids_stride) {
     __shared__ int blocks[MAX_SLOTS];
+    __shared__ int expert_ids[MAX_SLOTS];
     const int s = threadIdx.x;
-    const auto id = [&](int i) { return ids[(i / topk) * ids_stride + i % topk]; };
+    if (s < slots) { expert_ids[s] = ids[(s / topk) * ids_stride + s % topk]; }
+    __syncthreads();
+    const auto id = [&](int i) { return expert_ids[i]; };
     int first = s < slots, count = 0;
     if (s < slots) {
         for (int j = 0; j < slots; ++j) {
@@ -140,6 +143,7 @@ __global__ void group_routes(const int * ids, routes * r, int slots, int group_r
     }
     blocks[s] = first ? (count + group_rows - 1) / group_rows : 0;
     __syncthreads();
+    if (s >= slots) { return; }
     int group = 0, row = 0, total = 0;
     for (int j = 0; j < slots; ++j) {
         total += blocks[j];
@@ -249,18 +253,17 @@ __global__ void vector_projection(bank w, bank u, const int8_t * x, const float 
 }
 
 // Wide-load comparator from the same G128 prototypes: four adjacent channels per aligned load.
-template<bool GATE_UP,int ROWS,int FILTER_ROWS=0> __global__ void vector_wide_projection(
+template<bool GATE_UP,int ROWS,int FILTER_ROWS=0,int WAVES=4> __device__ __forceinline__ void vector_wide_body(
         bank wb,bank ub,const signed char * x,const float * dx,const routes * r,float * y,int topk,float limit) {
-    constexpr int WAVES=4;
     const int n=wb.n,k=wb.k;
     int group=blockIdx.y;if(group>=r->groups)return;
-    int lane=threadIdx.x&31,wave=threadIdx.x/32,tile=blockIdx.x;
+    int lane=threadIdx.x&31,wave=threadIdx.x/32,tile=WAVES==1?blockIdx.x*4+wave:blockIdx.x;
     int base=tile*16+(lane%4)*4,expert=r->experts[group],nr=r->counts[group];
     const unsigned * w=reinterpret_cast<const unsigned *>(wb.data+expert*wb.stride);
     const unsigned * u=GATE_UP?reinterpret_cast<const unsigned *>(ub.data+expert*ub.stride):nullptr;
     if constexpr(FILTER_ROWS>0)if(nr>FILTER_ROWS)return;
     float sum[ROWS][4]={},sumu[ROWS][4]={};
-    for(int kg=wave;kg<k/128;kg+=WAVES){
+    for(int kg=WAVES==1?0:wave;kg<k/128;kg+=WAVES){
         int acc[ROWS][4]={},accu[ROWS][4]={};
 #pragma unroll
         for(int t=0;t<2;++t){
@@ -295,6 +298,17 @@ template<bool GATE_UP,int ROWS,int FILTER_ROWS=0> __global__ void vector_wide_pr
             }
         }
     }
+    if constexpr(WAVES==1){
+        if(lane<4){
+#pragma unroll
+            for(int row=0;row<ROWS;++row)if(row<nr){
+                int slot=r->slots[group*MAX_ROWS+row];
+#pragma unroll
+                for(int col=0;col<4;++col)y[size_t(slot)*n+base+col]=GATE_UP?activate(sum[row][col],sumu[row][col],limit):sum[row][col];
+            }
+        }
+        return;
+    }
     __shared__ float partial[WAVES][ROWS][16];
     __shared__ float partialu[GATE_UP?WAVES:1][ROWS][16];
     if(lane<4){
@@ -317,9 +331,14 @@ template<bool GATE_UP,int ROWS,int FILTER_ROWS=0> __global__ void vector_wide_pr
 }
 
 
+template <bool GATE_UP, int ROWS> __global__ void vector_wide_projection(
+        bank w, bank u, const int8_t * x, const float * dx, const routes * r, float * y, int topk, float limit) {
+    vector_wide_body<GATE_UP, ROWS>(w, u, x, dx, r, y, topk, limit);
+}
+
 // A WMMA tile shares its packed weight fragments across up to 16 routed rows. Activation precision is the same as vector execution.
 template <bool GATE_UP, int MIN_ROWS = 0>
-__global__ void wmma_projection(bank w, bank u, const int8_t * x, const float * dx, const routes * r,
+__device__ __forceinline__ void wmma_body(bank w, bank u, const int8_t * x, const float * dx, const routes * r,
         float * y, int topk, float limit) {
 #if defined(RDNA4)
     using i2 = int __attribute__((ext_vector_type(2)));
@@ -362,6 +381,23 @@ __global__ void wmma_projection(bank w, bank u, const int8_t * x, const float * 
 #else
     GGML_UNUSED_VARS(w, u, x, dx, r, y, topk, limit);
 #endif
+}
+
+template <bool GATE_UP, int MIN_ROWS = 0> __global__ void wmma_projection(
+        bank w, bank u, const int8_t * x, const float * dx, const routes * r, float * y, int topk, float limit) {
+    wmma_body<GATE_UP, MIN_ROWS>(w, u, x, dx, r, y, topk, limit);
+}
+
+// Match the tile geometry so singleton/vector and reused/WMMA groups share one launch.
+template <bool GATE_UP> __global__ void singleton_projection(
+        bank w, bank u, const int8_t * x, const float * dx, const routes * r, float * y, int topk, float limit) {
+    const int group = blockIdx.y;
+    if (group >= r->groups) { return; }
+    if (r->counts[group] == 1) {
+        vector_wide_body<GATE_UP, 1, 0, 1>(w, u, x, dx, r, y, topk, limit);
+    } else {
+        wmma_body<GATE_UP>(w, u, x, dx, r, y, topk, limit);
+    }
 }
 
 __global__ void reduce_slots(const float * x, const float * rw, float * y, int h, int topk) {
@@ -491,19 +527,22 @@ void run_chunk(ggml_backend_cuda_context & ctx, const ggml_cuda_moe_int4_ffn & f
     float * out = static_cast<float *>(f.dst->data) + size_t(start) * h;
     group_routes<<<1, MAX_SLOTS, 0, stream>>>(ids, s.routing, slots, ROWS, topk, ids_stride);
     quantize_i8<<<dim3(h / 128, m), 128, 0, stream>>>(x, s.xq, s.xd, h, h * sizeof(float), 1, h * sizeof(float));
-    // The narrow Qwen geometry benefits from wide vector loads at one row and WMMA during verification.
+    // Qwen uses wide vector loads at one row and selects vector/WMMA per expert during verification.
     // Keep explicit comparators and leave other geometries on the previously tested vector mechanism.
     static const int path = [] {
         const char * p = getenv("GGML_HIP_MOE_INT4_PATH");
         if (!p || strcmp(p, "auto") == 0) { return -1; }
         if (strcmp(p, "vector") == 0) { return 0; }
         if (p && strcmp(p, "wmma") == 0) { return 1; }
+        if (p && strcmp(p, "singleton") == 0) { return 4; }
         if (p && strcmp(p, "mixed") == 0) { return 2; }
         if (p && strcmp(p, "wide") == 0) { return 3; }
-        GGML_ABORT("GGML_HIP_MOE_INT4_PATH must be auto, vector, wide, wmma or mixed");
+        GGML_ABORT("GGML_HIP_MOE_INT4_PATH must be auto, vector, wide, wmma, singleton or mixed");
     }();
-    const int selected = path < 0 ? ((h == 2560 && ff == 640) ? (m == 1 ? 3 : 1) : 0) : path;
-    if (selected == 1) {
+    const int selected = path < 0 ? ((h == 2560 && ff == 640) ? (m == 1 ? 3 : 4) : 0) : path;
+    if (selected == 4) {
+        singleton_projection<true><<<dim3(ff / 64, slots), 128, 0, stream>>>(gate, up, s.xq, s.xd, s.routing, s.hidden, topk, f.limit);
+    } else if (selected == 1) {
         wmma_projection<true><<<dim3((ff + 63) / 64, slots), 128, 0, stream>>>(gate, up, s.xq, s.xd, s.routing, s.hidden, topk, f.limit);
     } else if (selected == 3) {
         vector_wide_projection<true, ROWS><<<dim3(ff / 16, slots), 128, 0, stream>>>(gate, up, s.xq, s.xd, s.routing, s.hidden, topk, f.limit);
@@ -516,7 +555,9 @@ void run_chunk(ggml_backend_cuda_context & ctx, const ggml_cuda_moe_int4_ffn & f
             s.hidden, topk, ids_stride, 1, f.limit, ff * sizeof(float), size_t(topk) * ff * sizeof(float));
     }
     quantize_i8<<<dim3(ff / 128, slots), 128, 0, stream>>>(s.hidden, s.hq, s.hd, ff, ff * sizeof(float), 1, ff * sizeof(float));
-    if (selected == 1) {
+    if (selected == 4) {
+        singleton_projection<false><<<dim3(h / 64, slots), 128, 0, stream>>>(down, {}, s.hq, s.hd, s.routing, s.down, topk, 0.0f);
+    } else if (selected == 1) {
         wmma_projection<false><<<dim3((h + 63) / 64, slots), 128, 0, stream>>>(down, {}, s.hq, s.hd, s.routing, s.down, topk, 0.0f);
     } else if (selected == 3) {
         vector_wide_projection<false, ROWS><<<dim3(h / 16, slots), 128, 0, stream>>>(down, {}, s.hq, s.hd, s.routing, s.down, topk, 0.0f);

@@ -19,8 +19,10 @@ def main():
     p.add_argument('--bank', required=True)
     p.add_argument('--fixtures', required=True)
     p.add_argument('--output', required=True)
-    p.add_argument('--modes', nargs='+', choices=['q4_0', 'vector', 'wide', 'wmma', 'mixed', 'auto'], default=['q4_0', 'vector', 'wmma', 'mixed'])
-    p.add_argument('--plain-modes', nargs='+', choices=['q4_0', 'vector', 'wide', 'wmma', 'mixed', 'auto'], default=['vector', 'q4_0'])
+    p.add_argument('--baseline-build', help='Frozen earlier build, for the baseline mode')
+    choices = ['q4_0', 'vector', 'wide', 'wmma', 'mixed', 'singleton', 'auto', 'baseline']
+    p.add_argument('--modes', nargs='+', choices=choices, default=['q4_0', 'vector', 'wmma', 'mixed'])
+    p.add_argument('--plain-modes', nargs='+', choices=choices, default=['vector', 'q4_0'])
     p.add_argument('--widths', nargs='+', type=int, default=[5, 8])
     args = p.parse_args()
     root = Path(__file__).resolve().parents[2]
@@ -34,6 +36,12 @@ def main():
     paths = [build/'rocm-int4-ffn', build/'bin/libggml-hip.so', build/'bin/libggml-base.so']
     meta = dict(branch=git('branch', '--show-current'), commit=git('rev-parse', 'HEAD'), status=git('status', '--short'),
         binaries={str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in paths}, arms={})
+    baseline = Path(args.baseline_build).resolve() if args.baseline_build else None
+    if baseline:
+        meta['baseline_binaries'] = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in
+                                    [baseline/'rocm-int4-ffn', baseline/'bin/libggml-hip.so', baseline/'bin/libggml-base.so']}
+    if 'baseline' in args.modes + args.plain_modes and baseline is None:
+        p.error('baseline mode requires --baseline-build')
     arms = []
     for width in args.widths:
         for mode in args.modes:
@@ -45,11 +53,13 @@ def main():
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         for name, mode, width, rotate in arms:
             arm_env = env.copy()
+            arm_build = baseline if mode == 'baseline' else build
+            arm_env.update(LD_LIBRARY_PATH=f'{arm_build}/bin:/opt/rocm/lib', DELPHI_COMPARE_BINDIR=str(arm_build/'bin'))
             arm_env['GGML_HIP_MOE_INT4_DECODE'] = '0' if mode == 'q4_0' else '1'
-            arm_env['GGML_HIP_MOE_INT4_PATH'] = mode
+            arm_env['GGML_HIP_MOE_INT4_PATH'] = 'auto' if mode == 'baseline' else mode
             model = bank/('matched-q4_0.gguf' if mode == 'q4_0' else 'g128.gguf')
             fixture = fixtures/'rotation.manifest' if rotate else fixtures/f'w{width}'
-            cmd = [str(build/'rocm-int4-ffn'), str(model), str(fixture), '0', str(width), '5', '4']
+            cmd = [str(arm_build/'rocm-int4-ffn'), str(model), str(fixture), '0', str(width), '5', '4']
             if rotate: arm_env['DELPHI_COMPARE_ROTATE'] = '1'; cmd.append('--manifest')
             print('running', name, flush=True)
             with (output/f'{name}.jsonl').open('w') as out, (output/f'{name}.log').open('w') as err:
@@ -67,6 +77,7 @@ def main():
                     shutil.copyfile(Path(path)/'ggml-output.f32', saved/(Path(path).name+'.f32'))
             else:
                 shutil.copyfile(fixture/'ggml-output.f32', output/(name+'.f32'))
+                shutil.copyfile(fixture/'ggml-kernels.tsv', output/(name+'-kernels.tsv'))
             timings = json.loads((output/f'{name}.jsonl').read_text())
             record['median_us'] = statistics.median(timings['device_us'])
             print(name, round(record['median_us'], 3), 'us', flush=True)
