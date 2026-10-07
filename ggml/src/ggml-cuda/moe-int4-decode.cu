@@ -705,7 +705,7 @@ static bool moe_int4_rows_supported(const ggml_cuda_moe_int4_ffn & f) {
     return f.x->ne[2] >= 1;
 }
 
-constexpr int MOE_INT4_PREFILL_CHUNK_ROWS = 2048; // rows per prefill pass: bounds the pool scratch (about 110 MiB per 1000 rows)
+constexpr int MOE_INT4_PREFILL_CHUNK_ROWS = 2048; // rows per prefill pass: bounds the pool scratch (about 100 MiB per 1000 rows)
 constexpr int MOE_INT4_PREFILL_MAX_EXPERTS = 1024; // the routing scan of the prefill path has one thread per expert
 
 // Rows from which the prefill kernels (tiles of 32 slots, activations through shared memory) run instead of the decode kernels in chunks of 16

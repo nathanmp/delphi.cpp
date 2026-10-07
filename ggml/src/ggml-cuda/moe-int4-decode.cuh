@@ -31,7 +31,7 @@
 // BF16 router weight -> BF16; FP32 sum of the eight slots in slot order -> BF16 -> F32.
 //
 // Scratch of the decode kernels (routing tables, partial sums, intermediates; about 10 MB) is per backend context and per stream of that
-// context, allocated before capture; the prefill kernels take theirs (about 110 MiB per 1000 rows, at most 2048 rows per pass) from the pool of
+// context, allocated before capture; the prefill kernels take theirs (about 100 MiB per 1000 rows, at most 2048 rows per pass) from the pool of
 // the context for the duration of the region. The regions of one context are ordered by data dependence (a layer reads the output of the previous
 // one, also across the join of a concurrent stream group), so they never overlap on one scratch; the per-stream split keeps the
 // regions of different streams apart even if a future graph optimizer ordered them differently.
