@@ -8,7 +8,9 @@
 #endif
 
 // delphi.cpp: one complete GLM-shaped routed expert FFN (gate/up -> clipped SiLU * up -> down * router weight -> slot sum) with INT4
-// weights and BF16 tensor-core MMA, for the decode and speculative-verification widths of 1..GGML_CUDA_MOE_INT4_MAX_TOKENS rows.
+// weights and BF16 tensor-core MMA, for any number of rows: the decode kernels for 1..GGML_CUDA_MOE_INT4_MAX_TOKENS rows (and wider batches
+// in chunks of that many rows), the prefill kernels (moe-int4-prefill.cuh) from GGML_CUDA_MOE_INT4_PREFILL_MIN_ROWS rows (default 64).
+// Every row has the same bits on every path and in any batch.
 // Port of the W4A16 decode kernels of vllm-cmp170hx (ampere_marlin/decode_orig.cu); see moe-int4-decode.cu for provenance.
 //
 // Storage: the routed expert tensors are GGML_TYPE_Q4_G128 (4.125 bpw: symmetric INT4, one BF16 scale per 128 values). A weight
@@ -22,14 +24,15 @@
 //
 // Selected by GGML_CUDA_MOE_INT4_DECODE=1 (default 0: the weights stay ROWMAJOR and every node takes the shadow path, which is
 // correct and slow: use Q4_0 weights of the same values for a baseline). A region that the matcher of ggml-cuda.cu accepts runs as
-// five kernels on the compute stream: input bridge + aligned routing, W13, clipped SwiGLU, W2 with router weights, slot sum +
-// output bridge. A region that does not fit (more than 16 rows, other shapes, unaligned activations) takes the shadow path per node.
+// five kernels on the compute stream (decode) or about nine (prefill): input bridge + routing, W13, clipped SwiGLU, W2 with router weights,
+// slot sum + output bridge. A region that does not fit (other shapes, unaligned activations) takes the shadow path per node.
 // Arithmetic (rounding points follow the reference): F32 -> BF16 input; INT4 -> BF16 weights, one BF16 scale multiply, FP32 MMA
 // sums; W13 partials of four K slices added in a fixed order; BF16 gate/up; clamped SiLU in FP32 -> BF16; BF16 down sum times the
 // BF16 router weight -> BF16; FP32 sum of the eight slots in slot order -> BF16 -> F32.
 //
-// Scratch (routing tables, partial sums, intermediates; about 10 MB) is per backend context and per stream of that context,
-// allocated before capture. The regions of one context are ordered by data dependence (a layer reads the output of the previous
+// Scratch of the decode kernels (routing tables, partial sums, intermediates; about 10 MB) is per backend context and per stream of that
+// context, allocated before capture; the prefill kernels take theirs (about 110 MiB per 1000 rows, at most 2048 rows per pass) from the pool of
+// the context for the duration of the region. The regions of one context are ordered by data dependence (a layer reads the output of the previous
 // one, also across the join of a concurrent stream group), so they never overlap on one scratch; the per-stream split keeps the
 // regions of different streams apart even if a future graph optimizer ordered them differently.
 
@@ -88,8 +91,9 @@ void ggml_cuda_moe_int4_free_scratch(const ggml_backend_cuda_context * ctx);
 // mode: -1 uses GGML_CUDA_MOE_INT4_DECODE, else 0 or 1.
 void ggml_backend_cuda_moe_int4_set_mode(int mode);
 // out[0..15]: packed weight sets, sets packed so far, packing microseconds, bytes of packed weights, regions built (a capture counts
-// once), scratch bytes, nodes on the shadow path, of them with more than 16 rows, regions refused for: more than 16 rows, activation
-// layout, weights, missing state (not packed / not primed / no scratch), then the weight sets that were refused at prepare.
+// once), scratch bytes, nodes on the shadow path, of them with more than 16 rows, regions refused for: no rows, activation
+// layout, weights, missing state (not packed / not primed / no scratch), the weight sets that were refused at
+// prepare, regions run on the prefill kernels, their rows, regions of more than 16 rows run as decode chunks.
 void ggml_backend_cuda_moe_int4_get_stats(int64_t * out);
 // The packed layout of the tensor with the data address data: which = 0 codes (int32 [K/16][2N], Marlin tiles), 1 scales
 // (bf16 [K/128][N]). Expert e is at ptr + e * stride. Returns false if the tensor is not PACKED.

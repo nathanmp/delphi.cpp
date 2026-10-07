@@ -59,6 +59,8 @@
 #ifdef GGML_CUDA_MOE_INT4_AVAILABLE
 
 #include "ggml-impl.h"
+#include "moe-int4-common.cuh"
+#include "moe-int4-prefill.cuh"
 
 #include <cuda_bf16.h>
 
@@ -75,47 +77,6 @@
 extern "C" __device__ float __nv_expf(float); // libdevice: the precise expf, whatever -use_fast_math says
 
 namespace {
-
-__device__ __forceinline__ uint32_t lop3_and_or(uint32_t a, uint32_t b, uint32_t c) {
-  uint32_t r;
-  asm("lop3.b32 %0, %1, %2, %3, %4;\n"
-      : "=r"(r)
-      : "r"(a), "r"(b), "r"(c), "n"((0xf0 & 0xcc) | 0xaa));
-  return r;
-}
-
-// nibbles at bits [0,4) and [16,20) of q -> bf16x2 (nib - 8), exact.
-__device__ __forceinline__ __nv_bfloat162 deq2(uint32_t q) {
-  uint32_t v = lop3_and_or(q, 0x000f000fu, 0x43004300u);
-  const uint32_t sub = 0x43084308u;
-  return __hsub2(*reinterpret_cast<__nv_bfloat162*>(&v),
-                 *reinterpret_cast<const __nv_bfloat162*>(&sub));
-}
-
-__device__ __forceinline__ uint32_t scl(__nv_bfloat162 v, __nv_bfloat162 s) {
-  __nv_bfloat162 r = __hmul2(v, s);
-  return *reinterpret_cast<uint32_t*>(&r);
-}
-
-__device__ __forceinline__ void mma_bf16(float* c, uint32_t a0, uint32_t a1, uint32_t a2,
-                                         uint32_t a3, uint32_t b0, uint32_t b1) {
-  asm volatile(
-      "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-      : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
-}
-
-__device__ __forceinline__ void cp_async16(void* smem, const void* gmem, bool pred) {
-  const uint32_t s = static_cast<uint32_t>(__cvta_generic_to_shared(smem));
-  asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(s), "l"(gmem),
-               "r"(pred ? 16 : 0));
-}
-__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n"); }
-template <int N>
-__device__ __forceinline__ void cp_async_wait() {
-  asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
-}
 
 constexpr int WARPS = 4;  // per CTA (warps are independent; the CTA is only a container)
 
@@ -354,6 +315,7 @@ constexpr int TOPK      = GGML_CUDA_MOE_INT4_TOPK;
 constexpr int MAX_M     = GGML_CUDA_MOE_INT4_MAX_TOKENS;
 constexpr int MAX_SLOTS = MAX_M * TOPK;
 constexpr int KSPLIT13  = 4;                         // W13 K slices (HIDDEN/16/64), summed in a fixed order by moe_dec_act
+static_assert(HIDDEN == PF_HIDDEN && FF == PF_FF && TOPK == PF_TOPK, "decode and prefill kernels share the shape");
 
 constexpr int ilog2_ce(int v) { return v <= 1 ? 0 : 1 + ilog2_ce(v >> 1); }
 
@@ -673,6 +635,7 @@ std::atomic<int>              moe_int4_override{-1};
 std::atomic<bool>             moe_int4_primed[GGML_CUDA_MAX_DEVICES];
 std::atomic<int64_t>          moe_int4_packs{0}, moe_int4_pack_us{0}, moe_int4_runs{0}, moe_int4_scratch_bytes{0}, moe_int4_shadows{0},
                               moe_int4_shadows_wide{0}, moe_int4_prepare_refused{0};
+std::atomic<int64_t>          moe_int4_prefill_runs{0}, moe_int4_prefill_rows{0}, moe_int4_chunked_runs{0};
 std::atomic<int64_t>          moe_int4_refused[MOE_INT4_REFUSE_COUNT];
 std::atomic<bool>             moe_int4_logged[MOE_INT4_REFUSE_COUNT + 2];
 
@@ -739,8 +702,24 @@ static bool moe_int4_rows_supported(const ggml_cuda_moe_int4_ffn & f) {
     if (f.x == nullptr || f.ids == nullptr) {
         return false;
     }
-    const int64_t m = f.x->ne[2];
-    return m >= 1 && m <= MAX_M;
+    return f.x->ne[2] >= 1;
+}
+
+constexpr int MOE_INT4_PREFILL_CHUNK_ROWS = 2048; // rows per prefill pass: bounds the pool scratch (about 110 MiB per 1000 rows)
+constexpr int MOE_INT4_PREFILL_MAX_EXPERTS = 1024; // the routing scan of the prefill path has one thread per expert
+
+// Rows from which the prefill kernels (tiles of 32 slots, activations through shared memory) run instead of the decode kernels in chunks of 16
+// rows. Both are bitwise equal for every row; this only picks the faster. GGML_CUDA_MOE_INT4_PREFILL_MIN_ROWS overrides the default.
+static int moe_int4_prefill_min_rows() {
+    static const int v = [] {
+        const char * e = getenv("GGML_CUDA_MOE_INT4_PREFILL_MIN_ROWS");
+        return e != nullptr && atoi(e) > MAX_M ? atoi(e) : 64;
+    }();
+    return v;
+}
+
+static bool moe_int4_use_prefill(const int64_t rows, const int64_t n_experts) {
+    return rows >= moe_int4_prefill_min_rows() && n_experts <= MOE_INT4_PREFILL_MAX_EXPERTS;
 }
 
 static bool moe_int4_layout_supported(const ggml_cuda_moe_int4_ffn & f) {
@@ -771,6 +750,13 @@ static void moe_int4_prime(const int device) {
     CUDA_CHECK(cudaFuncGetAttributes(&attr, moe_int4_sum));
     CUDA_CHECK(cudaFuncGetAttributes(&attr, moe_int4_packed_to_q4_0));
     CUDA_CHECK(cudaFuncGetAttributes(&attr, moe_int4_rowmajor_to_q4_0));
+    CUDA_CHECK(cudaFuncGetAttributes(&attr, pf_hist));
+    CUDA_CHECK(cudaFuncGetAttributes(&attr, pf_scan));
+    CUDA_CHECK(cudaFuncGetAttributes(&attr, pf_scatter));
+    CUDA_CHECK(cudaFuncGetAttributes(&attr, pf_x2bf16));
+    CUDA_CHECK(cudaFuncGetAttributes(&attr, pf_w13));
+    CUDA_CHECK(cudaFuncGetAttributes(&attr, pf_w2));
+    CUDA_CHECK(cudaFuncGetAttributes(&attr, pf_sum));
     moe_int4_primed[device].store(true, std::memory_order_release);
 }
 
@@ -916,7 +902,7 @@ bool ggml_cuda_moe_int4_ready(ggml_backend_cuda_context & ctx, const ggml_cuda_m
         return refuse(MOE_INT4_REFUSE_WEIGHTS, "region refused: weights not supported (type, shape, buffer or alignment): ordinary path");
     }
     if (!moe_int4_rows_supported(f)) {
-        return refuse(MOE_INT4_REFUSE_ROWS, "region refused: more than 16 rows (prefill or wide catch-up): ordinary path on Q4_0 conversions");
+        return refuse(MOE_INT4_REFUSE_ROWS, "region refused: no rows: ordinary path");
     }
     if (!moe_int4_layout_supported(f)) {
         return refuse(MOE_INT4_REFUSE_LAYOUT, "region refused: activation layout (type, strides, alignment): ordinary path on Q4_0 conversions");
@@ -934,28 +920,72 @@ bool ggml_cuda_moe_int4_ready(ggml_backend_cuda_context & ctx, const ggml_cuda_m
     return true;
 }
 
-void ggml_cuda_moe_int4_run(ggml_backend_cuda_context & ctx, const ggml_cuda_moe_int4_ffn & f) {
-    moe_int4_set c;
-    moe_int4_scratch_buffers * s = moe_int4_scratch_find(ctx);
-    GGML_ASSERT(moe_int4_find_ffn(ctx.device, f, c) && s != nullptr);
+// Rows [row0, row0 + m) with m <= MAX_M on the decode kernels.
+static void moe_int4_run_decode(ggml_backend_cuda_context & ctx, const ggml_cuda_moe_int4_ffn & f, const moe_int4_set & c,
+        moe_int4_scratch_buffers * s, const int row0, const int m) {
     cudaStream_t stream = ctx.stream();
-    const int m       = (int) f.x->ne[2];
     const int n_slots = m * TOPK;
     const int64_t estride = (int64_t) (c.slot / sizeof(int4));
     const int4 * g = (const int4 *) f.gate->data, * u = (const int4 *) f.up->data, * d = (const int4 *) f.down->data;
     auto scales = [](const int4 * w) { return (const int4 *) ((const char *) w + MOE_INT4_CODES); };
+    const float *   x   = (const float *) f.x->data + (int64_t) row0 * (f.x->nb[2] / sizeof(float));
+    const int32_t * ids = (const int32_t *) f.ids->data + (int64_t) row0 * (f.ids->nb[1] / sizeof(int32_t));
+    const float *   rw  = (const float *) f.weights->data + (int64_t) row0 * TOPK;
+    float *         dst = (float *) f.dst->data + (int64_t) row0 * HIDDEN;
 
-    moe_int4_prep<<<1 + m * HIDDEN / (256 * 4), 256, 0, stream>>>((const float *) f.x->data, f.x->nb[2] / sizeof(float),
-        (const int32_t *) f.ids->data, f.ids->nb[1] / sizeof(int32_t), (int) c.n_experts, m, s->xb, s->sorted, s->eids, s->ntpp, s->ctr);
+    moe_int4_prep<<<1 + m * HIDDEN / (256 * 4), 256, 0, stream>>>(x, f.x->nb[2] / sizeof(float), ids, f.ids->nb[1] / sizeof(int32_t), (int) c.n_experts, m,
+        s->xb, s->sorted, s->eids, s->ntpp, s->ctr);
     CUDA_CHECK(cudaGetLastError());
-    moe_int4_w13_launch::run(ctx.device, stream, s->xb, HIDDEN, g, u, scales(g), scales(u), estride, s->sorted, s->eids, s->ntpp,
-        (const float *) f.weights->data, n_slots, s->ctr, s->part, nullptr);
+    moe_int4_w13_launch::run(ctx.device, stream, s->xb, HIDDEN, g, u, scales(g), scales(u), estride, s->sorted, s->eids, s->ntpp, rw, n_slots, s->ctr, s->part,
+        nullptr);
     moe_dec_act<KSPLIT13><<<n_slots, FF / 4, 0, stream>>>(s->part, n_slots, FF, f.limit, s->h);
     CUDA_CHECK(cudaGetLastError());
-    moe_int4_w2_launch::run(ctx.device, stream, s->h, FF, d, nullptr, scales(d), nullptr, estride, s->sorted, s->eids, s->ntpp,
-        (const float *) f.weights->data, n_slots, s->ctr, nullptr, s->c3);
-    moe_int4_sum<<<dim3(HIDDEN / 8 / 128, m), 128, 0, stream>>>(s->c3, (float *) f.dst->data);
+    moe_int4_w2_launch::run(ctx.device, stream, s->h, FF, d, nullptr, scales(d), nullptr, estride, s->sorted, s->eids, s->ntpp, rw, n_slots, s->ctr, nullptr,
+        s->c3);
+    moe_int4_sum<<<dim3(HIDDEN / 8 / 128, m), 128, 0, stream>>>(s->c3, dst);
     CUDA_CHECK(cudaGetLastError());
+}
+
+// Rows [row0, row0 + m) on the prefill kernels; the scratch comes from the pool of the backend context for the duration of the pass (as the
+// Q4_0 conversions of the shadow path do, also inside the single-use capture of a prefill graph: the pool address is valid for that launch).
+static void moe_int4_run_prefill(ggml_backend_cuda_context & ctx, const ggml_cuda_moe_int4_ffn & f, const moe_int4_set & c, const int row0, const int m) {
+    cudaStream_t stream = ctx.stream();
+    const int n_experts = (int) c.n_experts;
+    const pf_scratch need = pf_scratch_layout(nullptr, m, n_experts);
+    ggml_cuda_pool_alloc<char> pool(ctx.pool(), need.bytes);
+    const pf_scratch s = pf_scratch_layout(pool.get(), m, n_experts);
+    const pf_weights w = { (const int4 *) f.gate->data, (const int4 *) f.up->data, (const int4 *) f.down->data, (int64_t) (c.slot / sizeof(int4)) };
+    const float *   x   = (const float *) f.x->data + (int64_t) row0 * (f.x->nb[2] / sizeof(float));
+    const int32_t * ids = (const int32_t *) f.ids->data + (int64_t) row0 * (f.ids->nb[1] / sizeof(int32_t));
+    const float *   rw  = (const float *) f.weights->data + (int64_t) row0 * TOPK;
+    float *         dst = (float *) f.dst->data + (int64_t) row0 * HIDDEN;
+
+    pf_route(stream, s, ids, f.ids->nb[1] / sizeof(int32_t), m, n_experts, x, f.x->nb[2] / sizeof(float));
+    pf_launch_w13(stream, s, w, m, f.limit);
+    pf_launch_w2(stream, s, w, m, rw);
+    pf_launch_sum(stream, s, m, dst);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void ggml_cuda_moe_int4_run(ggml_backend_cuda_context & ctx, const ggml_cuda_moe_int4_ffn & f) {
+    moe_int4_set c;
+    moe_int4_scratch_buffers * s = moe_int4_scratch_find(ctx);
+    GGML_ASSERT(moe_int4_find_ffn(ctx.device, f, c) && s != nullptr);
+    const int m = (int) f.x->ne[2];
+    if (moe_int4_use_prefill(m, c.n_experts)) {
+        for (int row0 = 0; row0 < m; row0 += MOE_INT4_PREFILL_CHUNK_ROWS) {
+            moe_int4_run_prefill(ctx, f, c, row0, std::min(MOE_INT4_PREFILL_CHUNK_ROWS, m - row0));
+        }
+        moe_int4_prefill_runs.fetch_add(1);
+        moe_int4_prefill_rows.fetch_add(m);
+    } else {
+        for (int row0 = 0; row0 < m; row0 += MAX_M) {
+            moe_int4_run_decode(ctx, f, c, s, row0, std::min(MAX_M, m - row0));
+        }
+        if (m > MAX_M) {
+            moe_int4_chunked_runs.fetch_add(1);
+        }
+    }
     moe_int4_runs.fetch_add(1);
 }
 
@@ -1071,7 +1101,9 @@ void ggml_backend_cuda_moe_int4_get_stats(int64_t * out) {
     out[10] = moe_int4_refused[MOE_INT4_REFUSE_WEIGHTS].load();
     out[11] = moe_int4_refused[MOE_INT4_REFUSE_STATE].load();
     out[12] = moe_int4_prepare_refused.load();
-    out[13] = out[14] = out[15] = 0;
+    out[13] = moe_int4_prefill_runs.load();
+    out[14] = moe_int4_prefill_rows.load();
+    out[15] = moe_int4_chunked_runs.load();
 }
 
 bool ggml_backend_cuda_moe_int4_get_pack(const void * data, int which, const void ** ptr, size_t * bytes, size_t * stride) {
