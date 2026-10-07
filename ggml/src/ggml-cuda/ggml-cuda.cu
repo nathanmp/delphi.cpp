@@ -2352,6 +2352,8 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     if (src0->type == GGML_TYPE_Q4_G128) {
 #ifdef GGML_HIP_MOE_INT4_AVAILABLE
+        ggml_exec_trace_dispatch(dst->op, GGML_EXEC_TRACE_DISPATCH_GPU_MOE_INT4, GGML_EXEC_TRACE_DISPATCH_VARIANT_DEFAULT,
+                ggml_cuda_info().devices[ctx.device].cc, (uint32_t) dst->ne[2]);
         ggml_hip_moe_int4_mul_mat_id(ctx, dst);
         return;
 #else

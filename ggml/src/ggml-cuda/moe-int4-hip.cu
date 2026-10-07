@@ -603,13 +603,22 @@ void ggml_hip_moe_int4_mul_mat_id(ggml_backend_cuda_context & ctx, const ggml_te
     GGML_ASSERT(supported_weight(w) && x->type == GGML_TYPE_F32 && x->nb[0] == sizeof(float) &&
         dst->type == GGML_TYPE_F32 && dst->nb[0] == sizeof(float) && ids->type == GGML_TYPE_I32 && ids->nb[0] == sizeof(int32_t));
     const int k = w->ne[0], topk = ids->ne[0], m = ids->ne[1], input_rows = x->ne[1];
+    const int chunk_rows = std::min(m, std::min(1024, 65535 / std::max(topk, input_rows)));
+    GGML_ASSERT(chunk_rows > 0);
     ggml_cuda_pool_alloc<int8_t> q(ctx.pool());
     ggml_cuda_pool_alloc<float> d(ctx.pool());
-    q.alloc(size_t(k) * input_rows * m); d.alloc(size_t(k / 128) * input_rows * m);
-    quantize_i8<<<dim3(k / 128, input_rows * m), 128, 0, ctx.stream()>>>(static_cast<const float *>(x->data), q.get(), d.get(),
-        k, x->nb[1], input_rows, x->nb[2]);
-    vector_projection<false, 1, false><<<dim3(w->ne[1] / 16, topk * m), 128, 0, ctx.stream()>>>(get_bank(ctx.device, w), {},
-        q.get(), d.get(), nullptr, static_cast<const int *>(ids->data), static_cast<float *>(dst->data), topk, ids->nb[1] / sizeof(int32_t), input_rows, 0.0f, dst->nb[1], dst->nb[2]);
+    q.alloc(size_t(k) * input_rows * chunk_rows); d.alloc(size_t(k / 128) * input_rows * chunk_rows);
+    const bank weights = get_bank(ctx.device, w);
+    for (int start = 0; start < m; start += chunk_rows) {
+        const int rows = std::min(chunk_rows, m - start);
+        const float * input = reinterpret_cast<const float *>(static_cast<const char *>(x->data) + start * x->nb[2]);
+        const int * selected = reinterpret_cast<const int *>(static_cast<const char *>(ids->data) + start * ids->nb[1]);
+        float * output = reinterpret_cast<float *>(static_cast<char *>(dst->data) + start * dst->nb[2]);
+        quantize_i8<<<dim3(k / 128, input_rows * rows), 128, 0, ctx.stream()>>>(input, q.get(), d.get(),
+            k, x->nb[1], input_rows, x->nb[2]);
+        vector_projection<false, 1, false><<<dim3(w->ne[1] / 16, topk * rows), 128, 0, ctx.stream()>>>(weights, {},
+            q.get(), d.get(), nullptr, selected, output, topk, ids->nb[1] / sizeof(int32_t), input_rows, 0.0f, dst->nb[1], dst->nb[2]);
+    }
     CUDA_CHECK(cudaGetLastError());
     fallbacks++;
 }

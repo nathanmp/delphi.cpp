@@ -11011,6 +11011,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int rows : {1, 5, 17}) {
             test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_G128, GGML_TYPE_F32, 12, 10, broadcast, 80, rows, 640));
         }
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_G128, GGML_TYPE_F32, 12, 10, broadcast, 32, 1031, 128));
     }
 
     // TODO: https://github.com/ggml-org/llama.cpp/pull/26223#issuecomment-5585815365
