@@ -77,6 +77,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--extra-inputs", default='{"temperature":0,"ignore_eos":true}')
     parser.add_argument("--timeout", type=float, default=1800)
     parser.add_argument("--model", default=None)
+    parser.add_argument("--prompts-json", type=Path, help="JSON list of {id, category, turns}; with --prompt-index it replaces the SPEED-Bench loader")
+    parser.add_argument("--prompt-index", type=int, default=0)
     parser.add_argument("--output", required=True)
     args = parser.parse_args(argv)
 
@@ -85,8 +87,11 @@ def main(argv: list[str] | None = None) -> int:
     extra = sb.parse_extra_inputs(args.extra_inputs)
     args.extra_inputs = extra
     args.concurrency = 1
-    samples = sb.load_samples(args)
-    sample = samples[0]
+    if args.prompts_json:
+        entry = json.loads(args.prompts_json.read_text())[args.prompt_index]
+        sample = sb.Sample(id=entry["id"], category=entry["category"], turns=entry["turns"])
+    else:
+        sample = sb.load_samples(args)[0]
     if len(sample.turns) != 1:
         print(f"spec-repeat-client: {sample.id} has {len(sample.turns)} turns; one expected", file=sys.stderr)
         return 2
