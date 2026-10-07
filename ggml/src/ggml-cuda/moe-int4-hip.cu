@@ -385,7 +385,7 @@ weight_state * find_state(int device, const void * data) {
 
 bool supported_weight(const ggml_tensor * t) {
     return t && t->type == GGML_TYPE_Q4_G128 && t->ne[0] % 128 == 0 && t->ne[1] % 16 == 0 &&
-        t->ne[3] == 1 && ggml_is_contiguous(t) && t->data && t->nb[2] % 16 == 0;
+        t->ne[3] == 1 && !t->view_src && ggml_is_contiguous(t) && t->data && t->nb[2] % 16 == 0;
 }
 
 bank get_bank(int device, const ggml_tensor * t) {

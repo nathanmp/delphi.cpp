@@ -19,6 +19,7 @@
 // GGML_HIP_MOE_INT4_PATH=auto (default) uses wide vector loads for one-row H=2560/FF=640 work and I8 WMMA for its wider batches;
 // other shapes use K-split vector dots. Explicit vector/wide/wmma/mixed modes are experimental comparators. Vector and WMMA sum
 // K groups in different F32 orders, so the mode/width selection does not promise bitwise batch invariance.
+// Weight-bank views and partial routed nodes are not advertised as HIP G128 operations; they keep the CPU fallback.
 
 // delphi.cpp: one complete GLM-shaped routed expert FFN (gate/up -> clipped SiLU * up -> down * router weight -> slot sum) with INT4
 // weights and BF16 tensor-core MMA, for any number of rows: the decode kernels for 1..GGML_CUDA_MOE_INT4_MAX_TOKENS rows (and wider batches
@@ -58,7 +59,7 @@ struct ggml_cuda_moe_int4_ffn {
     const ggml_tensor * down    = nullptr; // Q4_G128 [ff, hidden, E]
     const ggml_tensor * x       = nullptr; // F32  [hidden, 1, M]
     const ggml_tensor * ids     = nullptr; // I32  [topk, M]
-    const ggml_tensor * weights = nullptr; // F32  [1, 8, M], contiguous: the router weights by slot
+    const ggml_tensor * weights = nullptr; // F32  [1, topk, M], contiguous: the router weights by slot
     ggml_tensor *       dst     = nullptr; // F32  [hidden, M], contiguous
     float               limit   = 0.0f;    // 0 for ordinary SwiGLU; NVIDIA requires GLM's clamp
 };
@@ -66,8 +67,7 @@ struct ggml_cuda_moe_int4_ffn {
 // GGML_CUDA_MOE_INT4_DECODE, or the override of ggml_backend_cuda_moe_int4_set_mode.
 bool ggml_cuda_moe_int4_enabled();
 
-// Whether the CUDA backend can hold weights of this tensor: the type is Q4_G128 and the device supports it (NVIDIA, Ampere or newer).
-// Used by supports_op: every MUL_MAT_ID that the ordinary path supports for Q4_0 is supported for these weights (shadow path).
+// Device eligibility for G128 routed weights: NVIDIA (ordinary shadow path) or RDNA4 (direct G128 path).
 bool ggml_cuda_moe_int4_type_supported(int device);
 
 // The type that the ordinary dispatch logic must assume for the weights of a MUL_MAT_ID (Q4_0 for Q4_G128 weights, else the type).
@@ -117,7 +117,9 @@ void ggml_backend_cuda_moe_int4_set_mode(int mode);
 // once), scratch bytes, nodes on the shadow path, of them with more than 16 rows, regions refused for: no rows, activation
 // layout, weights, missing state (not packed / not primed / no scratch), the weight sets that were refused at
 // prepare, regions run on the prefill kernels, their rows, regions of more than 16 rows run as decode chunks.
+// HIP counts packed tensors in [0..1], direct fallback nodes in [6], and chunked FFNs in [15]; unused counters are zero.
 void ggml_backend_cuda_moe_int4_get_stats(int64_t * out);
 // The packed layout of the tensor with the data address data: which = 0 codes (int32 [K/16][2N], Marlin tiles), 1 scales
 // (bf16 [K/128][N]). Expert e is at ptr + e * stride. Returns false if the tensor is not PACKED.
+// HIP layout: codes uint32 [N/16][K/16][lane32], scales bf16 [N][K/128], in the same expert-sized slot.
 bool ggml_backend_cuda_moe_int4_get_pack(const void * data, int which, const void ** ptr, size_t * bytes, size_t * stride);

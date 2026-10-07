@@ -6572,7 +6572,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                         // delphi: INT4 expert weights; MUL_MAT_ID only (moe-int4-decode.cuh: matched region or Q4_0 conversion)
                         return op->op == GGML_OP_MUL_MAT_ID && ggml_cuda_moe_int4_type_supported(dev_ctx->device)
 #ifdef GGML_HIP_MOE_INT4_AVAILABLE
-                            && a->ne[1] % 16 == 0 && ggml_is_contiguous(a) && op->src[1]->type == GGML_TYPE_F32
+                            && a->ne[1] % 16 == 0 && !a->view_src && ggml_is_contiguous(a) && op->src[1]->type == GGML_TYPE_F32
                             && op->src[2]->nb[0] == sizeof(int32_t) && op->src[1]->nb[0] == sizeof(float)
                             && !ggml_mul_mat_id_is_partial(op)
 #endif
