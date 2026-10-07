@@ -16,6 +16,9 @@
 // Weights are packed in place per tensor. Readback or writes first restore its canonical bytes; stable device layout flags let
 // captured fallback kernels read either layout. Scratch is owned by backend context, stream and matrix shape, and lives until
 // context destruction. Mode overrides are test-only; use a fresh backend when changing mode after graph capture.
+// GGML_HIP_MOE_INT4_PATH=auto (default) uses wide vector loads for one-row H=2560/FF=640 work and I8 WMMA for its wider batches;
+// other shapes use K-split vector dots. Explicit vector/wide/wmma/mixed modes are experimental comparators. Vector and WMMA sum
+// K groups in different F32 orders, so the mode/width selection does not promise bitwise batch invariance.
 
 // delphi.cpp: one complete GLM-shaped routed expert FFN (gate/up -> clipped SiLU * up -> down * router weight -> slot sum) with INT4
 // weights and BF16 tensor-core MMA, for any number of rows: the decode kernels for 1..GGML_CUDA_MOE_INT4_MAX_TOKENS rows (and wider batches

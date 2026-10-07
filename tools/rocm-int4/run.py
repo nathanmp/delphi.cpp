@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import statistics
+import shutil
 import subprocess
 import sys
 
@@ -18,6 +19,9 @@ def main():
     p.add_argument('--bank', required=True)
     p.add_argument('--fixtures', required=True)
     p.add_argument('--output', required=True)
+    p.add_argument('--modes', nargs='+', choices=['q4_0', 'vector', 'wide', 'wmma', 'mixed', 'auto'], default=['q4_0', 'vector', 'wmma', 'mixed'])
+    p.add_argument('--plain-modes', nargs='+', choices=['q4_0', 'vector', 'wide', 'wmma', 'mixed', 'auto'], default=['vector', 'q4_0'])
+    p.add_argument('--widths', nargs='+', type=int, default=[5, 8])
     args = p.parse_args()
     root = Path(__file__).resolve().parents[2]
     spec = importlib.util.spec_from_file_location('delphi_profile', root/'tools/bottlenecks/profile.py')
@@ -31,10 +35,10 @@ def main():
     meta = dict(branch=git('branch', '--show-current'), commit=git('rev-parse', 'HEAD'), status=git('status', '--short'),
         binaries={str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in paths}, arms={})
     arms = []
-    for width in (5, 8):
-        for mode in ('q4_0', 'vector', 'wmma', 'mixed'):
+    for width in args.widths:
+        for mode in args.modes:
             arms.append((f'{mode}-w{width}', mode, width, False))
-    for mode in ('vector', 'q4_0'):
+    for mode in args.plain_modes:
         arms.append((f'{mode}-w1-cached', mode, 1, False))
         arms.append((f'{mode}-w1-rotation', mode, 1, True))
     with open('/tmp/delphi-representative.lock', 'w') as lock:
@@ -56,6 +60,13 @@ def main():
             meta['arms'][name] = record
             (output/'run.json').write_text(json.dumps(meta, indent=2)+'\n')
             if result.returncode: raise RuntimeError(f'{name} failed; see {output}/{name}.log')
+            if rotate:
+                saved = output/name; saved.mkdir(exist_ok=True)
+                for line in fixture.read_text().splitlines():
+                    _, path = line.split(maxsplit=1)
+                    shutil.copyfile(Path(path)/'ggml-output.f32', saved/(Path(path).name+'.f32'))
+            else:
+                shutil.copyfile(fixture/'ggml-output.f32', output/(name+'.f32'))
             timings = json.loads((output/f'{name}.jsonl').read_text())
             record['median_us'] = statistics.median(timings['device_us'])
             print(name, round(record['median_us'], 3), 'us', flush=True)

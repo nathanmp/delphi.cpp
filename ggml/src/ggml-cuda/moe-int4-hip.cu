@@ -248,6 +248,75 @@ __global__ void vector_projection(bank w, bank u, const int8_t * x, const float 
     }
 }
 
+// Wide-load comparator from the same G128 prototypes: four adjacent channels per aligned load.
+template<bool GATE_UP,int ROWS,int FILTER_ROWS=0> __global__ void vector_wide_projection(
+        bank wb,bank ub,const signed char * x,const float * dx,const routes * r,float * y,int topk,float limit) {
+    constexpr int WAVES=4;
+    const int n=wb.n,k=wb.k;
+    int group=blockIdx.y;if(group>=r->groups)return;
+    int lane=threadIdx.x&31,wave=threadIdx.x/32,tile=blockIdx.x;
+    int base=tile*16+(lane%4)*4,expert=r->experts[group],nr=r->counts[group];
+    const unsigned * w=reinterpret_cast<const unsigned *>(wb.data+expert*wb.stride);
+    const unsigned * u=GATE_UP?reinterpret_cast<const unsigned *>(ub.data+expert*ub.stride):nullptr;
+    if constexpr(FILTER_ROWS>0)if(nr>FILTER_ROWS)return;
+    float sum[ROWS][4]={},sumu[ROWS][4]={};
+    for(int kg=wave;kg<k/128;kg+=WAVES){
+        int acc[ROWS][4]={},accu[ROWS][4]={};
+#pragma unroll
+        for(int t=0;t<2;++t){
+            size_t wi=((size_t(tile))*(k/16)+kg*8+t*4+lane/8)*32+(lane%4)*4+16*((lane/4)%2);
+            uint4 packed=*reinterpret_cast<const uint4 *>(w+wi),up{};
+            if constexpr(GATE_UP)up=*reinterpret_cast<const uint4 *>(u+wi);
+            unsigned codes[4]={packed.x,packed.y,packed.z,packed.w},ucodes[4]={up.x,up.y,up.z,up.w};
+            int kk=kg*128+t*64+(lane/4)*8;
+#pragma unroll
+            for(int row=0;row<ROWS;++row)if(row<nr){
+                int slot=r->slots[group*MAX_ROWS+row],xr=GATE_UP?slot/topk:slot;
+                auto xp=reinterpret_cast<const int *>(x+size_t(xr)*k+kk);int a=xp[0],b=xp[1];
+#pragma unroll
+                for(int col=0;col<4;++col){
+                    int lo,hi;unpack8(codes[col],lo,hi);
+                    acc[row][col]=ggml_cuda_dp4a(lo,a,acc[row][col]);
+                    acc[row][col]=ggml_cuda_dp4a(hi,b,acc[row][col]);
+                    if constexpr(GATE_UP){unpack8(ucodes[col],lo,hi);accu[row][col]=ggml_cuda_dp4a(lo,a,accu[row][col]);accu[row][col]=ggml_cuda_dp4a(hi,b,accu[row][col]);}
+                }
+            }
+        }
+#pragma unroll
+        for(int row=0;row<ROWS;++row)if(row<nr){
+            int slot=r->slots[group*MAX_ROWS+row],xr=GATE_UP?slot/topk:slot;float xs=dx[size_t(xr)*(k/128)+kg];
+#pragma unroll
+            for(int col=0;col<4;++col){
+                int dot=acc[row][col],udot=accu[row][col];
+#pragma unroll
+                for(int stride=4;stride<=16;stride*=2){dot+=__shfl_xor(dot,stride);if constexpr(GATE_UP)udot+=__shfl_xor(udot,stride);}
+                float ws=scale_at(wb.data+expert*wb.stride,k,n,base+col,kg,true);sum[row][col]+=float(dot)*(ws*xs);
+                if constexpr(GATE_UP){float ups=scale_at(ub.data+expert*ub.stride,k,n,base+col,kg,true);sumu[row][col]+=float(udot)*(ups*xs);}
+            }
+        }
+    }
+    __shared__ float partial[WAVES][ROWS][16];
+    __shared__ float partialu[GATE_UP?WAVES:1][ROWS][16];
+    if(lane<4){
+#pragma unroll
+        for(int row=0;row<ROWS;++row)if(row<nr){
+#pragma unroll
+            for(int col=0;col<4;++col){int j=lane*4+col;partial[wave][row][j]=sum[row][col];if constexpr(GATE_UP)partialu[wave][row][j]=sumu[row][col];}
+        }
+    }
+    __syncthreads();
+    if(wave==0 && lane<16){
+#pragma unroll
+        for(int row=0;row<ROWS;++row)if(row<nr){
+            float v=partial[0][row][lane],uv=GATE_UP?partialu[0][row][lane]:0;
+#pragma unroll
+            for(int j=1;j<WAVES;++j){v+=partial[j][row][lane];if constexpr(GATE_UP)uv+=partialu[j][row][lane];}
+            int slot=r->slots[group*MAX_ROWS+row];y[size_t(slot)*n+tile*16+lane]=GATE_UP?activate(v,uv,limit):v;
+        }
+    }
+}
+
+
 // A WMMA tile shares its packed weight fragments across up to 16 routed rows. Activation precision is the same as vector execution.
 template <bool GATE_UP, int MIN_ROWS = 0>
 __global__ void wmma_projection(bank w, bank u, const int8_t * x, const float * dx, const routes * r,
@@ -356,7 +425,8 @@ void change_layout(weight_state & s, bool packed) {
         } else { unpack_groups<<<grid, 256, 0, stream>>>(tmp, dst, s.stride, s.k, s.n, ce); }
         CUDA_CHECK(cudaGetLastError());
     }
-    CUDA_CHECK(cudaMemsetAsync(s.flag, packed ? 1 : 0, sizeof(int), stream));
+    const int flag = packed ? 1 : 0;
+    CUDA_CHECK(cudaMemcpyAsync(s.flag, &flag, sizeof(flag), cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
     CUDA_CHECK(cudaFree(tmp));
     s.packed = packed;
@@ -421,16 +491,23 @@ void run_chunk(ggml_backend_cuda_context & ctx, const ggml_cuda_moe_int4_ffn & f
     float * out = static_cast<float *>(f.dst->data) + size_t(start) * h;
     group_routes<<<1, MAX_SLOTS, 0, stream>>>(ids, s.routing, slots, ROWS, topk, ids_stride);
     quantize_i8<<<dim3(h / 128, m), 128, 0, stream>>>(x, s.xq, s.xd, h, h * sizeof(float), 1, h * sizeof(float));
-    // These are experimental comparators. Select once before graph capture; the default remains the measured vector mechanism.
+    // The narrow Qwen geometry benefits from wide vector loads at one row and WMMA during verification.
+    // Keep explicit comparators and leave other geometries on the previously tested vector mechanism.
     static const int path = [] {
         const char * p = getenv("GGML_HIP_MOE_INT4_PATH");
+        if (!p || strcmp(p, "auto") == 0) { return -1; }
+        if (strcmp(p, "vector") == 0) { return 0; }
         if (p && strcmp(p, "wmma") == 0) { return 1; }
         if (p && strcmp(p, "mixed") == 0) { return 2; }
-        return 0;
+        if (p && strcmp(p, "wide") == 0) { return 3; }
+        GGML_ABORT("GGML_HIP_MOE_INT4_PATH must be auto, vector, wide, wmma or mixed");
     }();
-    if (path == 1) {
+    const int selected = path < 0 ? ((h == 2560 && ff == 640) ? (m == 1 ? 3 : 1) : 0) : path;
+    if (selected == 1) {
         wmma_projection<true><<<dim3((ff + 63) / 64, slots), 128, 0, stream>>>(gate, up, s.xq, s.xd, s.routing, s.hidden, topk, f.limit);
-    } else if (path == 2 && m > 1) {
+    } else if (selected == 3) {
+        vector_wide_projection<true, ROWS><<<dim3(ff / 16, slots), 128, 0, stream>>>(gate, up, s.xq, s.xd, s.routing, s.hidden, topk, f.limit);
+    } else if (selected == 2 && m > 1) {
         vector_projection<true, 2, true, 2><<<dim3(ff / 16, slots), 128, 0, stream>>>(gate, up, s.xq, s.xd, s.routing, nullptr,
             s.hidden, topk, ids_stride, 1, f.limit, ff * sizeof(float), size_t(topk) * ff * sizeof(float));
         wmma_projection<true, 3><<<dim3((ff + 63) / 64, slots), 128, 0, stream>>>(gate, up, s.xq, s.xd, s.routing, s.hidden, topk, f.limit);
@@ -439,9 +516,11 @@ void run_chunk(ggml_backend_cuda_context & ctx, const ggml_cuda_moe_int4_ffn & f
             s.hidden, topk, ids_stride, 1, f.limit, ff * sizeof(float), size_t(topk) * ff * sizeof(float));
     }
     quantize_i8<<<dim3(ff / 128, slots), 128, 0, stream>>>(s.hidden, s.hq, s.hd, ff, ff * sizeof(float), 1, ff * sizeof(float));
-    if (path == 1) {
+    if (selected == 1) {
         wmma_projection<false><<<dim3((h + 63) / 64, slots), 128, 0, stream>>>(down, {}, s.hq, s.hd, s.routing, s.down, topk, 0.0f);
-    } else if (path == 2 && m > 1) {
+    } else if (selected == 3) {
+        vector_wide_projection<false, ROWS><<<dim3(h / 16, slots), 128, 0, stream>>>(down, {}, s.hq, s.hd, s.routing, s.down, topk, 0.0f);
+    } else if (selected == 2 && m > 1) {
         vector_projection<false, 2, true, 2><<<dim3(h / 16, slots), 128, 0, stream>>>(down, {}, s.hq, s.hd, s.routing, nullptr,
             s.down, topk, ids_stride, topk, 0.0f, h * sizeof(float), size_t(topk) * h * sizeof(float));
         wmma_projection<false, 3><<<dim3((h + 63) / 64, slots), 128, 0, stream>>>(down, {}, s.hq, s.hd, s.routing, s.down, topk, 0.0f);

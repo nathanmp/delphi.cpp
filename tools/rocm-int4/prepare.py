@@ -43,6 +43,7 @@ def main():
     p.add_argument('--layer', type=int, default=0)
     p.add_argument('--output', required=True)
     p.add_argument('--widths', default='1,5,8,17')
+    p.add_argument('--actual', help='validation output path, with optional {width} placeholder')
     args = p.parse_args()
     out = Path(args.output)
     out.mkdir(parents=True, exist_ok=True)
@@ -114,10 +115,11 @@ def main():
                 slots[rows, which] = q8(hidden).astype(np.float64) @ down.T
             np.sum(slots * ww[..., None], axis=1).astype(np.float32).tofile(d/'reference.f32')
         else:
-            actual = np.fromfile(d/'ggml-output.f32', np.float32)
+            actual_path = Path(args.actual.format(width=m)) if args.actual else d/'ggml-output.f32'
+            actual = np.fromfile(actual_path, np.float32)
             ref = np.fromfile(d/'reference.f32', np.float32)
             assert actual.shape == ref.shape and np.all(np.isfinite(actual))
-            result = error(actual, ref)
+            result = dict(actual=str(actual_path), **error(actual, ref))
             assert result['nmse'] < 1e-7, (m, result)
             (d/'validation.json').write_text(json.dumps(result, indent=2)+'\n')
             print(m, result)
