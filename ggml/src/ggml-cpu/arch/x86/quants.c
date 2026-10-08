@@ -698,6 +698,43 @@ void ggml_vec_dot_q1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
 #endif
 }
 
+void ggml_vec_dot_q4_g128_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+#if defined(__AVX2__)
+    assert(n % QK4_G128 == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_q4_g128 * GGML_RESTRICT x = vx;
+    const block_q8_0    * GGML_RESTRICT y = vy;
+    const __m256i ones8  = _mm256_set1_epi8(1);
+    const __m256i ones16 = _mm256_set1_epi16(1);
+    __m256 acc[4] = { _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps() };
+
+    for (int i = 0; i < n / QK4_G128; ++i) {
+        const ggml_bf16_t d16 = { x[i].d };
+        const float dx = GGML_BF16_TO_FP32(d16);
+        for (int g = 0; g < 4; ++g) {
+            const block_q8_0 * yg = y + 4 * i + g;
+            const __m256i qx = bytes_from_nibbles_32(x[i].qs + 16 * g);
+            const __m256i qy = _mm256_loadu_si256((const __m256i *) yg->qs);
+            // Unsigned nibbles with a zero-point correction also handle a Q8 code of -128 without sign overflow.
+            const __m256i dot = _mm256_maddubs_epi16(qx, qy);
+            const __m256i correction = _mm256_slli_epi16(_mm256_maddubs_epi16(ones8, qy), 3);
+            const __m256i sums = _mm256_madd_epi16(_mm256_sub_epi16(dot, correction), ones16);
+            const __m256 scale = _mm256_set1_ps(dx * GGML_CPU_FP16_TO_FP32(yg->d));
+            acc[g] = _mm256_fmadd_ps(scale, _mm256_cvtepi32_ps(sums), acc[g]);
+        }
+    }
+
+    *s = hsum_float_8(_mm256_add_ps(_mm256_add_ps(acc[0], acc[1]), _mm256_add_ps(acc[2], acc[3])));
+#else
+    ggml_vec_dot_q4_g128_q8_0_generic(n, s, bs, vx, bx, vy, by, nrc);
+#endif
+}
+
 void ggml_vec_dot_q4_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     const int qk = QK8_0;
     const int nb = n / qk;
