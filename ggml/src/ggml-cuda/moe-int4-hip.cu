@@ -835,6 +835,11 @@ void ggml_cuda_moe_int4_forget(int device, const void * base, size_t bytes) {
 
 void ggml_cuda_moe_int4_free_scratch(const ggml_backend_cuda_context * ctx) {
     std::lock_guard<std::mutex> lock(state_mutex);
+    if (const char * e = getenv("GGML_HIP_MOE_INT4_STATS"); e && atoi(e)) {
+        GGML_LOG_WARN("hip g128: states %zu, packs %lld (%.1f ms), fused runs %lld (batch %lld, rows %lld), unfused nodes %lld\n",
+                states.size(), (long long) packs.load(), pack_us.load() / 1000.0, (long long) runs.load(),
+                (long long) batch_runs.load(), (long long) batch_rows.load(), (long long) fallbacks.load());
+    }
     for (auto it = scratches.begin(); it != scratches.end();) {
         if (std::get<0>(it->first) != ctx) { ++it; continue; }
         ggml_cuda_set_device(it->second.device);
@@ -851,29 +856,32 @@ void ggml_cuda_moe_int4_free_scratch(const ggml_backend_cuda_context * ctx) {
     }
 }
 
-// Pack the new expert from a device copy, so a resident bank stays packed and the other experts are not touched.
-bool ggml_backend_cuda_moe_int4_set_expert(const ggml_tensor * t, int64_t expert, const void * src) {
-    static std::map<int, std::pair<char *, size_t>> uploads;
+// A packed bank stays packed: the expert is packed from its device copy into its slot. Other experts are not touched.
+void ggml_cuda_moe_int4_set_expert(ggml_backend_cuda_context & ctx, const ggml_tensor * t, int64_t expert, const void * src) {
     std::lock_guard<std::mutex> lock(state_mutex);
-    weight_state * s = nullptr;
-    for (auto & c : states) { if (c.data == t->data) { s = &c; } }
-    if (!s || !s->packed || expert < 0 || expert >= s->experts || size_t(t->nb[2]) != s->stride) { return false; }
-    ggml_cuda_set_device(s->device);
-    auto & tmp = uploads[s->device];
-    if (tmp.second < s->stride) {
-        if (tmp.first) { CUDA_CHECK(cudaFree(tmp.first)); }
-        CUDA_CHECK(cudaMalloc(&tmp.first, s->stride));
-        tmp.second = s->stride;
+    weight_state * s = find_state(ctx.device, t->data);
+    char * dst = static_cast<char *>(t->data) + expert * t->nb[2];
+    if (!s || !s->packed) {
+        CUDA_CHECK(cudaMemcpyAsync(dst, src, t->nb[2], cudaMemcpyDeviceToDevice, ctx.stream()));
+        return;
     }
-    const cudaStream_t stream = cudaStreamPerThread;
-    char * dst = s->data + expert * s->stride;
+    GGML_ASSERT(expert >= 0 && expert < s->experts && size_t(t->nb[2]) == s->stride);
     const unsigned grid = std::min<size_t>((size_t(s->k) * s->n / 8 + 255) / 256, 65535);
-    CUDA_CHECK(cudaMemcpyAsync(tmp.first, src, s->stride, cudaMemcpyHostToDevice, stream));
-    pack_codes<<<grid, 256, 0, stream>>>(tmp.first, dst, s->stride, s->k, s->n, 1);
-    pack_scales<<<grid, 256, 0, stream>>>(tmp.first, dst, s->stride, s->k, s->n, 1);
+    pack_codes<<<grid, 256, 0, ctx.stream()>>>(static_cast<const char *>(src), dst, s->stride, s->k, s->n, 1);
+    pack_scales<<<grid, 256, 0, ctx.stream()>>>(static_cast<const char *>(src), dst, s->stride, s->k, s->n, 1);
     CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    return true;
+}
+
+void ggml_cuda_moe_int4_forget_inside(int device, const ggml_tensor * t) {
+    std::lock_guard<std::mutex> lock(state_mutex);
+    const char * base = static_cast<const char *>(t->data);
+    for (auto it = states.begin(); it != states.end();) {
+        if (it->device != device || it->data == base || it->data < base || it->data >= base + ggml_nbytes(t)) { ++it; continue; }
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaFree(it->flag));
+        it = states.erase(it);
+    }
 }
 
 void ggml_backend_cuda_moe_int4_set_mode(int mode) { override_mode.store(mode < 0 ? -1 : mode != 0); }

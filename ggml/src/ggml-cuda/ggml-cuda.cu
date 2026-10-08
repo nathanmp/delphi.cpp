@@ -7151,6 +7151,19 @@ static void ggml_backend_cuda_stage_unregister(void * ptr) {
     }
 }
 
+#ifdef GGML_HIP_MOE_INT4_AVAILABLE
+// delphi: expert-cache slot writes (llama-expert-cache.cpp), ordered on the stream of backend
+static void ggml_backend_cuda_moe_int4_set_expert_proc(ggml_backend_t backend, const ggml_tensor * t, int64_t expert, const void * src) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    ggml_cuda_moe_int4_set_expert(*cuda_ctx, t, expert, src);
+}
+
+static void ggml_backend_cuda_moe_int4_forget_inside_proc(ggml_backend_t backend, const ggml_tensor * t) {
+    ggml_cuda_moe_int4_forget_inside(((ggml_backend_cuda_context *) backend->context)->device, t);
+}
+#endif
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_stage_register") == 0) {
@@ -7215,7 +7228,10 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
 #ifdef GGML_HIP_MOE_INT4_AVAILABLE
     if (strcmp(name, "ggml_backend_cuda_moe_int4_set_expert") == 0) {
-        return (void *)ggml_backend_cuda_moe_int4_set_expert;
+        return (void *)ggml_backend_cuda_moe_int4_set_expert_proc;
+    }
+    if (strcmp(name, "ggml_backend_cuda_moe_int4_forget_inside") == 0) {
+        return (void *)ggml_backend_cuda_moe_int4_forget_inside_proc;
     }
 #endif
     return nullptr;
