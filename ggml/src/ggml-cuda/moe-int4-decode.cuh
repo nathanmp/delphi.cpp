@@ -2,10 +2,27 @@
 
 #include "common.cuh"
 
-// The kernels use NVIDIA PTX (mma.sync bf16, cp.async). Elsewhere the INT4 path is never selected and the type is not supported.
+// NVIDIA uses BF16 PTX MMA. HIP has an independent RDNA4 W4A8 implementation in moe-int4-hip.cu.
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 #define GGML_CUDA_MOE_INT4_AVAILABLE
 #endif
+#if defined(GGML_USE_HIP)
+#define GGML_HIP_MOE_INT4_AVAILABLE
+#endif
+
+// HIP: a complete ordinary/clipped SwiGLU FFN with 2..16 experts per token is enabled by default for eligible RDNA4 G128 weights.
+// GGML_HIP_MOE_INT4_DECODE=0 disables this fusion. K and N must be
+// multiples of 128. Batches of at least 64 rows group routes across up to 1024 tokens and use I8 WMMA; smaller batches use the
+// decode path in chunks of at most 16 tokens. GGML_HIP_MOE_INT4_BATCH=0 selects the old chunked path for A/B tests.
+// Input and hidden activations use symmetric Q8 groups of 128;
+// dots, scales, SwiGLU and ordered weighted reduction have F32 boundaries. Unmatched nodes read G128 directly, without a shadow bank.
+// Weights are packed in place per tensor. Readback or writes first restore its canonical bytes; stable device layout flags let
+// captured fallback kernels read either layout. Scratch is owned by backend context, stream and matrix shape, and lives until
+// context destruction. Mode overrides are test-only; use a fresh backend when changing mode after graph capture.
+// GGML_HIP_MOE_INT4_PATH=auto (default) uses wide vector loads for one-row H=2560/FF=640 work and I8 WMMA for its wider batches;
+// other shapes use K-split vector dots. Explicit vector/wide/wmma/mixed modes are experimental comparators. Vector and WMMA sum
+// K groups in different F32 orders, so the mode/width selection does not promise bitwise batch invariance.
+// Weight-bank views and partial routed nodes are not advertised as HIP G128 operations; they keep the CPU fallback.
 
 // delphi.cpp: one complete GLM-shaped routed expert FFN (gate/up -> clipped SiLU * up -> down * router weight -> slot sum) with INT4
 // weights and BF16 tensor-core MMA, for any number of rows: the decode kernels for 1..GGML_CUDA_MOE_INT4_MAX_TOKENS rows (and wider batches
@@ -44,17 +61,16 @@ struct ggml_cuda_moe_int4_ffn {
     const ggml_tensor * up      = nullptr; // Q4_G128 [hidden, ff, E]
     const ggml_tensor * down    = nullptr; // Q4_G128 [ff, hidden, E]
     const ggml_tensor * x       = nullptr; // F32  [hidden, 1, M]
-    const ggml_tensor * ids     = nullptr; // I32  [8, M]
-    const ggml_tensor * weights = nullptr; // F32  [1, 8, M], contiguous: the router weights by slot
+    const ggml_tensor * ids     = nullptr; // I32  [topk, M]
+    const ggml_tensor * weights = nullptr; // F32  [1, topk, M], contiguous: the router weights by slot
     ggml_tensor *       dst     = nullptr; // F32  [hidden, M], contiguous
-    float               limit   = 0.0f;    // SwiGLU clamp of the model; the kernel is built for GLM's 10
+    float               limit   = 0.0f;    // 0 for ordinary SwiGLU; NVIDIA requires GLM's clamp
 };
 
-// GGML_CUDA_MOE_INT4_DECODE, or the override of ggml_backend_cuda_moe_int4_set_mode.
+// GGML_CUDA_MOE_INT4_DECODE (opt-in), GGML_HIP_MOE_INT4_DECODE (opt-out), or the test mode override.
 bool ggml_cuda_moe_int4_enabled();
 
-// Whether the CUDA backend can hold weights of this tensor: the type is Q4_G128 and the device supports it (NVIDIA, Ampere or newer).
-// Used by supports_op: every MUL_MAT_ID that the ordinary path supports for Q4_0 is supported for these weights (shadow path).
+// Device eligibility for G128 routed weights: NVIDIA (ordinary shadow path) or RDNA4 (direct G128 path).
 bool ggml_cuda_moe_int4_type_supported(int device);
 
 // The type that the ordinary dispatch logic must assume for the weights of a MUL_MAT_ID (Q4_0 for Q4_G128 weights, else the type).
@@ -78,10 +94,20 @@ void ggml_cuda_moe_int4_run(ggml_backend_cuda_context & ctx, const ggml_cuda_moe
 void ggml_cuda_moe_int4_shadow(ggml_backend_cuda_context & ctx, const ggml_tensor * dst, ggml_cuda_pool_alloc<char> & storage,
         ggml_tensor & src0_q, ggml_tensor & dst_q);
 
-// A buffer is freed or written ([base, base + size) of the device): forgets the packed sets whose tensors overlap the range.
+// Forget metadata when the owning buffer is freed.
 void ggml_cuda_moe_int4_forget(int device, const void * base, size_t size);
 
-// Aborts if [data, data + size) holds PACKED weights: a read-back of such a tensor would return the kernel layout.
+// Preserve untouched packed bytes before a partial write. HIP retains stable layout metadata for captured fallbacks.
+void ggml_cuda_moe_int4_before_write(int device, const void * base, size_t size);
+
+#ifdef GGML_HIP_MOE_INT4_AVAILABLE
+// Register stable layout flags before capture; unmatched nodes use the direct G128 implementation.
+void ggml_hip_moe_int4_prepare_graph(ggml_backend_cuda_context & ctx, const ggml_cgraph * graph);
+void ggml_hip_moe_int4_note_tensor(const ggml_tensor * tensor);
+void ggml_hip_moe_int4_mul_mat_id(ggml_backend_cuda_context & ctx, const ggml_tensor * dst);
+#endif
+
+// NVIDIA refuses packed readback; HIP restores the canonical layout before readback or a generic copy.
 void ggml_cuda_moe_int4_check_not_packed(int device, const void * data, size_t size, const char * what);
 
 // Frees the scratch of a backend context (called by its destructor).
@@ -94,7 +120,9 @@ void ggml_backend_cuda_moe_int4_set_mode(int mode);
 // once), scratch bytes, nodes on the shadow path, of them with more than 16 rows, regions refused for: no rows, activation
 // layout, weights, missing state (not packed / not primed / no scratch), the weight sets that were refused at
 // prepare, regions run on the prefill kernels, their rows, regions of more than 16 rows run as decode chunks.
+// HIP counts packed tensors in [0..1], direct fallback nodes in [6], batch FFNs/rows in [13..14], and chunked FFNs in [15].
 void ggml_backend_cuda_moe_int4_get_stats(int64_t * out);
 // The packed layout of the tensor with the data address data: which = 0 codes (int32 [K/16][2N], Marlin tiles), 1 scales
 // (bf16 [K/128][N]). Expert e is at ptr + e * stride. Returns false if the tensor is not PACKED.
+// HIP layout: codes uint32 [N/16][K/16][lane32], scales bf16 [N][K/128], in the same expert-sized slot.
 bool ggml_backend_cuda_moe_int4_get_pack(const void * data, int which, const void ** ptr, size_t * bytes, size_t * stride);
