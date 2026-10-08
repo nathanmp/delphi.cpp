@@ -226,7 +226,7 @@ void quantize_row_q4_g128(const float * GGML_RESTRICT x, void * GGML_RESTRICT y,
     quantize_row_q4_g128_ref(x, y, k);
 }
 
-// delphi.cpp: weights of type Q4_G128 against F32 activations, scalar. Only for completeness and tests on the CPU backend.
+// Exact-activation reference for Q4_G128; production dots use the Q8 activation bridge.
 void ggml_vec_dot_q4_g128_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     const int nb = n / QK4_G128;
 
@@ -252,6 +252,35 @@ void ggml_vec_dot_q4_g128_f32(int n, float * GGML_RESTRICT s, size_t bs, const v
             }
         }
         sumf += GGML_BF16_TO_FP32(d16) * sumi;
+    }
+
+    *s = sumf;
+}
+
+void ggml_vec_dot_q4_g128_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(n % QK4_G128 == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_q4_g128 * GGML_RESTRICT x = vx;
+    const block_q8_0    * GGML_RESTRICT y = vy;
+    float sumf = 0.0f;
+
+    for (int i = 0; i < n / QK4_G128; ++i) {
+        const ggml_bf16_t d16 = { x[i].d };
+        const float dx = GGML_BF16_TO_FP32(d16);
+        for (int g = 0; g < QK4_G128 / QK8_0; ++g) {
+            const block_q8_0 * yg = y + i * (QK4_G128 / QK8_0) + g;
+            int sumi = 0;
+            for (int j = 0; j < QK8_0 / 2; ++j) {
+                const uint8_t q = x[i].qs[g * (QK8_0 / 2) + j];
+                sumi += ((q & 15) - 8) * yg->qs[j] + ((q >> 4) - 8) * yg->qs[j + QK8_0 / 2];
+            }
+            sumf += dx * GGML_CPU_FP16_TO_FP32(yg->d) * sumi;
+        }
     }
 
     *s = sumf;

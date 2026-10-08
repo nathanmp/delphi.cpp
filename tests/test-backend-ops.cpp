@@ -13203,7 +13203,7 @@ struct numa_reference_pool {
     decltype(ggml_backend_cpu_set_threadpool) * set_pool = nullptr;
 
     explicit numa_reference_pool(ggml_backend_t backend) : backend(backend) {
-        if (numa_reference_threads == 0) { return; }
+        if (!backend || numa_reference_threads == 0) { return; }
         auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
         auto create = reinterpret_cast<decltype(ggml_threadpool_new) *>(ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_new"));
         free_pool = reinterpret_cast<decltype(ggml_threadpool_free) *>(ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_free"));
@@ -13733,6 +13733,8 @@ int main(int argc, char ** argv) {
         if (ggml_backend_set_n_threads_fn) {
             ggml_backend_set_n_threads_fn(backend.get(), n_threads > 0 ? n_threads : std::max<int>(1, N_THREADS/2));
         }
+        // Node-by-node comparisons also execute view-only graphs on the tested CPU backend.
+        numa_reference_pool tested_pool(ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU ? backend.get() : nullptr);
 
         size_t free, total;  // NOLINT
         ggml_backend_dev_memory(dev, &free, &total);
