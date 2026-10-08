@@ -798,7 +798,7 @@ struct llm_graph_params {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
     const llama_mtp_device_draft_cache * mtp_device_draft_cache;
-    const llama_expert_cache * expert_cache = nullptr;
+    llama_expert_cache * expert_cache = nullptr;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -1056,7 +1056,7 @@ struct llm_graph_context {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
     const llama_mtp_device_draft_cache * mtp_device_draft_cache;
-    const llama_expert_cache * expert_cache = nullptr;
+    llama_expert_cache * expert_cache = nullptr;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 

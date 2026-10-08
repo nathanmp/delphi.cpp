@@ -2283,7 +2283,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         return build_moe_ffn_split(cur, up_exps, gate_exps, down_exps, selected_experts, weights, n_expert, il);
     }
 
-    if (expert_cache && ubatch.n_tokens <= 16 && expert_cache->layer(il) &&
+    if (expert_cache && ubatch.n_tokens <= llama_expert_cache::max_rows && expert_cache->layer(il) &&
             type_op == LLM_FFN_SILU && !weight_before_ffn && !gate_up_exps &&
             !up_exps_s && !gate_exps_s && !down_exps_s && !up_exps_b && !gate_exps_b && !down_exps_b &&
             (loras == nullptr || loras->empty())) {
@@ -2438,6 +2438,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s); // [n_embd, n_expert_used, n_tokens]
     cb(experts, "ffn_moe_down", il);
 
+    // Record prompt routing for the next expert-cache refresh, next to the routed CPU work that already has the IDs.
+    if (expert_cache) {
+        if (auto * rec = expert_cache->build_record(ctx0, selected_experts, il)) {
+            cb(rec, "ffn_cache_cpu_record", il);
+            ggml_build_forward_expand(gf, rec);
+        }
+    }
+
     if (down_exps_s) {
         cb(experts, "ffn_moe_down_scaled", il);
     }
@@ -2495,25 +2503,22 @@ ggml_tensor * llm_graph_context::build_moe_ffn_cache(
     auto name = [&](ggml_tensor * t, const char * label, bool cpu) {
         cb(t, (std::string(cpu ? "ffn_cache_cpu_" : "ffn_cache_gpu_") + label).c_str(), il);
     };
-    auto lookup = [&](ggml_tensor * map) {
-        auto * flat = ggml_reshape_1d(ctx0, ggml_cont(ctx0, ids), ggml_nelements(ids));
-        return ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, map, flat), ids->ne[0], ids->ne[1]);
-    };
-    auto * hot = lookup(resident.hot_ids);
-    auto * cold = lookup(resident.cold_ids);
+    auto * flat = ggml_reshape_1d(ctx0, ggml_cont(ctx0, ids), ggml_nelements(ids));
+    auto * hot = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, resident.hot_ids, flat), ids->ne[0], ids->ne[1]);
     ggml_build_forward_expand(gf, hot);
-    ggml_build_forward_expand(gf, cold);
 
-    // One CPU transfer before GPU expert work. Expert IDs are exactly representable as F32.
+    // One CPU transfer before GPU expert work. Expert IDs are exactly representable as F32. The CPU maps the original IDs to
+    // cold IDs and records them for the next membership refresh.
     const int64_t nx = ggml_nelements(cur), nw = ggml_nelements(weights);
     auto * packet = ggml_concat(ctx0, ggml_reshape_1d(ctx0, ggml_cont(ctx0, cur), nx),
             ggml_reshape_1d(ctx0, ggml_cont(ctx0, weights), nw), 0);
-    packet = ggml_concat(ctx0, packet, ggml_cast(ctx0, ggml_reshape_1d(ctx0, cold, ggml_nelements(cold)), GGML_TYPE_F32), 0);
+    packet = ggml_concat(ctx0, packet, ggml_cast(ctx0, flat, GGML_TYPE_F32), 0);
     auto * input = ggml_dup(ctx0, packet);
     name(input, "packet", true);
     auto * cx = ggml_view_3d(ctx0, input, cur->ne[0], 1, cur->ne[2], cur->ne[0] * sizeof(float), cur->ne[0] * sizeof(float), 0);
     auto * cw = ggml_view_3d(ctx0, input, 1, ids->ne[0], ids->ne[1], sizeof(float), ids->ne[0] * sizeof(float), nx * sizeof(float));
-    auto * ci = ggml_cast(ctx0, ggml_view_2d(ctx0, input, ids->ne[0], ids->ne[1], ids->ne[0] * sizeof(float), (nx + nw) * sizeof(float)), GGML_TYPE_I32);
+    auto * ci = expert_cache->build_cold_ids(ctx0,
+            ggml_view_2d(ctx0, input, ids->ne[0], ids->ne[1], ids->ne[0] * sizeof(float), (nx + nw) * sizeof(float)), il);
     name(cx, "input", true); name(ci, "ids", true); name(cw, "weights", true);
     ggml_build_forward_expand(gf, cx);
     ggml_build_forward_expand(gf, ci);
@@ -2540,7 +2545,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn_cache(
         }
         return out;
     };
-    auto * gy = part(cur, hot, weights, resident.gate, resident.up, resident.down, false);
+    auto * gy = part(cur, hot, weights, expert_cache->gate(), expert_cache->up(), expert_cache->down(), false);
     auto * cy = part(cx, ci, cw, gate, up, down, true);
     auto * out = ggml_add(ctx0, gy, cy);
     name(out, "merge", false);

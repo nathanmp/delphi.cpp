@@ -2537,6 +2537,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     sched_reserve();
 
+    if (expert_cache) {
+        expert_cache->before_batch(sched.get(), n_tokens_all, cparams.warmup);
+    }
+
     bool did_optimize = false;
 
     // handle any pending shifts/copies
