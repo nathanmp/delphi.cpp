@@ -3132,6 +3132,7 @@ private:
             const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
             if (ctx_dft) {
+                const uint64_t t_rollback = common_spec_ledger_now();
                 if (use_ckpt_dft) {
                     ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                 }
@@ -3139,6 +3140,12 @@ private:
                 common_speculative_wait_ctx(ctx_dft);
                 if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, ckpt.pos_max + 1, -1)) {
                     GGML_ABORT("failed to remove sequence %d\n", slot.id);
+                }
+                common_spec_ledger_span(COMMON_SPEC_LEDGER_DFT_ROLLBACK, t_rollback, (uint32_t) (ckpt.pos_max + 1));
+                if (common_spec_ledger_on()) {
+                    common_spec_ledger_witness(COMMON_SPEC_WITNESS_KV, nullptr, 0,
+                            llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id),
+                            llama_memory_seq_pos_max(llama_get_memory(ctx_dft), slot.id), 1);
                 }
             }
 
@@ -3758,9 +3765,17 @@ private:
         queue_tasks.yield_to_queue([&]() {
             const auto phase = has_prompt ? GGML_EXEC_TRACE_PHASE_PROMPT : GGML_EXEC_TRACE_PHASE_GENERATION_TARGET;
             server_exec_trace_phase_scope trace_phase(phase);
+            const uint64_t t_decode = common_spec_ledger_now();
             ret = llama_decode(ctx_tgt, batch_view);
+            if (!has_prompt) {
+                common_spec_ledger_span(COMMON_SPEC_LEDGER_TGT_DECODE, t_decode, batch_view.n_tokens);
+            }
             if (ret == 0 && has_output) {
+                const uint64_t t_sync = common_spec_ledger_now();
                 llama_synchronize(ctx_tgt);
+                if (!has_prompt) {
+                    common_spec_ledger_span(COMMON_SPEC_LEDGER_TGT_SYNC, t_sync, batch_view.n_tokens);
+                }
             }
         });
 
@@ -3991,6 +4006,7 @@ private:
             GGML_ASSERT(n_draft > 0);
 
             // verify and try to accept the draft
+            const uint64_t t_accept = common_spec_ledger_now();
             {
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 
@@ -4047,6 +4063,13 @@ private:
 
                 common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
 
+                common_spec_ledger_span(COMMON_SPEC_LEDGER_ACCEPT, t_accept, (uint32_t) n_draft, (uint32_t) (accepted.size() - 1));
+                if (common_spec_ledger_on()) {
+                    std::vector<int32_t> ids(accepted.begin(), accepted.end());
+                    common_spec_ledger_witness(COMMON_SPEC_WITNESS_ACCEPTED, ids.data(), (uint32_t) ids.size(),
+                            (int64_t) n_draft, (int64_t) (accepted.size() - 1));
+                }
+
                 slot.spec_draft = std::move(accepted);
             }
 
@@ -4079,7 +4102,14 @@ private:
             slot.sampled = ids.back(); // last accepted token
             SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
 
+            const uint64_t t_kv_rollback = common_spec_ledger_now();
             slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+            common_spec_ledger_span(COMMON_SPEC_LEDGER_KV_ROLLBACK, t_kv_rollback, (uint32_t) slot.prompt.tokens.pos_next());
+            if (common_spec_ledger_on() && ctx_dft) {
+                common_spec_ledger_witness(COMMON_SPEC_WITNESS_KV, nullptr, 0,
+                        llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id),
+                        llama_memory_seq_pos_max(llama_get_memory(ctx_dft), slot.id), 3);
+            }
 
             for (size_t i = 0; i < ids.size(); ++i) {
                 completion_token_output result;

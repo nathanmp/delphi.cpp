@@ -50,6 +50,37 @@ common_speculative * common_speculative_init(common_params_speculative & params,
 
 void common_speculative_free(common_speculative * spec);
 
+// Opt-in cycle ledger for observing speculative decoding (handoff 2 of the DFlash2 task). Off unless DELPHI_SPEC_LEDGER=<file> is
+// set; then host spans and witnesses are buffered in memory (no printing, no allocation, no device synchronization) and written as
+// JSON lines when the speculative state is freed. Timestamps use the execution trace's clock (CLOCK_MONOTONIC_RAW).
+enum common_spec_ledger_stage : uint16_t {
+    COMMON_SPEC_LEDGER_TGT_DECODE = 1,  // server: llama_decode(ctx_tgt) host call.              a = tokens
+    COMMON_SPEC_LEDGER_TGT_SYNC,        // server: llama_synchronize(ctx_tgt) after the decode.  a = tokens
+    COMMON_SPEC_LEDGER_PROCESS,         // common_speculative_process, all implementations.     a = tokens
+    COMMON_SPEC_LEDGER_FEAT_GATHER,     // DFlash: target layer rows copied into the inject batch. a = rows, b = layers, x = bytes
+    COMMON_SPEC_LEDGER_DFT_INGEST,      // DFlash: llama_decode(ctx_dft, injected features).    a = rows, b = first pos, c = last pos
+    COMMON_SPEC_LEDGER_DRAFT,           // common_speculative_draft, all implementations.       a = candidates returned
+    COMMON_SPEC_LEDGER_DFT_BLOCK,       // DFlash: llama_decode(ctx_dft, noise block).          a = rows, b = requested L
+    COMMON_SPEC_LEDGER_DFT_LATTICE,     // DFlash2: llama_get_embeddings_nextn(ctx_dft) (synchronizes). a = rows, x = physical bytes, c = logical bytes
+    COMMON_SPEC_LEDGER_DFT_WALK,        // DFlash2: selector lattice walk on the host.          a = candidates, b = block rows
+    COMMON_SPEC_LEDGER_DFT_ROLLBACK,    // server: draft KV removal after the draft block.     a = first removed pos
+    COMMON_SPEC_LEDGER_ACCEPT,          // server: target sampling and acceptance of a draft.  a = draft size, b = accepted drafts
+    COMMON_SPEC_LEDGER_KV_ROLLBACK,     // server: KV removal after acceptance.                a = first removed pos
+};
+
+enum common_spec_ledger_witness_kind : uint16_t {
+    COMMON_SPEC_WITNESS_CANDIDATES = 1, // ids = candidate tokens in order, a = rows of the block, b = cutoff position (0: none), c = p_min * 1e6
+    COMMON_SPEC_WITNESS_KV,             // a = target pos_max, b = draft pos_max, c = point (1 after draft rollback, 2 after ingest, 3 after acceptance)
+    COMMON_SPEC_WITNESS_ACCEPTED,       // ids = accepted tokens (draft + bonus), a = draft size, b = accepted drafts
+};
+
+bool     common_spec_ledger_on();
+uint64_t common_spec_ledger_now();     // 0 when off
+void     common_spec_ledger_span(common_spec_ledger_stage stage, uint64_t t0_ns,
+                                 uint32_t a = 0, uint32_t b = 0, uint32_t c = 0, uint64_t x = 0); // the span ends now
+void     common_spec_ledger_witness(common_spec_ledger_witness_kind kind, const int32_t * ids, uint32_t n,
+                                    int64_t a = 0, int64_t b = 0, int64_t c = 0);
+
 struct common_speculative_draft_params {
     // this flag is used to chain the drafts through all the available implementations
     // after the first successful draft from an implementation, we set it
