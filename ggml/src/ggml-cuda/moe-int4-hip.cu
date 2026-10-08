@@ -66,6 +66,7 @@ std::map<std::tuple<const ggml_backend_cuda_context *, int, int, int, int, int>,
 std::atomic<int> override_mode{-1};
 std::atomic<bool> have_g128{false};
 std::atomic<int64_t> packs{0}, pack_us{0}, runs{0}, fallbacks{0}, wide_runs{0}, scratch_bytes{0};
+std::atomic<int64_t> batch_runs{0}, batch_rows{0};
 
 __device__ __forceinline__ int code_at(const char * src, int k, int n, int out, int kk, bool packed) {
     if (packed) {
@@ -750,7 +751,7 @@ void ggml_cuda_moe_int4_run(ggml_backend_cuda_context & ctx, const ggml_cuda_moe
         for (int start = 0; start < rows; start += BATCH_ROWS) {
             run_batch(ctx, f, *s, start, std::min(BATCH_ROWS, rows - start));
         }
-        runs++; wide_runs++;
+        runs++; batch_runs++; batch_rows += rows;
         return;
     }
     scratch * s = get_scratch(ctx, f.gate->ne[0], f.gate->ne[1], false);
@@ -843,6 +844,7 @@ void ggml_backend_cuda_moe_int4_get_stats(int64_t * out) {
     for (int i = 0; i < 16; ++i) { out[i] = 0; }
     for (const auto & s : states) { if (s.packed) { out[0]++; out[3] += s.stride * s.experts; } }
     out[1] = packs; out[2] = pack_us; out[4] = runs; out[5] = scratch_bytes; out[6] = fallbacks; out[15] = wide_runs;
+    out[13] = batch_runs; out[14] = batch_rows;
 }
 
 bool ggml_backend_cuda_moe_int4_get_pack(const void * data, int which, const void ** ptr, size_t * bytes, size_t * stride) {

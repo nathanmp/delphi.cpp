@@ -11,7 +11,9 @@
 #endif
 
 // HIP: GGML_HIP_MOE_INT4_DECODE=1 selects a complete ordinary/clipped SwiGLU FFN with 2..16 experts per token. K and N must be
-// multiples of 128. Larger batches run in chunks of 16 rows. Input and hidden activations use symmetric Q8 groups of 128;
+// multiples of 128. Batches of at least 64 rows group routes across up to 1024 tokens and use I8 WMMA; smaller batches use the
+// decode path in chunks of at most 16 tokens. GGML_HIP_MOE_INT4_BATCH=0 selects the old chunked path for A/B tests.
+// Input and hidden activations use symmetric Q8 groups of 128;
 // dots, scales, SwiGLU and ordered weighted reduction have F32 boundaries. Unmatched nodes read G128 directly, without a shadow bank.
 // Weights are packed in place per tensor. Readback or writes first restore its canonical bytes; stable device layout flags let
 // captured fallback kernels read either layout. Scratch is owned by backend context, stream and matrix shape, and lives until
@@ -117,7 +119,7 @@ void ggml_backend_cuda_moe_int4_set_mode(int mode);
 // once), scratch bytes, nodes on the shadow path, of them with more than 16 rows, regions refused for: no rows, activation
 // layout, weights, missing state (not packed / not primed / no scratch), the weight sets that were refused at
 // prepare, regions run on the prefill kernels, their rows, regions of more than 16 rows run as decode chunks.
-// HIP counts packed tensors in [0..1], direct fallback nodes in [6], and chunked FFNs in [15]; unused counters are zero.
+// HIP counts packed tensors in [0..1], direct fallback nodes in [6], batch FFNs/rows in [13..14], and chunked FFNs in [15].
 void ggml_backend_cuda_moe_int4_get_stats(int64_t * out);
 // The packed layout of the tensor with the data address data: which = 0 codes (int32 [K/16][2N], Marlin tiles), 1 scales
 // (bf16 [K/128][N]). Expert e is at ptr + e * stride. Returns false if the tensor is not PACKED.

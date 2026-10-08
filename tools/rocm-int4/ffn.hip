@@ -117,7 +117,9 @@ int main(int argc, char ** argv) try {
         // Persistent GPU inputs keep direct replay independent of scheduler copies.
         auto inputs = ggml_init(params);
         auto x = ggml_new_tensor_3d(inputs, GGML_TYPE_F32, k, 1, width);
-        auto ids = ggml_new_tensor_2d(inputs, GGML_TYPE_I32, topk, width);
+        const bool strided_ids = std::getenv("DELPHI_COMPARE_STRIDED_IDS") != nullptr;
+        auto ids_storage = ggml_new_tensor_2d(inputs, GGML_TYPE_I32, topk + (strided_ids ? 3 : 0), width);
+        auto ids = strided_ids ? ggml_view_2d(inputs, ids_storage, topk, width, ids_storage->nb[1], 0) : ids_storage;
         auto rw = ggml_new_tensor_3d(inputs, GGML_TYPE_F32, 1, topk, width);
         ggml_set_name(x, "fixture-input"); ggml_set_input(x);
         ggml_set_name(ids, "fixture-ids"); ggml_set_input(ids);
@@ -162,7 +164,15 @@ int main(int argc, char ** argv) try {
         auto sched = ggml_backend_sched_new(backends, nullptr, 2, 256, false, true);
         require(ggml_backend_sched_alloc_graph(sched, graph), "graph allocation failed");
         load_bytes(dir + "/input.f32", 0, x);
-        load_bytes(dir + "/ids.i32", 0, ids);
+        if (strided_ids) {
+            std::ifstream file(dir + "/ids.i32", std::ios::binary);
+            std::vector<int32_t> data(topk * width);
+            file.read(reinterpret_cast<char *>(data.data()), data.size() * sizeof(int32_t));
+            require(bool(file), "ids input unavailable");
+            for (int row = 0; row < width; ++row) {
+                ggml_backend_tensor_set(ids_storage, data.data() + row * topk, row * ids_storage->nb[1], topk * sizeof(int32_t));
+            }
+        } else { load_bytes(dir + "/ids.i32", 0, ids); }
         load_bytes(dir + "/router.f32", 0, rw);
         for (int i = 0; i < 8; ++i) {
             require(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS, "warmup failed");
