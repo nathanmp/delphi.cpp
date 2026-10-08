@@ -10,7 +10,15 @@
 #include <fstream>
 #include <set>
 #include <stdexcept>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 #include <tuple>
+
+#ifdef __linux__
+#include <pthread.h>
+#include <sched.h>
+#endif
 
 const llama_expert_cache::entry * llama_expert_cache::layer(int il) const {
     return il >= 0 && il < (int) layers.size() && layers[il].hot_ids ? &layers[il] : nullptr;
@@ -120,12 +128,14 @@ std::unique_ptr<llama_expert_cache> llama_expert_cache::create(
     if (!result->buffer) { throw std::runtime_error("cannot allocate expert-cache arena"); }
     ggml_backend_buffer_set_usage(result->buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
     result->owner_of.assign(n_slots, {-1, -1});
+    result->lent_lo = n_slots;
     std::vector<int32_t> none(n_expert, -1);
     for (auto & l : result->layers) {
         if (l.owner) { ggml_backend_tensor_set(l.hot_ids, none.data(), 0, none.size() * sizeof(int32_t)); }
     }
     if (auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(result->gpu))) {
         result->set_expert = (decltype(result->set_expert)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_moe_int4_set_expert");
+        result->forget_inside = (decltype(result->forget_inside)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_moe_int4_forget_inside");
     }
 
     result->refresh();
@@ -230,39 +240,221 @@ ggml_tensor * llama_expert_cache::build_record(ggml_context * ctx, ggml_tensor *
     return ggml_custom_4d(ctx, GGML_TYPE_I32, 1, 1, 1, 1, args, 1, op_record, 1, &layers[il]);
 }
 
-void llama_expert_cache::before_batch(ggml_backend_sched_t sched, int64_t n_tokens, bool is_warmup) {
+bool llama_expert_cache::needs_refresh(int64_t n_tokens, bool is_warmup) {
     // Graph reuse ignores warmup, so the ops read this flag at execution time.
     warmup = is_warmup;
-    if (warmup) { return; }
-    if (n_tokens > max_rows) { pending = true; return; }
-    if (!pending) { return; }
+    if (warmup) { return false; }
+    if (n_tokens > max_rows) { pending = true; return false; }
+    if (!pending) { return false; }
     pending = false;
-    if (window < 0) {
+    if (window < 0 && lent_lo == (int64_t) owner_of.size()) {
         LLAMA_LOG_WARN("expert-cache: static; previous decode hits %.1f%% selections, %.1f%% distinct\n",
                 all_sel ? 100.0 * hit_sel / all_sel : 0.0, all_distinct ? 100.0 * hit_distinct / all_distinct : 0.0);
         hit_sel = all_sel = hit_distinct = all_distinct = 0;
-        return;
+        return false;
     }
-    // No queued GPU work may read a slot that this refresh overwrites.
-    ggml_backend_sched_synchronize(sched);
-    refresh();
+    return true;
 }
 
-void llama_expert_cache::upload(int il, int e, int s) {
-    const auto & l = model->layers[il];
-    const ggml_tensor * src[] = { l.ffn_gate_exps, l.ffn_up_exps, l.ffn_down_exps };
-    for (int p = 0; p < 3; ++p) {
-        const char * data = static_cast<const char *>(src[p]->data) + e * src[p]->nb[2];
-        if (!set_expert || !set_expert(banks[p], s, data)) {
-            ggml_backend_tensor_set(banks[p], data, s * banks[p]->nb[2], banks[p]->nb[2]);
+bool llama_expert_cache::lend(void * user_data, ggml_backend_t backend, int n_slots, size_t slot_size, void ** slots) {
+    auto & c = *static_cast<llama_expert_cache *>(user_data);
+    if (backend != c.gpu || n_slots <= 0) { return false; }
+    // Ring slot j uses the top of bank j % 3, so lending evicts the same arena slots in all three banks.
+    const size_t slab = c.banks[0]->nb[2];
+    const int64_t per_slot = (slot_size + slab - 1) / slab, per_bank = (n_slots + 2) / 3, total = c.owner_of.size();
+    const int64_t lo = total - per_bank * per_slot;
+    if (lo < 0) {
+        LLAMA_LOG_WARN("expert-cache: cannot lend %d staging slots of %.1f MiB from %lld arena slots\n", n_slots,
+                slot_size / 1048576.0, (long long) total);
+        return false;
+    }
+    int64_t evicted = 0;
+    if (lo < c.lent_lo) {
+        // Decode graphs read the arena; no queued work may read a slot that the ring now writes.
+        ggml_backend_synchronize(c.gpu);
+        std::vector<bool> changed(c.layers.size(), false);
+        for (int64_t s = lo; s < c.lent_lo; ++s) {
+            const auto [il, e] = c.owner_of[s];
+            if (il < 0) { continue; }
+            c.layers[il].slot[e] = -1;
+            c.layers[il].cold[e] = e;
+            c.owner_of[s] = {-1, -1};
+            changed[il] = true;
+            evicted++;
+        }
+        c.push_maps(changed);
+        c.lent_lo = lo;
+    }
+    for (int j = 0; j < n_slots; ++j) {
+        slots[j] = static_cast<char *>(c.banks[j % 3]->data) + (total - (j / 3 + 1) * per_slot) * slab;
+    }
+    LLAMA_LOG_WARN("expert-cache: lent %lld of %lld arena slots as %d staging slots of %.1f MiB, evicted %lld experts\n",
+            (long long) (total - lo), (long long) total, n_slots, slot_size / 1048576.0, (long long) evicted);
+    return true;
+}
+
+void llama_expert_cache::push_maps(const std::vector<bool> & changed) {
+    for (auto & l : layers) {
+        if (l.owner && changed[l.il]) { ggml_backend_tensor_set(l.hot_ids, l.slot.data(), 0, l.slot.size() * sizeof(int32_t)); }
+    }
+}
+
+// The CPUs next to the GPU, from sysfs; empty if unknown. Copies from them reach ~30 GB/s instead of ~18 GB/s unpinned.
+static std::vector<int> local_cpus(ggml_backend_dev_t dev) {
+    std::vector<int> cpus;
+#ifdef __linux__
+    ggml_backend_dev_props props = {};
+    ggml_backend_dev_get_props(dev, &props);
+    if (!props.device_id) { return cpus; }
+    std::ifstream f(std::string("/sys/bus/pci/devices/") + props.device_id + "/local_cpulist");
+    std::string list;
+    if (!std::getline(f, list)) { return cpus; }
+    size_t pos = 0;
+    while (pos < list.size()) {
+        const size_t end = std::min(list.find(',', pos), list.size());
+        const std::string r = list.substr(pos, end - pos);
+        const size_t dash = r.find('-');
+        const int first = atoi(r.c_str()), last = dash == std::string::npos ? first : atoi(r.c_str() + dash + 1);
+        for (int c = first; c <= last && c < CPU_SETSIZE; ++c) { cpus.push_back(c); }
+        pos = end + 1;
+    }
+#else
+    GGML_UNUSED(dev);
+#endif
+    return cpus;
+}
+
+static void pin_thread(const std::vector<int> & cpus) {
+#ifdef __linux__
+    if (cpus.empty()) { return; }
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    for (int c : cpus) { CPU_SET(c, &set); }
+    pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+#else
+    GGML_UNUSED(cpus);
+#endif
+}
+
+// Pipelined refill: threads next to the GPU copy expert slabs into one pinned half while the GPU uploads the other half to
+// device scratch and packs each slab into its arena slot, all on the backend stream.
+void llama_expert_cache::upload(const std::vector<upload_job> & jobs) {
+    if (jobs.empty()) { return; }
+    struct slab { const char * src; ggml_tensor * bank; int64_t slot; };
+    std::vector<slab> slabs;
+    for (const auto & j : jobs) {
+        const auto & l = model->layers[j.il];
+        const ggml_tensor * src[] = { l.ffn_gate_exps, l.ffn_up_exps, l.ffn_down_exps };
+        for (int p = 0; p < 3; ++p) {
+            slabs.push_back({ static_cast<const char *>(src[p]->data) + j.e * src[p]->nb[2], banks[p], j.s });
         }
     }
+    const size_t bytes = banks[0]->nb[2];
+    GGML_ASSERT(banks[1]->nb[2] == bytes && banks[2]->nb[2] == bytes);
+    if (!set_expert) {
+        for (const auto & x : slabs) { ggml_backend_tensor_set(x.bank, x.src, x.slot * bytes, bytes); }
+        return;
+    }
+    static const int per_half = [] { const char * e = getenv("LLAMA_MOE_CACHE_REFILL_SLABS"); return e ? std::max(1, atoi(e)) : 32; }();
+    static const int n_threads = [] { const char * e = getenv("LLAMA_MOE_CACHE_REFILL_THREADS"); return e ? std::max(1, atoi(e)) : 8; }();
+    ggml_backend_dev_t dev = ggml_backend_get_device(gpu);
+    if (cpus.empty()) { cpus = local_cpus(dev); }
+    if (!pinned) {
+        // allocate (and first-touch) the pinned buffer next to the GPU
+        std::thread([&] {
+            pin_thread(cpus);
+            if (auto * buft = ggml_backend_dev_host_buffer_type(dev)) { pinned.reset(ggml_backend_buft_alloc_buffer(buft, 2 * per_half * bytes)); }
+            if (pinned) { memset(ggml_backend_buffer_get_base(pinned.get()), 0, 2 * per_half * bytes); }
+        }).join();
+        if (!pinned) { throw std::runtime_error("expert-cache: cannot allocate pinned refill buffers"); }
+    }
+    ggml_context_ptr sctx(ggml_init({ggml_tensor_overhead(), nullptr, true}));
+    ggml_tensor * scratch = ggml_new_tensor_1d(sctx.get(), GGML_TYPE_I8, 2 * per_half * bytes);
+    ggml_backend_buffer_ptr sbuf(ggml_backend_alloc_ctx_tensors_from_buft(sctx.get(), ggml_backend_get_default_buffer_type(gpu)));
+    if (!sbuf) { throw std::runtime_error("expert-cache: cannot allocate refill scratch"); }
+    ggml_backend_event_t ev[2] = { ggml_backend_event_new(dev), ggml_backend_event_new(dev) };
+    char * host = static_cast<char *>(ggml_backend_buffer_get_base(pinned.get()));
+
+    // workers copy batch `batch` when it changes; each takes an interleaved share of every slab
+    std::mutex mutex;
+    std::condition_variable cv_start, cv_done;
+    int64_t batch = -1;
+    int done = 0;
+    bool stop = false;
+    size_t first = 0, n = 0;
+    char * dst = nullptr;
+    std::vector<std::thread> workers;
+    for (int t = 0; t < n_threads; ++t) {
+        workers.emplace_back([&, t] {
+            pin_thread(cpus);
+            int64_t seen = -1;
+            for (;;) {
+                {
+                    std::unique_lock<std::mutex> lock(mutex);
+                    cv_start.wait(lock, [&] { return stop || batch != seen; });
+                    if (stop) { return; }
+                    seen = batch;
+                }
+                const size_t part = (bytes / n_threads + 63) & ~size_t(63);
+                const size_t off = std::min(bytes, t * part), len = std::min(bytes, off + part) - off;
+                for (size_t i = 0; i < n; ++i) { memcpy(dst + i * bytes + off, slabs[first + i].src + off, len); }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    done++;
+                }
+                cv_done.notify_one();
+            }
+        });
+    }
+    const size_t n_batches = (slabs.size() + per_half - 1) / per_half;
+    for (size_t b = 0; b < n_batches; ++b) {
+        const int half = b % 2;
+        int64_t t = ggml_time_us();
+        if (b >= 2) { ggml_backend_event_synchronize(ev[half]); } // the upload that read this half is done
+        upload_wait_us += ggml_time_us() - t;
+        t = ggml_time_us();
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            first = b * per_half;
+            n = std::min<size_t>(per_half, slabs.size() - first);
+            dst = host + half * per_half * bytes;
+            done = 0;
+            batch = b;
+        }
+        cv_start.notify_all();
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            cv_done.wait(lock, [&] { return done == n_threads; });
+        }
+        upload_copy_us += ggml_time_us() - t;
+        ggml_backend_tensor_set_async(gpu, scratch, dst, half * per_half * bytes, n * bytes);
+        for (size_t i = 0; i < n; ++i) {
+            const auto & x = slabs[first + i];
+            set_expert(gpu, x.bank, x.slot, static_cast<const char *>(scratch->data) + (half * per_half + i) * bytes);
+        }
+        ggml_backend_event_record(ev[half], gpu);
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        stop = true;
+    }
+    cv_start.notify_all();
+    for (auto & th : workers) { th.join(); }
+    ggml_backend_synchronize(gpu);
+    ggml_backend_event_free(ev[0]);
+    ggml_backend_event_free(ev[1]);
 }
 
 // Global top-N of (layer, expert) by selections in the most recent window rows. Rows that the window does not hold yet are
 // filled from the profile prior. Resident experts keep a hysteresis bonus, because a replacement costs a full PCIe upload.
 void llama_expert_cache::refresh() {
     const int64_t t0 = ggml_time_us();
+    const int64_t reclaimed = owner_of.size() - lent_lo;
+    if (reclaimed > 0) {
+        // The caller reclaimed the staging slots. Their pointers inside the banks had their own weight layouts.
+        for (auto * b : banks) { if (forget_inside) { forget_inside(gpu, b); } }
+        lent_lo = owner_of.size();
+    }
     const int64_t prior_rows = window > 0 ? window : 2048;
     struct candidate { double score; int il, e; };
     std::vector<candidate> candidates;
@@ -303,26 +495,26 @@ void llama_expert_cache::refresh() {
         if (owner_of[s].first < 0) { free_slots.push_back(s); }
     }
     std::reverse(free_slots.begin(), free_slots.end());
-    int64_t uploaded = 0;
+    std::vector<upload_job> jobs;
     for (size_t i = 0; i < n_keep; ++i) {
         const auto & c = candidates[i];
         auto & l = layers[c.il];
         if (l.slot[c.e] >= 0) { continue; }
         const int s = free_slots.back();
         free_slots.pop_back();
-        upload(c.il, c.e, s);
+        jobs.push_back({c.il, c.e, s});
         l.slot[c.e] = s;
         l.cold[c.e] = -1;
         owner_of[s] = {c.il, c.e};
         changed[c.il] = true;
-        uploaded++;
     }
-    for (auto & l : layers) {
-        if (l.owner && changed[l.il]) { ggml_backend_tensor_set(l.hot_ids, l.slot.data(), 0, l.slot.size() * sizeof(int32_t)); }
-    }
+    const int64_t uploaded = jobs.size();
+    upload_copy_us = upload_wait_us = 0;
+    upload(jobs);
+    push_maps(changed);
     const double ms = (ggml_time_us() - t0) / 1000.0;
-    LLAMA_LOG_WARN("expert-cache: refresh %lld: %zu resident, %lld uploaded in %.1f ms, window covers %.1f%%; previous decode hits %.1f%% selections, %.1f%% distinct\n",
-            (long long) n_refresh, n_keep, (long long) uploaded, ms, total > 0 ? 100.0 * covered / total : 0.0,
+    LLAMA_LOG_WARN("expert-cache: refresh %lld: %zu resident, %lld uploaded (%lld slots reclaimed) in %.1f ms (memcpy %.1f, gpu wait %.1f), window covers %.1f%%; previous decode hits %.1f%% selections, %.1f%% distinct\n",
+            (long long) n_refresh, n_keep, (long long) uploaded, (long long) reclaimed, ms, upload_copy_us / 1e3, upload_wait_us / 1e3, total > 0 ? 100.0 * covered / total : 0.0,
             all_sel ? 100.0 * hit_sel / all_sel : 0.0, all_distinct ? 100.0 * hit_distinct / all_distinct : 0.0);
     n_refresh++;
     n_uploaded += uploaded;

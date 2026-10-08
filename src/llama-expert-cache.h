@@ -10,7 +10,8 @@ struct llama_model;
 
 // Experimental GPU-hot / CPU-cold routed experts. Host experts remain authoritative. All layers share one slot arena, so a
 // membership change rewrites slots and maps but never changes a graph. Membership is fixed while a response decodes; it is
-// rebuilt at the first small batch after a prompt, from the routing of the most recent rows.
+// rebuilt at the first small batch after a prompt, from the routing of the most recent rows. A prompt that streams experts
+// (GGML_SCHED_STAGE=1) borrows the top of the arena for the staging ring; the refresh after the prompt fills it again.
 struct llama_expert_cache {
     // Batches with more rows use the original routed experts (and only record their routing).
     static constexpr int64_t max_rows = 16;
@@ -42,13 +43,19 @@ struct llama_expert_cache {
     // CPU op: records the routed ids (I32 [top_k, n_tokens]) of a batch that does not use the arena. Null if not recorded.
     ggml_tensor * build_record(ggml_context * ctx, ggml_tensor * ids, int il);
 
-    // Call before each decoded batch while no graph is running. Rebuilds membership at the first small batch after a prompt.
-    void before_batch(ggml_backend_sched_t sched, int64_t n_tokens, bool is_warmup);
+    // Call before each decoded batch while no graph is running. True at the first small batch after a prompt: then the
+    // caller synchronizes, reclaims lent staging slots from every scheduler, and calls refresh().
+    bool needs_refresh(int64_t n_tokens, bool is_warmup);
+    void refresh();
+
+    // ggml_backend_sched_stage_lend_t: evict the experts in the top of the arena and lend it as staging slots
+    static bool lend(void * user_data, ggml_backend_t backend, int n_slots, size_t slot_size, void ** slots);
 
 private:
+    struct upload_job { int il, e, s; };
     void record(entry & l, const char * data, size_t nb0, size_t nb1, int64_t k, int64_t rows, bool is_f32);
-    void refresh();
-    void upload(int il, int e, int s);
+    void upload(const std::vector<upload_job> & jobs);
+    void push_maps(const std::vector<bool> & changed);
     static void op_cold_ids(ggml_tensor * dst, int ith, int nth, void * userdata);
     static void op_record(ggml_tensor * dst, int ith, int nth, void * userdata);
 
@@ -59,7 +66,11 @@ private:
     ggml_tensor * banks[3] = {};
     std::vector<entry> layers;
     std::vector<std::pair<int, int>> owner_of; // arena slot -> (layer, expert), or (-1, -1)
-    bool (*set_expert)(const ggml_tensor *, int64_t, const void *) = nullptr;
+    void (*set_expert)(ggml_backend_t, const ggml_tensor *, int64_t, const void *) = nullptr;
+    void (*forget_inside)(ggml_backend_t, const ggml_tensor *) = nullptr;
+    int64_t lent_lo = 0;       // arena slots from lent_lo up are lent to the staging ring
+    ggml_backend_buffer_ptr pinned; // refill bounce buffers
+    std::vector<int> cpus;          // the CPUs next to the GPU, for the refill threads
 
     int64_t window = 2048;     // rows; 0 keeps every row, negative never refreshes
     bool record_prompts = true;
@@ -73,4 +84,5 @@ private:
     uint32_t stamp_gen = 0;
     int64_t n_refresh = 0, n_uploaded = 0;
     double refresh_ms = 0.0;
+    int64_t upload_copy_us = 0, upload_wait_us = 0;
 };

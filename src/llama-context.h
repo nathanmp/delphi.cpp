@@ -454,6 +454,9 @@ private:
     // make the main scheduler live and forget the graphs of every slot
     void graph_alt_reset();
 
+    // expert cache: the staging ring borrows the arena instead of allocating its own slots
+    void sched_set_stage_lender();
+
     FILE * moe_routing_log = nullptr;
     int64_t moe_routing_log_max_tokens = 16;
     std::vector<uint8_t> moe_routing_buf;

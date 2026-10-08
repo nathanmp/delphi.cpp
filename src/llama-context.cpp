@@ -782,6 +782,7 @@ void llama_context::sched_reserve() {
     gf_res_prev_active = nullptr;
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    sched_set_stage_lender();
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -842,6 +843,7 @@ void llama_context::sched_reserve() {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+                sched_set_stage_lender();
                 gf = graph_reserve(n_tokens_pp, n_seqs_pp, n_outputs_pp_first, mctx_pp_ptr);
             }
             if (!gf) {
@@ -2537,8 +2539,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     sched_reserve();
 
-    if (expert_cache) {
-        expert_cache->before_batch(sched.get(), n_tokens_all, cparams.warmup);
+    if (expert_cache && expert_cache->needs_refresh(n_tokens_all, cparams.warmup)) {
+        // the staging ring of any scheduler may hold arena slots that the refresh fills again
+        ggml_backend_sched_synchronize(sched.get());
+        ggml_backend_sched_stage_reclaim(sched.get());
+        for (auto & slot : graph_slots) {
+            if (slot.sched) { ggml_backend_sched_stage_reclaim(slot.sched.get()); }
+        }
+        expert_cache->refresh();
     }
 
     bool did_optimize = false;
@@ -3252,6 +3260,12 @@ llm_graph_result * llama_context::get_gf_res_prev() {
     return res.get();
 }
 
+void llama_context::sched_set_stage_lender() {
+    if (expert_cache) {
+        ggml_backend_sched_set_stage_lender(sched.get(), llama_expert_cache::lend, expert_cache.get());
+    }
+}
+
 void llama_context::graph_slot_activate(int id) {
     if (id == graph_slot_live) {
         return;
@@ -3268,6 +3282,7 @@ void llama_context::graph_slot_activate(int id) {
     if (!sched) {
         sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
                 gf_res_reserve->get_max_nodes(), cparams.pipeline_parallel, cparams.op_offload));
+        sched_set_stage_lender();
         gf_res_prev_active = nullptr;
     }
 }
