@@ -7,6 +7,7 @@
 #include <assert.h>
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <math.h>
 #include <stdio.h>
 #include <string>
@@ -249,6 +250,59 @@ static int test_vec_dot_q(bool verbose) {
     return num_failed;
 }
 
+static int test_vec_dot_g128(bool verbose) {
+    const auto * w = ggml_get_type_traits(GGML_TYPE_Q4_G128);
+    const auto * a = ggml_get_type_traits(GGML_TYPE_Q8_0);
+    const auto * cpu = ggml_get_type_traits_cpu(GGML_TYPE_Q4_G128);
+    assert(cpu->vec_dot_type == GGML_TYPE_Q8_0);
+    int num_failed = 0;
+    for (int n : {128, 256, 640, 4096}) {
+        for (int pattern = 0; pattern < 4; ++pattern) {
+            // Offset two-byte-aligned blocks to exercise unaligned vector loads.
+            std::vector<uint8_t> weights(ggml_row_size(GGML_TYPE_Q4_G128, n) + 2);
+            std::vector<uint8_t> activations(ggml_row_size(GGML_TYPE_Q8_0, n) + 2);
+            uint8_t * wx = weights.data() + 2;
+            uint8_t * ay = activations.data() + 2;
+            for (int i = 0; i < n / 128; ++i) {
+                const ggml_bf16_t scale = ggml_fp32_to_bf16(i % 3 == 0 ? -0.375f : i % 3 == 1 ? 0.0f : 1.0625f);
+                uint8_t * block = wx + i * ggml_type_size(GGML_TYPE_Q4_G128);
+                memcpy(block, &scale, sizeof(scale));
+                for (int j = 0; j < 64; ++j) {
+                    block[2 + j] = pattern == 0 ? 0x00 : pattern == 1 ? 0xff : pattern == 2 ? 0x88 : (uint8_t) (j * 37 + i * 13);
+                }
+            }
+            for (int i = 0; i < n / 32; ++i) {
+                const ggml_fp16_t scale = ggml_fp32_to_fp16(i % 2 ? 0.125f : 1.0f);
+                uint8_t * block = ay + i * ggml_type_size(GGML_TYPE_Q8_0);
+                memcpy(block, &scale, sizeof(scale));
+                for (int j = 0; j < 32; ++j) {
+                    block[2 + j] = (uint8_t) ((j * 31 + i * 17) % 256);
+                }
+                block[2] = 0x80;  // -128 must not overflow a sign correction
+                block[3] = 0x7f;
+            }
+            std::vector<float> x(n), y(n);
+            w->to_float(wx, x.data(), n);
+            a->to_float(ay, y.data(), n);
+            double ref = 0.0, magnitude = 0.0;
+            for (int j = 0; j < n; ++j) {
+                const double product = (double) x[j] * y[j];
+                ref += product;
+                magnitude += fabs(product);
+            }
+            float result[3] = {-123.0f, INFINITY, 456.0f};
+            cpu->vec_dot(n, result + 1, 0, wx, 0, ay, 0, 1);
+            const bool failed = !std::isfinite(result[1]) || fabs(result[1] - ref) > 1e-6 * std::max(1.0, magnitude) ||
+                result[0] != -123.0f || result[2] != 456.0f;
+            num_failed += failed;
+            if (failed || verbose) {
+                printf("g128 quantized dot n=%4d pattern=%d: %s (ref=%f got=%f)\n", n, pattern, RESULT_STR[failed], ref, result[1]);
+            }
+        }
+    }
+    return num_failed;
+}
+
 int main(int argc, char * argv[]) {
     bool verbose = false;
 
@@ -265,11 +319,13 @@ int main(int argc, char * argv[]) {
     }
 
     ggml_cpu_init();
+    ggml_numa_init(GGML_NUMA_STRATEGY_TENSORS);
 
     int num_failed = 0;
 
     num_failed += test_vec_dot_f32(verbose);
     num_failed += test_vec_dot_q(verbose);
+    num_failed += test_vec_dot_g128(verbose);
 
     if (num_failed || verbose) {
         printf("%d tests failed\n", num_failed);
