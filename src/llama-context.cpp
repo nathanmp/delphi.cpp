@@ -3208,6 +3208,8 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         res = std::max<uint32_t>(1024u, 12u*model.n_tensors());
     } else {
         res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
+        // Static residency adds a second routed branch and CPU input materialization per layer.
+        if (expert_cache) { res += 64u * model.layers.size(); }
         for (const auto & lora : model.loras) {
             res += lora->get_n_nodes();
         }
