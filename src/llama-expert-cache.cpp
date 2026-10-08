@@ -263,7 +263,7 @@ bool llama_expert_cache::lend(void * user_data, ggml_backend_t backend, int n_sl
     const size_t slab = c.banks[0]->nb[2];
     const int64_t per_slot = (slot_size + slab - 1) / slab, per_bank = (n_slots + 2) / 3, total = c.owner_of.size();
     const int64_t lo = total - per_bank * per_slot;
-    if (lo < 0) {
+    if (lo <= 0) { // a lent slot at the bank base would share the bank's layout state
         LLAMA_LOG_WARN("expert-cache: cannot lend %d staging slots of %.1f MiB from %lld arena slots\n", n_slots,
                 slot_size / 1048576.0, (long long) total);
         return false;
