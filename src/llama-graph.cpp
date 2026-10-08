@@ -2509,23 +2509,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn_cache(
 
     // One CPU transfer before GPU expert work. Expert IDs are exactly representable as F32. The CPU maps the original IDs to
     // cold IDs and records them for the next membership refresh.
-    const int64_t nx = ggml_nelements(cur), nw = ggml_nelements(weights);
-    auto * packet = ggml_concat(ctx0, ggml_reshape_1d(ctx0, ggml_cont(ctx0, cur), nx),
-            ggml_reshape_1d(ctx0, ggml_cont(ctx0, weights), nw), 0);
-    packet = ggml_concat(ctx0, packet, ggml_cast(ctx0, flat, GGML_TYPE_F32), 0);
+    const int64_t nx = ggml_nelements(cur);
+    auto * packet = ggml_concat(ctx0, ggml_reshape_1d(ctx0, ggml_cont(ctx0, cur), nx), ggml_cast(ctx0, flat, GGML_TYPE_F32), 0);
     auto * input = ggml_dup(ctx0, packet);
     name(input, "packet", true);
     auto * cx = ggml_view_3d(ctx0, input, cur->ne[0], 1, cur->ne[2], cur->ne[0] * sizeof(float), cur->ne[0] * sizeof(float), 0);
-    auto * cw = ggml_view_3d(ctx0, input, 1, ids->ne[0], ids->ne[1], sizeof(float), ids->ne[0] * sizeof(float), nx * sizeof(float));
     auto * ci = expert_cache->build_cold_ids(ctx0,
-            ggml_view_2d(ctx0, input, ids->ne[0], ids->ne[1], ids->ne[0] * sizeof(float), (nx + nw) * sizeof(float)), il);
-    name(cx, "input", true); name(ci, "ids", true); name(cw, "weights", true);
+            ggml_view_2d(ctx0, input, ids->ne[0], ids->ne[1], ids->ne[0] * sizeof(float), nx * sizeof(float)), il);
+    name(cx, "input", true); name(ci, "ids", true);
     ggml_build_forward_expand(gf, cx);
     ggml_build_forward_expand(gf, ci);
-    ggml_build_forward_expand(gf, cw);
 
-    auto part = [&](ggml_tensor * x, ggml_tensor * route, ggml_tensor * rw,
-                    ggml_tensor * gu, ggml_tensor * uu, ggml_tensor * du, bool cpu) {
+    // Each part leaves zeros in the other part's rows. The GPU part is built first so that it runs while the CPU part does.
+    auto part = [&](ggml_tensor * x, ggml_tensor * route, ggml_tensor * gu, ggml_tensor * uu, ggml_tensor * du, bool cpu) {
         auto * g = ggml_mul_mat_id_partial(ctx0, gu, x, route);
         auto * u = ggml_mul_mat_id_partial(ctx0, uu, x, route);
         name(g, "gate", cpu); name(u, "up", cpu);
@@ -2533,22 +2529,29 @@ ggml_tensor * llm_graph_context::build_moe_ffn_cache(
         name(a, "swiglu", cpu);
         auto * d = ggml_mul_mat_id_partial(ctx0, du, a, route);
         name(d, "down", cpu);
-        auto * weighted = ggml_mul(ctx0, d, rw);
-        name(weighted, "weighted", cpu);
-        ggml_build_forward_expand(gf, weighted);
-        ggml_tensor * out = nullptr;
-        for (int64_t j = 0; j < ids->ne[0]; ++j) {
-            auto * v = ggml_view_2d(ctx0, weighted, weighted->ne[0], ids->ne[1], weighted->nb[2], j * weighted->nb[1]);
-            ggml_build_forward_expand(gf, v);
-            if (!out) { out = v; }
-            else { out = ggml_add(ctx0, out, v); name(out, "sum", cpu); ggml_build_forward_expand(gf, out); }
-        }
-        return out;
+        ggml_build_forward_expand(gf, d);
+        return d;
     };
-    auto * gy = part(cur, hot, weights, expert_cache->gate(), expert_cache->up(), expert_cache->down(), false);
-    auto * cy = part(cx, ci, cw, gate, up, down, true);
-    auto * out = ggml_add(ctx0, gy, cy);
-    name(out, "merge", false);
+    auto * gd = part(cur, hot, expert_cache->gate(), expert_cache->up(), expert_cache->down(), false);
+    auto * cd = part(cx, ci, gate, up, down, true);
+
+    // Merge the per-expert outputs on the GPU and reduce them as build_moe_ffn does, so the backend fuses the weighted sum.
+    auto * experts = ggml_add(ctx0, gd, cd);
+    name(experts, "merge", false);
+    experts = ggml_mul(ctx0, experts, weights);
+    name(experts, "weighted", false);
+    ggml_build_forward_expand(gf, experts);
+    ggml_tensor * views[LLAMA_MAX_EXPERTS] = {};
+    for (int64_t j = 0; j < ids->ne[0]; ++j) {
+        views[j] = ggml_view_2d(ctx0, experts, experts->ne[0], ids->ne[1], experts->nb[2], j * experts->nb[1]);
+        ggml_build_forward_expand(gf, views[j]);
+    }
+    ggml_tensor * out = views[0];
+    for (int64_t j = 1; j < ids->ne[0]; ++j) {
+        out = ggml_add(ctx0, out, views[j]);
+        name(out, "sum", false);
+        ggml_build_forward_expand(gf, out);
+    }
     return out;
 }
 
