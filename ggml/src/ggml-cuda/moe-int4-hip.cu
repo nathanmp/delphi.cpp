@@ -2,6 +2,7 @@
 // delphi.cpp: compact G128 routed FFNs on RDNA4. Adapted from the tested tools/rdna4-int4 prototypes at d448ff4df.
 // F32 boundaries, symmetric Q8 activation groups of 128, exact integer group dots, and F32 scale/reduction arithmetic.
 #include "moe-int4-decode.cuh"
+#include "moe-schedule.cuh"
 
 #ifdef GGML_HIP_MOE_INT4_AVAILABLE
 
@@ -17,6 +18,8 @@ namespace {
 constexpr int MAX_ROWS = 16;
 constexpr int MAX_TOPK = 16;
 constexpr int MAX_SLOTS = MAX_ROWS * MAX_TOPK;
+constexpr int BATCH_ROWS = 1024;
+constexpr int BATCH_MIN_ROWS = 64;
 
 struct bank {
     const char * data;
@@ -47,9 +50,19 @@ struct scratch {
     float * xd, * hd, * hidden, * down;
 };
 
+struct batch_scratch {
+    int device;
+    void * base;
+    size_t bytes;
+    int * offsets, * slots, * schedule, * group_offsets;
+    int8_t * xq, * hq;
+    float * xd, * hd, * hidden, * down;
+};
+
 std::mutex state_mutex;
 std::vector<weight_state> states;
 std::map<std::tuple<const ggml_backend_cuda_context *, int, int, int>, scratch> scratches;
+std::map<std::tuple<const ggml_backend_cuda_context *, int, int, int, int, int>, batch_scratch> batch_scratches;
 std::atomic<int> override_mode{-1};
 std::atomic<bool> have_g128{false};
 std::atomic<int64_t> packs{0}, pack_us{0}, runs{0}, fallbacks{0}, wide_runs{0}, scratch_bytes{0};
@@ -336,21 +349,17 @@ template <bool GATE_UP, int ROWS> __global__ void vector_wide_projection(
     vector_wide_body<GATE_UP, ROWS>(w, u, x, dx, r, y, topk, limit);
 }
 
-// A WMMA tile shares its packed weight fragments across up to 16 routed rows. Activation precision is the same as vector execution.
-template <bool GATE_UP, int MIN_ROWS = 0>
-__device__ __forceinline__ void wmma_body(bank w, bank u, const int8_t * x, const float * dx, const routes * r,
-        float * y, int topk, float limit) {
+// Both schedules use the same W4A8 arithmetic. Slots retain token/top-k order for the final reduction.
+template <bool GATE_UP>
+__device__ __forceinline__ void wmma_tile_body(bank w, bank u, const int8_t * x, const float * dx,
+        const int * slots, int expert, int nr, float * y, int topk, float limit) {
 #if defined(RDNA4)
     using i2 = int __attribute__((ext_vector_type(2)));
     using i8 = int __attribute__((ext_vector_type(8)));
     using f8 = float __attribute__((ext_vector_type(8)));
-    const int group = blockIdx.y;
-    if (group >= r->groups) { return; }
     const int lane = threadIdx.x % 32, tile = blockIdx.x * 4 + threadIdx.x / 32, col = lane % 16;
     if (tile * 16 >= w.n) { return; }
-    const int expert = r->experts[group], nr = r->counts[group];
-    if (nr < MIN_ROWS) { return; }
-    const int slot = col < nr ? r->slots[group * MAX_ROWS + col] : 0, xr = GATE_UP ? slot / topk : slot;
+    const int slot = col < nr ? slots[col] : 0, xr = GATE_UP ? slot / topk : slot;
     const char * wp = w.data + expert * w.stride, * up = GATE_UP ? u.data + expert * u.stride : nullptr;
     f8 sum{}, sumu{};
     for (int kg = 0; kg < w.k / 128; ++kg) {
@@ -379,8 +388,54 @@ __device__ __forceinline__ void wmma_body(bank w, bank u, const int8_t * x, cons
         for (int j = 0; j < 8; ++j) { y[size_t(slot) * w.n + tile * 16 + (lane / 16) * 8 + j] = GATE_UP ? activate(sum[j], sumu[j], limit) : sum[j]; }
     }
 #else
-    GGML_UNUSED_VARS(w, u, x, dx, r, y, topk, limit);
+    GGML_UNUSED_VARS(w, u, x, dx, slots, expert, nr, y, topk, limit);
 #endif
+}
+
+// A WMMA tile shares its packed weight fragments across up to 16 routed rows.
+template <bool GATE_UP, int MIN_ROWS = 0>
+__device__ __forceinline__ void wmma_body(bank w, bank u, const int8_t * x, const float * dx, const routes * r,
+        float * y, int topk, float limit) {
+    const int group = blockIdx.y;
+    if (group >= r->groups || r->counts[group] < MIN_ROWS) { return; }
+    wmma_tile_body<GATE_UP>(w, u, x, dx, r->slots + group * MAX_ROWS, r->experts[group], r->counts[group], y, topk, limit);
+}
+
+// Expert offsets come from the shared stable counting sort. Only the small group-count scan is new.
+__global__ void batch_group_offsets(const int * offsets, int * groups, int experts) {
+    __shared__ int scan[256];
+    const int chunk = (experts + 255) / 256;
+    const int begin = min(int(threadIdx.x) * chunk, experts), end = min(begin + chunk, experts);
+    int sum = 0;
+    for (int e = begin; e < end; ++e) { sum += (offsets[e + 1] - offsets[e] + MAX_ROWS - 1) / MAX_ROWS; }
+    scan[threadIdx.x] = sum;
+    __syncthreads();
+    for (int step = 1; step < 256; step *= 2) {
+        const int v = int(threadIdx.x) >= step ? scan[threadIdx.x - step] : 0;
+        __syncthreads();
+        scan[threadIdx.x] += v;
+        __syncthreads();
+    }
+    int base = scan[threadIdx.x] - sum;
+    for (int e = begin; e < end; ++e) {
+        groups[e] = base;
+        base += (offsets[e + 1] - offsets[e] + MAX_ROWS - 1) / MAX_ROWS;
+    }
+    if (threadIdx.x == 255) { groups[experts] = scan[255]; }
+}
+
+template <bool GATE_UP> __global__ void batch_projection(bank w, bank u, const int8_t * x, const float * dx,
+        const int * offsets, const int * groups, const int * slots, int experts, float * y, int topk, float limit) {
+    const int group = blockIdx.y;
+    if (group >= groups[experts]) { return; }
+    int lo = 0, hi = experts;
+    while (lo < hi) {
+        const int mid = (lo + hi) / 2;
+        if (groups[mid + 1] <= group) { lo = mid + 1; } else { hi = mid; }
+    }
+    const int start = offsets[lo] + (group - groups[lo]) * MAX_ROWS;
+    const int count = min(MAX_ROWS, offsets[lo + 1] - start);
+    wmma_tile_body<GATE_UP>(w, u, x, dx, slots + start, lo, count, y, topk, limit);
 }
 
 template <bool GATE_UP, int MIN_ROWS = 0> __global__ void wmma_projection(
@@ -495,6 +550,63 @@ scratch * get_scratch(ggml_backend_cuda_context & ctx, int h, int f, bool create
     s.down = reinterpret_cast<float *>(p);
     scratch_bytes += s.bytes;
     return &scratches.emplace(key, s).first->second;
+}
+
+bool batch_enabled(int rows) {
+    static const bool enabled = [] { const char * p = getenv("GGML_HIP_MOE_INT4_BATCH"); return !p || atoi(p) != 0; }();
+    return enabled && rows >= BATCH_MIN_ROWS;
+}
+
+batch_scratch * get_batch_scratch(ggml_backend_cuda_context & ctx, int h, int f, int experts, int topk, bool create) {
+    const auto key = std::make_tuple(&ctx, ctx.curr_stream_no, h, f, experts, topk);
+    std::lock_guard<std::mutex> lock(state_mutex);
+    auto it = batch_scratches.find(key);
+    if (it != batch_scratches.end()) { return &it->second; }
+    if (!create || capturing(ctx)) { return nullptr; }
+    batch_scratch s{};
+    s.device = ctx.device;
+    const size_t slots = size_t(BATCH_ROWS) * topk;
+    const size_t schedule = ggml_cuda_moe_schedule_scratch_size(experts, slots);
+    const size_t integers = 2 * (experts + 1) + slots + schedule;
+    const size_t xq = size_t(BATCH_ROWS) * h, hq = slots * f;
+    const size_t xd = size_t(BATCH_ROWS) * (h / 128), hd = slots * (f / 128);
+    s.bytes = integers * sizeof(int) + xq + hq + (xd + hd + slots * (h + f)) * sizeof(float);
+    CUDA_CHECK(cudaMalloc(&s.base, s.bytes));
+    char * p = static_cast<char *>(s.base);
+    s.offsets = reinterpret_cast<int *>(p); p += (experts + 1) * sizeof(int);
+    s.group_offsets = reinterpret_cast<int *>(p); p += (experts + 1) * sizeof(int);
+    s.slots = reinterpret_cast<int *>(p); p += slots * sizeof(int);
+    s.schedule = reinterpret_cast<int *>(p); p += schedule * sizeof(int);
+    s.xq = reinterpret_cast<int8_t *>(p); p += xq;
+    s.hq = reinterpret_cast<int8_t *>(p); p += hq;
+    s.xd = reinterpret_cast<float *>(p); p += xd * sizeof(float);
+    s.hd = reinterpret_cast<float *>(p); p += hd * sizeof(float);
+    s.hidden = reinterpret_cast<float *>(p); p += slots * f * sizeof(float);
+    s.down = reinterpret_cast<float *>(p);
+    scratch_bytes += s.bytes;
+    return &batch_scratches.emplace(key, s).first->second;
+}
+
+void run_batch(ggml_backend_cuda_context & ctx, const ggml_cuda_moe_int4_ffn & f, batch_scratch & s, int start, int m) {
+    const int h = f.gate->ne[0], ff = f.gate->ne[1], experts = f.gate->ne[2], topk = f.ids->ne[0], slots = m * topk;
+    const auto stream = ctx.stream();
+    const bank gate = get_bank(ctx.device, f.gate), up = get_bank(ctx.device, f.up), down = get_bank(ctx.device, f.down);
+    const int ids_stride = f.ids->nb[1] / sizeof(int);
+    const int * ids = static_cast<const int *>(f.ids->data) + start * ids_stride;
+    const float * x = static_cast<const float *>(f.x->data) + size_t(start) * h;
+    const float * rw = static_cast<const float *>(f.weights->data) + size_t(start) * topk;
+    float * out = static_cast<float *>(f.dst->data) + size_t(start) * h;
+    ggml_cuda_moe_schedule_build(ids, ids_stride, m, topk, experts, s.offsets, s.slots, nullptr, s.schedule, stream);
+    batch_group_offsets<<<1, 256, 0, stream>>>(s.offsets, s.group_offsets, experts);
+    const int groups = std::min(slots, (slots + MAX_ROWS - 1) / MAX_ROWS + experts);
+    quantize_i8<<<dim3(h / 128, m), 128, 0, stream>>>(x, s.xq, s.xd, h, h * sizeof(float), 1, h * sizeof(float));
+    batch_projection<true><<<dim3((ff + 63) / 64, groups), 128, 0, stream>>>(gate, up, s.xq, s.xd,
+            s.offsets, s.group_offsets, s.slots, experts, s.hidden, topk, f.limit);
+    quantize_i8<<<dim3(ff / 128, slots), 128, 0, stream>>>(s.hidden, s.hq, s.hd, ff, ff * sizeof(float), 1, ff * sizeof(float));
+    batch_projection<false><<<dim3((h + 63) / 64, groups), 128, 0, stream>>>(down, {}, s.hq, s.hd,
+            s.offsets, s.group_offsets, s.slots, experts, s.down, topk, 0.0f);
+    reduce_slots<<<dim3((h + 255) / 256, m), 256, 0, stream>>>(s.down, rw, out, h, topk);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 bool eligible(ggml_backend_cuda_context & ctx, const ggml_cuda_moe_int4_ffn & f) {
@@ -614,20 +726,35 @@ bool ggml_cuda_moe_int4_prepare(ggml_backend_cuda_context & ctx, const ggml_cuda
         }
     }
     pack_us += ggml_time_us() - start;
+    if (batch_enabled(f.x->ne[2])) {
+        return get_batch_scratch(ctx, f.gate->ne[0], f.gate->ne[1], f.gate->ne[2], f.ids->ne[0], true) != nullptr;
+    }
     return get_scratch(ctx, f.gate->ne[0], f.gate->ne[1], true) != nullptr;
 }
 
 bool ggml_cuda_moe_int4_ready(ggml_backend_cuda_context & ctx, const ggml_cuda_moe_int4_ffn & f) {
-    if (!eligible(ctx, f) || !get_scratch(ctx, f.gate->ne[0], f.gate->ne[1], !capturing(ctx))) { return false; }
+    if (!eligible(ctx, f)) { return false; }
+    if (batch_enabled(f.x->ne[2])) {
+        if (!get_batch_scratch(ctx, f.gate->ne[0], f.gate->ne[1], f.gate->ne[2], f.ids->ne[0], !capturing(ctx))) { return false; }
+    } else if (!get_scratch(ctx, f.gate->ne[0], f.gate->ne[1], !capturing(ctx))) { return false; }
     std::lock_guard<std::mutex> lock(state_mutex);
     for (const ggml_tensor * t : {f.gate, f.up, f.down}) { auto * s = find_state(ctx.device, t->data); if (!s || !s->packed) { return false; } }
     return true;
 }
 
 void ggml_cuda_moe_int4_run(ggml_backend_cuda_context & ctx, const ggml_cuda_moe_int4_ffn & f) {
+    const int rows = f.x->ne[2];
+    if (batch_enabled(rows)) {
+        auto * s = get_batch_scratch(ctx, f.gate->ne[0], f.gate->ne[1], f.gate->ne[2], f.ids->ne[0], false);
+        GGML_ASSERT(s);
+        for (int start = 0; start < rows; start += BATCH_ROWS) {
+            run_batch(ctx, f, *s, start, std::min(BATCH_ROWS, rows - start));
+        }
+        runs++; wide_runs++;
+        return;
+    }
     scratch * s = get_scratch(ctx, f.gate->ne[0], f.gate->ne[1], false);
     GGML_ASSERT(s);
-    const int rows = f.x->ne[2];
     for (int start = 0; start < rows; start += MAX_ROWS) {
         const int m = std::min(MAX_ROWS, rows - start);
         if (m == 1) { run_chunk<1>(ctx, f, *s, start, m); }
@@ -699,6 +826,13 @@ void ggml_cuda_moe_int4_free_scratch(const ggml_backend_cuda_context * ctx) {
         CUDA_CHECK(cudaFree(it->second.base));
         scratch_bytes -= it->second.bytes;
         it = scratches.erase(it);
+    }
+    for (auto it = batch_scratches.begin(); it != batch_scratches.end();) {
+        if (std::get<0>(it->first) != ctx) { ++it; continue; }
+        ggml_cuda_set_device(it->second.device);
+        CUDA_CHECK(cudaFree(it->second.base));
+        scratch_bytes -= it->second.bytes;
+        it = batch_scratches.erase(it);
     }
 }
 
