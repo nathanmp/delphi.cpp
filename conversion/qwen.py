@@ -725,6 +725,15 @@ class DFlashModel(Qwen3Model):
             self.gguf_writer.add_sliding_window(sliding_window)
             self.gguf_writer.add_sliding_window_pattern(is_swa)
 
+        # MiMo drafts: rotary on part of each head and a value scale, as in the MiMo target
+        partial_rotary_factor = self.hparams.get("partial_rotary_factor")
+        if partial_rotary_factor is not None and float(partial_rotary_factor) < 1.0:
+            head_dim = self.hparams.get("head_dim") or self.hparams["hidden_size"] // self.hparams["num_attention_heads"]
+            self.gguf_writer.add_rope_dimension_count(int(head_dim * float(partial_rotary_factor)))
+        value_scale = dflash_config.get("attention_value_scale")
+        if value_scale is not None and float(value_scale) != 1.0:
+            self.gguf_writer.add_attn_value_scale(float(value_scale))
+
         causal = self.hparams.get("is_causal")
         if causal is None:
             causal = dflash_config.get("causal")
