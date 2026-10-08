@@ -691,8 +691,9 @@ void run_chunk(ggml_backend_cuda_context & ctx, const ggml_cuda_moe_int4_ffn & f
 bool ggml_cuda_moe_int4_enabled() {
     const int mode = override_mode.load(std::memory_order_relaxed);
     if (mode >= 0) { return mode != 0; }
-    static const bool enabled = [] { const char * e = getenv("GGML_HIP_MOE_INT4_DECODE"); return e && atoi(e) != 0; }();
-    return enabled;
+    static const bool enabled = [] { const char * e = getenv("GGML_HIP_MOE_INT4_DECODE"); return !e || atoi(e) != 0; }();
+    // Keep ordinary graphs outside the G128 preparation and matcher scans.
+    return enabled && have_g128.load(std::memory_order_relaxed);
 }
 
 bool ggml_cuda_moe_int4_type_supported(int device) {

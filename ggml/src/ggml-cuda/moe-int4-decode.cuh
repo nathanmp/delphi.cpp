@@ -10,7 +10,8 @@
 #define GGML_HIP_MOE_INT4_AVAILABLE
 #endif
 
-// HIP: GGML_HIP_MOE_INT4_DECODE=1 selects a complete ordinary/clipped SwiGLU FFN with 2..16 experts per token. K and N must be
+// HIP: a complete ordinary/clipped SwiGLU FFN with 2..16 experts per token is enabled by default for eligible RDNA4 G128 weights.
+// GGML_HIP_MOE_INT4_DECODE=0 disables this fusion. K and N must be
 // multiples of 128. Batches of at least 64 rows group routes across up to 1024 tokens and use I8 WMMA; smaller batches use the
 // decode path in chunks of at most 16 tokens. GGML_HIP_MOE_INT4_BATCH=0 selects the old chunked path for A/B tests.
 // Input and hidden activations use symmetric Q8 groups of 128;
@@ -66,7 +67,7 @@ struct ggml_cuda_moe_int4_ffn {
     float               limit   = 0.0f;    // 0 for ordinary SwiGLU; NVIDIA requires GLM's clamp
 };
 
-// GGML_CUDA_MOE_INT4_DECODE, or the override of ggml_backend_cuda_moe_int4_set_mode.
+// GGML_CUDA_MOE_INT4_DECODE (opt-in), GGML_HIP_MOE_INT4_DECODE (opt-out), or the test mode override.
 bool ggml_cuda_moe_int4_enabled();
 
 // Device eligibility for G128 routed weights: NVIDIA (ordinary shadow path) or RDNA4 (direct G128 path).
