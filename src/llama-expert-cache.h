@@ -3,15 +3,18 @@
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
 #include <cstdint>
+#include <cstdio>
 #include <memory>
 #include <vector>
 
 struct llama_model;
 
 // Experimental GPU-hot / CPU-cold routed experts. Host experts remain authoritative. All layers share one slot arena, so a
-// membership change rewrites slots and maps but never changes a graph. Membership is fixed while a response decodes; it is
-// rebuilt at the first small batch after a prompt, from the routing of the most recent rows. A prompt that streams experts
-// (GGML_SCHED_STAGE=1) borrows the top of the arena for the staging ring; the refresh after the prompt fills it again.
+// membership change rewrites slots and maps but never changes a graph. Membership is rebuilt at the first small batch after a
+// prompt, from the routing of the most recent rows, and while a response decodes: every `every` small batches a worker
+// copies the experts that entered the window's top set to a device scratch on its own stream, and a later batch boundary
+// packs them into the slots of the experts that left it. A prompt that streams experts (GGML_SCHED_STAGE=1) borrows the top
+// of the arena for the staging ring; the refresh after the prompt fills it again.
 struct llama_expert_cache {
     // Batches with more rows use the original routed experts (and only record their routing).
     static constexpr int64_t max_rows = 16;
@@ -44,7 +47,8 @@ struct llama_expert_cache {
     ggml_tensor * build_record(ggml_context * ctx, ggml_tensor * ids, int il);
 
     // Call before each decoded batch while no graph is running. True at the first small batch after a prompt: then the
-    // caller synchronizes, reclaims lent staging slots from every scheduler, and calls refresh().
+    // caller synchronizes, reclaims lent staging slots from every scheduler, and calls refresh(). Other small batches may
+    // start or apply a decode-time refresh here (applying one synchronizes the GPU).
     bool needs_refresh(int64_t n_tokens, bool is_warmup);
     void refresh();
 
@@ -53,6 +57,12 @@ struct llama_expert_cache {
 
 private:
     struct upload_job { int il, e, s; };
+    struct candidate { double score; int il, e; };
+    struct async_refresh;
+    // the resident set refresh() would choose now, best first
+    std::vector<candidate> select(size_t n_slots) const;
+    void tick();
+    void cancel_async();
     void record(entry & l, const char * data, size_t nb0, size_t nb1, int64_t k, int64_t rows, bool is_f32);
     void upload(const std::vector<upload_job> & jobs);
     void push_maps(const std::vector<bool> & changed);
@@ -72,9 +82,15 @@ private:
     ggml_backend_buffer_ptr pinned; // refill bounce buffers
     std::vector<int> cpus;          // the CPUs next to the GPU, for the refill threads
 
-    int64_t window = 2048;     // rows; 0 keeps every row, negative never refreshes
+    int64_t window = 256;      // rows; 0 keeps every row, negative never refreshes
     bool record_prompts = true;
-    double hysteresis = 0.25;  // score bonus of a resident expert
+    double hysteresis = 1.0;   // score bonus of a resident expert
+    int64_t every = 8;         // small batches between decode-time refreshes; 0 refreshes only after prompts
+    int64_t max_async = 32;    // experts per decode-time refresh (device scratch and pinned buffer: 3 slabs each)
+    int64_t n_small = 0;
+    std::unique_ptr<async_refresh> async;
+    int64_t n_async = 0, n_async_uploaded = 0;
+    double async_apply_ms = 0.0;
     bool pending = false;      // a prompt was processed since the last refresh
     bool warmup = false;       // warmup rows are not routing evidence
 
@@ -85,4 +101,9 @@ private:
     int64_t n_refresh = 0, n_uploaded = 0;
     double refresh_ms = 0.0;
     int64_t upload_copy_us = 0, upload_wait_us = 0;
+    // LLAMA_MOE_CACHE_DUMP=<file>: every routed row, batch start and refresh, for offline policy replay
+    // (tools/expert-cache/replay.py).
+    FILE * dump = nullptr;
+    uint32_t batch_seq = 0;
+    void dump_record(int il, int kind, int64_t rows, int64_t k, const char * data, size_t nb0, size_t nb1, bool is_f32);
 };

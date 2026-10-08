@@ -35,6 +35,13 @@ std::unique_ptr<llama_expert_cache> llama_expert_cache::create(
     if (const char * env = getenv("LLAMA_MOE_CACHE_WINDOW")) { result->window = atoll(env); }
     if (const char * env = getenv("LLAMA_MOE_CACHE_PREFILL")) { result->record_prompts = atoi(env) != 0; }
     if (const char * env = getenv("LLAMA_MOE_CACHE_HYSTERESIS")) { result->hysteresis = std::max(0.0, atof(env)); }
+    if (const char * env = getenv("LLAMA_MOE_CACHE_EVERY")) { result->every = std::max(0LL, atoll(env)); }
+    if (const char * env = getenv("LLAMA_MOE_CACHE_ASYNC_EXPERTS")) { result->max_async = std::max(1LL, atoll(env)); }
+    if (const char * path = getenv("LLAMA_MOE_CACHE_DUMP"); path && *path) {
+        result->dump = fopen(path, "wb");
+        if (!result->dump) { throw std::runtime_error("cannot open LLAMA_MOE_CACHE_DUMP"); }
+        fwrite("DELPHI_MOE_DUMP1", 1, 16, result->dump);
+    }
 
     // Every routed layer must be original host G128 with one geometry, because all layers share the slot arena.
     const int n_layers = model.layers.size();
@@ -153,17 +160,47 @@ std::unique_ptr<llama_expert_cache> llama_expert_cache::create(
             }
         }
     }
-    LLAMA_LOG_WARN("%s: %lld slots, %.2f MiB allocated on %s; window %lld rows, prompts %s, hysteresis %.2f\n", __func__,
+    LLAMA_LOG_WARN("%s: %lld slots, %.2f MiB allocated on %s; window %lld rows, prompts %s, hysteresis %.2f, decode-time refresh every %lld small batches (up to %lld experts)\n", __func__,
             (long long) n_slots, ggml_backend_buffer_get_size(result->buffer.get()) / 1048576.0, ggml_backend_name(result->gpu),
-            (long long) result->window, result->record_prompts ? "on" : "off", result->hysteresis);
+            (long long) result->window, result->record_prompts ? "on" : "off", result->hysteresis, (long long) result->every,
+            (long long) result->max_async);
     return result;
 }
 
+// Decode-time refresh: a worker copies the incoming experts' slabs through a pinned buffer to a device scratch on a backend
+// of its own (a second stream on the cache GPU), so the copy overlaps decoding; tick() packs them into arena slots once done.
+struct llama_expert_cache::async_refresh {
+    ggml_backend_ptr copy;
+    ggml_backend_buffer_ptr host;
+    ggml_context_ptr ctx;
+    ggml_tensor * scratch = nullptr;
+    ggml_backend_buffer_ptr scratch_buf;
+    std::thread worker;
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::vector<const char *> srcs;          // slab sources, 3 per incoming expert
+    std::vector<upload_job> jobs;            // incoming experts and the slots they take
+    std::vector<std::pair<int, int>> evict;  // per job, the expert leaving that slot, or (-1, -1)
+    bool queued = false, done = false, stop = false;
+    int64_t copy_us = 0;
+
+    ~async_refresh() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stop = true;
+        }
+        cv.notify_all();
+        if (worker.joinable()) { worker.join(); }
+    }
+};
+
 llama_expert_cache::~llama_expert_cache() {
+    async.reset();
+    if (dump) { fclose(dump); }
     if (n_refresh) {
-        LLAMA_LOG_WARN("expert-cache: %lld refreshes, %lld experts uploaded, %.1f ms; decode hits since last refresh: %.1f%% selections, %.1f%% distinct\n",
-                (long long) n_refresh, (long long) n_uploaded, refresh_ms, all_sel ? 100.0 * hit_sel / all_sel : 0.0,
-                all_distinct ? 100.0 * hit_distinct / all_distinct : 0.0);
+        LLAMA_LOG_WARN("expert-cache: %lld refreshes, %lld experts uploaded, %.1f ms; %lld decode-time refreshes, %lld experts, %.1f ms applying; decode hits since last refresh: %.1f%% selections, %.1f%% distinct\n",
+                (long long) n_refresh, (long long) n_uploaded, refresh_ms, (long long) n_async, (long long) n_async_uploaded,
+                async_apply_ms, all_sel ? 100.0 * hit_sel / all_sel : 0.0, all_distinct ? 100.0 * hit_distinct / all_distinct : 0.0);
     }
 }
 
@@ -187,6 +224,22 @@ void llama_expert_cache::record(entry & l, const char * data, size_t nb0, size_t
     }
 }
 
+// Record: u32 batch, u16 layer, u16 rows, u8 top_k, u8 kind (0 small batch, 1 prompt batch, 2 refresh, 3 batch start with
+// rows = min(n_tokens, 65535)), u16 0, then rows * top_k u8 expert ids.
+void llama_expert_cache::dump_record(int il, int kind, int64_t rows, int64_t k, const char * data, size_t nb0, size_t nb1, bool is_f32) {
+    const uint16_t head[5] = { uint16_t(il), uint16_t(std::min<int64_t>(rows, 65535)), uint16_t(k | (kind << 8)), 0, 0 };
+    fwrite(&batch_seq, sizeof(batch_seq), 1, dump);
+    fwrite(head, sizeof(uint16_t), 4, dump);
+    for (int64_t r = 0; data && r < rows; ++r) {
+        uint8_t ids[256];
+        for (int64_t j = 0; j < k; ++j) {
+            const char * p = data + r * nb1 + j * nb0;
+            ids[j] = uint8_t(is_f32 ? (int32_t) *reinterpret_cast<const float *>(p) : *reinterpret_cast<const int32_t *>(p));
+        }
+        fwrite(ids, 1, k, dump);
+    }
+}
+
 void llama_expert_cache::op_cold_ids(ggml_tensor * dst, int ith, int nth, void * userdata) {
     GGML_UNUSED(nth);
     if (ith != 0) { return; }
@@ -197,6 +250,9 @@ void llama_expert_cache::op_cold_ids(ggml_tensor * dst, int ith, int nth, void *
     const bool warmup = c.warmup;
     if (!warmup && c.window >= 0) {
         c.record(l, (const char *) ids->data, ids->nb[0], ids->nb[1], k, rows, true);
+    }
+    if (!warmup && c.dump) {
+        c.dump_record(l.il, 0, rows, k, (const char *) ids->data, ids->nb[0], ids->nb[1], true);
     }
     // Hit statistics: selections, and distinct experts, because the CPU reads each expert once per ubatch.
     c.stamp_gen++;
@@ -224,7 +280,12 @@ void llama_expert_cache::op_record(ggml_tensor * dst, int ith, int nth, void * u
     auto & l = *static_cast<entry *>(userdata);
     if (l.owner->warmup) { return; }
     const ggml_tensor * ids = dst->src[0];
-    l.owner->record(l, (const char *) ids->data, ids->nb[0], ids->nb[1], ids->ne[0], ids->ne[1], false);
+    if (l.owner->window >= 0 && l.owner->record_prompts) {
+        l.owner->record(l, (const char *) ids->data, ids->nb[0], ids->nb[1], ids->ne[0], ids->ne[1], false);
+    }
+    if (l.owner->dump) {
+        l.owner->dump_record(l.il, 1, ids->ne[1], ids->ne[0], (const char *) ids->data, ids->nb[0], ids->nb[1], false);
+    }
 }
 
 ggml_tensor * llama_expert_cache::build_cold_ids(ggml_context * ctx, ggml_tensor * ids, int il) {
@@ -234,7 +295,7 @@ ggml_tensor * llama_expert_cache::build_cold_ids(ggml_context * ctx, ggml_tensor
 }
 
 ggml_tensor * llama_expert_cache::build_record(ggml_context * ctx, ggml_tensor * ids, int il) {
-    if (window < 0 || !record_prompts || !layer(il)) { return nullptr; }
+    if (((window < 0 || !record_prompts) && !dump) || !layer(il)) { return nullptr; }
     GGML_ASSERT(ids->type == GGML_TYPE_I32 && ids->ne[2] == 1 && ids->ne[3] == 1);
     ggml_tensor * args[] = { ids };
     return ggml_custom_4d(ctx, GGML_TYPE_I32, 1, 1, 1, 1, args, 1, op_record, 1, &layers[il]);
@@ -244,8 +305,15 @@ bool llama_expert_cache::needs_refresh(int64_t n_tokens, bool is_warmup) {
     // Graph reuse ignores warmup, so the ops read this flag at execution time.
     warmup = is_warmup;
     if (warmup) { return false; }
+    if (dump) {
+        batch_seq++;
+        dump_record(0, 3, n_tokens, 0, nullptr, 0, 0, false);
+    }
     if (n_tokens > max_rows) { pending = true; return false; }
-    if (!pending) { return false; }
+    if (!pending) {
+        tick();
+        return false;
+    }
     pending = false;
     if (window < 0 && lent_lo == (int64_t) owner_of.size()) {
         LLAMA_LOG_WARN("expert-cache: static; previous decode hits %.1f%% selections, %.1f%% distinct\n",
@@ -259,6 +327,7 @@ bool llama_expert_cache::needs_refresh(int64_t n_tokens, bool is_warmup) {
 bool llama_expert_cache::lend(void * user_data, ggml_backend_t backend, int n_slots, size_t slot_size, void ** slots) {
     auto & c = *static_cast<llama_expert_cache *>(user_data);
     if (backend != c.gpu || n_slots <= 0) { return false; }
+    c.cancel_async();
     // Ring slot j uses the top of bank j % 3, so lending evicts the same arena slots in all three banks.
     const size_t slab = c.banks[0]->nb[2];
     const int64_t per_slot = (slot_size + slab - 1) / slab, per_bank = (n_slots + 2) / 3, total = c.owner_of.size();
@@ -447,8 +516,185 @@ void llama_expert_cache::upload(const std::vector<upload_job> & jobs) {
 
 // Global top-N of (layer, expert) by selections in the most recent window rows. Rows that the window does not hold yet are
 // filled from the profile prior. Resident experts keep a hysteresis bonus, because a replacement costs a full PCIe upload.
+std::vector<llama_expert_cache::candidate> llama_expert_cache::select(size_t n_slots) const {
+    const int64_t prior_rows = window > 0 ? window : 2048;
+    std::vector<candidate> candidates;
+    for (auto & l : layers) {
+        if (!l.owner) { continue; }
+        const double fill = std::max<int64_t>(0, prior_rows - l.rows);
+        for (int e = 0; e < (int) l.count.size(); ++e) {
+            const double score = l.count[e] + fill * l.prior[e];
+            if (score > 0) { candidates.push_back({score * (l.slot[e] >= 0 ? 1.0 + hysteresis : 1.0), l.il, e}); }
+        }
+    }
+    const size_t n_keep = std::min(n_slots, candidates.size());
+    std::partial_sort(candidates.begin(), candidates.begin() + n_keep, candidates.end(), [](const candidate & a, const candidate & b) {
+        return a.score != b.score ? a.score > b.score : std::tie(a.il, a.e) < std::tie(b.il, b.e);
+    });
+    candidates.resize(n_keep);
+    return candidates;
+}
+
+void llama_expert_cache::cancel_async() {
+    if (!async) { return; }
+    std::unique_lock<std::mutex> lock(async->mutex);
+    async->cv.wait(lock, [&] { return !async->queued; });
+    async->done = false;
+}
+
+void llama_expert_cache::tick() {
+    if (every <= 0 || window < 0 || !set_expert) { return; }
+    const int64_t n_slots = owner_of.size();
+    if (async) {
+        bool ready;
+        {
+            std::lock_guard<std::mutex> lock(async->mutex);
+            ready = async->done;
+        }
+        if (ready) {
+            // Swap the copied experts in. The decode that just returned left the GPU idle; the packs read the scratch, so
+            // they finish before the worker writes it again, and the maps change before the next graph runs.
+            const int64_t t0 = ggml_time_us();
+            ggml_backend_synchronize(gpu);
+            const size_t bytes = banks[0]->nb[2];
+            std::vector<bool> changed(layers.size(), false);
+            for (size_t i = 0; i < async->jobs.size(); ++i) {
+                const auto & j = async->jobs[i];
+                const auto [il, e] = async->evict[i];
+                if (il >= 0) {
+                    layers[il].slot[e] = -1;
+                    layers[il].cold[e] = e;
+                    changed[il] = true;
+                }
+                layers[j.il].slot[j.e] = j.s;
+                layers[j.il].cold[j.e] = -1;
+                owner_of[j.s] = {j.il, j.e};
+                changed[j.il] = true;
+                for (int p = 0; p < 3; ++p) {
+                    set_expert(gpu, banks[p], j.s, static_cast<const char *>(async->scratch->data) + (3 * i + p) * bytes);
+                }
+            }
+            ggml_backend_synchronize(gpu);
+            push_maps(changed);
+            {
+                std::lock_guard<std::mutex> lock(async->mutex);
+                async->done = false;
+            }
+            n_async++;
+            n_async_uploaded += async->jobs.size();
+            async_apply_ms += (ggml_time_us() - t0) / 1000.0;
+        }
+    }
+    if (++n_small % every != 0 || lent_lo != n_slots) { return; }
+    if (async) {
+        std::lock_guard<std::mutex> lock(async->mutex);
+        if (async->queued || async->done) { return; }
+    }
+
+    // Experts that entered the top set, best first, take the free slots and then the slots of the resident experts that
+    // left it, weakest first.
+    const auto keep = select(n_slots);
+    std::vector<std::vector<bool>> in(layers.size());
+    for (auto & l : layers) { if (l.owner) { in[l.il].assign(l.count.size(), false); } }
+    for (const auto & c : keep) { in[c.il][c.e] = true; }
+    std::vector<candidate> add;
+    for (const auto & c : keep) {
+        if (layers[c.il].slot[c.e] < 0 && (int64_t) add.size() < max_async) { add.push_back(c); }
+    }
+    if (add.empty()) { return; }
+    const int64_t prior_rows = window > 0 ? window : 2048;
+    std::vector<candidate> out;
+    std::vector<int> free_slots;
+    for (int64_t s = 0; s < n_slots; ++s) {
+        const auto [il, e] = owner_of[s];
+        if (il < 0) {
+            free_slots.push_back(s);
+        } else if (!in[il][e]) {
+            const auto & l = layers[il];
+            out.push_back({l.count[e] + std::max<int64_t>(0, prior_rows - l.rows) * l.prior[e], il, e});
+        }
+    }
+    std::sort(out.begin(), out.end(), [](const candidate & a, const candidate & b) {
+        return a.score != b.score ? a.score < b.score : std::tie(a.il, a.e) < std::tie(b.il, b.e);
+    });
+    const size_t n_add = std::min(add.size(), free_slots.size() + out.size());
+    if (n_add == 0) { return; }
+
+    if (!async) {
+        async = std::make_unique<async_refresh>();
+        ggml_backend_dev_t dev = ggml_backend_get_device(gpu);
+        const size_t bytes = banks[0]->nb[2], size = 3 * max_async * bytes;
+        async->copy.reset(ggml_backend_dev_init(dev, nullptr));
+        if (auto * buft = ggml_backend_dev_host_buffer_type(dev)) { async->host.reset(ggml_backend_buft_alloc_buffer(buft, size)); }
+        async->ctx.reset(ggml_init({ggml_tensor_overhead(), nullptr, true}));
+        async->scratch = ggml_new_tensor_1d(async->ctx.get(), GGML_TYPE_I8, size);
+        async->scratch_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(async->ctx.get(), ggml_backend_get_default_buffer_type(gpu)));
+        if (!async->copy || !async->host || !async->scratch_buf) {
+            LLAMA_LOG_WARN("expert-cache: cannot allocate %.1f MiB for decode-time refresh; refreshing after prompts only\n", size / 1048576.0);
+            async.reset();
+            every = 0;
+            return;
+        }
+        if (cpus.empty()) { cpus = local_cpus(dev); }
+        auto * a = async.get();
+        a->worker = std::thread([a, bytes, cpus = cpus] {
+            pin_thread(cpus);
+            char * host = static_cast<char *>(ggml_backend_buffer_get_base(a->host.get()));
+            for (;;) {
+                {
+                    std::unique_lock<std::mutex> lock(a->mutex);
+                    a->cv.wait(lock, [&] { return a->stop || a->queued; });
+                    if (a->stop) { return; }
+                }
+                const int64_t t0 = ggml_time_us();
+                for (size_t i = 0; i < a->srcs.size(); ++i) { memcpy(host + i * bytes, a->srcs[i], bytes); }
+                ggml_backend_tensor_set_async(a->copy.get(), a->scratch, host, 0, a->srcs.size() * bytes);
+                ggml_backend_synchronize(a->copy.get());
+                {
+                    std::lock_guard<std::mutex> lock(a->mutex);
+                    a->copy_us += ggml_time_us() - t0;
+                    a->queued = false;
+                    a->done = true;
+                }
+                a->cv.notify_all();
+            }
+        });
+    }
+
+    std::lock_guard<std::mutex> lock(async->mutex);
+    async->jobs.clear();
+    async->evict.clear();
+    async->srcs.clear();
+    size_t next_out = 0;
+    for (size_t i = 0; i < n_add; ++i) {
+        int s;
+        if (!free_slots.empty()) {
+            s = free_slots.back();
+            free_slots.pop_back();
+            async->evict.push_back({-1, -1});
+        } else {
+            const auto & o = out[next_out++];
+            s = layers[o.il].slot[o.e];
+            async->evict.push_back({o.il, o.e});
+        }
+        const auto & c = add[i];
+        async->jobs.push_back({c.il, c.e, s});
+        const auto & l = model->layers[c.il];
+        for (const ggml_tensor * w : { l.ffn_gate_exps, l.ffn_up_exps, l.ffn_down_exps }) {
+            async->srcs.push_back(static_cast<const char *>(w->data) + c.e * w->nb[2]);
+        }
+    }
+    async->queued = true;
+    async->cv.notify_all();
+}
+
 void llama_expert_cache::refresh() {
     const int64_t t0 = ggml_time_us();
+    cancel_async();
+    if (dump) {
+        dump_record(0, 2, 0, 0, nullptr, 0, 0, false);
+        fflush(dump);
+    }
     const int64_t reclaimed = owner_of.size() - lent_lo;
     if (reclaimed > 0) {
         // The caller reclaimed the staging slots. Their pointers inside the banks had their own weight layouts.
@@ -456,23 +702,15 @@ void llama_expert_cache::refresh() {
         lent_lo = owner_of.size();
     }
     const int64_t prior_rows = window > 0 ? window : 2048;
-    struct candidate { double score; int il, e; };
-    std::vector<candidate> candidates;
     double total = 0;
     for (auto & l : layers) {
         if (!l.owner) { continue; }
         const double fill = std::max<int64_t>(0, prior_rows - l.rows);
-        for (int e = 0; e < (int) l.count.size(); ++e) {
-            const double score = l.count[e] + fill * l.prior[e];
-            total += score;
-            if (score > 0) { candidates.push_back({score * (l.slot[e] >= 0 ? 1.0 + hysteresis : 1.0), l.il, e}); }
-        }
+        for (int e = 0; e < (int) l.count.size(); ++e) { total += l.count[e] + fill * l.prior[e]; }
     }
     const size_t n_slots = owner_of.size();
-    const size_t n_keep = std::min(n_slots, candidates.size());
-    std::partial_sort(candidates.begin(), candidates.begin() + n_keep, candidates.end(), [](const candidate & a, const candidate & b) {
-        return a.score != b.score ? a.score > b.score : std::tie(a.il, a.e) < std::tie(b.il, b.e);
-    });
+    const auto candidates = select(n_slots);
+    const size_t n_keep = candidates.size();
     std::vector<std::vector<bool>> keep(layers.size());
     double covered = 0;
     for (size_t i = 0; i < n_keep; ++i) {
