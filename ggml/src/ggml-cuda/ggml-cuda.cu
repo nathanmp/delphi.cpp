@@ -4336,7 +4336,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         int ffn_nodes = 0;
         if (ggml_cuda_match_moe_int4_ffn(cgraph, i, ffn, ffn_nodes)) {
             const int output_idx = i + ffn_nodes - 1;
-            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, ffn_nodes, &output_idx, 1) &&
+            // HIP quantizes each row chunk of x into scratch before it writes the same rows of dst, so dst may reuse
+            // x in place when the rows coincide (ggml-alloc gives x's memory to the FFN output in wide batches)
+            const ggml_tensor * x_alias = nullptr;
+#ifdef GGML_HIP_MOE_INT4_AVAILABLE
+            if (ffn.x->data == ffn.dst->data && ffn.x->nb[2] == ffn.dst->nb[1]) {
+                x_alias = ffn.x;
+            }
+#endif
+            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, ffn_nodes, &output_idx, 1, false, x_alias) &&
                     ggml_cuda_moe_int4_ready(*cuda_ctx, ffn)) {
                 trace_fused_mul_mat(i, node->op, GGML_EXEC_TRACE_DISPATCH_GPU_MOE_INT4);
                 ggml_cuda_moe_int4_run(*cuda_ctx, ffn);
@@ -7159,6 +7167,12 @@ static void ggml_backend_cuda_moe_int4_set_expert_proc(ggml_backend_t backend, c
     ggml_cuda_moe_int4_set_expert(*cuda_ctx, t, expert, src);
 }
 
+static void ggml_backend_cuda_stage_prepare(ggml_backend_t backend, ggml_tensor * weight) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    ggml_cuda_moe_int4_stage_prepare(*cuda_ctx, weight);
+}
+
 static void ggml_backend_cuda_moe_int4_forget_inside_proc(ggml_backend_t backend, const ggml_tensor * t) {
     ggml_cuda_moe_int4_forget_inside(((ggml_backend_cuda_context *) backend->context)->device, t);
 }
@@ -7232,6 +7246,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_moe_int4_forget_inside") == 0) {
         return (void *)ggml_backend_cuda_moe_int4_forget_inside_proc;
+    }
+    if (strcmp(name, "ggml_backend_stage_prepare") == 0) {
+        return (void *)ggml_backend_cuda_stage_prepare;
     }
 #endif
     return nullptr;

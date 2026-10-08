@@ -130,6 +130,8 @@ bool ggml_backend_cuda_moe_int4_get_pack(const void * data, int which, const voi
 #ifdef GGML_HIP_MOE_INT4_AVAILABLE
 // Copy expert slab `expert` of a G128 bank from device memory on the stream of ctx. A packed bank stays packed.
 void ggml_cuda_moe_int4_set_expert(ggml_backend_cuda_context & ctx, const ggml_tensor * t, int64_t expert, const void * src);
+// Pack a staged weight (new canonical content at every use) in place on the stream of ctx; see ggml_backend_stage_prepare_t.
+void ggml_cuda_moe_int4_stage_prepare(ggml_backend_cuda_context & ctx, ggml_tensor * t);
 // Forget the layout of weights that lie inside t (staging slots lent from t), but not that of t.
 void ggml_cuda_moe_int4_forget_inside(int device, const ggml_tensor * t);
 #endif

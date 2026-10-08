@@ -872,6 +872,39 @@ void ggml_cuda_moe_int4_set_expert(ggml_backend_cuda_context & ctx, const ggml_t
     CUDA_CHECK(cudaGetLastError());
 }
 
+// A staging slot holds a new expert tensor in the canonical layout at every use. Pack it in place on the compute stream so
+// that the fused kernels read it; its state stays packed, because every later use is packed here again.
+void ggml_cuda_moe_int4_stage_prepare(ggml_backend_cuda_context & ctx, ggml_tensor * t) {
+    if (t->type != GGML_TYPE_Q4_G128 || !supported_weight(t) || !ggml_cuda_moe_int4_type_supported(ctx.device)) { return; }
+    // staged experts are the only G128 tensors of a model whose experts stay in host memory: enable the matcher
+    have_g128.store(true, std::memory_order_relaxed);
+    register_weight(ctx, t);
+    const int64_t start = ggml_time_us();
+    std::lock_guard<std::mutex> lock(state_mutex);
+    weight_state * s = find_state(ctx.device, t->data);
+    GGML_ASSERT(s && s->stride == size_t(t->nb[2]) && s->experts == t->ne[2]);
+    const cudaStream_t stream = ctx.stream();
+    const int chunk = std::min(s->experts, 16);
+    ggml_cuda_pool_alloc<char> tmp(ctx.pool(), chunk * s->stride);
+    for (int e = 0; e < s->experts; e += chunk) {
+        const int ce = std::min(chunk, s->experts - e);
+        char * dst = s->data + e * s->stride;
+        CUDA_CHECK(cudaMemcpyAsync(tmp.get(), dst, ce * s->stride, cudaMemcpyDeviceToDevice, stream));
+        const unsigned grid = std::min<size_t>((size_t(ce) * s->k * s->n / 8 + 255) / 256, 65535);
+        pack_codes<<<grid, 256, 0, stream>>>(tmp.get(), dst, s->stride, s->k, s->n, ce);
+        pack_scales<<<grid, 256, 0, stream>>>(tmp.get(), dst, s->stride, s->k, s->n, ce);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    if (!s->packed) {
+        const int flag = 1;
+        CUDA_CHECK(cudaMemcpyAsync(s->flag, &flag, sizeof(flag), cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream)); // once per slot: flag lives on the host stack
+        s->packed = true;
+    }
+    packs++;
+    pack_us += ggml_time_us() - start;
+}
+
 void ggml_cuda_moe_int4_forget_inside(int device, const ggml_tensor * t) {
     std::lock_guard<std::mutex> lock(state_mutex);
     const char * base = static_cast<const char *>(t->data);
