@@ -3551,7 +3551,10 @@ llm_graph_cb llama_context::graph_get_cb() const {
         const bool routed = strcmp(name, "ffn_moe_up") == 0 || strcmp(name, "ffn_moe_gate") == 0 ||
                 strcmp(name, "ffn_moe_down") == 0 || strcmp(name, "ffn_moe_swiglu") == 0 ||
                 strcmp(name, "ffn_moe_weighted") == 0 || strcmp(name, "ffn_moe_out") == 0;
-        if (cache_cpu || (cpu_experts && routed)) {
+        // Model builders can rename the returned MoE tensor. Keep an explicitly placed cache merge on its GPU.
+        const bool cache_merge = expert_cache && strcmp(name, "ffn_moe_out") == 0 &&
+                ggml_backend_sched_get_tensor_backend(sched.get(), cur) == expert_cache->backend();
+        if (cache_cpu || (cpu_experts && routed && !cache_merge)) {
             ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend_cpu);
         } else if (cache_gpu && expert_cache) {
             ggml_backend_sched_set_tensor_backend(sched.get(), cur, expert_cache->backend());
