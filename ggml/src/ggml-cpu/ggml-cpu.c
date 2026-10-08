@@ -1780,6 +1780,16 @@ struct mmid_row_mapping {
     int32_t i2;
 };
 
+// GGML_CPU_G128_ROWS=0 restores the per-row vec_dot loop for G128 experts (A/B).
+static bool ggml_cpu_g128_rows_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char * env = getenv("GGML_CPU_G128_ROWS");
+        enabled = env ? atoi(env) != 0 : 1;
+    }
+    return enabled != 0;
+}
+
 static void ggml_compute_forward_mul_mat_id_one_chunk(
     struct ggml_tensor * dst,
     const struct ggml_tensor * src0,
@@ -1802,6 +1812,33 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
 
     ggml_vec_dot_t    const vec_dot      = type_traits_cpu[type].vec_dot;
     enum ggml_type    const vec_dot_type = type_traits_cpu[type].vec_dot_type;
+
+    if (type == GGML_TYPE_Q4_G128 && vec_dot_type == GGML_TYPE_Q8_0 && ggml_cpu_g128_rows_enabled()) {
+        // Decode each weight row once for up to GGML_Q4_G128_MAX_ROWS of this expert's tokens (MTP verification and small
+        // batches route a few tokens to the same expert). The results equal the per-row vec_dot.
+        for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += GGML_Q4_G128_MAX_ROWS) {
+            const int ny = (int) MIN(GGML_Q4_G128_MAX_ROWS, ir1_end - iir1);
+            const void * cols[GGML_Q4_G128_MAX_ROWS];
+            float * dsts[GGML_Q4_G128_MAX_ROWS];
+            for (int r = 0; r < ny; ++r) {
+                const struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, iir1 + r);
+                const int64_t i11 = row_mapping.i1 % ne11;
+                const int64_t i12 = row_mapping.i2;
+                cols[r] = (const char *) wdata + (src1_cont || src1->type != vec_dot_type
+                        ? (i11 + i12*ne11)*row_size
+                        : (i11*nb11 + i12*nb12));
+                dsts[r] = (float *) ((char *) dst->data + (row_mapping.i1*nb1 + i12*nb2));
+            }
+            for (int64_t ir0 = ir0_start; ir0 < ir0_end; ++ir0) {
+                float out[GGML_Q4_G128_MAX_ROWS];
+                ggml_vec_dot_q4_g128_q8_0_rows(ne00, out, src0_cur + ir0*nb01, cols, ny);
+                for (int r = 0; r < ny; ++r) {
+                    dsts[r][ir0] = out[r];
+                }
+            }
+        }
+        return;
+    }
 
     const int64_t blck_0 = 16;
     const int64_t blck_1 = 16;
