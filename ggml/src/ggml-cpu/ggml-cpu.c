@@ -18,6 +18,7 @@
 #include "common.h"
 #include "iqk/iqk_mul_mat.h"
 #include "moe-prof.h"
+#include "cpu-timeline.h"
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h> // using malloc.h with MSC/MINGW
@@ -572,6 +573,8 @@ struct ggml_threadpool {
     uint32_t     poll;        // Polling level (0 - no polling)
 
     enum ggml_status ec;
+
+    int32_t timeline_call;    // GGML_CPU_TIMELINE record of the running graph compute, or -1
 };
 
 // Per-thread state
@@ -3771,6 +3774,13 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 #endif
 
     const bool trace_nodes = state->ith == 0 && ggml_exec_trace_observing();
+    const int32_t tl_call = tp->timeline_call;
+    const struct ggml_tensor * tl_last = NULL; // the last computed node when it was not followed by a barrier
+    int tl_last_n = 0, tl_last_fused = 0;
+    int64_t tl_last_t0 = 0, tl_last_t1 = 0;
+    if (tl_call >= 0) {
+        ggml_cpu_timeline_enter(tl_call, state->ith);
+    }
     uint64_t trace_cpu_start = 0;
     uint32_t trace_cpu_node = 0;
     uint32_t trace_cpu_node_count = 0;
@@ -3797,6 +3807,9 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             trace_cpu_start = ggml_exec_trace_cpu_node_begin();
         }
 
+        const int64_t tl_t0 = tl_call >= 0 ? ggml_cpu_timeline_now() : 0;
+        const int tl_node = node_n;
+
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
         // Try fused ops, fall back to normal compute
         const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
@@ -3815,8 +3828,18 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             tp->ec    = GGML_STATUS_ABORTED;
         }
 
+        const int64_t tl_t1 = tl_call >= 0 ? ggml_cpu_timeline_now() : 0;
+        if (tl_call >= 0) {
+            tl_last = node; tl_last_n = tl_node; tl_last_fused = n_fused; tl_last_t0 = tl_t0; tl_last_t1 = tl_t1;
+        }
+
         if (node_n + 1 < cgraph->n_nodes) {
             ggml_barrier(state->threadpool);
+            if (tl_call >= 0) {
+                ggml_cpu_timeline_node(tl_call, state->ith, tl_node, n_fused, state->ith == 0 ? node : NULL,
+                        tl_t0, tl_t1, ggml_cpu_timeline_now());
+                tl_last = NULL;
+            }
             if (trace_nodes) {
                 ggml_exec_trace_cpu_node_end(trace_cpu_start, trace_cpu_node, trace_cpu_node_count);
                 trace_cpu_start = 0;
@@ -3831,6 +3854,14 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 #endif
 
     ggml_barrier(state->threadpool);
+
+    if (tl_call >= 0) {
+        if (tl_last) {
+            ggml_cpu_timeline_node(tl_call, state->ith, tl_last_n, tl_last_fused, state->ith == 0 ? tl_last : NULL,
+                    tl_last_t0, tl_last_t1, ggml_cpu_timeline_now());
+        }
+        ggml_cpu_timeline_exit(tl_call, state->ith);
+    }
 
     if (trace_nodes && trace_cpu_start != 0) {
         ggml_exec_trace_cpu_node_end(trace_cpu_start, trace_cpu_node, trace_cpu_node_count);
@@ -4003,6 +4034,7 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
         threadpool->poll             = tpp->poll;
         threadpool->prio             = tpp->prio;
         threadpool->ec               = GGML_STATUS_SUCCESS;
+        threadpool->timeline_call    = -1;
     }
 
     // Allocate and init workers state
@@ -4093,6 +4125,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         threadpool->abort            = -1;
         threadpool->ec               = GGML_STATUS_SUCCESS;
     }
+    threadpool->timeline_call = ggml_cpu_timeline_begin(cgraph, n_threads);
 
 #ifdef GGML_USE_OPENMP
     if (n_threads > 1) {
@@ -4134,6 +4167,11 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 
     // don't leave affinity set on the main thread
     clear_numa_thread_affinity();
+
+    if (threadpool->timeline_call >= 0) {
+        ggml_cpu_timeline_end(threadpool->timeline_call);
+        threadpool->timeline_call = -1;
+    }
 
     enum ggml_status ret = threadpool->ec;
 

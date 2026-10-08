@@ -35,6 +35,8 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/iqp.h
         ggml-cpu/moe-prof.cpp
         ggml-cpu/moe-prof.h
+        ggml-cpu/cpu-timeline.cpp
+        ggml-cpu/cpu-timeline.h
         ggml-cpu/hbm.cpp
         ggml-cpu/hbm.h
         ggml-cpu/quants.c
