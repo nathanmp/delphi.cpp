@@ -325,6 +325,15 @@ extern "C" {
     // delphi: number of compute buffer reservations so far (explicit, and automatic on a graph that does not fit)
     GGML_API uint64_t             ggml_backend_sched_get_n_reserves(ggml_backend_sched_t sched);
 
+    // delphi: an owner of device memory lends it to the staging ring (GGML_SCHED_STAGE=1) instead of the ring allocating its
+    // own slots. When a graph stages weights and the ring holds no slots that fit, lend is called with the number of slots
+    // and their minimum size; it fills slots and returns true, or returns false (the ring then allocates its own slots).
+    // The memory stays lent until ggml_backend_sched_stage_reclaim.
+    typedef bool (*ggml_backend_sched_stage_lend_t)(void * user_data, ggml_backend_t backend, int n_slots, size_t slot_size, void ** slots);
+    GGML_API void                 ggml_backend_sched_set_stage_lender(ggml_backend_sched_t sched, ggml_backend_sched_stage_lend_t lend, void * user_data);
+    // delphi: wait until no queued work reads or writes the lent slots, and stop using them. Returns true if slots were lent.
+    GGML_API bool                 ggml_backend_sched_stage_reclaim(ggml_backend_sched_t sched);
+
     GGML_API int                  ggml_backend_sched_get_n_backends(ggml_backend_sched_t sched);
     GGML_API ggml_backend_t       ggml_backend_sched_get_backend(ggml_backend_sched_t sched, int i);
 

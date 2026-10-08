@@ -2840,7 +2840,9 @@ struct ggml_backend_sched_stage_job {
 struct ggml_backend_sched_stage_ring {
     ggml_backend_stage_upload_t upload = nullptr;
     ggml_backend_stage_d2d_t    d2d    = nullptr;
-    ggml_backend_buffer_t buffers[GGML_SCHED_STAGE_MAX_SLOTS] = {};
+    ggml_backend_buffer_t buffers[GGML_SCHED_STAGE_MAX_SLOTS] = {}; // null when the slots are lent
+    void *                slots[GGML_SCHED_STAGE_MAX_SLOTS]   = {}; // device memory of each slot
+    bool                  lent = false;                             // slots belong to the stage lender
     ggml_backend_event_t  done[GGML_SCHED_STAGE_MAX_SLOTS]    = {}; // upload finished, recorded on the copy stream
     ggml_backend_event_t  free[GGML_SCHED_STAGE_MAX_SLOTS]    = {}; // slot read, recorded on the compute stream
     bool busy[GGML_SCHED_STAGE_MAX_SLOTS]          = {};            // queued, and the read is not recorded yet
@@ -2891,6 +2893,8 @@ struct ggml_backend_sched_stage {
     bool redirect = true;
     struct held { ggml_tensor * input_cpy; void * data; int backend_id; int slot; };
     std::vector<held> holding;
+    ggml_backend_sched_stage_lend_t lend = nullptr;
+    void * lend_user = nullptr;
 };
 
 static void ggml_backend_sched_stage_run_job(
@@ -2904,7 +2908,7 @@ static void ggml_backend_sched_stage_run_job(
         ggml_backend_event_synchronize(ring.free[job.slot]);
     }
     lap(w->us_free);
-    char * dst = (char *) ggml_backend_buffer_get_base(ring.buffers[job.slot]);
+    char * dst = (char *) ring.slots[job.slot];
     if (stage->registrar && stage->registrar->locked(job.src, job.size)) {
         // straight from the page-locked weights
         ring.upload(backend, dst, job.src, job.size, ring.done[job.slot]);
@@ -3063,7 +3067,8 @@ static void ggml_backend_sched_stage_drain(ggml_backend_sched_stage * stage) {
     }
 }
 
-static void ggml_backend_sched_stage_release_ring(ggml_backend_sched_stage_ring & ring) {
+// wait until no queued upload writes and no queued work reads a slot, then forget the slots (lent slots are not freed)
+static void ggml_backend_sched_stage_drop_slots(ggml_backend_sched_stage_ring & ring) {
     for (int s = 0; s < GGML_SCHED_STAGE_MAX_SLOTS; s++) {
         if (ring.done[s] != nullptr) {
             ggml_backend_event_synchronize(ring.done[s]);
@@ -3073,9 +3078,17 @@ static void ggml_backend_sched_stage_release_ring(ggml_backend_sched_stage_ring 
         }
         ggml_backend_buffer_free(ring.buffers[s]);
         ring.buffers[s] = nullptr;
+        ring.slots[s] = nullptr;
         ring.busy[s] = false;
         ring.free_recorded[s] = false;
     }
+    ring.lent = false;
+    ring.slot_size = 0;
+    ring.next = 0;
+}
+
+static void ggml_backend_sched_stage_release_ring(ggml_backend_sched_stage_ring & ring) {
+    ggml_backend_sched_stage_drop_slots(ring);
     for (int c = 0; c < GGML_SCHED_STAGE_MAX_BOUNCE; c++) {
         if (ring.bounce_ev[c] != nullptr) {
             ggml_backend_event_synchronize(ring.bounce_ev[c]);
@@ -3085,8 +3098,6 @@ static void ggml_backend_sched_stage_release_ring(ggml_backend_sched_stage_ring 
     ggml_backend_buffer_free(ring.bounce);
     ring.bounce = nullptr;
     ring.bounce_next = 0;
-    ring.slot_size = 0;
-    ring.next = 0;
 }
 
 static void ggml_backend_sched_stage_free(ggml_backend_sched_stage * stage) {
@@ -3216,10 +3227,18 @@ static void ggml_backend_sched_stage_begin(ggml_backend_sched_t sched) {
         ggml_backend_t backend = sched->backends[b];
         ggml_backend_dev_t dev = ggml_backend_get_device(backend);
         ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend);
+        // lent memory first; the lender cannot lend part of the slots
+        ring.lent = stage->lend != nullptr && stage->lend(stage->lend_user, backend, stage->n_slots, need[b], ring.slots);
+        if (!ring.lent) {
+            std::fill(std::begin(ring.slots), std::end(ring.slots), nullptr);
+        }
         bool ok = true;
         for (int s = 0; s < stage->n_slots && ok; s++) {
-            ring.buffers[s] = ggml_backend_buft_alloc_buffer(buft, need[b]);
-            ok = ring.buffers[s] != nullptr;
+            if (!ring.lent) {
+                ring.buffers[s] = ggml_backend_buft_alloc_buffer(buft, need[b]);
+                ring.slots[s] = ring.buffers[s] != nullptr ? ggml_backend_buffer_get_base(ring.buffers[s]) : nullptr;
+            }
+            ok = ring.slots[s] != nullptr;
             if (ok && ring.done[s] == nullptr) {
                 ring.done[s] = ggml_backend_event_new(dev);
                 ring.free[s] = ggml_backend_event_new(dev);
@@ -3249,8 +3268,8 @@ static void ggml_backend_sched_stage_begin(ggml_backend_sched_t sched) {
                 }
             }
         }
-        GGML_LOG_INFO("%s: staging ring on %s: %d slots of %.1f MiB, %s\n", __func__, ggml_backend_name(backend),
-                stage->n_slots, need[b]/1048576.0, ring.bounce != nullptr ? "pinned bounce buffers" : "direct uploads");
+        GGML_LOG_INFO("%s: staging ring on %s: %d %s slots of %.1f MiB, %s\n", __func__, ggml_backend_name(backend),
+                stage->n_slots, ring.lent ? "lent" : "own", need[b]/1048576.0, ring.bounce != nullptr ? "pinned bounce buffers" : "direct uploads");
     }
 
     ggml_backend_sched_stage_pump(sched);
@@ -3285,11 +3304,11 @@ static bool ggml_backend_sched_stage_consume(
     if (stage->redirect && sched->callback_eval == nullptr) {
         // the split reads the slot in place; ggml_backend_sched_stage_release frees it after the split's work
         stage->holding.push_back({ input_cpy, input_cpy->data, item.backend_id, item.slot });
-        input_cpy->data = ggml_backend_buffer_get_base(ring.buffers[item.slot]);
+        input_cpy->data = ring.slots[item.slot];
         stage->n_consumed++;
         return true;
     }
-    ring.d2d(split_backend, input_cpy->data, ggml_backend_buffer_get_base(ring.buffers[item.slot]), ggml_nbytes(item.input));
+    ring.d2d(split_backend, input_cpy->data, ring.slots[item.slot], ggml_nbytes(item.input));
     ggml_backend_event_record(ring.free[item.slot], split_backend);
     ring.free_recorded[item.slot] = true;
     ring.busy[item.slot] = false;
@@ -3313,6 +3332,30 @@ static void ggml_backend_sched_stage_release(ggml_backend_sched_t sched, ggml_ba
     }
     stage->holding.clear();
     ggml_backend_sched_stage_pump(sched);
+}
+
+void ggml_backend_sched_set_stage_lender(ggml_backend_sched_t sched, ggml_backend_sched_stage_lend_t lend, void * user_data) {
+    if (sched->stage != nullptr) {
+        sched->stage->lend = lend;
+        sched->stage->lend_user = user_data;
+    }
+}
+
+bool ggml_backend_sched_stage_reclaim(ggml_backend_sched_t sched) {
+    ggml_backend_sched_stage * stage = sched->stage;
+    if (stage == nullptr) {
+        return false;
+    }
+    // queued jobs still upload into the slots; their done events are recorded only once they are issued
+    ggml_backend_sched_stage_drain(stage);
+    bool any = false;
+    for (auto & ring : stage->rings) {
+        if (ring.lent) {
+            ggml_backend_sched_stage_drop_slots(ring);
+            any = true;
+        }
+    }
+    return any;
 }
 
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
