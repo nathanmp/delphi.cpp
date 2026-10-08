@@ -22,7 +22,7 @@
 // GGML_HIP_MOE_INT4_PATH=auto (default) uses wide vector loads for one-row H=2560/FF=640 work and I8 WMMA for its wider batches;
 // other shapes use K-split vector dots. Explicit vector/wide/wmma/mixed modes are experimental comparators. Vector and WMMA sum
 // K groups in different F32 orders, so the mode/width selection does not promise bitwise batch invariance.
-// Weight-bank views and partial routed nodes are not advertised as HIP G128 operations; they keep the CPU fallback.
+// Weight-bank views keep the CPU fallback. Partial root-bank nodes support masked routes; fused partial FFNs require at most 16 rows.
 
 // delphi.cpp: one complete GLM-shaped routed expert FFN (gate/up -> clipped SiLU * up -> down * router weight -> slot sum) with INT4
 // weights and BF16 tensor-core MMA, for any number of rows: the decode kernels for 1..GGML_CUDA_MOE_INT4_MAX_TOKENS rows (and wider batches
@@ -64,6 +64,7 @@ struct ggml_cuda_moe_int4_ffn {
     const ggml_tensor * ids     = nullptr; // I32  [topk, M]
     const ggml_tensor * weights = nullptr; // F32  [1, topk, M], contiguous: the router weights by slot
     ggml_tensor *       dst     = nullptr; // F32  [hidden, M], contiguous
+    bool                partial = false; // HIP: negative or out-of-range IDs have zero contribution
     float               limit   = 0.0f;    // 0 for ordinary SwiGLU; NVIDIA requires GLM's clamp
 };
 

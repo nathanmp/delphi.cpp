@@ -3872,6 +3872,8 @@ static bool ggml_cuda_match_moe_int4_ffn(
     ggml_tensor * second = cgraph->nodes[node_idx + 1];
     ggml_tensor * glu    = cgraph->nodes[node_idx + 2];
     ggml_tensor * down   = cgraph->nodes[node_idx + 3];
+    const bool partial = ggml_mul_mat_id_is_partial(first);
+    if (partial != ggml_mul_mat_id_is_partial(second) || partial != ggml_mul_mat_id_is_partial(down)) { return false; }
     if (first->op != GGML_OP_MUL_MAT_ID || second->op != GGML_OP_MUL_MAT_ID || glu->op != GGML_OP_GLU ||
             down->op != GGML_OP_MUL_MAT_ID ||
 #ifdef GGML_HIP_MOE_INT4_AVAILABLE
@@ -3882,8 +3884,11 @@ static bool ggml_cuda_match_moe_int4_ffn(
             ggml_get_op_params_i32(glu, 1) != 0 /* not swapped */ ||
             !((glu->src[0] == first && glu->src[1] == second) || (glu->src[0] == second && glu->src[1] == first)) ||
             down->src[1] != glu || first->type != GGML_TYPE_F32 || second->type != GGML_TYPE_F32 || glu->type != GGML_TYPE_F32 ||
-            down->type != GGML_TYPE_F32 || ggml_mul_mat_id_is_partial(first) || ggml_mul_mat_id_is_partial(second) ||
-            ggml_mul_mat_id_is_partial(down)) {
+            down->type != GGML_TYPE_F32
+#ifndef GGML_HIP_MOE_INT4_AVAILABLE
+            || partial
+#endif
+            ) {
         return false;
     }
     if (first->src[1] != second->src[1] || first->src[2] != second->src[2] || first->src[2] != down->src[2]) {
@@ -3911,6 +3916,7 @@ static bool ggml_cuda_match_moe_int4_ffn(
         return false;
     }
 
+    ffn.partial = partial;
     ffn.gate    = glu->src[0]->src[0];
     ffn.up      = glu->src[1]->src[0];
     ffn.down    = down->src[0];
@@ -6511,7 +6517,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 if (b->type == GGML_TYPE_F16 && a->type != GGML_TYPE_F16) {
                     return false;
                 }
-                if (ggml_mul_mat_id_is_partial(op) && (b->type != GGML_TYPE_F32 ||
+                bool hip_g128 = false;
+#ifdef GGML_HIP_MOE_INT4_AVAILABLE
+                hip_g128 = a->type == GGML_TYPE_Q4_G128;
+#endif
+                if (ggml_mul_mat_id_is_partial(op) && !hip_g128 && (b->type != GGML_TYPE_F32 ||
                         !ggml_cuda_should_use_mmq(ggml_cuda_moe_int4_dispatch_type(a), ggml_cuda_info().devices[dev_ctx->device].cc, 1, a->ne[2]) ||
                         ggml_cuda_moe_packed_inplace_fmt(a) != GGML_CUDA_MOE_PACKED_NONE)) {
                     return false; // see ggml_cuda_mul_mat_id
@@ -6574,7 +6584,6 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
 #ifdef GGML_HIP_MOE_INT4_AVAILABLE
                             && a->ne[1] % 16 == 0 && !a->view_src && ggml_is_contiguous(a) && op->src[1]->type == GGML_TYPE_F32
                             && op->src[2]->nb[0] == sizeof(int32_t) && op->src[1]->nb[0] == sizeof(float)
-                            && !ggml_mul_mat_id_is_partial(op)
 #endif
                             ;
 #endif // GGML_CUDA_MOE_INT4_AVAILABLE

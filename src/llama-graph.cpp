@@ -1,4 +1,5 @@
 #include "llama-graph.h"
+#include "llama-expert-cache.h"
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -1606,6 +1607,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     mctx             (params.mctx),
     cross            (params.cross),
     mtp_device_draft_cache(params.mtp_device_draft_cache),
+    expert_cache     (params.expert_cache),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -2281,6 +2283,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         return build_moe_ffn_split(cur, up_exps, gate_exps, down_exps, selected_experts, weights, n_expert, il);
     }
 
+    if (expert_cache && ubatch.n_tokens <= 16 && expert_cache->layer(il) &&
+            type_op == LLM_FFN_SILU && !weight_before_ffn && !gate_up_exps &&
+            !up_exps_s && !gate_exps_s && !down_exps_s && !up_exps_b && !gate_exps_b && !down_exps_b &&
+            (loras == nullptr || loras->empty())) {
+        return build_moe_ffn_cache(cur, selected_experts, weights, up_exps, gate_exps, down_exps, il);
+    }
+
     if (weight_before_ffn) {
         // repeat cur to [n_embd, n_expert_used, n_tokens]
         ggml_tensor * repeated = ggml_repeat_4d(ctx0, cur, n_embd, n_expert_used, n_tokens, 1);
@@ -2477,6 +2486,59 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     cb(moe_out, "ffn_moe_out", il);
 
     return moe_out;
+}
+
+ggml_tensor * llm_graph_context::build_moe_ffn_cache(
+        ggml_tensor * cur, ggml_tensor * ids, ggml_tensor * weights,
+        ggml_tensor * up, ggml_tensor * gate, ggml_tensor * down, int il) const {
+    const auto & resident = *expert_cache->layer(il);
+    auto name = [&](ggml_tensor * t, const char * label, bool cpu) {
+        cb(t, (std::string(cpu ? "ffn_cache_cpu_" : "ffn_cache_gpu_") + label).c_str(), il);
+    };
+    auto lookup = [&](ggml_tensor * map) {
+        auto * flat = ggml_reshape_1d(ctx0, ggml_cont(ctx0, ids), ggml_nelements(ids));
+        return ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, map, flat), ids->ne[0], ids->ne[1]);
+    };
+    auto * hot = lookup(resident.hot_ids);
+    auto * cold = lookup(resident.cold_ids);
+    ggml_build_forward_expand(gf, hot);
+    ggml_build_forward_expand(gf, cold);
+
+    // Materialize every CPU input before queuing GPU expert work. Later CPU copies must not wait for that work.
+    auto * cx = ggml_dup(ctx0, cur);
+    auto * ci = ggml_dup(ctx0, cold);
+    auto * cw = ggml_dup(ctx0, weights);
+    name(cx, "input", true); name(ci, "ids", true); name(cw, "weights", true);
+    ggml_build_forward_expand(gf, cx);
+    ggml_build_forward_expand(gf, ci);
+    ggml_build_forward_expand(gf, cw);
+
+    auto part = [&](ggml_tensor * x, ggml_tensor * route, ggml_tensor * rw,
+                    ggml_tensor * gu, ggml_tensor * uu, ggml_tensor * du, bool cpu) {
+        auto * g = ggml_mul_mat_id_partial(ctx0, gu, x, route);
+        auto * u = ggml_mul_mat_id_partial(ctx0, uu, x, route);
+        name(g, "gate", cpu); name(u, "up", cpu);
+        auto * a = ggml_swiglu_split(ctx0, g, u);
+        name(a, "swiglu", cpu);
+        auto * d = ggml_mul_mat_id_partial(ctx0, du, a, route);
+        name(d, "down", cpu);
+        auto * weighted = ggml_mul(ctx0, d, rw);
+        name(weighted, "weighted", cpu);
+        ggml_build_forward_expand(gf, weighted);
+        ggml_tensor * out = nullptr;
+        for (int64_t j = 0; j < ids->ne[0]; ++j) {
+            auto * v = ggml_view_2d(ctx0, weighted, weighted->ne[0], ids->ne[1], weighted->nb[2], j * weighted->nb[1]);
+            ggml_build_forward_expand(gf, v);
+            if (!out) { out = v; }
+            else { out = ggml_add(ctx0, out, v); name(out, "sum", cpu); ggml_build_forward_expand(gf, out); }
+        }
+        return out;
+    };
+    auto * gy = part(cur, hot, weights, resident.gate, resident.up, resident.down, false);
+    auto * cy = part(cx, ci, cw, gate, up, down, true);
+    auto * out = ggml_add(ctx0, gy, cy);
+    name(out, "merge", false);
+    return out;
 }
 
 // The top cparams.moe_split_n experts run on the LLAMA_MOE_SPLIT device and the rest where the scheduler puts them. Each part

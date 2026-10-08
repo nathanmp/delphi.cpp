@@ -96,6 +96,7 @@ struct llama_cross {
 };
 
 struct llm_graph_params;
+struct llama_expert_cache;
 
 //
 // llm_graph_input
@@ -797,6 +798,7 @@ struct llm_graph_params {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
     const llama_mtp_device_draft_cache * mtp_device_draft_cache;
+    const llama_expert_cache * expert_cache = nullptr;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -1054,6 +1056,7 @@ struct llm_graph_context {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
     const llama_mtp_device_draft_cache * mtp_device_draft_cache;
+    const llama_expert_cache * expert_cache = nullptr;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -1186,6 +1189,10 @@ struct llm_graph_context {
              ggml_tensor * selected_experts_in = nullptr) const;
 
     // routed experts split between two devices (LLAMA_MOE_SPLIT), see build_moe_ffn
+    ggml_tensor * build_moe_ffn_cache(
+            ggml_tensor * cur, ggml_tensor * selected_experts, ggml_tensor * weights,
+            ggml_tensor * up, ggml_tensor * gate, ggml_tensor * down, int il) const;
+
     ggml_tensor * build_moe_ffn_split(
              ggml_tensor * cur,
              ggml_tensor * up_exps,

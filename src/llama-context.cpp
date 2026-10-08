@@ -147,6 +147,25 @@ llama_context::llama_context(
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
 
+    // LLAMA_MOE_ROUTING_LOG=<file>: append the router's top-k expert ids of every MoE layer to a binary file, for offline
+    // expert-placement profiling. Draft contexts (MTP, or with another context) are skipped, and so are ubatches of more
+    // than LLAMA_MOE_ROUTING_LOG_MAX_TOKENS tokens (default 16: decode and verify only). The eval callback
+    // copies one small tensor per layer to the host, which slows decode, but leaves the computation unchanged.
+    if (const char * path = getenv("LLAMA_MOE_ROUTING_LOG");
+            path != nullptr && *path != '\0' && params.cb_eval == nullptr && params.ctx_other == nullptr &&
+            params.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT) {
+        moe_routing_log = fopen(path, "ab");
+        if (moe_routing_log == nullptr) {
+            throw std::runtime_error(format("LLAMA_MOE_ROUTING_LOG: cannot open %s", path));
+        }
+        if (const char * env = getenv("LLAMA_MOE_ROUTING_LOG_MAX_TOKENS")) {
+            moe_routing_log_max_tokens = atoll(env);
+        }
+        cparams.cb_eval           = moe_routing_log_cb;
+        cparams.cb_eval_user_data = this;
+        LLAMA_LOG_WARN("%s: logging MoE routing to %s\n", __func__, path);
+    }
+
     cparams.ctx_other = nullptr;
 
     // TODO: more generic
@@ -558,6 +577,9 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
+        if (params.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && params.ctx_other == nullptr) {
+            expert_cache = llama_expert_cache::create(model, backends);
+        }
         sched_reserve();
 
         if (!cparams.flash_attn) {
@@ -578,7 +600,42 @@ llama_context::llama_context(
     }
 }
 
+// One record per (MoE layer, ubatch): int32 layer, int32 n_tokens, int32 top_k, then n_tokens*top_k int32 expert ids,
+// token-major. The top-k ids are usually a view of a sorted index tensor, so rows are read with their stride.
+bool llama_context::moe_routing_log_cb(ggml_tensor * t, bool ask, void * user_data) {
+    static const char prefix[] = "ffn_moe_topk-";
+    const bool match = strncmp(t->name, prefix, sizeof(prefix) - 1) == 0;
+    if (ask) {
+        return match;
+    }
+    if (!match) {
+        return true;
+    }
+
+    auto * ctx = (llama_context *) user_data;
+    const int64_t k        = t->ne[0];
+    const int64_t n_tokens = t->ne[1];
+    if (t->type != GGML_TYPE_I32 || t->nb[0] != sizeof(int32_t) || t->ne[2] != 1 || t->ne[3] != 1 ||
+            (ctx->moe_routing_log_max_tokens > 0 && n_tokens > ctx->moe_routing_log_max_tokens)) {
+        return true;
+    }
+
+    const size_t span = (size_t) (n_tokens - 1)*t->nb[1] + (size_t) k*sizeof(int32_t);
+    ctx->moe_routing_buf.resize(span);
+    ggml_backend_tensor_get(t, ctx->moe_routing_buf.data(), 0, span);
+
+    const int32_t hdr[3] = { (int32_t) atoi(t->name + sizeof(prefix) - 1), (int32_t) n_tokens, (int32_t) k };
+    fwrite(hdr, sizeof(hdr), 1, ctx->moe_routing_log);
+    for (int64_t i = 0; i < n_tokens; ++i) {
+        fwrite(ctx->moe_routing_buf.data() + i*t->nb[1], sizeof(int32_t), k, ctx->moe_routing_log);
+    }
+    // a client attributes records to its requests by the file size
+    fflush(ctx->moe_routing_log);
+    return true;
+}
+
 llama_context::~llama_context() {
+    if (moe_routing_log) { fclose(moe_routing_log); }
     // asynchronous state copies whose destination may already be gone
     state_async_pending.clear();
 
@@ -3364,6 +3421,7 @@ llm_graph_params llama_context::graph_params(
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.mtp_device_draft_cache =*/ &mtp_device_draft_cache,
+        /*.expert_cache =*/ expert_cache.get(),
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
@@ -3480,6 +3538,21 @@ llm_graph_cb llama_context::graph_get_cb() const {
             ggml_format_name(cur, "%s-%d", name, il);
         } else {
             ggml_set_name(cur, name);
+        }
+
+        static const bool cpu_experts = [] {
+            const char * p = getenv("LLAMA_MOE_CPU_PREFILL");
+            return p && atoi(p) != 0;
+        }();
+        const bool cache_cpu = strncmp(name, "ffn_cache_cpu_", 14) == 0;
+        const bool cache_gpu = strncmp(name, "ffn_cache_gpu_", 14) == 0;
+        const bool routed = strcmp(name, "ffn_moe_up") == 0 || strcmp(name, "ffn_moe_gate") == 0 ||
+                strcmp(name, "ffn_moe_down") == 0 || strcmp(name, "ffn_moe_swiglu") == 0 ||
+                strcmp(name, "ffn_moe_weighted") == 0 || strcmp(name, "ffn_moe_out") == 0;
+        if (cache_cpu || (cpu_experts && routed)) {
+            ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend_cpu);
+        } else if (cache_gpu && expert_cache) {
+            ggml_backend_sched_set_tensor_backend(sched.get(), cur, expert_cache->backend());
         }
 
         const char * split_tag = strncmp(name, "ffn_moe_x", 9) == 0 ? name + 9 : strncmp(name, "attn_x", 6) == 0 ? name + 6 : nullptr;
