@@ -7213,6 +7213,11 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_cuda_moe_int4_get_pack") == 0) {
         return (void *)ggml_backend_cuda_moe_int4_get_pack;
     }
+#ifdef GGML_HIP_MOE_INT4_AVAILABLE
+    if (strcmp(name, "ggml_backend_cuda_moe_int4_set_expert") == 0) {
+        return (void *)ggml_backend_cuda_moe_int4_set_expert;
+    }
+#endif
     return nullptr;
 }
 

@@ -127,3 +127,8 @@ void ggml_backend_cuda_moe_int4_get_stats(int64_t * out);
 // (bf16 [K/128][N]). Expert e is at ptr + e * stride. Returns false if the tensor is not PACKED.
 // HIP layout: codes uint32 [N/16][K/16][lane32], scales bf16 [N][K/128], in the same expert-sized slot.
 bool ggml_backend_cuda_moe_int4_get_pack(const void * data, int which, const void ** ptr, size_t * bytes, size_t * stride);
+#ifdef GGML_HIP_MOE_INT4_AVAILABLE
+// Write expert slab `expert` of a registered, packed G128 bank from host memory and keep the bank packed. Returns false if the
+// bank is not packed; then an ordinary tensor write is correct. The caller guarantees that no queued work reads the bank.
+bool ggml_backend_cuda_moe_int4_set_expert(const ggml_tensor * t, int64_t expert, const void * src);
+#endif
