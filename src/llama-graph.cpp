@@ -2504,10 +2504,16 @@ ggml_tensor * llm_graph_context::build_moe_ffn_cache(
     ggml_build_forward_expand(gf, hot);
     ggml_build_forward_expand(gf, cold);
 
-    // Materialize every CPU input before queuing GPU expert work. Later CPU copies must not wait for that work.
-    auto * cx = ggml_dup(ctx0, cur);
-    auto * ci = ggml_dup(ctx0, cold);
-    auto * cw = ggml_dup(ctx0, weights);
+    // One CPU transfer before GPU expert work. Expert IDs are exactly representable as F32.
+    const int64_t nx = ggml_nelements(cur), nw = ggml_nelements(weights);
+    auto * packet = ggml_concat(ctx0, ggml_reshape_1d(ctx0, ggml_cont(ctx0, cur), nx),
+            ggml_reshape_1d(ctx0, ggml_cont(ctx0, weights), nw), 0);
+    packet = ggml_concat(ctx0, packet, ggml_cast(ctx0, ggml_reshape_1d(ctx0, cold, ggml_nelements(cold)), GGML_TYPE_F32), 0);
+    auto * input = ggml_dup(ctx0, packet);
+    name(input, "packet", true);
+    auto * cx = ggml_view_3d(ctx0, input, cur->ne[0], 1, cur->ne[2], cur->ne[0] * sizeof(float), cur->ne[0] * sizeof(float), 0);
+    auto * cw = ggml_view_3d(ctx0, input, 1, ids->ne[0], ids->ne[1], sizeof(float), ids->ne[0] * sizeof(float), nx * sizeof(float));
+    auto * ci = ggml_cast(ctx0, ggml_view_2d(ctx0, input, ids->ne[0], ids->ne[1], ids->ne[0] * sizeof(float), (nx + nw) * sizeof(float)), GGML_TYPE_I32);
     name(cx, "input", true); name(ci, "ids", true); name(cw, "weights", true);
     ggml_build_forward_expand(gf, cx);
     ggml_build_forward_expand(gf, ci);
