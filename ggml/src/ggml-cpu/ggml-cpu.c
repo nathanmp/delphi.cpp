@@ -18,6 +18,7 @@
 #include "common.h"
 #include "iqk/iqk_mul_mat.h"
 #include "moe-prof.h"
+#include "cpu-timeline.h"
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h> // using malloc.h with MSC/MINGW
@@ -572,6 +573,8 @@ struct ggml_threadpool {
     uint32_t     poll;        // Polling level (0 - no polling)
 
     enum ggml_status ec;
+
+    int32_t timeline_call;    // GGML_CPU_TIMELINE record of the running graph compute, or -1
 };
 
 // Per-thread state
@@ -1777,6 +1780,16 @@ struct mmid_row_mapping {
     int32_t i2;
 };
 
+// GGML_CPU_G128_ROWS=0 restores the per-row vec_dot loop for G128 experts (A/B).
+static bool ggml_cpu_g128_rows_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char * env = getenv("GGML_CPU_G128_ROWS");
+        enabled = env ? atoi(env) != 0 : 1;
+    }
+    return enabled != 0;
+}
+
 static void ggml_compute_forward_mul_mat_id_one_chunk(
     struct ggml_tensor * dst,
     const struct ggml_tensor * src0,
@@ -1799,6 +1812,33 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
 
     ggml_vec_dot_t    const vec_dot      = type_traits_cpu[type].vec_dot;
     enum ggml_type    const vec_dot_type = type_traits_cpu[type].vec_dot_type;
+
+    if (type == GGML_TYPE_Q4_G128 && vec_dot_type == GGML_TYPE_Q8_0 && ggml_cpu_g128_rows_enabled()) {
+        // Decode each weight row once for up to GGML_Q4_G128_MAX_ROWS of this expert's tokens (MTP verification and small
+        // batches route a few tokens to the same expert). The results equal the per-row vec_dot.
+        for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += GGML_Q4_G128_MAX_ROWS) {
+            const int ny = (int) MIN(GGML_Q4_G128_MAX_ROWS, ir1_end - iir1);
+            const void * cols[GGML_Q4_G128_MAX_ROWS];
+            float * dsts[GGML_Q4_G128_MAX_ROWS];
+            for (int r = 0; r < ny; ++r) {
+                const struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, iir1 + r);
+                const int64_t i11 = row_mapping.i1 % ne11;
+                const int64_t i12 = row_mapping.i2;
+                cols[r] = (const char *) wdata + (src1_cont || src1->type != vec_dot_type
+                        ? (i11 + i12*ne11)*row_size
+                        : (i11*nb11 + i12*nb12));
+                dsts[r] = (float *) ((char *) dst->data + (row_mapping.i1*nb1 + i12*nb2));
+            }
+            for (int64_t ir0 = ir0_start; ir0 < ir0_end; ++ir0) {
+                float out[GGML_Q4_G128_MAX_ROWS];
+                ggml_vec_dot_q4_g128_q8_0_rows(ne00, out, src0_cur + ir0*nb01, cols, ny);
+                for (int r = 0; r < ny; ++r) {
+                    dsts[r][ir0] = out[r];
+                }
+            }
+        }
+        return;
+    }
 
     const int64_t blck_0 = 16;
     const int64_t blck_1 = 16;
@@ -3771,6 +3811,13 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 #endif
 
     const bool trace_nodes = state->ith == 0 && ggml_exec_trace_observing();
+    const int32_t tl_call = tp->timeline_call;
+    const struct ggml_tensor * tl_last = NULL; // the last computed node when it was not followed by a barrier
+    int tl_last_n = 0, tl_last_fused = 0;
+    int64_t tl_last_t0 = 0, tl_last_t1 = 0;
+    if (tl_call >= 0) {
+        ggml_cpu_timeline_enter(tl_call, state->ith);
+    }
     uint64_t trace_cpu_start = 0;
     uint32_t trace_cpu_node = 0;
     uint32_t trace_cpu_node_count = 0;
@@ -3797,6 +3844,9 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             trace_cpu_start = ggml_exec_trace_cpu_node_begin();
         }
 
+        const int64_t tl_t0 = tl_call >= 0 ? ggml_cpu_timeline_now() : 0;
+        const int tl_node = node_n;
+
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
         // Try fused ops, fall back to normal compute
         const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
@@ -3815,8 +3865,18 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             tp->ec    = GGML_STATUS_ABORTED;
         }
 
+        const int64_t tl_t1 = tl_call >= 0 ? ggml_cpu_timeline_now() : 0;
+        if (tl_call >= 0) {
+            tl_last = node; tl_last_n = tl_node; tl_last_fused = n_fused; tl_last_t0 = tl_t0; tl_last_t1 = tl_t1;
+        }
+
         if (node_n + 1 < cgraph->n_nodes) {
             ggml_barrier(state->threadpool);
+            if (tl_call >= 0) {
+                ggml_cpu_timeline_node(tl_call, state->ith, tl_node, n_fused, state->ith == 0 ? node : NULL,
+                        tl_t0, tl_t1, ggml_cpu_timeline_now());
+                tl_last = NULL;
+            }
             if (trace_nodes) {
                 ggml_exec_trace_cpu_node_end(trace_cpu_start, trace_cpu_node, trace_cpu_node_count);
                 trace_cpu_start = 0;
@@ -3831,6 +3891,14 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 #endif
 
     ggml_barrier(state->threadpool);
+
+    if (tl_call >= 0) {
+        if (tl_last) {
+            ggml_cpu_timeline_node(tl_call, state->ith, tl_last_n, tl_last_fused, state->ith == 0 ? tl_last : NULL,
+                    tl_last_t0, tl_last_t1, ggml_cpu_timeline_now());
+        }
+        ggml_cpu_timeline_exit(tl_call, state->ith);
+    }
 
     if (trace_nodes && trace_cpu_start != 0) {
         ggml_exec_trace_cpu_node_end(trace_cpu_start, trace_cpu_node, trace_cpu_node_count);
@@ -4003,6 +4071,7 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
         threadpool->poll             = tpp->poll;
         threadpool->prio             = tpp->prio;
         threadpool->ec               = GGML_STATUS_SUCCESS;
+        threadpool->timeline_call    = -1;
     }
 
     // Allocate and init workers state
@@ -4093,6 +4162,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         threadpool->abort            = -1;
         threadpool->ec               = GGML_STATUS_SUCCESS;
     }
+    threadpool->timeline_call = ggml_cpu_timeline_begin(cgraph, n_threads);
 
 #ifdef GGML_USE_OPENMP
     if (n_threads > 1) {
@@ -4134,6 +4204,11 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 
     // don't leave affinity set on the main thread
     clear_numa_thread_affinity();
+
+    if (threadpool->timeline_call >= 0) {
+        ggml_cpu_timeline_end(threadpool->timeline_call);
+        threadpool->timeline_call = -1;
+    }
 
     enum ggml_status ret = threadpool->ec;
 

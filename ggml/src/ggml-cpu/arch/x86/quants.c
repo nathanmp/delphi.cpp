@@ -698,6 +698,59 @@ void ggml_vec_dot_q1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
 #endif
 }
 
+#if defined(__AVX2__)
+// Bytes ahead of the current block to prefetch (GGML_CPU_G128_PREFETCH, 0 = off). A thread streams a contiguous slice of weight
+// rows, so the prefetch runs into its next rows; only the last one of a slice reaches past it. 1024: MiMo MTP decode CPU expert
+// time -3% (2026-10-08 timelines); 512-8192 measure alike.
+static int g128_prefetch_bytes(void) {
+    static int bytes = -1;
+    if (bytes < 0) {
+        const char * env = getenv("GGML_CPU_G128_PREFETCH");
+        bytes = env ? atoi(env) : 1024;
+    }
+    return bytes;
+}
+
+// Decodes each 32-weight group once for NR activation rows. Per row, the arithmetic and accumulation order are those of the
+// single-row kernel, so every result is bitwise identical to it.
+static inline __attribute__((always_inline)) void g128_dot_rows(int n, float * GGML_RESTRICT s, const block_q4_g128 * GGML_RESTRICT x,
+        const block_q8_0 * const * y, const int NR, const int pf) {
+    const __m256i ones8  = _mm256_set1_epi8(1);
+    const __m256i ones16 = _mm256_set1_epi16(1);
+    __m256 acc[GGML_Q4_G128_MAX_ROWS][4];
+    for (int r = 0; r < NR; ++r) {
+        for (int g = 0; g < 4; ++g) {
+            acc[r][g] = _mm256_setzero_ps();
+        }
+    }
+
+    for (int i = 0; i < n / QK4_G128; ++i) {
+        if (pf) {
+            _mm_prefetch((const char *) (x + i) + pf, _MM_HINT_T0);
+        }
+        const ggml_bf16_t d16 = { x[i].d };
+        const float dx = GGML_BF16_TO_FP32(d16);
+        for (int g = 0; g < 4; ++g) {
+            const __m256i qx = bytes_from_nibbles_32(x[i].qs + 16 * g);
+            for (int r = 0; r < NR; ++r) {
+                const block_q8_0 * yg = y[r] + 4 * i + g;
+                const __m256i qy = _mm256_loadu_si256((const __m256i *) yg->qs);
+                // Unsigned nibbles with a zero-point correction also handle a Q8 code of -128 without sign overflow.
+                const __m256i dot = _mm256_maddubs_epi16(qx, qy);
+                const __m256i correction = _mm256_slli_epi16(_mm256_maddubs_epi16(ones8, qy), 3);
+                const __m256i sums = _mm256_madd_epi16(_mm256_sub_epi16(dot, correction), ones16);
+                const __m256 scale = _mm256_set1_ps(dx * GGML_CPU_FP16_TO_FP32(yg->d));
+                acc[r][g] = _mm256_fmadd_ps(scale, _mm256_cvtepi32_ps(sums), acc[r][g]);
+            }
+        }
+    }
+
+    for (int r = 0; r < NR; ++r) {
+        s[r] = hsum_float_8(_mm256_add_ps(_mm256_add_ps(acc[r][0], acc[r][1]), _mm256_add_ps(acc[r][2], acc[r][3])));
+    }
+}
+#endif
+
 void ggml_vec_dot_q4_g128_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
 #if defined(__AVX2__)
     assert(n % QK4_G128 == 0);
@@ -707,31 +760,27 @@ void ggml_vec_dot_q4_g128_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const 
     UNUSED(by);
     UNUSED(bs);
 
-    const block_q4_g128 * GGML_RESTRICT x = vx;
-    const block_q8_0    * GGML_RESTRICT y = vy;
-    const __m256i ones8  = _mm256_set1_epi8(1);
-    const __m256i ones16 = _mm256_set1_epi16(1);
-    __m256 acc[4] = { _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps() };
-
-    for (int i = 0; i < n / QK4_G128; ++i) {
-        const ggml_bf16_t d16 = { x[i].d };
-        const float dx = GGML_BF16_TO_FP32(d16);
-        for (int g = 0; g < 4; ++g) {
-            const block_q8_0 * yg = y + 4 * i + g;
-            const __m256i qx = bytes_from_nibbles_32(x[i].qs + 16 * g);
-            const __m256i qy = _mm256_loadu_si256((const __m256i *) yg->qs);
-            // Unsigned nibbles with a zero-point correction also handle a Q8 code of -128 without sign overflow.
-            const __m256i dot = _mm256_maddubs_epi16(qx, qy);
-            const __m256i correction = _mm256_slli_epi16(_mm256_maddubs_epi16(ones8, qy), 3);
-            const __m256i sums = _mm256_madd_epi16(_mm256_sub_epi16(dot, correction), ones16);
-            const __m256 scale = _mm256_set1_ps(dx * GGML_CPU_FP16_TO_FP32(yg->d));
-            acc[g] = _mm256_fmadd_ps(scale, _mm256_cvtepi32_ps(sums), acc[g]);
-        }
-    }
-
-    *s = hsum_float_8(_mm256_add_ps(_mm256_add_ps(acc[0], acc[1]), _mm256_add_ps(acc[2], acc[3])));
+    const block_q8_0 * y = vy;
+    g128_dot_rows(n, s, vx, &y, 1, g128_prefetch_bytes());
 #else
     ggml_vec_dot_q4_g128_q8_0_generic(n, s, bs, vx, bx, vy, by, nrc);
+#endif
+}
+
+void ggml_vec_dot_q4_g128_q8_0_rows(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, int ny) {
+#if defined(__AVX2__)
+    assert(n % QK4_G128 == 0);
+    const block_q8_0 * const * y = (const block_q8_0 * const *) vy;
+    // Several rows make the kernel compute-bound; the prefetch then only costs issue slots (2026-10-08 microbenchmark).
+    switch (ny) {
+        case 1: g128_dot_rows(n, s, vx, y, 1, g128_prefetch_bytes()); break;
+        case 2: g128_dot_rows(n, s, vx, y, 2, 0); break;
+        case 3: g128_dot_rows(n, s, vx, y, 3, 0); break;
+        case 4: g128_dot_rows(n, s, vx, y, 4, 0); break;
+        default: GGML_ABORT("ny %d > GGML_Q4_G128_MAX_ROWS", ny);
+    }
+#else
+    ggml_vec_dot_q4_g128_q8_0_rows_generic(n, s, vx, vy, ny);
 #endif
 }
 

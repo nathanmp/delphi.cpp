@@ -1918,6 +1918,12 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
     }
 }
 
+// delphi: staging ring decisions that split_graph needs (defined with the ring below)
+static bool ggml_backend_sched_stage_redirects(ggml_backend_sched_t sched, const struct ggml_tensor * node,
+        const struct ggml_tensor * weight, int backend_id);
+static int  ggml_backend_sched_stage_split_weights(ggml_backend_sched_t sched);
+static ggml_backend_buffer_t ggml_backend_sched_stage_anchor(ggml_backend_sched_t sched, int backend_id);
+
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
 void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     // reset splits
@@ -2180,6 +2186,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         split->i_start = 0;
         split->n_inputs = 0;
         int cur_backend_id = split->backend_id;
+        // delphi: weights of the current split that the staging ring redirects, and whether it copies another weight
+        int  split_staged   = 0;
+        bool split_unstaged = false;
         for (; i < graph->n_nodes; i++) {
             struct ggml_tensor * node = graph->nodes[i];
 
@@ -2218,6 +2227,12 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                                 continue;
                             }
                             if (split->n_inputs == 0) {
+                                continue;
+                            }
+                            // delphi: a weight that the staging ring redirects to its slot takes no copy memory, so the split
+                            // keeps up to GGML_SCHED_STAGE_SPLIT_WEIGHTS of them and the routed FFN of a layer can fuse
+                            if (!split_unstaged && split_staged < ggml_backend_sched_stage_split_weights(sched) &&
+                                    ggml_backend_sched_stage_redirects(sched, node, src, cur_backend_id)) {
                                 continue;
                             }
                             need_new_split = true;
@@ -2259,6 +2274,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 split->i_start = i;
                 split->n_inputs = 0;
                 cur_backend_id = node_backend_id;
+                split_staged = 0;
+                split_unstaged = false;
             }
 
             // find inputs that are not on the same backend
@@ -2307,12 +2324,23 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     // create a copy of the input in the split's backend
                     if (sched_hv_copy(sched, src, cur_backend_id, 0) == NULL) {
                         ggml_backend_t backend = sched->backends[cur_backend_id];
+                        // delphi: the staging ring points a redirected copy at its slot, so the copy needs no memory of its own.
+                        // ggml-alloc skips a tensor that has a buffer and data; the anchor gives it both until the ring sets data.
+                        const bool redirected = view_src == NULL && ggml_backend_sched_stage_redirects(sched, node, src, cur_backend_id);
+                        if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS && ggml_backend_buffer_is_host(src->buffer)) {
+                            split_staged   += redirected;
+                            split_unstaged |= !redirected;
+                        }
                         for (int c = 0; c < sched->n_copies; c++) {
                             struct ggml_tensor * tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
                             ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
                             if (sched->n_copies > 1) {
                                 ggml_set_input(tensor_copy);
                                 ggml_set_output(tensor_copy); // prevent ggml-alloc from overwriting the tensor
+                            }
+                            if (redirected) {
+                                tensor_copy->buffer = ggml_backend_sched_stage_anchor(sched, cur_backend_id);
+                                tensor_copy->data   = ggml_backend_buffer_get_base(tensor_copy->buffer);
                             }
                             tensor_id_copy(src_id, cur_backend_id, c) = tensor_copy;
                             SET_CAUSE(tensor_copy, "4.cpy");
@@ -2838,9 +2866,13 @@ struct ggml_backend_sched_stage_job {
 };
 
 struct ggml_backend_sched_stage_ring {
-    ggml_backend_stage_upload_t upload = nullptr;
-    ggml_backend_stage_d2d_t    d2d    = nullptr;
-    ggml_backend_buffer_t buffers[GGML_SCHED_STAGE_MAX_SLOTS] = {};
+    ggml_backend_stage_upload_t  upload  = nullptr;
+    ggml_backend_stage_d2d_t     d2d     = nullptr;
+    ggml_backend_stage_prepare_t prepare = nullptr;
+    ggml_backend_buffer_t        anchor  = nullptr; // buffer and placeholder data of redirected copies (see split_graph)
+    ggml_backend_buffer_t buffers[GGML_SCHED_STAGE_MAX_SLOTS] = {}; // null when the slots are lent
+    void *                slots[GGML_SCHED_STAGE_MAX_SLOTS]   = {}; // device memory of each slot
+    bool                  lent = false;                             // slots belong to the stage lender
     ggml_backend_event_t  done[GGML_SCHED_STAGE_MAX_SLOTS]    = {}; // upload finished, recorded on the copy stream
     ggml_backend_event_t  free[GGML_SCHED_STAGE_MAX_SLOTS]    = {}; // slot read, recorded on the compute stream
     bool busy[GGML_SCHED_STAGE_MAX_SLOTS]          = {};            // queued, and the read is not recorded yet
@@ -2891,6 +2923,9 @@ struct ggml_backend_sched_stage {
     bool redirect = true;
     struct held { ggml_tensor * input_cpy; void * data; int backend_id; int slot; };
     std::vector<held> holding;
+    ggml_backend_sched_stage_lend_t lend = nullptr;
+    void * lend_user = nullptr;
+    int split_weights = 1; // redirected weights per split (GGML_SCHED_STAGE_SPLIT_WEIGHTS)
 };
 
 static void ggml_backend_sched_stage_run_job(
@@ -2904,7 +2939,7 @@ static void ggml_backend_sched_stage_run_job(
         ggml_backend_event_synchronize(ring.free[job.slot]);
     }
     lap(w->us_free);
-    char * dst = (char *) ggml_backend_buffer_get_base(ring.buffers[job.slot]);
+    char * dst = (char *) ring.slots[job.slot];
     if (stage->registrar && stage->registrar->locked(job.src, job.size)) {
         // straight from the page-locked weights
         ring.upload(backend, dst, job.src, job.size, ring.done[job.slot]);
@@ -3006,6 +3041,7 @@ static ggml_backend_sched_stage * ggml_backend_sched_stage_new(ggml_backend_sche
         ggml_backend_sched_stage_ring & ring = stage->rings[b];
         ring.upload = (ggml_backend_stage_upload_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_stage_upload");
         ring.d2d    = (ggml_backend_stage_d2d_t)    ggml_backend_reg_get_proc_address(reg, "ggml_backend_stage_d2d");
+        ring.prepare = (ggml_backend_stage_prepare_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_stage_prepare");
         if (ring.upload == nullptr || ring.d2d == nullptr) {
             ring.upload = nullptr;
             continue;
@@ -3022,6 +3058,11 @@ static ggml_backend_sched_stage * ggml_backend_sched_stage_new(ggml_backend_sche
     if (n_dev == 0) {
         GGML_LOG_WARN("%s: GGML_SCHED_STAGE=1, but no backend supports staging\n", __func__);
         stage->enabled = false;
+    }
+    // one layer's routed gate/up/down per split, while another split's weights can still upload
+    stage->split_weights = stage->n_slots >= 6 ? 3 : 1;
+    if (const char * e = getenv("GGML_SCHED_STAGE_SPLIT_WEIGHTS")) {
+        stage->split_weights = std::max(1, std::min(stage->n_slots, atoi(e)));
     }
     if (n_threads == 0) {
         n_threads = std::max(2, 8/std::max(1, n_dev));
@@ -3063,7 +3104,8 @@ static void ggml_backend_sched_stage_drain(ggml_backend_sched_stage * stage) {
     }
 }
 
-static void ggml_backend_sched_stage_release_ring(ggml_backend_sched_stage_ring & ring) {
+// wait until no queued upload writes and no queued work reads a slot, then forget the slots (lent slots are not freed)
+static void ggml_backend_sched_stage_drop_slots(ggml_backend_sched_stage_ring & ring) {
     for (int s = 0; s < GGML_SCHED_STAGE_MAX_SLOTS; s++) {
         if (ring.done[s] != nullptr) {
             ggml_backend_event_synchronize(ring.done[s]);
@@ -3073,9 +3115,17 @@ static void ggml_backend_sched_stage_release_ring(ggml_backend_sched_stage_ring 
         }
         ggml_backend_buffer_free(ring.buffers[s]);
         ring.buffers[s] = nullptr;
+        ring.slots[s] = nullptr;
         ring.busy[s] = false;
         ring.free_recorded[s] = false;
     }
+    ring.lent = false;
+    ring.slot_size = 0;
+    ring.next = 0;
+}
+
+static void ggml_backend_sched_stage_release_ring(ggml_backend_sched_stage_ring & ring) {
+    ggml_backend_sched_stage_drop_slots(ring);
     for (int c = 0; c < GGML_SCHED_STAGE_MAX_BOUNCE; c++) {
         if (ring.bounce_ev[c] != nullptr) {
             ggml_backend_event_synchronize(ring.bounce_ev[c]);
@@ -3085,8 +3135,6 @@ static void ggml_backend_sched_stage_release_ring(ggml_backend_sched_stage_ring 
     ggml_backend_buffer_free(ring.bounce);
     ring.bounce = nullptr;
     ring.bounce_next = 0;
-    ring.slot_size = 0;
-    ring.next = 0;
 }
 
 static void ggml_backend_sched_stage_free(ggml_backend_sched_stage * stage) {
@@ -3121,27 +3169,62 @@ static void ggml_backend_sched_stage_free(ggml_backend_sched_stage * stage) {
         for (int c = 0; c < GGML_SCHED_STAGE_MAX_BOUNCE; c++) {
             ggml_backend_event_free(ring.chunk_ev[c]);
         }
+        ggml_backend_buffer_free(ring.anchor);
     }
     delete stage;
 }
 
-// the host weights of a split that the copy loop would copy whole to the split backend
+// the host weight `weight` of `node` that the copy loop would copy whole to the split backend
+static bool ggml_backend_sched_stage_whole(
+        ggml_backend_sched_t sched, const struct ggml_tensor * node, const struct ggml_tensor * weight, int backend_id) {
+    if ((weight->flags & GGML_TENSOR_FLAG_INPUT) || weight->buffer == nullptr ||
+            ggml_backend_buffer_get_usage(weight->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
+            !ggml_backend_buffer_is_host(weight->buffer) || ggml_nbytes(weight) < GGML_SCHED_STAGE_MIN_BYTES ||
+            sched->stage->rings[backend_id].upload == nullptr) {
+        return false;
+    }
+    if (node != nullptr && node->op == GGML_OP_MUL_MAT_ID && (node->src[0] == weight || sched_hv_copy(sched, (ggml_tensor *) weight, backend_id, sched->cur_copy) == node->src[0])) {
+        // the copy loop copies only the used experts when it expects some experts to stay unused
+        const struct ggml_tensor * ids = node->src[2];
+        return ggml_offload_cost_expected_active_experts(weight->ne[2], ids->ne[1], ids->ne[0]) >= weight->ne[2] - 0.5;
+    }
+    return true;
+}
+
 static bool ggml_backend_sched_stage_eligible(
         ggml_backend_sched_t sched, const struct ggml_backend_sched_split * split,
         const struct ggml_tensor * input, const struct ggml_tensor * input_cpy) {
-    if ((input->flags & GGML_TENSOR_FLAG_INPUT) || input->buffer == nullptr ||
-            ggml_backend_buffer_get_usage(input->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
-            !ggml_backend_buffer_is_host(input->buffer) || ggml_nbytes(input) < GGML_SCHED_STAGE_MIN_BYTES ||
-            sched->stage->rings[split->backend_id].upload == nullptr) {
-        return false;
+    // a redirected copy has no memory of its own: it must be staged
+    if (input_cpy->buffer != nullptr && input_cpy->buffer == sched->stage->rings[split->backend_id].anchor) {
+        return true;
     }
     const struct ggml_tensor * node = split->graph.n_nodes > 0 ? split->graph.nodes[0] : nullptr;
-    if (node != nullptr && node->op == GGML_OP_MUL_MAT_ID && node->src[0] == input_cpy) {
-        // the copy loop copies only the used experts when it expects some experts to stay unused
-        const struct ggml_tensor * ids = node->src[2];
-        return ggml_offload_cost_expected_active_experts(input->ne[2], ids->ne[1], ids->ne[0]) >= input->ne[2] - 0.5;
+    if (node != nullptr && !(node->op == GGML_OP_MUL_MAT_ID && node->src[0] == input_cpy)) {
+        node = nullptr;
     }
-    return true;
+    return ggml_backend_sched_stage_whole(sched, node, input, split->backend_id);
+}
+
+static bool ggml_backend_sched_stage_redirects(ggml_backend_sched_t sched, const struct ggml_tensor * node,
+        const struct ggml_tensor * weight, int backend_id) {
+    ggml_backend_sched_stage * stage = sched->stage;
+    return stage != nullptr && stage->enabled && stage->redirect && sched->callback_eval == nullptr &&
+        ggml_backend_sched_stage_whole(sched, node, weight, backend_id);
+}
+
+static int ggml_backend_sched_stage_split_weights(ggml_backend_sched_t sched) {
+    return sched->stage != nullptr ? sched->stage->split_weights : 1;
+}
+
+static ggml_backend_buffer_t ggml_backend_sched_stage_anchor(ggml_backend_sched_t sched, int backend_id) {
+    ggml_backend_sched_stage_ring & ring = sched->stage->rings[backend_id];
+    if (ring.anchor == nullptr) {
+        ring.anchor = ggml_backend_buft_alloc_buffer(ggml_backend_get_default_buffer_type(sched->backends[backend_id]), 256);
+        GGML_ASSERT(ring.anchor != nullptr);
+        // the copies hold weights: backends may treat them as such (e.g. the fused HIP G128 FFN)
+        ggml_backend_buffer_set_usage(ring.anchor, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    }
+    return ring.anchor;
 }
 
 // queue uploads for the next items while their slots are free
@@ -3216,10 +3299,18 @@ static void ggml_backend_sched_stage_begin(ggml_backend_sched_t sched) {
         ggml_backend_t backend = sched->backends[b];
         ggml_backend_dev_t dev = ggml_backend_get_device(backend);
         ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend);
+        // lent memory first; the lender cannot lend part of the slots
+        ring.lent = stage->lend != nullptr && stage->lend(stage->lend_user, backend, stage->n_slots, need[b], ring.slots);
+        if (!ring.lent) {
+            std::fill(std::begin(ring.slots), std::end(ring.slots), nullptr);
+        }
         bool ok = true;
         for (int s = 0; s < stage->n_slots && ok; s++) {
-            ring.buffers[s] = ggml_backend_buft_alloc_buffer(buft, need[b]);
-            ok = ring.buffers[s] != nullptr;
+            if (!ring.lent) {
+                ring.buffers[s] = ggml_backend_buft_alloc_buffer(buft, need[b]);
+                ring.slots[s] = ring.buffers[s] != nullptr ? ggml_backend_buffer_get_base(ring.buffers[s]) : nullptr;
+            }
+            ok = ring.slots[s] != nullptr;
             if (ok && ring.done[s] == nullptr) {
                 ring.done[s] = ggml_backend_event_new(dev);
                 ring.free[s] = ggml_backend_event_new(dev);
@@ -3249,8 +3340,8 @@ static void ggml_backend_sched_stage_begin(ggml_backend_sched_t sched) {
                 }
             }
         }
-        GGML_LOG_INFO("%s: staging ring on %s: %d slots of %.1f MiB, %s\n", __func__, ggml_backend_name(backend),
-                stage->n_slots, need[b]/1048576.0, ring.bounce != nullptr ? "pinned bounce buffers" : "direct uploads");
+        GGML_LOG_INFO("%s: staging ring on %s: %d %s slots of %.1f MiB, %s\n", __func__, ggml_backend_name(backend),
+                stage->n_slots, ring.lent ? "lent" : "own", need[b]/1048576.0, ring.bounce != nullptr ? "pinned bounce buffers" : "direct uploads");
     }
 
     ggml_backend_sched_stage_pump(sched);
@@ -3285,11 +3376,17 @@ static bool ggml_backend_sched_stage_consume(
     if (stage->redirect && sched->callback_eval == nullptr) {
         // the split reads the slot in place; ggml_backend_sched_stage_release frees it after the split's work
         stage->holding.push_back({ input_cpy, input_cpy->data, item.backend_id, item.slot });
-        input_cpy->data = ggml_backend_buffer_get_base(ring.buffers[item.slot]);
+        input_cpy->data = ring.slots[item.slot];
+        if (ring.prepare != nullptr) {
+            ring.prepare(split_backend, input_cpy);
+        }
         stage->n_consumed++;
         return true;
     }
-    ring.d2d(split_backend, input_cpy->data, ggml_backend_buffer_get_base(ring.buffers[item.slot]), ggml_nbytes(item.input));
+    ring.d2d(split_backend, input_cpy->data, ring.slots[item.slot], ggml_nbytes(item.input));
+    if (ring.prepare != nullptr) {
+        ring.prepare(split_backend, input_cpy);
+    }
     ggml_backend_event_record(ring.free[item.slot], split_backend);
     ring.free_recorded[item.slot] = true;
     ring.busy[item.slot] = false;
@@ -3313,6 +3410,30 @@ static void ggml_backend_sched_stage_release(ggml_backend_sched_t sched, ggml_ba
     }
     stage->holding.clear();
     ggml_backend_sched_stage_pump(sched);
+}
+
+void ggml_backend_sched_set_stage_lender(ggml_backend_sched_t sched, ggml_backend_sched_stage_lend_t lend, void * user_data) {
+    if (sched->stage != nullptr) {
+        sched->stage->lend = lend;
+        sched->stage->lend_user = user_data;
+    }
+}
+
+bool ggml_backend_sched_stage_reclaim(ggml_backend_sched_t sched) {
+    ggml_backend_sched_stage * stage = sched->stage;
+    if (stage == nullptr) {
+        return false;
+    }
+    // queued jobs still upload into the slots; their done events are recorded only once they are issued
+    ggml_backend_sched_stage_drain(stage);
+    bool any = false;
+    for (auto & ring : stage->rings) {
+        if (ring.lent) {
+            ggml_backend_sched_stage_drop_slots(ring);
+            any = true;
+        }
+    }
+    return any;
 }
 
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
@@ -3459,6 +3580,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             } else if (ggml_backend_sched_stage_consume(sched, split_id, split_backend, input_cpy)) {
                 // uploaded ahead by the staging ring; the device-to-device copy is ordered on the compute stream
             } else {
+                GGML_ASSERT((sched->stage == nullptr || input_cpy->buffer != sched->stage->rings[split_backend_id].anchor) &&
+                        "staging: a redirected input has no memory, but the ring did not stage it");
                 // wait for the split backend to finish using the input before overwriting it. The slot event states
                 // exactly that; a backend may queue the copy outside its compute stream after this wait (CUDA without
                 // peer access uploads on a copy stream), so a later event would delay the copy for nothing
@@ -3660,6 +3783,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         sched->trace_graph_id, split_id + 1, split_backend_id + 1,
                         ggml_backend_sched_trace_device_id(sched, split_backend_id),
                         sched->trace_backend_node_ids, split->graph.n_nodes);
+            }
+            if (sched->stage != nullptr && !sched->stage->holding.empty()) {
+                // redirected inputs read a slot that changes from use to use; a graph id would let a backend replay
+                // a captured graph without comparing the data pointers (ggml-cuda), so drop it
+                split->graph.uid = 0;
             }
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             ggml_backend_sched_stage_release(sched, split_backend);

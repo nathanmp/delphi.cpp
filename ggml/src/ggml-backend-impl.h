@@ -144,6 +144,9 @@ extern "C" {
     // stream. Found through get_proc_address under the names "ggml_backend_stage_upload" and "ggml_backend_stage_d2d".
     typedef void (*ggml_backend_stage_upload_t)(ggml_backend_t backend, void * dst, const void * src, size_t size, ggml_backend_event_t done);
     typedef void (*ggml_backend_stage_d2d_t)   (ggml_backend_t backend, void * dst, const void * src, size_t size);
+    // a staged weight is ready for the split on the compute stream ("ggml_backend_stage_prepare", optional): the backend may
+    // convert it in place on that stream, for example into the layout its kernels read. Its content is new for every use.
+    typedef void (*ggml_backend_stage_prepare_t)(ggml_backend_t backend, struct ggml_tensor * weight);
     // page-lock a host range for direct uploads from every device ("ggml_backend_stage_register"), and undo it
     // ("ggml_backend_stage_unregister"); register returns false if the range could not be locked
     typedef bool (*ggml_backend_stage_register_t)  (void * ptr, size_t size);

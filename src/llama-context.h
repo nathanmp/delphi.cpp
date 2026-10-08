@@ -3,6 +3,7 @@
 #include "llama.h"
 #include "llama-ext.h"
 #include "llama-cparams.h"
+#include "llama-expert-cache.h"
 #include "llama-graph.h"
 #include "llama-adapter.h"
 #include "llama-impl.h"
@@ -392,6 +393,7 @@ private:
     ggml_context_ptr         attn_split_ctx;
     ggml_backend_buffer_ptr  attn_split_buf;
     std::vector<ggml_backend_ptr> backends;
+    std::unique_ptr<llama_expert_cache> expert_cache;
 
     // training
     ggml_opt_context_t opt_ctx = nullptr;
@@ -451,6 +453,14 @@ private:
     ggml_backend_sched_t graph_sched_main() const;
     // make the main scheduler live and forget the graphs of every slot
     void graph_alt_reset();
+
+    // expert cache: the staging ring borrows the arena instead of allocating its own slots
+    void sched_set_stage_lender();
+
+    FILE * moe_routing_log = nullptr;
+    int64_t moe_routing_log_max_tokens = 16;
+    std::vector<uint8_t> moe_routing_buf;
+    static bool moe_routing_log_cb(ggml_tensor * t, bool ask, void * user_data);
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

@@ -22,7 +22,7 @@
 // GGML_HIP_MOE_INT4_PATH=auto (default) uses wide vector loads for one-row H=2560/FF=640 work and I8 WMMA for its wider batches;
 // other shapes use K-split vector dots. Explicit vector/wide/wmma/mixed modes are experimental comparators. Vector and WMMA sum
 // K groups in different F32 orders, so the mode/width selection does not promise bitwise batch invariance.
-// Weight-bank views and partial routed nodes are not advertised as HIP G128 operations; they keep the CPU fallback.
+// Weight-bank views keep the CPU fallback. Partial root-bank nodes support masked routes; fused partial FFNs require at most 16 rows.
 
 // delphi.cpp: one complete GLM-shaped routed expert FFN (gate/up -> clipped SiLU * up -> down * router weight -> slot sum) with INT4
 // weights and BF16 tensor-core MMA, for any number of rows: the decode kernels for 1..GGML_CUDA_MOE_INT4_MAX_TOKENS rows (and wider batches
@@ -64,6 +64,7 @@ struct ggml_cuda_moe_int4_ffn {
     const ggml_tensor * ids     = nullptr; // I32  [topk, M]
     const ggml_tensor * weights = nullptr; // F32  [1, topk, M], contiguous: the router weights by slot
     ggml_tensor *       dst     = nullptr; // F32  [hidden, M], contiguous
+    bool                partial = false; // HIP: negative or out-of-range IDs have zero contribution
     float               limit   = 0.0f;    // 0 for ordinary SwiGLU; NVIDIA requires GLM's clamp
 };
 
@@ -126,3 +127,11 @@ void ggml_backend_cuda_moe_int4_get_stats(int64_t * out);
 // (bf16 [K/128][N]). Expert e is at ptr + e * stride. Returns false if the tensor is not PACKED.
 // HIP layout: codes uint32 [N/16][K/16][lane32], scales bf16 [N][K/128], in the same expert-sized slot.
 bool ggml_backend_cuda_moe_int4_get_pack(const void * data, int which, const void ** ptr, size_t * bytes, size_t * stride);
+#ifdef GGML_HIP_MOE_INT4_AVAILABLE
+// Copy expert slab `expert` of a G128 bank from device memory on the stream of ctx. A packed bank stays packed.
+void ggml_cuda_moe_int4_set_expert(ggml_backend_cuda_context & ctx, const ggml_tensor * t, int64_t expert, const void * src);
+// Pack a staged weight (new canonical content at every use) in place on the stream of ctx; see ggml_backend_stage_prepare_t.
+void ggml_cuda_moe_int4_stage_prepare(ggml_backend_cuda_context & ctx, ggml_tensor * t);
+// Forget the layout of weights that lie inside t (staging slots lent from t), but not that of t.
+void ggml_cuda_moe_int4_forget_inside(int device, const ggml_tensor * t);
+#endif

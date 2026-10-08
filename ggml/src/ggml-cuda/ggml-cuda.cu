@@ -3872,6 +3872,8 @@ static bool ggml_cuda_match_moe_int4_ffn(
     ggml_tensor * second = cgraph->nodes[node_idx + 1];
     ggml_tensor * glu    = cgraph->nodes[node_idx + 2];
     ggml_tensor * down   = cgraph->nodes[node_idx + 3];
+    const bool partial = ggml_mul_mat_id_is_partial(first);
+    if (partial != ggml_mul_mat_id_is_partial(second) || partial != ggml_mul_mat_id_is_partial(down)) { return false; }
     if (first->op != GGML_OP_MUL_MAT_ID || second->op != GGML_OP_MUL_MAT_ID || glu->op != GGML_OP_GLU ||
             down->op != GGML_OP_MUL_MAT_ID ||
 #ifdef GGML_HIP_MOE_INT4_AVAILABLE
@@ -3882,8 +3884,11 @@ static bool ggml_cuda_match_moe_int4_ffn(
             ggml_get_op_params_i32(glu, 1) != 0 /* not swapped */ ||
             !((glu->src[0] == first && glu->src[1] == second) || (glu->src[0] == second && glu->src[1] == first)) ||
             down->src[1] != glu || first->type != GGML_TYPE_F32 || second->type != GGML_TYPE_F32 || glu->type != GGML_TYPE_F32 ||
-            down->type != GGML_TYPE_F32 || ggml_mul_mat_id_is_partial(first) || ggml_mul_mat_id_is_partial(second) ||
-            ggml_mul_mat_id_is_partial(down)) {
+            down->type != GGML_TYPE_F32
+#ifndef GGML_HIP_MOE_INT4_AVAILABLE
+            || partial
+#endif
+            ) {
         return false;
     }
     if (first->src[1] != second->src[1] || first->src[2] != second->src[2] || first->src[2] != down->src[2]) {
@@ -3911,6 +3916,7 @@ static bool ggml_cuda_match_moe_int4_ffn(
         return false;
     }
 
+    ffn.partial = partial;
     ffn.gate    = glu->src[0]->src[0];
     ffn.up      = glu->src[1]->src[0];
     ffn.down    = down->src[0];
@@ -4330,7 +4336,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         int ffn_nodes = 0;
         if (ggml_cuda_match_moe_int4_ffn(cgraph, i, ffn, ffn_nodes)) {
             const int output_idx = i + ffn_nodes - 1;
-            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, ffn_nodes, &output_idx, 1) &&
+            // HIP quantizes each row chunk of x into scratch before it writes the same rows of dst, so dst may reuse
+            // x in place when the rows coincide (ggml-alloc gives x's memory to the FFN output in wide batches)
+            const ggml_tensor * x_alias = nullptr;
+#ifdef GGML_HIP_MOE_INT4_AVAILABLE
+            if (ffn.x->data == ffn.dst->data && ffn.x->nb[2] == ffn.dst->nb[1]) {
+                x_alias = ffn.x;
+            }
+#endif
+            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, ffn_nodes, &output_idx, 1, false, x_alias) &&
                     ggml_cuda_moe_int4_ready(*cuda_ctx, ffn)) {
                 trace_fused_mul_mat(i, node->op, GGML_EXEC_TRACE_DISPATCH_GPU_MOE_INT4);
                 ggml_cuda_moe_int4_run(*cuda_ctx, ffn);
@@ -6511,7 +6525,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 if (b->type == GGML_TYPE_F16 && a->type != GGML_TYPE_F16) {
                     return false;
                 }
-                if (ggml_mul_mat_id_is_partial(op) && (b->type != GGML_TYPE_F32 ||
+                bool hip_g128 = false;
+#ifdef GGML_HIP_MOE_INT4_AVAILABLE
+                hip_g128 = a->type == GGML_TYPE_Q4_G128;
+#endif
+                if (ggml_mul_mat_id_is_partial(op) && !hip_g128 && (b->type != GGML_TYPE_F32 ||
                         !ggml_cuda_should_use_mmq(ggml_cuda_moe_int4_dispatch_type(a), ggml_cuda_info().devices[dev_ctx->device].cc, 1, a->ne[2]) ||
                         ggml_cuda_moe_packed_inplace_fmt(a) != GGML_CUDA_MOE_PACKED_NONE)) {
                     return false; // see ggml_cuda_mul_mat_id
@@ -6574,7 +6592,6 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
 #ifdef GGML_HIP_MOE_INT4_AVAILABLE
                             && a->ne[1] % 16 == 0 && !a->view_src && ggml_is_contiguous(a) && op->src[1]->type == GGML_TYPE_F32
                             && op->src[2]->nb[0] == sizeof(int32_t) && op->src[1]->nb[0] == sizeof(float)
-                            && !ggml_mul_mat_id_is_partial(op)
 #endif
                             ;
 #endif // GGML_CUDA_MOE_INT4_AVAILABLE
@@ -7142,6 +7159,25 @@ static void ggml_backend_cuda_stage_unregister(void * ptr) {
     }
 }
 
+#ifdef GGML_HIP_MOE_INT4_AVAILABLE
+// delphi: expert-cache slot writes (llama-expert-cache.cpp), ordered on the stream of backend
+static void ggml_backend_cuda_moe_int4_set_expert_proc(ggml_backend_t backend, const ggml_tensor * t, int64_t expert, const void * src) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    ggml_cuda_moe_int4_set_expert(*cuda_ctx, t, expert, src);
+}
+
+static void ggml_backend_cuda_stage_prepare(ggml_backend_t backend, ggml_tensor * weight) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    ggml_cuda_moe_int4_stage_prepare(*cuda_ctx, weight);
+}
+
+static void ggml_backend_cuda_moe_int4_forget_inside_proc(ggml_backend_t backend, const ggml_tensor * t) {
+    ggml_cuda_moe_int4_forget_inside(((ggml_backend_cuda_context *) backend->context)->device, t);
+}
+#endif
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_stage_register") == 0) {
@@ -7204,6 +7240,17 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_cuda_moe_int4_get_pack") == 0) {
         return (void *)ggml_backend_cuda_moe_int4_get_pack;
     }
+#ifdef GGML_HIP_MOE_INT4_AVAILABLE
+    if (strcmp(name, "ggml_backend_cuda_moe_int4_set_expert") == 0) {
+        return (void *)ggml_backend_cuda_moe_int4_set_expert_proc;
+    }
+    if (strcmp(name, "ggml_backend_cuda_moe_int4_forget_inside") == 0) {
+        return (void *)ggml_backend_cuda_moe_int4_forget_inside_proc;
+    }
+    if (strcmp(name, "ggml_backend_stage_prepare") == 0) {
+        return (void *)ggml_backend_cuda_stage_prepare;
+    }
+#endif
     return nullptr;
 }
 

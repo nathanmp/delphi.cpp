@@ -24,7 +24,7 @@ constexpr int BATCH_MIN_ROWS = 64;
 struct bank {
     const char * data;
     size_t stride;
-    int k, n;
+    int k, n, experts;
     const int * packed;
 };
 
@@ -142,14 +142,15 @@ __global__ void unpack_groups(const char * src, char * dst, size_t stride, int k
 }
 
 // The first occurrence owns a group. Split repeated IDs into tiles of 16, including duplicate IDs within a token.
-__global__ void group_routes(const int * ids, routes * r, int slots, int group_rows, int topk, int ids_stride) {
+__global__ void group_routes(const int * ids, routes * r, int slots, int group_rows, int topk, int ids_stride, int experts) {
     __shared__ int blocks[MAX_SLOTS];
     __shared__ int expert_ids[MAX_SLOTS];
     const int s = threadIdx.x;
     if (s < slots) { expert_ids[s] = ids[(s / topk) * ids_stride + s % topk]; }
     __syncthreads();
     const auto id = [&](int i) { return expert_ids[i]; };
-    int first = s < slots, count = 0;
+    const bool valid = s < slots && id(s) >= 0 && id(s) < experts;
+    int first = valid, count = 0;
     if (s < slots) {
         for (int j = 0; j < slots; ++j) {
             if (id(j) == id(s)) { count++; if (j < s) { first = 0; } }
@@ -167,7 +168,7 @@ __global__ void group_routes(const int * ids, routes * r, int slots, int group_r
         }
     }
     if (s == 0) { r->groups = total; }
-    if (s < slots) {
+    if (valid) {
         group += row / group_rows;
         r->slots[group * MAX_ROWS + row % group_rows] = s;
         if (row % group_rows == 0) {
@@ -204,6 +205,14 @@ __global__ void vector_projection(bank w, bank u, const int8_t * x, const float 
     const int out = tile * 16 + lane % 16;
     const int expert = r ? r->experts[group] : ids[(group / topk) * ids_stride + group % topk], nr = r ? r->counts[group] : 1;
     if constexpr (FILTER_ROWS > 0) { if (nr > FILTER_ROWS) { return; } }
+    if (expert < 0 || expert >= w.experts) {
+        if (!r && threadIdx.x < 16) {
+            auto * output = reinterpret_cast<float *>(reinterpret_cast<char *>(y) + (group / topk) * out_token_stride +
+                    (group % topk) * out_slot_stride);
+            output[tile * 16 + threadIdx.x] = 0.0f;
+        }
+        return;
+    }
     const char * wp = w.data + expert * w.stride, * up = GATE_UP ? u.data + expert * u.stride : nullptr;
     const bool packed = PACKED || *w.packed;
     float sum[ROWS] = {}, sumu[ROWS] = {};
@@ -484,7 +493,7 @@ bank get_bank(int device, const ggml_tensor * t) {
     std::lock_guard<std::mutex> lock(state_mutex);
     auto * s = find_state(device, t->data);
     GGML_ASSERT(s);
-    return {s->data, s->stride, s->k, s->n, s->flag};
+    return {s->data, s->stride, s->k, s->n, s->experts, s->flag};
 }
 
 // Keep flags alive until the weight buffer is freed. Captured generic kernels observe subsequent layout changes.
@@ -614,7 +623,7 @@ bool eligible(ggml_backend_cuda_context & ctx, const ggml_cuda_moe_int4_ffn & f)
     if (!ggml_cuda_moe_int4_type_supported(ctx.device) || !supported_weight(f.gate) || !supported_weight(f.up) ||
             !supported_weight(f.down) || !f.x || !f.ids || !f.weights || !f.dst) { return false; }
     const int h = f.gate->ne[0], ff = f.gate->ne[1], e = f.gate->ne[2], topk = f.ids->ne[0], m = f.x->ne[2];
-    if (h % 128 || ff % 128 || topk < 2 || topk > MAX_TOPK || m < 1 ||
+    if (h % 128 || ff % 128 || topk < 2 || topk > MAX_TOPK || m < 1 || (f.partial && m > MAX_ROWS) ||
             f.up->ne[0] != h || f.up->ne[1] != ff || f.up->ne[2] != e ||
             f.down->ne[0] != ff || f.down->ne[1] != h || f.down->ne[2] != e) { return false; }
     for (const ggml_tensor * t : {f.gate, f.up, f.down}) {
@@ -638,7 +647,11 @@ void run_chunk(ggml_backend_cuda_context & ctx, const ggml_cuda_moe_int4_ffn & f
     const int * ids = static_cast<const int *>(f.ids->data) + start * ids_stride;
     const float * rw = static_cast<const float *>(f.weights->data) + start * topk;
     float * out = static_cast<float *>(f.dst->data) + size_t(start) * h;
-    group_routes<<<1, MAX_SLOTS, 0, stream>>>(ids, s.routing, slots, ROWS, topk, ids_stride);
+    if (f.partial) {
+        CUDA_CHECK(cudaMemsetAsync(s.hidden, 0, size_t(slots) * ff * sizeof(float), stream));
+        CUDA_CHECK(cudaMemsetAsync(s.down, 0, size_t(slots) * h * sizeof(float), stream));
+    }
+    group_routes<<<1, MAX_SLOTS, 0, stream>>>(ids, s.routing, slots, ROWS, topk, ids_stride, f.gate->ne[2]);
     quantize_i8<<<dim3(h / 128, m), 128, 0, stream>>>(x, s.xq, s.xd, h, h * sizeof(float), 1, h * sizeof(float));
     // Qwen uses wide vector loads at one row and selects vector/WMMA per expert during verification.
     // Keep explicit comparators and leave other geometries on the previously tested vector mechanism.
@@ -822,6 +835,11 @@ void ggml_cuda_moe_int4_forget(int device, const void * base, size_t bytes) {
 
 void ggml_cuda_moe_int4_free_scratch(const ggml_backend_cuda_context * ctx) {
     std::lock_guard<std::mutex> lock(state_mutex);
+    if (const char * e = getenv("GGML_HIP_MOE_INT4_STATS"); e && atoi(e)) {
+        GGML_LOG_WARN("hip g128: states %zu, packs %lld (%.1f ms), fused runs %lld (batch %lld, rows %lld), unfused nodes %lld\n",
+                states.size(), (long long) packs.load(), pack_us.load() / 1000.0, (long long) runs.load(),
+                (long long) batch_runs.load(), (long long) batch_rows.load(), (long long) fallbacks.load());
+    }
     for (auto it = scratches.begin(); it != scratches.end();) {
         if (std::get<0>(it->first) != ctx) { ++it; continue; }
         ggml_cuda_set_device(it->second.device);
@@ -835,6 +853,67 @@ void ggml_cuda_moe_int4_free_scratch(const ggml_backend_cuda_context * ctx) {
         CUDA_CHECK(cudaFree(it->second.base));
         scratch_bytes -= it->second.bytes;
         it = batch_scratches.erase(it);
+    }
+}
+
+// A packed bank stays packed: the expert is packed from its device copy into its slot. Other experts are not touched.
+void ggml_cuda_moe_int4_set_expert(ggml_backend_cuda_context & ctx, const ggml_tensor * t, int64_t expert, const void * src) {
+    std::lock_guard<std::mutex> lock(state_mutex);
+    weight_state * s = find_state(ctx.device, t->data);
+    char * dst = static_cast<char *>(t->data) + expert * t->nb[2];
+    if (!s || !s->packed) {
+        CUDA_CHECK(cudaMemcpyAsync(dst, src, t->nb[2], cudaMemcpyDeviceToDevice, ctx.stream()));
+        return;
+    }
+    GGML_ASSERT(expert >= 0 && expert < s->experts && size_t(t->nb[2]) == s->stride);
+    const unsigned grid = std::min<size_t>((size_t(s->k) * s->n / 8 + 255) / 256, 65535);
+    pack_codes<<<grid, 256, 0, ctx.stream()>>>(static_cast<const char *>(src), dst, s->stride, s->k, s->n, 1);
+    pack_scales<<<grid, 256, 0, ctx.stream()>>>(static_cast<const char *>(src), dst, s->stride, s->k, s->n, 1);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// A staging slot holds a new expert tensor in the canonical layout at every use. Pack it in place on the compute stream so
+// that the fused kernels read it; its state stays packed, because every later use is packed here again.
+void ggml_cuda_moe_int4_stage_prepare(ggml_backend_cuda_context & ctx, ggml_tensor * t) {
+    if (t->type != GGML_TYPE_Q4_G128 || !supported_weight(t) || !ggml_cuda_moe_int4_type_supported(ctx.device)) { return; }
+    // staged experts are the only G128 tensors of a model whose experts stay in host memory: enable the matcher
+    have_g128.store(true, std::memory_order_relaxed);
+    register_weight(ctx, t);
+    const int64_t start = ggml_time_us();
+    std::lock_guard<std::mutex> lock(state_mutex);
+    weight_state * s = find_state(ctx.device, t->data);
+    GGML_ASSERT(s && s->stride == size_t(t->nb[2]) && s->experts == t->ne[2]);
+    const cudaStream_t stream = ctx.stream();
+    const int chunk = std::min(s->experts, 16);
+    ggml_cuda_pool_alloc<char> tmp(ctx.pool(), chunk * s->stride);
+    for (int e = 0; e < s->experts; e += chunk) {
+        const int ce = std::min(chunk, s->experts - e);
+        char * dst = s->data + e * s->stride;
+        CUDA_CHECK(cudaMemcpyAsync(tmp.get(), dst, ce * s->stride, cudaMemcpyDeviceToDevice, stream));
+        const unsigned grid = std::min<size_t>((size_t(ce) * s->k * s->n / 8 + 255) / 256, 65535);
+        pack_codes<<<grid, 256, 0, stream>>>(tmp.get(), dst, s->stride, s->k, s->n, ce);
+        pack_scales<<<grid, 256, 0, stream>>>(tmp.get(), dst, s->stride, s->k, s->n, ce);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    if (!s->packed) {
+        const int flag = 1;
+        CUDA_CHECK(cudaMemcpyAsync(s->flag, &flag, sizeof(flag), cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream)); // once per slot: flag lives on the host stack
+        s->packed = true;
+    }
+    packs++;
+    pack_us += ggml_time_us() - start;
+}
+
+void ggml_cuda_moe_int4_forget_inside(int device, const ggml_tensor * t) {
+    std::lock_guard<std::mutex> lock(state_mutex);
+    const char * base = static_cast<const char *>(t->data);
+    for (auto it = states.begin(); it != states.end();) {
+        if (it->device != device || it->data == base || it->data < base || it->data >= base + ggml_nbytes(t)) { ++it; continue; }
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaFree(it->flag));
+        it = states.erase(it);
     }
 }
 

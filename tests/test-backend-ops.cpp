@@ -5393,6 +5393,49 @@ struct test_mul_mat_id_partial : public test_case {
     }
 };
 
+// Complete masked G128 FFNs cover the cache's GPU branch, including entirely cold batches.
+struct test_g128_partial_ffn : public test_mul_mat_id_partial {
+    const int mask;
+    test_g128_partial_ffn(int64_t rows, int mask) : test_mul_mat_id_partial(GGML_TYPE_Q4_G128, 16, 6, true, 512, rows, 256), mask(mask) {}
+    std::string vars() override { return test_mul_mat_id_partial::vars() + ",ffn_mask=" + std::to_string(mask); }
+    double max_nmse_err() override { return 2e-3; }
+    bool use_weight_context() override { return true; }
+    ggml_tensor * build_graph(ggml_context * ctx) override { return build_graph(ctx, ctx); }
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        auto * gate = ggml_new_tensor_3d(ctx_weights, type_a, k, m, n_mats);
+        auto * up = ggml_new_tensor_3d(ctx_weights, type_a, k, m, n_mats);
+        auto * down = ggml_new_tensor_3d(ctx_weights, type_a, m, k, n_mats);
+        auto * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, 1, n);
+        auto * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n);
+        auto * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, n);
+        ggml_set_name(ids, "cache_ids");
+        auto * g = ggml_mul_mat_id_partial(ctx, gate, x, ids);
+        auto * u = ggml_mul_mat_id_partial(ctx, up, x, ids);
+        auto * a = ggml_swiglu_split(ctx, g, u);
+        auto * d = ggml_mul_mat_id_partial(ctx, down, a, ids);
+        auto * w = ggml_mul(ctx, d, weights);
+        ggml_tensor * y = nullptr;
+        for (int i = 0; i < n_used; ++i) {
+            auto * v = ggml_view_2d(ctx, w, k, n, w->nb[2], i * w->nb[1]);
+            y = y ? ggml_add(ctx, y, v) : v;
+        }
+        return y;
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        test_mul_mat_id_partial::initialize_tensors(ctx);
+        for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "cache_ids") != 0) { continue; }
+            std::vector<int32_t> ids(n_used * n);
+            for (int64_t r = 0; r < n; ++r) {
+                for (int i = 0; i < n_used; ++i) {
+                    ids[r * n_used + i] = mask == 0 ? -1 : mask == 1 ? i % 3 : i % 2 ? -1 : i % 3;
+                }
+            }
+            ggml_backend_tensor_set(t, ids.data(), 0, ids.size() * sizeof(int32_t));
+        }
+    }
+};
+
 // GGML_OP_MUL_MAT_ID with the routed rows concentrated on a small pool of the
 // experts, so that a single expert receives enough rows to reach the batched
 // repack/GEMM thresholds of the CPU IQK and repack paths.
@@ -11090,6 +11133,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         // concentrated routing: 128 rows * 4 experts over a pool of 8 is well
         // past the per-expert row count at which the weights are repacked
         test_cases.emplace_back(new test_mul_mat_id_pool(type_a, GGML_TYPE_F32, 128, 4, 8, false, 256, 128, 256));
+    }
+    for (int64_t rows : {1, 3, 6}) {
+        for (int mask : {0, 1, 2}) { test_cases.emplace_back(new test_g128_partial_ffn(rows, mask)); }
+        test_cases.emplace_back(new test_mul_mat_id_partial(GGML_TYPE_Q4_G128, 16, 6, true, 256, rows, 512));
+        test_cases.emplace_back(new test_mul_mat_id_partial(GGML_TYPE_Q4_G128, 16, 6, false, 512, rows, 256));
     }
     // partial MUL_MAT_ID (expert split): broadcast gate/up and per-slot down, few and many tokens
     for (ggml_type type_a : {GGML_TYPE_Q2_K, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0}) {

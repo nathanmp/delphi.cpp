@@ -286,6 +286,12 @@ void ggml_vec_dot_q4_g128_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs
     *s = sumf;
 }
 
+void ggml_vec_dot_q4_g128_q8_0_rows_generic(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, int ny) {
+    for (int r = 0; r < ny; ++r) {
+        ggml_vec_dot_q4_g128_q8_0(n, s + r, 0, vx, 0, vy[r], 0, 1);
+    }
+}
+
 void ggml_vec_dot_q4_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     const int qk = QK8_0;
     const int nb = n / qk;

@@ -1,4 +1,5 @@
 #include "llama-graph.h"
+#include "llama-expert-cache.h"
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -1606,6 +1607,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     mctx             (params.mctx),
     cross            (params.cross),
     mtp_device_draft_cache(params.mtp_device_draft_cache),
+    expert_cache     (params.expert_cache),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -2281,6 +2283,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         return build_moe_ffn_split(cur, up_exps, gate_exps, down_exps, selected_experts, weights, n_expert, il);
     }
 
+    if (expert_cache && ubatch.n_tokens <= llama_expert_cache::max_rows && expert_cache->layer(il) &&
+            type_op == LLM_FFN_SILU && !weight_before_ffn && !gate_up_exps &&
+            !up_exps_s && !gate_exps_s && !down_exps_s && !up_exps_b && !gate_exps_b && !down_exps_b &&
+            (loras == nullptr || loras->empty())) {
+        return build_moe_ffn_cache(cur, selected_experts, weights, up_exps, gate_exps, down_exps, il);
+    }
+
     if (weight_before_ffn) {
         // repeat cur to [n_embd, n_expert_used, n_tokens]
         ggml_tensor * repeated = ggml_repeat_4d(ctx0, cur, n_embd, n_expert_used, n_tokens, 1);
@@ -2429,6 +2438,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s); // [n_embd, n_expert_used, n_tokens]
     cb(experts, "ffn_moe_down", il);
 
+    // Record prompt routing for the next expert-cache refresh, next to the routed CPU work that already has the IDs.
+    if (expert_cache) {
+        if (auto * rec = expert_cache->build_record(ctx0, selected_experts, il)) {
+            cb(rec, "ffn_cache_cpu_record", il);
+            ggml_build_forward_expand(gf, rec);
+        }
+    }
+
     if (down_exps_s) {
         cb(experts, "ffn_moe_down_scaled", il);
     }
@@ -2477,6 +2494,65 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     cb(moe_out, "ffn_moe_out", il);
 
     return moe_out;
+}
+
+ggml_tensor * llm_graph_context::build_moe_ffn_cache(
+        ggml_tensor * cur, ggml_tensor * ids, ggml_tensor * weights,
+        ggml_tensor * up, ggml_tensor * gate, ggml_tensor * down, int il) const {
+    const auto & resident = *expert_cache->layer(il);
+    auto name = [&](ggml_tensor * t, const char * label, bool cpu) {
+        cb(t, (std::string(cpu ? "ffn_cache_cpu_" : "ffn_cache_gpu_") + label).c_str(), il);
+    };
+    auto * flat = ggml_reshape_1d(ctx0, ggml_cont(ctx0, ids), ggml_nelements(ids));
+    auto * hot = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, resident.hot_ids, flat), ids->ne[0], ids->ne[1]);
+    ggml_build_forward_expand(gf, hot);
+
+    // One CPU transfer before GPU expert work. Expert IDs are exactly representable as F32. The CPU maps the original IDs to
+    // cold IDs and records them for the next membership refresh.
+    const int64_t nx = ggml_nelements(cur);
+    auto * packet = ggml_concat(ctx0, ggml_reshape_1d(ctx0, ggml_cont(ctx0, cur), nx), ggml_cast(ctx0, flat, GGML_TYPE_F32), 0);
+    auto * input = ggml_dup(ctx0, packet);
+    name(input, "packet", true);
+    auto * cx = ggml_view_3d(ctx0, input, cur->ne[0], 1, cur->ne[2], cur->ne[0] * sizeof(float), cur->ne[0] * sizeof(float), 0);
+    auto * ci = expert_cache->build_cold_ids(ctx0,
+            ggml_view_2d(ctx0, input, ids->ne[0], ids->ne[1], ids->ne[0] * sizeof(float), nx * sizeof(float)), il);
+    name(cx, "input", true); name(ci, "ids", true);
+    ggml_build_forward_expand(gf, cx);
+    ggml_build_forward_expand(gf, ci);
+
+    // Each part leaves zeros in the other part's rows. The GPU part is built first so that it runs while the CPU part does.
+    auto part = [&](ggml_tensor * x, ggml_tensor * route, ggml_tensor * gu, ggml_tensor * uu, ggml_tensor * du, bool cpu) {
+        auto * g = ggml_mul_mat_id_partial(ctx0, gu, x, route);
+        auto * u = ggml_mul_mat_id_partial(ctx0, uu, x, route);
+        name(g, "gate", cpu); name(u, "up", cpu);
+        auto * a = ggml_swiglu_split(ctx0, g, u);
+        name(a, "swiglu", cpu);
+        auto * d = ggml_mul_mat_id_partial(ctx0, du, a, route);
+        name(d, "down", cpu);
+        ggml_build_forward_expand(gf, d);
+        return d;
+    };
+    auto * gd = part(cur, hot, expert_cache->gate(), expert_cache->up(), expert_cache->down(), false);
+    auto * cd = part(cx, ci, gate, up, down, true);
+
+    // Merge the per-expert outputs on the GPU and reduce them as build_moe_ffn does, so the backend fuses the weighted sum.
+    auto * experts = ggml_add(ctx0, gd, cd);
+    name(experts, "merge", false);
+    experts = ggml_mul(ctx0, experts, weights);
+    name(experts, "weighted", false);
+    ggml_build_forward_expand(gf, experts);
+    ggml_tensor * views[LLAMA_MAX_EXPERTS] = {};
+    for (int64_t j = 0; j < ids->ne[0]; ++j) {
+        views[j] = ggml_view_2d(ctx0, experts, experts->ne[0], ids->ne[1], experts->nb[2], j * experts->nb[1]);
+        ggml_build_forward_expand(gf, views[j]);
+    }
+    ggml_tensor * out = views[0];
+    for (int64_t j = 1; j < ids->ne[0]; ++j) {
+        out = ggml_add(ctx0, out, views[j]);
+        name(out, "sum", false);
+        ggml_build_forward_expand(gf, out);
+    }
+    return out;
 }
 
 // The top cparams.moe_split_n experts run on the LLAMA_MOE_SPLIT device and the rest where the scheduler puts them. Each part
