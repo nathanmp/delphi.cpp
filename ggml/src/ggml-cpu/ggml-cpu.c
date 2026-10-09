@@ -1805,7 +1805,7 @@ static int ggml_cpu_numa_chunks_per_thread(void) {
     static int chunks = -1;
     if (chunks < 0) {
         const char * env = getenv("GGML_CPU_NUMA_CHUNKS");
-        chunks = env ? MAX(0, atoi(env)) : 4;
+        chunks = env ? MAX(0, atoi(env)) : 2;
     }
     return chunks;
 }
@@ -2231,7 +2231,9 @@ static void ggml_compute_forward_mul_mat_id_impl(
         const int numa_chunks = numa_tensors ? ggml_cpu_numa_chunks_per_thread() : 0;
         if (numa_chunks > 0 && nr0 > nr1) {
             // a node's workers claim its rows of the expert in pieces, so a worker that starts late or runs slow does not
-            // hold up the node (static slices: the slowest worker ends ~10% after the median one in MiMo MTP decode)
+            // hold up the node (static slices: the slowest worker ends ~10% after the median one in MiMo MTP decode). Short
+            // pieces stream worse: MiMo CPU expert time per verify pass with 1/2/4/8 pieces per worker 39.0/37.9/41.4/46.5 ms,
+            // and a static slice plus a tail of 16-row pieces 39.5 ms.
             nchunk0 = MIN(nr0, (int64_t) work_nth * numa_chunks);
             nchunk1 = 1;
         } else if (nchunk0 * nchunk1 < work_nth * 4 || disable_chunking) {
