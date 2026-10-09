@@ -935,6 +935,10 @@ struct ggml_backend_sched {
     // without pipeline parallelism (one input copy): lets a device-to-device input copy wait on the device for the
     // destination to finish with its previous contents, instead of synchronizing the destination on the host
     ggml_backend_event_t xdev_events[GGML_SCHED_MAX_BACKENDS];
+    // without pipeline parallelism: recorded on the split backend before a split's inputs are queued, so that the host
+    // waits once per split, and only for the work before them, before overwriting the previous contents of the inputs
+    // (GGML_SCHED_REUSE_EVENTS=0: synchronize the split backend before every such input instead)
+    ggml_backend_event_t reuse_events[GGML_SCHED_MAX_BACKENDS];
     struct ggml_tensor ** graph_inputs;
     int n_graph_inputs;
     int graph_inputs_capacity;
@@ -2915,7 +2919,7 @@ struct ggml_backend_sched_stage_item {
     uint64_t seq;                   // job number of the upload
 };
 
-// GGML_SCHED_STAGE_TRACE=<file>: one line per upload job, "slot bytes queued start free issued" in microseconds on the clock
+// GGML_SCHED_STAGE_TRACE=<file>: one line per upload job, "backend slot bytes queued start free issued" in microseconds on the clock
 // of the execution trace (GGML_EXEC_TRACE), so the jobs can be placed against the device spans of the splits
 static int64_t ggml_backend_sched_stage_trace_us(void) {
 #if defined(CLOCK_MONOTONIC_RAW)
@@ -3022,7 +3026,7 @@ static void ggml_backend_sched_stage_run_job(
     static FILE * trace = getenv("GGML_SCHED_STAGE_TRACE") ? fopen(getenv("GGML_SCHED_STAGE_TRACE"), "w") : nullptr;
     struct trace_end {
         FILE * f; const ggml_backend_sched_stage_job & job; int64_t t_start, t_free;
-        ~trace_end() { if (f) { fprintf(f, "%d %zu %lld %lld %lld %lld\n", job.slot, job.size, (long long) job.t_queued,
+        ~trace_end() { if (f) { fprintf(f, "%d %d %zu %lld %lld %lld %lld\n", job.backend_id, job.slot, job.size, (long long) job.t_queued,
                 (long long) t_start, (long long) t_free, (long long) ggml_backend_sched_stage_trace_us()); fflush(f); } }
     } trace_guard { trace, job, t_start, t_free };
     char * dst = (char *) ring.slots[job.slot];
@@ -3703,6 +3707,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 ggml_backend_event_record(xdev_ev, split_backend);
             }
         }
+        // the reuse wait below is needed once per split: after it, the split backend has only the copies and staged
+        // uploads of this split's inputs queued, which do not read their previous contents. Waiting on the backend again
+        // for each input also waited for those: on two GPUs, about 25 ms per MiMo layer between the activation copies
+        ggml_backend_event_t reuse_ev = sched->reuse_events[split_backend_id];
+        bool reuse_waited = false;
+        if (reuse_ev != NULL && split->n_inputs > 0) {
+            ggml_backend_event_record(reuse_ev, split_backend);
+        }
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
@@ -3767,6 +3779,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         input_backend->iface.event_wait != NULL && split_backend->iface.cpy_tensor_async != NULL) {
                     // the async copy runs on the input backend's stream: make that stream wait for the split backend
                     ggml_backend_event_wait(input_backend, xdev_ev);
+                } else if (reuse_ev != NULL) {
+                    if (!reuse_waited) {
+                        const uint64_t wait_start = ggml_backend_sched_trace_detail_span_begin();
+                        ggml_backend_event_synchronize(reuse_ev);
+                        reuse_waited = true;
+                        ggml_backend_sched_trace_span_end(
+                                sched, wait_start, GGML_EXEC_TRACE_EVENT_BACKEND_WAIT,
+                                GGML_EXEC_TRACE_WAIT_COPY_DST_REUSE, split_id, split_backend_id,
+                                input_node_id, GGML_EXEC_TRACE_WAIT_API_EVENT_SYNCHRONIZE);
+                    }
                 } else {
                     const uint64_t wait_start = ggml_backend_sched_trace_detail_span_begin();
                     ggml_backend_synchronize(split_backend);
@@ -4152,6 +4174,16 @@ ggml_backend_sched_t ggml_backend_sched_new(
         }
     }
 
+    const char * reuse_env = getenv("GGML_SCHED_REUSE_EVENTS");
+    if (sched->n_copies == 1 && (reuse_env == nullptr || atoi(reuse_env) != 0)) {
+        for (int b = 0; b < n_backends; b++) {
+            ggml_backend_dev_t dev = backends[b]->device;
+            if (dev != nullptr && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                sched->reuse_events[b] = ggml_backend_event_new(dev);
+            }
+        }
+    }
+
     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
     sched->op_offload = op_offload;
     sched->stage = ggml_backend_sched_stage_new(sched);
@@ -4173,6 +4205,9 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
         }
         if (sched->xdev_events[b] != NULL) {
             ggml_backend_event_free(sched->xdev_events[b]);
+        }
+        if (sched->reuse_events[b] != NULL) {
+            ggml_backend_event_free(sched->reuse_events[b]);
         }
     }
     ggml_backend_sched_stage_free(sched->stage);
