@@ -9,6 +9,7 @@
 #include "ggml-impl.h"
 #include <atomic>
 #include <map>
+#include <set>
 #include <mutex>
 #include <vector>
 #include <tuple>
@@ -101,27 +102,27 @@ __device__ __forceinline__ float activate(float gate, float up, float limit) {
 }
 
 // Packing and its inverse preserve every canonical code and BF16 scale. One temporary expert slice suffices.
-__global__ void pack_codes(const char * src, char * dst, size_t stride, int k, int n, int experts) {
-    const size_t words = size_t(k) * n / 8;
-    for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < words * experts; i += size_t(gridDim.x) * blockDim.x) {
-        const int e = i / words, lane = i % 32;
-        const size_t tile = (i % words) / 32;
-        const int out = int(tile / (k / 16)) * 16 + lane % 16;
-        const int kk = int(tile % (k / 16)) * 16 + (lane / 16) * 8;
-        unsigned q = 0;
-        for (int j = 0; j < 8; ++j) {
-            q |= unsigned(code_at(src + e * stride, k, n, out, kk + j, false)) << (8 * (j % 4) + 4 * (j / 4));
-        }
-        reinterpret_cast<unsigned *>(dst + e * stride)[i % words] = q;
+// Packs whole experts, one block per 16-row x 128-weight tile: its 16 canonical groups (1 KB) are read
+// coalesced into LDS, and its 256 code words (1 KB, contiguous) and 16 scales are written. (code_at with packed = true reads it back).
+__global__ void pack_tiles(const char * src, char * dst, size_t stride, int k, int n) {
+    __shared__ uint16_t g[16 * 33];
+    const int kgs = k / 128, tile = blockIdx.x / kgs, kg = blockIdx.x % kgs;
+    const char * s = src + blockIdx.y * stride;
+    char * d = dst + blockIdx.y * stride;
+    for (int i = threadIdx.x; i < 16 * 33; i += blockDim.x) {
+        const int r = i / 33;
+        g[i] = reinterpret_cast<const uint16_t *>(s + (size_t(tile * 16 + r) * kgs + kg) * 66)[i % 33];
     }
-}
-
-__global__ void pack_scales(const char * src, char * dst, size_t stride, int k, int n, int experts) {
-    const size_t groups = size_t(k / 128) * n;
-    for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < groups * experts; i += size_t(gridDim.x) * blockDim.x) {
-        const size_t e = i / groups, g = i % groups;
-        reinterpret_cast<uint16_t *>(dst + e * stride + size_t(k) * n / 2)[g] =
-            *reinterpret_cast<const uint16_t *>(src + e * stride + g * 66);
+    __syncthreads();
+    const int lane = threadIdx.x % 32, t8 = threadIdx.x / 32;
+    const int j = t8 * 16 + (lane / 16) * 8; // the word holds codes j..j+7 of the group for output row lane % 16
+    const uint8_t * b = reinterpret_cast<const uint8_t *>(g) + (lane % 16) * 66 + 2 + (j / 32) * 16 + j % 16;
+    const unsigned x = b[0] | b[1] << 8 | b[2] << 16 | unsigned(b[3]) << 24;
+    const unsigned y = b[4] | b[5] << 8 | b[6] << 16 | unsigned(b[7]) << 24;
+    reinterpret_cast<unsigned *>(d)[(size_t(tile) * (k / 16) + kg * 8 + t8) * 32 + lane] = j % 32 >= 16 ?
+        ((x >> 4) & 0x0f0f0f0fu) | (y & 0xf0f0f0f0u) : (x & 0x0f0f0f0fu) | ((y & 0x0f0f0f0fu) << 4);
+    if (threadIdx.x < 16) {
+        reinterpret_cast<uint16_t *>(d + size_t(k) * n / 2)[size_t(tile * 16 + threadIdx.x) * kgs + kg] = g[threadIdx.x * 33];
     }
 }
 
@@ -519,11 +520,12 @@ void change_layout(weight_state & s, bool packed) {
         const int ce = std::min(chunk, s.experts - e);
         char * dst = s.data + e * s.stride;
         CUDA_CHECK(cudaMemcpyAsync(tmp, dst, ce * s.stride, cudaMemcpyDeviceToDevice, stream));
-        const unsigned grid = std::min<size_t>((size_t(ce) * s.k * s.n / (packed ? 8 : 128) + 255) / 256, 65535);
         if (packed) {
-            pack_codes<<<grid, 256, 0, stream>>>(tmp, dst, s.stride, s.k, s.n, ce);
-            pack_scales<<<grid, 256, 0, stream>>>(tmp, dst, s.stride, s.k, s.n, ce);
-        } else { unpack_groups<<<grid, 256, 0, stream>>>(tmp, dst, s.stride, s.k, s.n, ce); }
+            pack_tiles<<<dim3((s.n / 16) * (s.k / 128), ce), 256, 0, stream>>>(tmp, dst, s.stride, s.k, s.n);
+        } else {
+            const unsigned grid = std::min<size_t>((size_t(ce) * s.k * s.n / 128 + 255) / 256, 65535);
+            unpack_groups<<<grid, 256, 0, stream>>>(tmp, dst, s.stride, s.k, s.n, ce);
+        }
         CUDA_CHECK(cudaGetLastError());
     }
     const int flag = packed ? 1 : 0;
@@ -866,14 +868,139 @@ void ggml_cuda_moe_int4_set_expert(ggml_backend_cuda_context & ctx, const ggml_t
         return;
     }
     GGML_ASSERT(expert >= 0 && expert < s->experts && size_t(t->nb[2]) == s->stride);
-    const unsigned grid = std::min<size_t>((size_t(s->k) * s->n / 8 + 255) / 256, 65535);
-    pack_codes<<<grid, 256, 0, ctx.stream()>>>(static_cast<const char *>(src), dst, s->stride, s->k, s->n, 1);
-    pack_scales<<<grid, 256, 0, ctx.stream()>>>(static_cast<const char *>(src), dst, s->stride, s->k, s->n, 1);
+    pack_tiles<<<dim3((s->n / 16) * (s->k / 128), 1), 256, 0, ctx.stream()>>>(static_cast<const char *>(src), dst, s->stride, s->k, s->n);
     CUDA_CHECK(cudaGetLastError());
 }
 
-// A staging slot holds a new expert tensor in the canonical layout at every use. Pack it in place on the compute stream so
-// that the fused kernels read it; its state stays packed, because every later use is packed here again.
+// Staging uploads that arrive packed (GGML_HIP_MOE_INT4_PACK_ON_UPLOAD=0: off), so the compute stream never repacks. Through
+// bounce buffers, the staging threads pack while they copy (ggml_cuda_moe_int4_stage_pack_host) and the chunk goes straight
+// into the slot. Direct uploads from page-locked weights (or GGML_SCHED_STAGE_PACK_HOST=0) go to a device scratch on the copy
+// stream, and a pack stream writes them packed into the slot.
+// 2026-10-09, MiMo prefill (8192-token ubatches, 16K tokens): the old in-place pack took ~54 of ~191 ms per layer (640-726
+// t/s). In place with pack_tiles 692-810, device pack on upload 748-792, host pack 853-856 t/s (65K tokens: 842).
+// The device pack kernels queue behind the compute kernels, which fill the device, so four scratch buffers let the uploads run
+// ahead meanwhile (two made the ring upload-bound). A high-priority pack stream slowed the compute (prefill 831 -> 580-734).
+#define STAGE_PACK_SCRATCH 4
+struct stage_packer {
+    cudaStream_t stream = nullptr;
+    char * scratch[STAGE_PACK_SCRATCH] = {};
+    size_t cap = 0;
+    cudaEvent_t uploaded[STAGE_PACK_SCRATCH] = {}, packed[STAGE_PACK_SCRATCH] = {};
+    int next = 0;
+};
+std::map<int, stage_packer> stage_packers;            // per device; used by that device's staging thread
+std::set<std::pair<int, const void *>> staged_packed; // slots whose pending upload was packed (state_mutex)
+
+static bool pack_on_upload_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_HIP_MOE_INT4_PACK_ON_UPLOAD");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+// The layout of pack_tiles, computed on the host over whole experts (tiles [ith/nth, (ith+1)/nth) of the chunk), so that the
+// staging threads can pack while they copy into the bounce buffers.
+static void moe_int4_pack_host(int k, int n, size_t stride, void * dst, const void * src, size_t size, int ith, int nth) {
+    const int kgs = k / 128;
+    const size_t per_expert = size_t(n / 16) * kgs, total = size / stride * per_expert;
+    const size_t t0 = total * ith / nth, t1 = total * (ith + 1) / nth;
+    const uint64_t m = 0x0f0f0f0f0f0f0f0full;
+    for (size_t t = t0; t < t1; ++t) {
+        const size_t e = t / per_expert;
+        const int tile = int((t % per_expert) / kgs), kg = int((t % per_expert) % kgs);
+        const uint8_t * s = static_cast<const uint8_t *>(src) + e * stride;
+        uint8_t * d = static_cast<uint8_t *>(dst) + e * stride;
+        uint32_t * words = reinterpret_cast<uint32_t *>(d) + (size_t(tile) * (k / 16) + kg * 8) * 32;
+        uint16_t * scales = reinterpret_cast<uint16_t *>(d + size_t(k) * n / 2);
+        for (int r = 0; r < 16; ++r) {
+            const size_t gi = size_t(tile * 16 + r) * kgs + kg;
+            const uint8_t * g = s + gi * 66;
+            memcpy(scales + gi, g, 2);
+            for (int sb = 0; sb < 4; ++sb) {
+                uint64_t a, b;
+                memcpy(&a, g + 2 + sb * 16, 8);
+                memcpy(&b, g + 2 + sb * 16 + 8, 8);
+                const uint64_t la = a & m, lb = b & m, ha = (a >> 4) & m, hb = (b >> 4) & m;
+                words[(2 * sb) * 32 + r]          = uint32_t(la) | uint32_t(la >> 32) << 4;
+                words[(2 * sb) * 32 + r + 16]     = uint32_t(lb) | uint32_t(lb >> 32) << 4;
+                words[(2 * sb + 1) * 32 + r]      = uint32_t(ha) | uint32_t(ha >> 32) << 4;
+                words[(2 * sb + 1) * 32 + r + 16] = uint32_t(hb) | uint32_t(hb >> 32) << 4;
+            }
+        }
+    }
+}
+
+void ggml_cuda_moe_int4_stage_pack_host(const ggml_tensor * w, void * dst, const void * src, size_t size, int ith, int nth) {
+    GGML_ASSERT(size % w->nb[2] == 0);
+    moe_int4_pack_host(int(w->ne[0]), int(w->ne[1]), w->nb[2], dst, src, size, ith, nth);
+}
+
+size_t ggml_cuda_moe_int4_stage_pack_unit(int device, const ggml_tensor * w) {
+    return pack_on_upload_enabled() && supported_weight(w) && ggml_cuda_moe_int4_type_supported(device) ? size_t(w->nb[2]) : 0;
+}
+
+void ggml_cuda_moe_int4_stage_upload_packed(int device, cudaStream_t copy, const ggml_tensor * w, char * slot, size_t offset,
+        const void * src, size_t size, bool prepacked, cudaEvent_t copied, cudaEvent_t done) {
+    const size_t stride = w->nb[2];
+    GGML_ASSERT(offset % stride == 0 && size % stride == 0 && size > 0);
+    stage_packer * p;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        p = &stage_packers[device];
+        staged_packed.insert({device, slot});
+    }
+    if (prepacked) {
+        // packed on the host (ggml_cuda_moe_int4_stage_pack_host): straight into the slot
+        CUDA_CHECK(cudaMemcpyAsync(slot + offset, src, size, cudaMemcpyHostToDevice, copy));
+        if (copied) {
+            CUDA_CHECK(cudaEventRecord(copied, copy));
+        }
+        if (done) {
+            CUDA_CHECK(cudaEventRecord(done, copy));
+        }
+        return;
+    }
+    if (p->stream == nullptr) {
+        CUDA_CHECK(cudaStreamCreateWithFlags(&p->stream, cudaStreamNonBlocking));
+        for (int b = 0; b < STAGE_PACK_SCRATCH; ++b) {
+            CUDA_CHECK(cudaEventCreateWithFlags(&p->uploaded[b], cudaEventDisableTiming));
+            CUDA_CHECK(cudaEventCreateWithFlags(&p->packed[b], cudaEventDisableTiming));
+            CUDA_CHECK(cudaEventRecord(p->packed[b], p->stream));
+        }
+    }
+    if (size > p->cap) {
+        CUDA_CHECK(cudaStreamSynchronize(p->stream));
+        CUDA_CHECK(cudaStreamSynchronize(copy));
+        for (char *& b : p->scratch) {
+            if (b) { CUDA_CHECK(cudaFree(b)); }
+            CUDA_CHECK(cudaMalloc(&b, size));
+        }
+        p->cap = size;
+    }
+    // the upload of a chunk overlaps the packing of the ones before
+    const int b = p->next;
+    p->next = (b + 1) % STAGE_PACK_SCRATCH;
+    // a host wait: a copy-stream wait on the pack stream slowed the uploads from 25.7 to 19.6 GB/s; with four buffers the pack is
+    // rarely still running
+    CUDA_CHECK(cudaEventSynchronize(p->packed[b]));
+    CUDA_CHECK(cudaMemcpyAsync(p->scratch[b], src, size, cudaMemcpyHostToDevice, copy));
+    CUDA_CHECK(cudaEventRecord(p->uploaded[b], copy));
+    if (copied) {
+        CUDA_CHECK(cudaEventRecord(copied, copy));
+    }
+    CUDA_CHECK(cudaStreamWaitEvent(p->stream, p->uploaded[b], 0));
+    const int k = int(w->ne[0]), n = int(w->ne[1]);
+    pack_tiles<<<dim3((n / 16) * (k / 128), unsigned(size / stride)), 256, 0, p->stream>>>(p->scratch[b], slot + offset, stride, k, n);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaEventRecord(p->packed[b], p->stream));
+    if (done) {
+        CUDA_CHECK(cudaEventRecord(done, p->stream));
+    }
+}
+
+// A staging slot holds a new expert tensor in the canonical layout at every use, unless its upload packed it. Pack it in place
+// on the compute stream so that the fused kernels read it; its state stays packed, because every later use is packed again.
 void ggml_cuda_moe_int4_stage_prepare(ggml_backend_cuda_context & ctx, ggml_tensor * t) {
     if (t->type != GGML_TYPE_Q4_G128 || !supported_weight(t) || !ggml_cuda_moe_int4_type_supported(ctx.device)) { return; }
     // staged experts are the only G128 tensors of a model whose experts stay in host memory: enable the matcher
@@ -883,16 +1010,26 @@ void ggml_cuda_moe_int4_stage_prepare(ggml_backend_cuda_context & ctx, ggml_tens
     std::lock_guard<std::mutex> lock(state_mutex);
     weight_state * s = find_state(ctx.device, t->data);
     GGML_ASSERT(s && s->stride == size_t(t->nb[2]) && s->experts == t->ne[2]);
+    GGML_ASSERT(s->k == t->ne[0] && s->n == t->ne[1]);
     const cudaStream_t stream = ctx.stream();
+    if (staged_packed.erase({ctx.device, t->data}) > 0) {
+        if (!s->packed) {
+            const int flag = 1;
+            CUDA_CHECK(cudaMemcpyAsync(s->flag, &flag, sizeof(flag), cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream)); // once per slot: flag lives on the host stack
+            s->packed = true;
+        }
+        packs++;
+        pack_us += ggml_time_us() - start;
+        return;
+    }
     const int chunk = std::min(s->experts, 16);
     ggml_cuda_pool_alloc<char> tmp(ctx.pool(), chunk * s->stride);
     for (int e = 0; e < s->experts; e += chunk) {
         const int ce = std::min(chunk, s->experts - e);
         char * dst = s->data + e * s->stride;
         CUDA_CHECK(cudaMemcpyAsync(tmp.get(), dst, ce * s->stride, cudaMemcpyDeviceToDevice, stream));
-        const unsigned grid = std::min<size_t>((size_t(ce) * s->k * s->n / 8 + 255) / 256, 65535);
-        pack_codes<<<grid, 256, 0, stream>>>(tmp.get(), dst, s->stride, s->k, s->n, ce);
-        pack_scales<<<grid, 256, 0, stream>>>(tmp.get(), dst, s->stride, s->k, s->n, ce);
+        pack_tiles<<<dim3((s->n / 16) * (s->k / 128), ce), 256, 0, stream>>>(tmp.get(), dst, s->stride, s->k, s->n);
     }
     CUDA_CHECK(cudaGetLastError());
     if (!s->packed) {

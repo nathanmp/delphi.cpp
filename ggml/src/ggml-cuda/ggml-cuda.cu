@@ -7173,6 +7173,19 @@ static void ggml_backend_cuda_stage_prepare(ggml_backend_t backend, ggml_tensor 
     ggml_cuda_moe_int4_stage_prepare(*cuda_ctx, weight);
 }
 
+// delphi: staging uploads packed on the way ("ggml_backend_stage_pack_unit", "ggml_backend_stage_upload_packed")
+static size_t ggml_backend_cuda_stage_pack_unit(ggml_backend_t backend, const ggml_tensor * weight) {
+    return ggml_cuda_moe_int4_stage_pack_unit(((ggml_backend_cuda_context *) backend->context)->device, weight);
+}
+
+static void ggml_backend_cuda_stage_upload_packed(ggml_backend_t backend, const ggml_tensor * weight, void * slot, size_t offset,
+        const void * src, size_t size, bool prepacked, ggml_backend_event_t copied, ggml_backend_event_t done) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    ggml_cuda_moe_int4_stage_upload_packed(cuda_ctx->device, ggml_backend_cuda_stage_stream(cuda_ctx), weight, (char *) slot, offset,
+            src, size, prepacked, copied ? (cudaEvent_t) copied->context : nullptr, done ? (cudaEvent_t) done->context : nullptr);
+}
+
 static void ggml_backend_cuda_moe_int4_forget_inside_proc(ggml_backend_t backend, const ggml_tensor * t) {
     ggml_cuda_moe_int4_forget_inside(((ggml_backend_cuda_context *) backend->context)->device, t);
 }
@@ -7249,6 +7262,15 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_stage_prepare") == 0) {
         return (void *)ggml_backend_cuda_stage_prepare;
+    }
+    if (strcmp(name, "ggml_backend_stage_pack_unit") == 0) {
+        return (void *)ggml_backend_cuda_stage_pack_unit;
+    }
+    if (strcmp(name, "ggml_backend_stage_upload_packed") == 0) {
+        return (void *)ggml_backend_cuda_stage_upload_packed;
+    }
+    if (strcmp(name, "ggml_backend_stage_pack_host") == 0) {
+        return (void *)ggml_cuda_moe_int4_stage_pack_host;
     }
 #endif
     return nullptr;

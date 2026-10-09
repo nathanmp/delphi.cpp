@@ -131,7 +131,17 @@ bool ggml_backend_cuda_moe_int4_get_pack(const void * data, int which, const voi
 // Copy expert slab `expert` of a G128 bank from device memory on the stream of ctx. A packed bank stays packed.
 void ggml_cuda_moe_int4_set_expert(ggml_backend_cuda_context & ctx, const ggml_tensor * t, int64_t expert, const void * src);
 // Pack a staged weight (new canonical content at every use) in place on the stream of ctx; see ggml_backend_stage_prepare_t.
+// A slot that ggml_cuda_moe_int4_stage_upload_packed filled is packed already.
 void ggml_cuda_moe_int4_stage_prepare(ggml_backend_cuda_context & ctx, ggml_tensor * t);
+// Bytes of one expert of host weight w if staging uploads of w should be packed on the way (whole experts per chunk), else 0.
+size_t ggml_cuda_moe_int4_stage_pack_unit(int device, const ggml_tensor * w);
+// Upload size bytes (whole experts) of host weight w from src through a device scratch on the copy stream and pack them into
+// slot + offset on a pack stream; copied (optional) is recorded once src is read, done (optional) once they are packed.
+// prepacked: src holds them packed already (ggml_cuda_moe_int4_stage_pack_host) and goes straight into the slot.
+void ggml_cuda_moe_int4_stage_upload_packed(int device, cudaStream_t copy, const ggml_tensor * w, char * slot, size_t offset,
+        const void * src, size_t size, bool prepacked, cudaEvent_t copied, cudaEvent_t done);
+// Pack part ith of nth of size bytes (whole experts) of host weight w from src to dst in host memory, as the pack kernel does.
+void ggml_cuda_moe_int4_stage_pack_host(const ggml_tensor * w, void * dst, const void * src, size_t size, int ith, int nth);
 // Forget the layout of weights that lie inside t (staging slots lent from t), but not that of t.
 void ggml_cuda_moe_int4_forget_inside(int device, const ggml_tensor * t);
 #endif
