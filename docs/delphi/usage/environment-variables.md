@@ -25,6 +25,7 @@ These switches control how `ggml_backend_sched` copies and synchronizes split in
 | `GGML_SCHED_COPY_REUSE_WAIT` | off | `1` | Wait for the reuse of the input copy slot before every host input copy |
 | `GGML_SCHED_INPUT_ORDER` | on | `0` | Copy split inputs in first-use order instead of the order of their producers |
 | `GGML_SCHED_XDEV_EVENTS` | off (on with `LLAMA_MOE_SPLIT`) | `1` | Without pipeline parallelism, order a device-to-device input copy with an event on the devices instead of a host wait for the destination |
+| `GGML_SCHED_REUSE_EVENTS` | `1` | `0` | Without pipeline parallelism, the host waits once per split, on an event recorded before its inputs are queued, before overwriting the inputs; `0` synchronizes the destination device before every device-to-device input copy, which also waits for the copies and staged uploads queued for the earlier inputs |
 
 What each default does:
 
