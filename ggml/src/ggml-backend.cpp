@@ -2710,6 +2710,18 @@ static void ggml_backend_sched_stage_pin(const std::vector<int> & cpus) {
 }
 
 // splits a memcpy over the calling thread and n - 1 helper threads
+// Optional: a backend that converts staged weights into another layout can do it during the upload instead of in prepare, off
+// the compute stream. pack_unit returns the bytes of one expert of the host weight if it wants that (uploads then come in
+// whole experts), else 0; upload_packed uploads size bytes of the weight at src to slot + offset in that layout, records copied
+// (optional) once src is read and done (optional) once they are ready. Found as "ggml_backend_stage_pack_unit" and
+// "ggml_backend_stage_upload_packed".
+typedef size_t (*ggml_backend_stage_pack_unit_t)(ggml_backend_t backend, const struct ggml_tensor * weight);
+// prepacked: src holds the data in that layout already, made by pack_host ("ggml_backend_stage_pack_host", optional), which
+// converts part ith of nth of size bytes (whole experts) of the weight from src to dst in host memory.
+typedef void (*ggml_backend_stage_upload_packed_t)(ggml_backend_t backend, const struct ggml_tensor * weight, void * slot, size_t offset,
+        const void * src, size_t size, bool prepacked, ggml_backend_event_t copied, ggml_backend_event_t done);
+typedef void (*ggml_backend_stage_pack_host_t)(const struct ggml_tensor * weight, void * dst, const void * src, size_t size, int ith, int nth);
+
 struct ggml_backend_sched_stage_copier {
     std::vector<std::thread> threads;
     std::mutex mutex;
@@ -2722,8 +2734,14 @@ struct ggml_backend_sched_stage_copier {
     const char * src = nullptr;
     size_t size = 0;
     int n = 1;
+    ggml_backend_stage_pack_host_t xform = nullptr; // pack instead of copy (see pack)
+    const struct ggml_tensor * xform_weight = nullptr;
 
     void part(int i) {
+        if (xform != nullptr) {
+            xform(xform_weight, dst, src, size, i, n);
+            return;
+        }
         const size_t begin = (size/n*i) & ~(size_t) 63;
         const size_t end   = i == n - 1 ? size : (size/n*(i + 1)) & ~(size_t) 63;
         if (end > begin) {
@@ -2757,8 +2775,21 @@ struct ggml_backend_sched_stage_copier {
     }
 
     void copy(void * d, const void * s, size_t sz) {
+        run(d, s, sz, nullptr, nullptr);
+    }
+
+    // the threads convert whole experts of weight w into the layout of its device while they copy
+    void pack(void * d, const void * s, size_t sz, ggml_backend_stage_pack_host_t fn, const struct ggml_tensor * w) {
+        run(d, s, sz, fn, w);
+    }
+
+    void run(void * d, const void * s, size_t sz, ggml_backend_stage_pack_host_t fn, const struct ggml_tensor * w) {
         if (n == 1 || sz < (4u << 20)) {
-            memcpy(d, s, sz);
+            if (fn != nullptr) {
+                fn(w, d, s, sz, 0, 1);
+            } else {
+                memcpy(d, s, sz);
+            }
             return;
         }
         {
@@ -2766,6 +2797,8 @@ struct ggml_backend_sched_stage_copier {
             dst = (char *) d;
             src = (const char *) s;
             size = sz;
+            xform = fn;
+            xform_weight = w;
             pending = n - 1;
             generation++;
         }
@@ -2876,10 +2909,16 @@ struct ggml_backend_sched_stage_job {
     const void * src;
     size_t size;
     int64_t t_queued; // GGML_SCHED_STAGE_TRACE
+    const struct ggml_tensor * weight; // the host weight, for upload_packed
+    size_t unit;                       // upload_packed in whole units of this many bytes; 0: plain uploads
 };
+
 
 struct ggml_backend_sched_stage_ring {
     ggml_backend_stage_upload_t  upload  = nullptr;
+    ggml_backend_stage_pack_unit_t     pack_unit     = nullptr;
+    ggml_backend_stage_upload_packed_t upload_packed = nullptr;
+    ggml_backend_stage_pack_host_t     pack_host     = nullptr;
     ggml_backend_stage_d2d_t     d2d     = nullptr;
     ggml_backend_stage_prepare_t prepare = nullptr;
     ggml_backend_buffer_t        anchor  = nullptr; // buffer and placeholder data of redirected copies (see split_graph)
@@ -2961,6 +3000,42 @@ static void ggml_backend_sched_stage_run_job(
                 (long long) t_start, (long long) t_free, (long long) ggml_backend_sched_stage_trace_us()); fflush(f); } }
     } trace_guard { trace, job, t_start, t_free };
     char * dst = (char *) ring.slots[job.slot];
+    if (job.unit > 0) {
+        // whole units per chunk, straight from page-locked weights or through the bounce buffers
+        const size_t chunk = std::max(job.unit, stage->chunk_size / job.unit * job.unit);
+        const bool direct = ring.bounce == nullptr || (stage->registrar && stage->registrar->locked(job.src, job.size));
+        GGML_ASSERT(job.size % job.unit == 0 && (direct || chunk <= stage->chunk_size));
+        char * bounce = direct ? nullptr : (char *) ggml_backend_buffer_get_base(ring.bounce);
+        for (size_t off = 0; off < job.size; off += chunk) {
+            const size_t n = std::min(chunk, job.size - off);
+            const bool last = off + n >= job.size;
+            if (direct) {
+                ring.upload_packed(backend, job.weight, dst, off, (const char *) job.src + off, n, false, nullptr, last ? ring.done[job.slot] : nullptr);
+                w->bytes_direct += n;
+                lap(w->us_upload);
+                continue;
+            }
+            const int c = ring.bounce_next;
+            ring.bounce_next = (c + 1) % stage->n_bounce;
+            if (ring.bounce_ev[c] != nullptr) {
+                ggml_backend_event_synchronize(ring.bounce_ev[c]);
+            }
+            lap(w->us_bounce);
+            if (ring.pack_host != nullptr) {
+                w->copier.pack(bounce + c*stage->chunk_size, (const char *) job.src + off, n, ring.pack_host, job.weight);
+            } else {
+                w->copier.copy(bounce + c*stage->chunk_size, (const char *) job.src + off, n);
+            }
+            lap(w->us_copy);
+            // the bounce buffer is free once the device read it, before the chunk is packed
+            ring.upload_packed(backend, job.weight, dst, off, bounce + c*stage->chunk_size, n, ring.pack_host != nullptr,
+                    ring.chunk_ev[c], last ? ring.done[job.slot] : nullptr);
+            ring.bounce_ev[c] = ring.chunk_ev[c];
+            lap(w->us_upload);
+            w->bytes_copy += n;
+        }
+        return;
+    }
     if (stage->registrar && stage->registrar->locked(job.src, job.size)) {
         // straight from the page-locked weights
         ring.upload(backend, dst, job.src, job.size, ring.done[job.slot]);
@@ -3063,6 +3138,17 @@ static ggml_backend_sched_stage * ggml_backend_sched_stage_new(ggml_backend_sche
         ring.upload = (ggml_backend_stage_upload_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_stage_upload");
         ring.d2d    = (ggml_backend_stage_d2d_t)    ggml_backend_reg_get_proc_address(reg, "ggml_backend_stage_d2d");
         ring.prepare = (ggml_backend_stage_prepare_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_stage_prepare");
+        ring.pack_unit     = (ggml_backend_stage_pack_unit_t)     ggml_backend_reg_get_proc_address(reg, "ggml_backend_stage_pack_unit");
+        ring.upload_packed = (ggml_backend_stage_upload_packed_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_stage_upload_packed");
+        ring.pack_host     = (ggml_backend_stage_pack_host_t)     ggml_backend_reg_get_proc_address(reg, "ggml_backend_stage_pack_host");
+        if (ring.pack_unit == nullptr || ring.upload_packed == nullptr) {
+            ring.pack_unit = nullptr;
+            ring.upload_packed = nullptr;
+            ring.pack_host = nullptr;
+        }
+        if (const char * e = getenv("GGML_SCHED_STAGE_PACK_HOST"); e != nullptr && atoi(e) == 0) {
+            ring.pack_host = nullptr;
+        }
         if (ring.upload == nullptr || ring.d2d == nullptr) {
             ring.upload = nullptr;
             continue;
@@ -3086,7 +3172,12 @@ static ggml_backend_sched_stage * ggml_backend_sched_stage_new(ggml_backend_sche
         stage->split_weights = std::max(1, std::min(stage->n_slots, atoi(e)));
     }
     if (n_threads == 0) {
-        n_threads = std::max(2, 8/std::max(1, n_dev));
+        // packing on the host is ~2x the work of the plain copy (8 threads: 16 vs 33 GB/s, 16 threads: 27 vs 42)
+        bool pack_host = false;
+        for (const auto & ring : stage->rings) {
+            pack_host = pack_host || ring.pack_host != nullptr;
+        }
+        n_threads = std::max(2, (pack_host ? 16 : 8)/std::max(1, n_dev));
     }
     if (const char * e = getenv("GGML_SCHED_STAGE_REGISTER"); e != nullptr && atoi(e) != 0 && n_dev > 0) {
         for (int b = 0; b < sched->n_backends && stage->registrar == nullptr; b++) {
@@ -3261,7 +3352,14 @@ static void ggml_backend_sched_stage_pump(ggml_backend_sched_t sched) {
         ggml_backend_sched_stage_worker * w = stage->workers[item.backend_id].get();
         {
             std::lock_guard<std::mutex> lock(w->mutex);
-            w->jobs.push_back({ item.backend_id, slot, ring.free_recorded[slot], item.input->data, ggml_nbytes(item.input), ggml_backend_sched_stage_trace_us() });
+            // packed uploads only where the split reads the slot itself: a copied slot would be prepared (packed) again
+            size_t unit = ring.pack_unit != nullptr && stage->redirect && sched->callback_eval == nullptr ?
+                    ring.pack_unit(stage->backends[item.backend_id], item.input) : 0;
+            if (unit > stage->chunk_size || ggml_nbytes(item.input) % std::max<size_t>(unit, 1) != 0) {
+                unit = 0; // a unit must fit a bounce buffer
+            }
+            w->jobs.push_back({ item.backend_id, slot, ring.free_recorded[slot], item.input->data, ggml_nbytes(item.input),
+                    ggml_backend_sched_stage_trace_us(), item.input, unit });
             item.seq = w->n_pushed++;
         }
         w->cv_job.notify_one();
