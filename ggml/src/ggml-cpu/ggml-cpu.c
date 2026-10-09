@@ -1800,6 +1800,16 @@ static bool ggml_cpu_g128_panel_enabled(void) {
     return enabled != 0;
 }
 
+// GGML_CPU_NUMA_CHUNKS: pieces per worker of a node's rows of an expert under --numa tensors (0: one static slice each).
+static int ggml_cpu_numa_chunks_per_thread(void) {
+    static int chunks = -1;
+    if (chunks < 0) {
+        const char * env = getenv("GGML_CPU_NUMA_CHUNKS");
+        chunks = env ? MAX(0, atoi(env)) : 4;
+    }
+    return chunks;
+}
+
 static bool ggml_cpu_g128_rows_supported(const struct ggml_tensor * src0) {
     return src0->type == GGML_TYPE_Q4_G128 && type_traits_cpu[src0->type].vec_dot_type == GGML_TYPE_Q8_0 &&
         ggml_cpu_g128_rows_enabled();
@@ -1926,7 +1936,7 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
 static void ggml_compute_forward_mul_mat_id_impl(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst,
-        const struct ggml_tensor * fuse_up,
+              struct ggml_tensor * fuse_up,
               struct ggml_tensor * fuse_dst,
         float fuse_limit) {
 
@@ -1948,6 +1958,9 @@ static void ggml_compute_forward_mul_mat_id_impl(
     const uint32_t numa_node = numa_tensors ? (uint32_t) params->numa_node : 0;
 
     const enum ggml_type type = src0->type;
+
+    // gate + up + SwiGLU of G128 experts through the row kernels (ggml_cpu_moe_fuse_up_gate_match)
+    const bool g128_fused = fuse_up != NULL && ggml_cpu_g128_rows_supported(src0);
 
     const bool src1_cont = ggml_is_contiguous(src1);
 
@@ -2065,13 +2078,28 @@ static void ggml_compute_forward_mul_mat_id_impl(
                 const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
 
                 if (partial && (i02 < 0 || i02 >= n_as)) {
-                    memset((char *) dst->data + id*nb1 + iid1*nb2, 0, ne0*sizeof(float));
-                    continue;
+                    continue; // zeroed by all threads below
                 }
                 assert(i02 >= 0 && i02 < n_as);
 
                 MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
                 matrix_row_counts[i02] += 1;
+            }
+        }
+    }
+
+    // Rows of another part's experts are zero: the threads share them, instead of the first thread clearing them all while the
+    // others wait (a partial MUL_MAT_ID of the expert cache leaves ~half of its rows, 16 KB each, to the GPU). A fused node
+    // clears only its SwiGLU output, the one that is read.
+    if (ggml_mul_mat_id_is_partial(dst)) {
+        struct ggml_tensor * zt = fuse_dst ? fuse_dst : dst;
+        int k = 0;
+        for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
+            for (int id = 0; id < n_ids; ++id) {
+                const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
+                if ((i02 < 0 || i02 >= n_as) && k++ % nth == ith) {
+                    memset((char *) zt->data + id*zt->nb[1] + iid1*zt->nb[2], 0, zt->ne[0]*sizeof(float));
+                }
             }
         }
     }
@@ -2155,7 +2183,7 @@ static void ggml_compute_forward_mul_mat_id_impl(
         const int64_t nr0 = numa_row0_end - numa_row0_start;
         const int64_t nr1 = cne1;
 
-        if (fuse_up) {
+        if (fuse_up && !g128_fused) {
             // Both weight shards are offset by numa_row0_start exactly like the unfused
             // call, so a socket still reads only its own output-row range of gate and up.
             const struct ggml_tensor * up0 = fuse_up->src[0];
@@ -2178,7 +2206,7 @@ static void ggml_compute_forward_mul_mat_id_impl(
         // given, so the `--numa tensors` column split is expressed by offsetting
         // src0 and dst rather than by an explicit row range. Under --numa tensors
         // the remaining split must be over this node's own workers.
-        if (!params->use_ref && ggml_cpu_iqk_mul_mat_enabled() &&
+        if (!g128_fused && !params->use_ref && ggml_cpu_iqk_mul_mat_enabled() &&
             ne13 == 1 && dst->type == GGML_TYPE_F32 &&
             (src1_cont || src1->type != vec_dot_type) &&
             iqk_mul_mat_moe(nr0, nr1, ne00, ne11,
@@ -2194,19 +2222,30 @@ static void ggml_compute_forward_mul_mat_id_impl(
             chunk_size = 64;
         }
 
-        // disable for NUMA
-        const bool disable_chunking = ggml_is_numa();
+        // disable for NUMA, except for --numa tensors, where the counters and the rows belong to the node
+        const bool disable_chunking = ggml_is_numa() && !numa_tensors;
 
         int64_t nchunk0 = (nr0 + chunk_size - 1) / chunk_size;
         int64_t nchunk1 = (nr1 + chunk_size - 1) / chunk_size;
 
-        if (nchunk0 * nchunk1 < work_nth * 4 || disable_chunking) {
+        const int numa_chunks = numa_tensors ? ggml_cpu_numa_chunks_per_thread() : 0;
+        if (numa_chunks > 0 && nr0 > nr1) {
+            // a node's workers claim its rows of the expert in pieces, so a worker that starts late or runs slow does not
+            // hold up the node (static slices: the slowest worker ends ~10% after the median one in MiMo MTP decode)
+            nchunk0 = MIN(nr0, (int64_t) work_nth * numa_chunks);
+            nchunk1 = 1;
+        } else if (nchunk0 * nchunk1 < work_nth * 4 || disable_chunking) {
             nchunk0 = nr0 > nr1 ? work_nth : 1;
             nchunk1 = nr0 > nr1 ? 1 : work_nth;
         }
 
-        const int64_t dr0 = (nr0 + nchunk0 - 1) / nchunk0;
+        int64_t dr0 = (nr0 + nchunk0 - 1) / nchunk0;
         const int64_t dr1 = (nr1 + nchunk1 - 1) / nchunk1;
+        if ((numa_chunks > 0 && nr0 > nr1) || g128_fused) {
+            // whole 8-row pieces: the fused SwiGLU below then takes the vector path for every row, as the unfused GLU does
+            dr0 = GGML_PAD(dr0, 8);
+            nchunk0 = (nr0 + dr0 - 1) / dr0;
+        }
 
         int current_chunk = work_ith;
 
@@ -2227,6 +2266,23 @@ static void ggml_compute_forward_mul_mat_id_impl(
                 ir0_start, ir0_end, ir1_start, ir1_end,
                 src0_cur, matrix_rows, row_size, src1_cont, wdata, g128_panels
             );
+            if (g128_fused) {
+                // the same rows of up, then SwiGLU over them: one node and one barrier instead of three
+                ggml_compute_forward_mul_mat_id_one_chunk(
+                    fuse_up, fuse_up->src[0], src1, ids, cur_a,
+                    ir0_start, ir0_end, ir1_start, ir1_end,
+                    (const char *) fuse_up->src[0]->data + cur_a * fuse_up->src[0]->nb[2],
+                    matrix_rows, row_size, src1_cont, wdata, g128_panels
+                );
+                for (int64_t ir1 = ir1_start; ir1 < ir1_end; ++ir1) {
+                    const struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, ir1);
+                    const size_t off = row_mapping.i1*nb1 + row_mapping.i2*nb2;
+                    ggml_vec_swiglu_f32((int) (ir0_end - ir0_start),
+                        (float *) ((char *) fuse_dst->data + row_mapping.i1*fuse_dst->nb[1] + row_mapping.i2*fuse_dst->nb[2]) + ir0_start,
+                        (const float *) ((const char *) dst->data + off) + ir0_start,
+                        (const float *) ((const char *) fuse_up->data + off) + ir0_start);
+                }
+            }
 
             if (work_nth >= nchunk0 * nchunk1) {
                 break;
@@ -3706,7 +3762,7 @@ static bool ggml_cpu_moe_fuse_up_gate_match(
         float * limit_out) {
 
     const char * disable = getenv("GGML_CPU_MOE_FUSE_UP_GATE");
-    if ((disable && strcmp(disable, "0") == 0) || !ggml_cpu_iqk_mul_mat_enabled()) {
+    if (disable && strcmp(disable, "0") == 0) {
         return false;
     }
 
@@ -3721,8 +3777,7 @@ static bool ggml_cpu_moe_fuse_up_gate_match(
     struct ggml_tensor * mm1 = cgraph->nodes[node_n + 1];
     struct ggml_tensor * glu = cgraph->nodes[node_n + 2];
 
-    if (ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU_CLAMP ||
-        ggml_get_op_params_i32(glu, 1) != 0 || !glu->src[1]) {
+    if (ggml_get_op_params_i32(glu, 1) != 0 || !glu->src[1]) {
         return false;
     }
 
@@ -3731,12 +3786,19 @@ static bool ggml_cpu_moe_fuse_up_gate_match(
     if (!((gate == mm0 && up == mm1) || (gate == mm1 && up == mm0))) {
         return false;
     }
-    if (ggml_mul_mat_id_is_partial(mm0) || ggml_mul_mat_id_is_partial(mm1)) {
-        return false;
-    }
 
     const struct ggml_tensor * gate0 = gate->src[0];
     const struct ggml_tensor * up0   = up->src[0];
+
+    // G128 experts fuse through the row kernels (ggml_compute_forward_mul_mat_id_impl), the others through IQK
+    const bool g128 = ggml_cpu_g128_rows_supported(gate0) && ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU;
+    if (!g128 && (!ggml_cpu_iqk_mul_mat_enabled() || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU_CLAMP ||
+                  ggml_mul_mat_id_is_partial(mm0) || ggml_mul_mat_id_is_partial(mm1))) {
+        return false;
+    }
+    if (ggml_mul_mat_id_is_partial(mm0) != ggml_mul_mat_id_is_partial(mm1)) {
+        return false;
+    }
 
     // MXFP4 experts live in the repack extra buffer, which has its own NUMA-aware
     // MUL_MAT_ID and runs from ggml_cpu_extra_compute_forward. Fusing would bypass it.
@@ -3762,14 +3824,14 @@ static bool ggml_cpu_moe_fuse_up_gate_match(
     if (!ggml_is_contiguous(gate->src[1]) && gate->src[1]->type == vec_dot_type) {
         return false;
     }
-    if (!iqk_mul_mat_moe_supported(gate0->ne[0], gate0->type, vec_dot_type)) {
+    if (!g128 && !iqk_mul_mat_moe_supported(gate0->ne[0], gate0->type, vec_dot_type)) {
         return false;
     }
 
     *gate_out  = gate;
     *up_out    = up;
     *glu_out   = glu;
-    *limit_out = ggml_get_op_params_f32(glu, 3);
+    *limit_out = g128 ? 0.0f : ggml_get_op_params_f32(glu, 3);
     return true;
 }
 
