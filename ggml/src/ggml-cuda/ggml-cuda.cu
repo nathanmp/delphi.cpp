@@ -6455,6 +6455,21 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_host_buffer_type(
 static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
 
+#ifdef GGML_USE_HIP
+    // delphi: the IQ*_K / IQ*_KS kernels come from ik_llama.cpp, which dropped ROCm; on ROCm they fault, so no op with such an operand
+    // is supported here (the model loader refuses to place these weights on a ROCm device).
+    for (const ggml_tensor * t : std::initializer_list<const ggml_tensor *>{op, op->src[0], op->src[1], op->src[2]}) {
+        if (!t) { continue; }
+        switch (t->type) {
+            case GGML_TYPE_IQ2_K: case GGML_TYPE_IQ3_K: case GGML_TYPE_IQ4_K: case GGML_TYPE_IQ5_K: case GGML_TYPE_IQ6_K:
+            case GGML_TYPE_IQ2_KS: case GGML_TYPE_IQ3_KS: case GGML_TYPE_IQ4_KS: case GGML_TYPE_IQ5_KS:
+                return false;
+            default:
+                break;
+        }
+    }
+#endif
+
     // check if all the sources are allocated on this device
     for (int i = 0; i < GGML_MAX_SRC; i++) {
         if (op->src[i] && op->src[i]->buffer && ggml_backend_buft_is_cuda(op->src[i]->buffer->buft)) {

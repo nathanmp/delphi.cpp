@@ -1104,6 +1104,19 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
 }
 
 // find the first buffer type in the list that can use the tensor
+// delphi: weight types that some GPU backends cannot run at all. Placing one there is an error, not a silent CPU fallback:
+// IQ*_K / IQ*_KS (ported from ik_llama.cpp) run on the CPU and CUDA only; Q4_G128 on the CPU and the devices whose backend accepts it.
+static bool is_backend_restricted_type(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_IQ2_K: case GGML_TYPE_IQ3_K: case GGML_TYPE_IQ4_K: case GGML_TYPE_IQ5_K: case GGML_TYPE_IQ6_K:
+        case GGML_TYPE_IQ2_KS: case GGML_TYPE_IQ3_KS: case GGML_TYPE_IQ4_KS: case GGML_TYPE_IQ5_KS:
+        case GGML_TYPE_Q4_G128:
+            return true;
+        default:
+            return false;
+    }
+}
+
 static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hparams, ggml_tensor * tensor, ggml_op op, const buft_list_t * buft_list) {
     GGML_ASSERT(!buft_list->empty());
     for (const auto & cur : *buft_list) {
@@ -1343,10 +1356,23 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             }
         }
 
+        // the device asked for: the override's, else the first (preferred) one of the layer's list
+        ggml_backend_buffer_type_t requested = buft ? buft : buft_list->front().second;
         if (!buft) {
             buft = select_weight_buft(hparams, t_meta, op, buft_list);
             if (!buft) {
                 throw std::runtime_error(format("failed to find a compatible buffer type for tensor %s", tn.str().c_str()));
+            }
+        }
+        if (is_backend_restricted_type(t_meta->type)) {
+            ggml_backend_dev_t req_dev = ggml_backend_buft_get_device(requested);
+            if (req_dev && ggml_backend_dev_type(req_dev) != GGML_BACKEND_DEVICE_TYPE_CPU && !ggml_backend_buft_is_host(requested) &&
+                    !weight_buft_supported(hparams, t_meta, op, requested, req_dev)) {
+                const bool iq_k = t_meta->type != GGML_TYPE_Q4_G128;
+                throw std::runtime_error(format("tensor %s is %s, which %s cannot run: %s; keep it on the CPU (an -ot override matching it to CPU, or fewer -ngl layers)",
+                        tn.str().c_str(), ggml_type_name(t_meta->type), ggml_backend_buft_name(requested),
+                        iq_k ? "IQ_K/IQ_KS types (ported from ik_llama.cpp) run only on the CPU and CUDA backends"
+                             : "Q4_G128 runs only on the CPU and on backends with G128 kernels (ROCm on RDNA4, CUDA)"));
             }
         }
 
