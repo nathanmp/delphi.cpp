@@ -2438,11 +2438,16 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s); // [n_embd, n_expert_used, n_tokens]
     cb(experts, "ffn_moe_down", il);
 
-    // Record prompt routing for the next expert-cache refresh, next to the routed CPU work that already has the IDs.
+    // Record prompt routing for the next expert-cache refresh. The IDs are a view of the full argsort, so a contiguous copy
+    // keeps the CPU transfer small; the record nodes go after the outputs (build_deferred_records), because a CPU split
+    // between layers makes the host wait for the GPU before it can queue the next layer.
     if (expert_cache) {
-        if (auto * rec = expert_cache->build_record(ctx0, selected_experts, il)) {
+        auto * ids = ggml_cont(ctx0, selected_experts);
+        if (auto * rec = expert_cache->build_record(ctx0, ids, il)) {
+            cb(ids, "ffn_cache_record_ids", il);
+            ggml_build_forward_expand(gf, ids);
             cb(rec, "ffn_cache_cpu_record", il);
-            ggml_build_forward_expand(gf, rec);
+            deferred_records.push_back(rec);
         }
     }
 
@@ -4294,6 +4299,13 @@ llm_graph_input_mem_hybrid_iswa * llm_graph_context::build_inp_mem_hybrid_iswa()
     auto inp = std::make_unique<llm_graph_input_mem_hybrid_iswa>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
 
     return (llm_graph_input_mem_hybrid_iswa *) res->add_input(std::move(inp));
+}
+
+void llm_graph_context::build_deferred_records() const {
+    for (auto * rec : deferred_records) {
+        ggml_build_forward_expand(gf, rec);
+    }
+    deferred_records.clear();
 }
 
 void llm_graph_context::build_dense_out(
