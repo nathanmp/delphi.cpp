@@ -286,7 +286,15 @@ void ggml_vec_dot_q4_g128_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs
     *s = sumf;
 }
 
-void ggml_vec_dot_q4_g128_q8_0_rows_generic(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, int ny) {
+void ggml_q4_g128_panel_generic(int n, const void * GGML_RESTRICT vy, void * GGML_RESTRICT panel) {
+    // the generic rows kernel reads the Q8_0 rows directly
+    UNUSED(n);
+    UNUSED(vy);
+    UNUSED(panel);
+}
+
+void ggml_vec_dot_q4_g128_q8_0_rows_generic(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const void * const * panel, int ny) {
+    UNUSED(panel);
     for (int r = 0; r < ny; ++r) {
         ggml_vec_dot_q4_g128_q8_0(n, s + r, 0, vx, 0, vy[r], 0, 1);
     }

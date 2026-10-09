@@ -54,9 +54,15 @@ void ggml_vec_dot_q4_g128_f32(int n, float * GGML_RESTRICT s, size_t bs, const v
 void ggml_vec_dot_q4_g128_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_vec_dot_q4_g128_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 // One G128 weight row against ny <= GGML_Q4_G128_MAX_ROWS Q8_0 activation rows: s[r] = dot(vx, vy[r]), each equal to ggml_vec_dot_q4_g128_q8_0.
+// panel[r] is the activation panel of vy[r] (ggml_q4_g128_panel), built once and reused for every weight row; panel may be NULL.
 #define GGML_Q4_G128_MAX_ROWS 4
-void ggml_vec_dot_q4_g128_q8_0_rows(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, int ny);
-void ggml_vec_dot_q4_g128_q8_0_rows_generic(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, int ny);
+// Activation panel of one Q8_0 row of n values: per 32-value block, the zero-point correction 8*(qy[2k] + qy[2k+1]) as 16
+// int16 and the FP32 scale. 32-byte aligned.
+#define GGML_Q4_G128_PANEL_SIZE(n) ((size_t) (n) / 32 * (32 + sizeof(float)))
+void ggml_q4_g128_panel(int n, const void * GGML_RESTRICT vy, void * GGML_RESTRICT panel);
+void ggml_q4_g128_panel_generic(int n, const void * GGML_RESTRICT vy, void * GGML_RESTRICT panel);
+void ggml_vec_dot_q4_g128_q8_0_rows(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const void * const * panel, int ny);
+void ggml_vec_dot_q4_g128_q8_0_rows_generic(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const void * const * panel, int ny);
 void ggml_vec_dot_q2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_vec_dot_q4_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_vec_dot_q4_1_q8_1(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);

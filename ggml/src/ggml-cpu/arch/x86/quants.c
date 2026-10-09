@@ -712,13 +712,21 @@ static int g128_prefetch_bytes(void) {
 }
 
 // Decodes each 32-weight group once for NR activation rows. Per row, the arithmetic and accumulation order are those of the
-// single-row kernel, so every result is bitwise identical to it.
+// single-row kernel, so every result is bitwise identical to it. With a panel (ggml_q4_g128_panel) the zero-point correction and
+// FP32 scale of each Q8_0 block are loaded instead of recomputed for every weight row; they are the same values.
 static inline __attribute__((always_inline)) void g128_dot_rows(int n, float * GGML_RESTRICT s, const block_q4_g128 * GGML_RESTRICT x,
-        const block_q8_0 * const * y, const int NR, const int pf) {
+        const block_q8_0 * const * y, const void * const * panel, const bool use_panel, const int NR, const int pf) {
     const __m256i ones8  = _mm256_set1_epi8(1);
     const __m256i ones16 = _mm256_set1_epi16(1);
+    const int nb = n / QK8_0;
+    const __m256i * pc[GGML_Q4_G128_MAX_ROWS];
+    const float   * pd[GGML_Q4_G128_MAX_ROWS];
     __m256 acc[GGML_Q4_G128_MAX_ROWS][4];
     for (int r = 0; r < NR; ++r) {
+        if (use_panel) {
+            pc[r] = (const __m256i *) panel[r];
+            pd[r] = (const float *) (pc[r] + nb);
+        }
         for (int g = 0; g < 4; ++g) {
             acc[r][g] = _mm256_setzero_ps();
         }
@@ -733,13 +741,15 @@ static inline __attribute__((always_inline)) void g128_dot_rows(int n, float * G
         for (int g = 0; g < 4; ++g) {
             const __m256i qx = bytes_from_nibbles_32(x[i].qs + 16 * g);
             for (int r = 0; r < NR; ++r) {
-                const block_q8_0 * yg = y[r] + 4 * i + g;
+                const int b = 4 * i + g;
+                const block_q8_0 * yg = y[r] + b;
                 const __m256i qy = _mm256_loadu_si256((const __m256i *) yg->qs);
                 // Unsigned nibbles with a zero-point correction also handle a Q8 code of -128 without sign overflow.
                 const __m256i dot = _mm256_maddubs_epi16(qx, qy);
-                const __m256i correction = _mm256_slli_epi16(_mm256_maddubs_epi16(ones8, qy), 3);
+                const __m256i correction = use_panel ? _mm256_load_si256(pc[r] + b)
+                                                 : _mm256_slli_epi16(_mm256_maddubs_epi16(ones8, qy), 3);
                 const __m256i sums = _mm256_madd_epi16(_mm256_sub_epi16(dot, correction), ones16);
-                const __m256 scale = _mm256_set1_ps(dx * GGML_CPU_FP16_TO_FP32(yg->d));
+                const __m256 scale = _mm256_set1_ps(dx * (use_panel ? pd[r][b] : GGML_CPU_FP16_TO_FP32(yg->d)));
                 acc[r][g] = _mm256_fmadd_ps(scale, _mm256_cvtepi32_ps(sums), acc[r][g]);
             }
         }
@@ -761,26 +771,56 @@ void ggml_vec_dot_q4_g128_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const 
     UNUSED(bs);
 
     const block_q8_0 * y = vy;
-    g128_dot_rows(n, s, vx, &y, 1, g128_prefetch_bytes());
+    g128_dot_rows(n, s, vx, &y, NULL, false, 1, g128_prefetch_bytes());
 #else
     ggml_vec_dot_q4_g128_q8_0_generic(n, s, bs, vx, bx, vy, by, nrc);
 #endif
 }
 
-void ggml_vec_dot_q4_g128_q8_0_rows(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, int ny) {
+void ggml_q4_g128_panel(int n, const void * GGML_RESTRICT vy, void * GGML_RESTRICT panel) {
+#if defined(__AVX2__)
+    const block_q8_0 * GGML_RESTRICT y = vy;
+    const int nb = n / QK8_0;
+    __m256i * pc = (__m256i *) panel;
+    float   * pd = (float *) (pc + nb);
+    const __m256i ones8 = _mm256_set1_epi8(1);
+    for (int b = 0; b < nb; ++b) {
+        const __m256i qy = _mm256_loadu_si256((const __m256i *) y[b].qs);
+        _mm256_store_si256(pc + b, _mm256_slli_epi16(_mm256_maddubs_epi16(ones8, qy), 3));
+        pd[b] = GGML_CPU_FP16_TO_FP32(y[b].d);
+    }
+#else
+    ggml_q4_g128_panel_generic(n, vy, panel);
+#endif
+}
+
+void ggml_vec_dot_q4_g128_q8_0_rows(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, const void * const * panel, int ny) {
 #if defined(__AVX2__)
     assert(n % QK4_G128 == 0);
     const block_q8_0 * const * y = (const block_q8_0 * const *) vy;
-    // Several rows make the kernel compute-bound; the prefetch then only costs issue slots (2026-10-08 microbenchmark).
+    // Several rows make the kernel compute-bound; the prefetch then only costs issue slots (2026-10-08 microbenchmark). Four
+    // rows run as two pairs over the L1-resident weight row: 16 accumulators spill (MUL_MAT_ID microbenchmark: 110 -> 99 us
+    // per expert matrix), while three rows as a pair and a single are slower (79 -> 85 us).
+    if (panel) {
+        switch (ny) {
+            case 1: g128_dot_rows(n, s, vx, y, panel, true, 1, g128_prefetch_bytes()); return;
+            case 2: g128_dot_rows(n, s, vx, y, panel, true, 2, 0); return;
+            case 3: g128_dot_rows(n, s, vx, y, panel, true, 3, 0); return;
+            case 4: g128_dot_rows(n, s, vx, y, panel, true, 2, 0);
+                    g128_dot_rows(n, s + 2, vx, y + 2, panel + 2, true, 2, 0); return;
+            default: break;
+        }
+    }
     switch (ny) {
-        case 1: g128_dot_rows(n, s, vx, y, 1, g128_prefetch_bytes()); break;
-        case 2: g128_dot_rows(n, s, vx, y, 2, 0); break;
-        case 3: g128_dot_rows(n, s, vx, y, 3, 0); break;
-        case 4: g128_dot_rows(n, s, vx, y, 4, 0); break;
+        case 1: g128_dot_rows(n, s, vx, y, NULL, false, 1, g128_prefetch_bytes()); break;
+        case 2: g128_dot_rows(n, s, vx, y, NULL, false, 2, 0); break;
+        case 3: g128_dot_rows(n, s, vx, y, NULL, false, 3, 0); break;
+        case 4: g128_dot_rows(n, s, vx, y, NULL, false, 2, 0);
+                g128_dot_rows(n, s + 2, vx, y + 2, NULL, false, 2, 0); break;
         default: GGML_ABORT("ny %d > GGML_Q4_G128_MAX_ROWS", ny);
     }
 #else
-    ggml_vec_dot_q4_g128_q8_0_rows_generic(n, s, vx, vy, ny);
+    ggml_vec_dot_q4_g128_q8_0_rows_generic(n, s, vx, vy, panel, ny);
 #endif
 }
 

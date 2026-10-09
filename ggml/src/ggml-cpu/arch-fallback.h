@@ -7,6 +7,7 @@
 #if defined(GGML_CPU_GENERIC) || !(defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64))
 #define ggml_vec_dot_q4_g128_q8_0_generic ggml_vec_dot_q4_g128_q8_0
 #define ggml_vec_dot_q4_g128_q8_0_rows_generic ggml_vec_dot_q4_g128_q8_0_rows
+#define ggml_q4_g128_panel_generic ggml_q4_g128_panel
 #endif
 
 #if defined(GGML_CPU_GENERIC)

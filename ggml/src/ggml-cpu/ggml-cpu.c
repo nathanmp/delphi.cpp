@@ -1790,6 +1790,26 @@ static bool ggml_cpu_g128_rows_enabled(void) {
     return enabled != 0;
 }
 
+// GGML_CPU_G128_PANEL=0 recomputes the activation correction and scale per weight row (A/B).
+static bool ggml_cpu_g128_panel_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char * env = getenv("GGML_CPU_G128_PANEL");
+        enabled = env ? atoi(env) != 0 : 1;
+    }
+    return enabled != 0;
+}
+
+static bool ggml_cpu_g128_rows_supported(const struct ggml_tensor * src0) {
+    return src0->type == GGML_TYPE_Q4_G128 && type_traits_cpu[src0->type].vec_dot_type == GGML_TYPE_Q8_0 &&
+        ggml_cpu_g128_rows_enabled();
+}
+
+// Bytes of one thread's G128 activation panels (GGML_Q4_G128_MAX_ROWS rows of ne00 values).
+static size_t ggml_cpu_g128_panels_size(int64_t ne00) {
+    return GGML_Q4_G128_MAX_ROWS * GGML_PAD(GGML_Q4_G128_PANEL_SIZE(ne00), 64);
+}
+
 static void ggml_compute_forward_mul_mat_id_one_chunk(
     struct ggml_tensor * dst,
     const struct ggml_tensor * src0,
@@ -1804,7 +1824,8 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
     const struct mmid_row_mapping * matrix_rows,
     const size_t row_size,
     const bool src1_cont,
-    const void * wdata) {
+    const void * wdata,
+    char * g128_panels) {
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -1813,12 +1834,18 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
     ggml_vec_dot_t    const vec_dot      = type_traits_cpu[type].vec_dot;
     enum ggml_type    const vec_dot_type = type_traits_cpu[type].vec_dot_type;
 
-    if (type == GGML_TYPE_Q4_G128 && vec_dot_type == GGML_TYPE_Q8_0 && ggml_cpu_g128_rows_enabled()) {
+    if (g128_panels) {
         // Decode each weight row once for up to GGML_Q4_G128_MAX_ROWS of this expert's tokens (MTP verification and small
-        // batches route a few tokens to the same expert). The results equal the per-row vec_dot.
+        // batches route a few tokens to the same expert), with each token's activation panel built once for all weight rows.
+        // The results equal the per-row vec_dot.
+        const size_t panel_stride = ggml_cpu_g128_panels_size(ne00) / GGML_Q4_G128_MAX_ROWS;
+        const bool use_panel = ggml_cpu_g128_panel_enabled();
         for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += GGML_Q4_G128_MAX_ROWS) {
             const int ny = (int) MIN(GGML_Q4_G128_MAX_ROWS, ir1_end - iir1);
+            // a single row is memory-bound: building its panel would only add work
+            const bool panel = use_panel && ny > 1;
             const void * cols[GGML_Q4_G128_MAX_ROWS];
+            const void * panels[GGML_Q4_G128_MAX_ROWS];
             float * dsts[GGML_Q4_G128_MAX_ROWS];
             for (int r = 0; r < ny; ++r) {
                 const struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, iir1 + r);
@@ -1828,10 +1855,14 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
                         ? (i11 + i12*ne11)*row_size
                         : (i11*nb11 + i12*nb12));
                 dsts[r] = (float *) ((char *) dst->data + (row_mapping.i1*nb1 + i12*nb2));
+                panels[r] = g128_panels + r * panel_stride;
+                if (panel) {
+                    ggml_q4_g128_panel(ne00, cols[r], g128_panels + r * panel_stride);
+                }
             }
             for (int64_t ir0 = ir0_start; ir0 < ir0_end; ++ir0) {
                 float out[GGML_Q4_G128_MAX_ROWS];
-                ggml_vec_dot_q4_g128_q8_0_rows(ne00, out, src0_cur + ir0*nb01, cols, ny);
+                ggml_vec_dot_q4_g128_q8_0_rows(ne00, out, src0_cur + ir0*nb01, cols, panel ? panels : NULL, ny);
                 for (int r = 0; r < ny; ++r) {
                     dsts[r][ir0] = out[r];
                 }
@@ -1966,6 +1997,13 @@ static void ggml_compute_forward_mul_mat_id_impl(
 
     if (iqp) {
         iqp_panels = incr_ptr_aligned(&wdata_cur, nth * ggml_cpu_iqp_scratch_size(dst), 64);
+    }
+
+    char * g128_panels = NULL;
+
+    if (ggml_cpu_g128_rows_supported(src0)) {
+        const size_t size = ggml_cpu_g128_panels_size(ne00);
+        g128_panels = (char *) incr_ptr_aligned(&wdata_cur, nth * size, 64) + (size_t) params->ith * size;
     }
 
     GGML_ASSERT(params->wsize >= (size_t)((char *) wdata_cur - (char *) params->wdata));
@@ -2187,7 +2225,7 @@ static void ggml_compute_forward_mul_mat_id_impl(
             ggml_compute_forward_mul_mat_id_one_chunk(
                 dst, src0, src1, ids, cur_a,
                 ir0_start, ir0_end, ir1_start, ir1_end,
-                src0_cur, matrix_rows, row_size, src1_cont, wdata
+                src0_cur, matrix_rows, row_size, src1_cont, wdata, g128_panels
             );
 
             if (work_nth >= nchunk0 * nchunk1) {
@@ -3496,6 +3534,10 @@ struct ggml_cplan ggml_graph_plan(
                         // the IQ panel path needs one scratch panel per thread on top of that
                         if (ggml_cpu_iqp_supports_mul_mat_id(node)) {
                             cur += n_tasks * ggml_cpu_iqp_scratch_size(node) + 64;
+                        }
+                        // G128 activation panels, one set per thread
+                        if (ggml_cpu_g128_rows_supported(src0)) {
+                            cur += n_tasks * ggml_cpu_g128_panels_size(src0->ne[0]) + 64;
                         }
                     } break;
                 case GGML_OP_OUT_PROD:
