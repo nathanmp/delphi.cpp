@@ -19,7 +19,8 @@ namespace {
 constexpr int MAX_ROWS = 16;
 constexpr int MAX_TOPK = 16;
 constexpr int MAX_SLOTS = MAX_ROWS * MAX_TOPK;
-constexpr int BATCH_ROWS = 1024;
+constexpr int BATCH_ROWS_DEFAULT = 4096;
+constexpr int TILE_ROWS = 32;
 constexpr int BATCH_MIN_ROWS = 64;
 
 struct bank {
@@ -52,10 +53,10 @@ struct scratch {
 };
 
 struct batch_scratch {
-    int device;
+    int device, rows;
     void * base;
     size_t bytes;
-    int * offsets, * slots, * schedule, * group_offsets;
+    int * offsets, * slots, * schedule, * group_offsets, * xsum, * hsum;
     int8_t * xq, * hq;
     float * xd, * hd, * hidden, * down;
 };
@@ -81,10 +82,25 @@ __device__ __forceinline__ int code_at(const char * src, int k, int n, int out, 
     return (group[2 + (j / 32) * 16 + j % 16] >> (j % 32 >= 16 ? 4 : 0)) & 15;
 }
 
+// Packed scales are [N/16][K/128][16]: the 16 outputs of a tile and group are adjacent, so half a wave loads its 8 at once.
+__host__ __device__ __forceinline__ size_t packed_scale_index(int k, int out, int group) {
+    return (size_t(out / 16) * (k / 128) + group) * 16 + out % 16;
+}
+
 __device__ __forceinline__ float scale_at(const char * src, int k, int n, int out, int group, bool packed) {
-    const uint16_t * d = packed ? reinterpret_cast<const uint16_t *>(src + size_t(k) * n / 2) + size_t(out) * (k / 128) + group :
+    const uint16_t * d = packed ? reinterpret_cast<const uint16_t *>(src + size_t(k) * n / 2) + packed_scale_index(k, out, group) :
         reinterpret_cast<const uint16_t *>(src + (size_t(out) * (k / 128) + group) * 66);
     return __uint_as_float(unsigned(*d) << 16);
+}
+
+// N (4 or 8) adjacent packed scales of one group; out must be a multiple of N.
+template <int N> __device__ __forceinline__ void scales_at(const char * src, int k, int n, int out, int group, float (&s)[N]) {
+    const uint16_t * d = reinterpret_cast<const uint16_t *>(src + size_t(k) * n / 2) + packed_scale_index(k, out, group);
+    unsigned w[N / 2];
+    if constexpr (N == 4) { const uint2 v = *reinterpret_cast<const uint2 *>(d); w[0] = v.x; w[1] = v.y; }
+    else { static_assert(N == 8, "4 or 8 scales"); const uint4 v = *reinterpret_cast<const uint4 *>(d); w[0] = v.x; w[1] = v.y; w[2] = v.z; w[3] = v.w; }
+#pragma unroll
+    for (int i = 0; i < N; ++i) { s[i] = __uint_as_float(i % 2 ? w[i / 2] & 0xffff0000u : w[i / 2] << 16); }
 }
 
 __device__ __forceinline__ void unpack8(unsigned q, int & lo, int & hi) {
@@ -122,7 +138,7 @@ __global__ void pack_tiles(const char * src, char * dst, size_t stride, int k, i
     reinterpret_cast<unsigned *>(d)[(size_t(tile) * (k / 16) + kg * 8 + t8) * 32 + lane] = j % 32 >= 16 ?
         ((x >> 4) & 0x0f0f0f0fu) | (y & 0xf0f0f0f0u) : (x & 0x0f0f0f0fu) | ((y & 0x0f0f0f0fu) << 4);
     if (threadIdx.x < 16) {
-        reinterpret_cast<uint16_t *>(d + size_t(k) * n / 2)[size_t(tile * 16 + threadIdx.x) * kgs + kg] = g[threadIdx.x * 33];
+        reinterpret_cast<uint16_t *>(d + size_t(k) * n / 2)[packed_scale_index(k, tile * 16 + threadIdx.x, kg)] = g[threadIdx.x * 33];
     }
 }
 
@@ -132,7 +148,7 @@ __global__ void unpack_groups(const char * src, char * dst, size_t stride, int k
         const size_t e = i / groups, g = i % groups;
         const int out = g / (k / 128), kg = g % (k / 128);
         char * p = dst + e * stride + g * 66;
-        *reinterpret_cast<uint16_t *>(p) = reinterpret_cast<const uint16_t *>(src + e * stride + size_t(k) * n / 2)[g];
+        *reinterpret_cast<uint16_t *>(p) = reinterpret_cast<const uint16_t *>(src + e * stride + size_t(k) * n / 2)[packed_scale_index(k, out, kg)];
         for (int b = 0; b < 4; ++b) {
             for (int j = 0; j < 16; ++j) {
                 p[2 + b * 16 + j] = code_at(src + e * stride, k, n, out, kg * 128 + b * 32 + j, true) |
@@ -179,8 +195,11 @@ __global__ void group_routes(const int * ids, routes * r, int slots, int group_r
     }
 }
 
-__global__ void quantize_i8(const float * x, int8_t * q, float * d, int k, size_t row_stride, int rows_per_token, size_t token_stride) {
+// sums (optional): each group's integer code sum, the zero-point term of batch_tiles.
+__global__ void quantize_i8(const float * x, int8_t * q, float * d, int k, size_t row_stride, int rows_per_token, size_t token_stride,
+        int * sums = nullptr) {
     __shared__ float a[128];
+    __shared__ int c[4];
     const int j = threadIdx.x, g = blockIdx.x, row = blockIdx.y;
     const float * input = reinterpret_cast<const float *>(reinterpret_cast<const char *>(x) + (row % rows_per_token) * row_stride +
         (row / rows_per_token) * token_stride);
@@ -192,8 +211,16 @@ __global__ void quantize_i8(const float * x, int8_t * q, float * d, int k, size_
         __syncthreads();
     }
     const float scale = a[0] / 127.0f, inv = scale > 0.0f ? 1.0f / scale : 0.0f;
-    q[size_t(row) * k + g * 128 + j] = int8_t(fminf(127.0f, fmaxf(-127.0f, rintf(v * inv))));
+    const int8_t code = int8_t(fminf(127.0f, fmaxf(-127.0f, rintf(v * inv))));
+    q[size_t(row) * k + g * 128 + j] = code;
     if (j == 0) { d[size_t(row) * (k / 128) + g] = scale; }
+    if (sums) {
+        int sum = code;
+        for (int o = 16; o; o /= 2) { sum += __shfl_xor(sum, o, 32); }
+        if (j % 32 == 0) { c[j / 32] = sum; }
+        __syncthreads();
+        if (j == 0) { sums[size_t(row) * (k / 128) + g] = c[0] + c[1] + c[2] + c[3]; }
+    }
 }
 
 // Four waves divide K128 groups; lanes share coalesced K8 loads. Reuse a weight word across routed rows.
@@ -312,13 +339,14 @@ template<bool GATE_UP,int ROWS,int FILTER_ROWS=0,int WAVES=4> __device__ __force
 #pragma unroll
         for(int row=0;row<ROWS;++row)if(row<nr){
             int slot=r->slots[group*MAX_ROWS+row],xr=GATE_UP?slot/topk:slot;float xs=dx[size_t(xr)*(k/128)+kg];
+            float ws[4],us[4];scales_at(wb.data+expert*wb.stride,k,n,base,kg,ws);if constexpr(GATE_UP)scales_at(ub.data+expert*ub.stride,k,n,base,kg,us);
 #pragma unroll
             for(int col=0;col<4;++col){
                 int dot=acc[row][col],udot=accu[row][col];
 #pragma unroll
                 for(int stride=4;stride<=16;stride*=2){dot+=__shfl_xor(dot,stride);if constexpr(GATE_UP)udot+=__shfl_xor(udot,stride);}
-                float ws=scale_at(wb.data+expert*wb.stride,k,n,base+col,kg,true);sum[row][col]+=float(dot)*(ws*xs);
-                if constexpr(GATE_UP){float ups=scale_at(ub.data+expert*ub.stride,k,n,base+col,kg,true);sumu[row][col]+=float(udot)*(ups*xs);}
+                sum[row][col]+=float(dot)*(ws[col]*xs);
+                if constexpr(GATE_UP){sumu[row][col]+=float(udot)*(us[col]*xs);}
             }
         }
     }
@@ -389,10 +417,12 @@ __device__ __forceinline__ void wmma_tile_body(bank w, bank u, const int8_t * x,
             if constexpr (GATE_UP) { accu = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true, ua, true, b, accu, false); }
         }
         const float xs = col < nr ? dx[size_t(xr) * (w.k / 128) + kg] : 0.0f;
+        float ws[8], us[8];
+        scales_at(wp, w.k, w.n, tile * 16 + (lane / 16) * 8, kg, ws);
+        if constexpr (GATE_UP) { scales_at(up, u.k, u.n, tile * 16 + (lane / 16) * 8, kg, us); }
         for (int j = 0; j < 8; ++j) {
-            const int out = tile * 16 + (lane / 16) * 8 + j;
-            sum[j] += float(acc[j]) * (scale_at(wp, w.k, w.n, out, kg, true) * xs);
-            if constexpr (GATE_UP) { sumu[j] += float(accu[j]) * (scale_at(up, u.k, u.n, out, kg, true) * xs); }
+            sum[j] += float(acc[j]) * (ws[j] * xs);
+            if constexpr (GATE_UP) { sumu[j] += float(accu[j]) * (us[j] * xs); }
         }
     }
     if (col < nr) {
@@ -413,12 +443,12 @@ __device__ __forceinline__ void wmma_body(bank w, bank u, const int8_t * x, cons
 }
 
 // Expert offsets come from the shared stable counting sort. Only the small group-count scan is new.
-__global__ void batch_group_offsets(const int * offsets, int * groups, int experts) {
+__global__ void batch_group_offsets(const int * offsets, int * groups, int experts, int rows) {
     __shared__ int scan[256];
     const int chunk = (experts + 255) / 256;
     const int begin = min(int(threadIdx.x) * chunk, experts), end = min(begin + chunk, experts);
     int sum = 0;
-    for (int e = begin; e < end; ++e) { sum += (offsets[e + 1] - offsets[e] + MAX_ROWS - 1) / MAX_ROWS; }
+    for (int e = begin; e < end; ++e) { sum += (offsets[e + 1] - offsets[e] + rows - 1) / rows; }
     scan[threadIdx.x] = sum;
     __syncthreads();
     for (int step = 1; step < 256; step *= 2) {
@@ -430,7 +460,7 @@ __global__ void batch_group_offsets(const int * offsets, int * groups, int exper
     int base = scan[threadIdx.x] - sum;
     for (int e = begin; e < end; ++e) {
         groups[e] = base;
-        base += (offsets[e + 1] - offsets[e] + MAX_ROWS - 1) / MAX_ROWS;
+        base += (offsets[e + 1] - offsets[e] + rows - 1) / rows;
     }
     if (threadIdx.x == 255) { groups[experts] = scan[255]; }
 }
@@ -447,6 +477,188 @@ template <bool GATE_UP> __global__ void batch_projection(bank w, bank u, const i
     const int start = offsets[lo] + (group - groups[lo]) * MAX_ROWS;
     const int count = min(MAX_ROWS, offsets[lo + 1] - start);
     wmma_tile_body<GATE_UP>(w, u, x, dx, slots + start, lo, count, y, topk, limit);
+}
+
+// Register-blocked G128 x Q8 batch tiles. Each wave owns MT routed-row tiles x NT output tiles (x2 for gate/up):
+// one weight fragment feeds MT WMMAs and one activation fragment feeds NT (2NT) WMMAs. Codes enter the WMMA
+// unsigned (q in 0..15) and the zero point is the accumulator start, -8 * (sum of the group's activation codes),
+// so the integer group dot is unchanged; the F32 scale/accumulate order matches wmma_tile_body exactly.
+// QUANT (gate/up only): the block's WAVES x NT tiles are one 128-wide group, which the epilogue quantizes to Q8
+// as quantize_i8 would, writing codes, scale and code sum for the down projection.
+template <bool GATE_UP, int MT, int NT, int WAVES, bool QUANT>
+__global__ __launch_bounds__(WAVES * 32) void batch_tiles(bank w, bank u, const int8_t * x, const float * dx, const int * xsum,
+        const int * offsets, const int * groups, const int * slots, int experts, float * y, int8_t * yq, float * yd, int * ysum,
+        int topk, float limit) {
+#if defined(RDNA4)
+    using i2 = int __attribute__((ext_vector_type(2)));
+    using i8 = int __attribute__((ext_vector_type(8)));
+    using f8 = float __attribute__((ext_vector_type(8)));
+    using u4 = unsigned __attribute__((ext_vector_type(4)));
+    constexpr int ROWS = MT * 16, G = GATE_UP ? 2 : 1;
+    static_assert(!QUANT || (GATE_UP && WAVES * NT * 16 == 128), "a quantizing block covers one 128-wide group");
+    const int group = blockIdx.y;
+    if (group >= groups[experts]) { return; }
+    int lo = 0, hi = experts;
+    while (lo < hi) {
+        const int mid = (lo + hi) / 2;
+        if (groups[mid + 1] <= group) { lo = mid + 1; } else { hi = mid; }
+    }
+    const int start = offsets[lo] + (group - groups[lo]) * ROWS;
+    const int count = min(ROWS, offsets[lo + 1] - start);
+    const int lane = threadIdx.x % 32, col = lane % 16, half = lane / 16, wave = __builtin_amdgcn_readfirstlane(threadIdx.x / 32);
+    const int ntiles = w.n / 16, tile0 = (blockIdx.x * WAVES + wave) * NT;
+    if (!QUANT && tile0 >= ntiles) { return; }
+    const int K = w.k, KG = K / 128;
+    const char * wp[G];
+    wp[0] = w.data + size_t(lo) * w.stride;
+    if constexpr (GATE_UP) { wp[1] = u.data + size_t(lo) * u.stride; }
+    int slot[MT];
+    const int8_t * xp[MT];
+    const float * xsp[MT];
+    const int * xcp[MT];
+#pragma unroll
+    for (int i = 0; i < MT; ++i) {
+        const int r = i * 16 + col, s = slots[start + min(r, count - 1)], xr = GATE_UP ? s / topk : s;
+        slot[i] = r < count ? s : -1;
+        xp[i] = x + size_t(xr) * K + half * 8;
+        xsp[i] = dx + size_t(xr) * KG;
+        xcp[i] = xsum + size_t(xr) * KG;
+    }
+    const unsigned * wq[G][NT];
+    const uint16_t * ws[G][NT];
+#pragma unroll
+    for (int g = 0; g < G; ++g) {
+#pragma unroll
+        for (int j = 0; j < NT; ++j) {
+            const int t = min(tile0 + j, ntiles - 1);
+            wq[g][j] = reinterpret_cast<const unsigned *>(wp[g]) + size_t(t) * (K / 16) * 32 + lane;
+            ws[g][j] = reinterpret_cast<const uint16_t *>(wp[g] + size_t(K) * w.n / 2) + size_t(t) * KG * 16 + half * 8;
+        }
+    }
+    f8 sum[G][NT][MT];
+#pragma unroll
+    for (int g = 0; g < G; ++g)
+#pragma unroll
+        for (int j = 0; j < NT; ++j)
+#pragma unroll
+            for (int i = 0; i < MT; ++i) { sum[g][j][i] = f8{}; }
+    for (int kg = 0; kg < KG; ++kg) {
+        unsigned word[G][NT][8];
+#pragma unroll
+        for (int g = 0; g < G; ++g)
+#pragma unroll
+            for (int j = 0; j < NT; ++j)
+#pragma unroll
+                for (int t = 0; t < 8; ++t) { word[g][j][t] = wq[g][j][(kg * 8 + t) * 32]; }
+        u4 sc[G][NT];
+#pragma unroll
+        for (int g = 0; g < G; ++g)
+#pragma unroll
+            for (int j = 0; j < NT; ++j) { sc[g][j] = *reinterpret_cast<const u4 *>(ws[g][j] + kg * 16); }
+        i8 acc[G][NT][MT], init[MT];
+#pragma unroll
+        for (int i = 0; i < MT; ++i) { const int c = -8 * xcp[i][kg]; init[i] = i8{c, c, c, c, c, c, c, c}; }
+#pragma unroll
+        for (int t = 0; t < 8; ++t) {
+            i2 b[MT];
+#pragma unroll
+            for (int i = 0; i < MT; ++i) {
+                const int * p = reinterpret_cast<const int *>(xp[i] + kg * 128 + t * 16);
+                b[i][0] = p[0]; b[i][1] = p[1];
+            }
+#pragma unroll
+            for (int g = 0; g < G; ++g)
+#pragma unroll
+                for (int j = 0; j < NT; ++j) {
+                    const unsigned q = word[g][j][t];
+                    i2 a; a[0] = int(q & 0x0f0f0f0fu); a[1] = int((q >> 4) & 0x0f0f0f0fu);
+#pragma unroll
+                    for (int i = 0; i < MT; ++i) {
+                        acc[g][j][i] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, a, true, b[i], t == 0 ? init[i] : acc[g][j][i], false);
+                    }
+                }
+        }
+        float xs[MT];
+#pragma unroll
+        for (int i = 0; i < MT; ++i) { xs[i] = xsp[i][kg]; }
+#pragma unroll
+        for (int g = 0; g < G; ++g)
+#pragma unroll
+            for (int j = 0; j < NT; ++j)
+#pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    const unsigned pair = sc[g][j][e / 2];
+                    const float s = __uint_as_float(e % 2 ? pair & 0xffff0000u : pair << 16);
+#pragma unroll
+                    for (int i = 0; i < MT; ++i) { sum[g][j][i][e] += float(acc[g][j][i][e]) * (s * xs[i]); }
+                }
+    }
+    if constexpr (QUANT) {
+        __shared__ float amax[WAVES][ROWS];
+        __shared__ int csum[WAVES][ROWS];
+        float v[NT][MT][8], m[MT];
+#pragma unroll
+        for (int i = 0; i < MT; ++i) {
+            m[i] = 0.0f;
+#pragma unroll
+            for (int j = 0; j < NT; ++j)
+#pragma unroll
+                for (int e = 0; e < 8; ++e) { v[j][i][e] = activate(sum[0][j][i][e], sum[1][j][i][e], limit); m[i] = fmaxf(m[i], fabsf(v[j][i][e])); }
+            m[i] = fmaxf(m[i], __shfl_xor(m[i], 16, 32));
+            if (half == 0) { amax[wave][i * 16 + col] = m[i]; }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int i = 0; i < MT; ++i) {
+            float a = amax[0][i * 16 + col];
+#pragma unroll
+            for (int o = 1; o < WAVES; ++o) { a = fmaxf(a, amax[o][i * 16 + col]); }
+            const float scale = a / 127.0f, inv = scale > 0.0f ? 1.0f / scale : 0.0f;
+            int c = 0;
+#pragma unroll
+            for (int j = 0; j < NT; ++j) {
+                unsigned packed[2] = {0, 0};
+#pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    const int q = int(int8_t(fminf(127.0f, fmaxf(-127.0f, rintf(v[j][i][e] * inv)))));
+                    c += q;
+                    packed[e / 4] |= unsigned(q & 0xff) << (8 * (e % 4));
+                }
+                if (slot[i] >= 0) {
+                    *reinterpret_cast<uint2 *>(yq + size_t(slot[i]) * w.n + (tile0 + j) * 16 + half * 8) = make_uint2(packed[0], packed[1]);
+                }
+            }
+            c += __shfl_xor(c, 16, 32);
+            if (half == 0) { csum[wave][i * 16 + col] = c; }
+            if (wave == 0 && half == 0 && slot[i] >= 0) { yd[size_t(slot[i]) * (w.n / 128) + blockIdx.x] = scale; }
+        }
+        __syncthreads();
+        if (wave == 0 && half == 0) {
+#pragma unroll
+            for (int i = 0; i < MT; ++i) {
+                if (slot[i] < 0) { continue; }
+                int c = 0;
+#pragma unroll
+                for (int o = 0; o < WAVES; ++o) { c += csum[o][i * 16 + col]; }
+                ysum[size_t(slot[i]) * (w.n / 128) + blockIdx.x] = c;
+            }
+        }
+        return;
+    }
+#pragma unroll
+    for (int j = 0; j < NT; ++j) {
+        if (tile0 + j >= ntiles) { break; }
+#pragma unroll
+        for (int i = 0; i < MT; ++i) {
+            if (slot[i] < 0) { continue; }
+            float * o = y + size_t(slot[i]) * w.n + (tile0 + j) * 16 + half * 8;
+#pragma unroll
+            for (int e = 0; e < 8; ++e) { o[e] = GATE_UP ? activate(sum[0][j][i][e], sum[G - 1][j][i][e], limit) : sum[0][j][i][e]; }
+        }
+    }
+#else
+    GGML_UNUSED_VARS(w, u, x, dx, xsum, offsets, groups, slots, experts, y, yq, yd, ysum, topk, limit);
+#endif
 }
 
 template <bool GATE_UP, int MIN_ROWS = 0> __global__ void wmma_projection(
@@ -569,33 +781,59 @@ bool batch_enabled(int rows) {
     return enabled && rows >= BATCH_MIN_ROWS;
 }
 
-batch_scratch * get_batch_scratch(ggml_backend_cuda_context & ctx, int h, int f, int experts, int topk, bool create) {
+// GGML_HIP_MOE_INT4_TILES=0 restores the 16-row single-tile batch kernels (with their float hidden buffer).
+bool tiles_enabled() {
+    static const bool enabled = [] { const char * p = getenv("GGML_HIP_MOE_INT4_TILES"); return !p || atoi(p) != 0; }();
+    return enabled;
+}
+
+// Rows per batch call: experts are re-read once per call, scratch grows by about topk * (h + f) * 5 bytes per row.
+int batch_rows_per_call() {
+    static const int rows = [] { const char * p = getenv("GGML_HIP_MOE_INT4_BATCH_ROWS"); return p ? std::max(BATCH_MIN_ROWS, atoi(p)) : BATCH_ROWS_DEFAULT; }();
+    return rows;
+}
+
+// Sized for the largest batch seen, up to batch_rows_per_call(): a smaller scratch only means more calls per batch.
+batch_scratch * get_batch_scratch(ggml_backend_cuda_context & ctx, int h, int f, int experts, int topk, int rows, bool create) {
     const auto key = std::make_tuple(&ctx, ctx.curr_stream_no, h, f, experts, topk);
+    const int want = std::min(batch_rows_per_call(), (rows + 255) / 256 * 256);
     std::lock_guard<std::mutex> lock(state_mutex);
     auto it = batch_scratches.find(key);
-    if (it != batch_scratches.end()) { return &it->second; }
+    if (it != batch_scratches.end()) {
+        if (it->second.rows >= want || !create || capturing(ctx)) { return &it->second; }
+        CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+        CUDA_CHECK(cudaFree(it->second.base));
+        scratch_bytes -= it->second.bytes;
+        batch_scratches.erase(it);
+    }
     if (!create || capturing(ctx)) { return nullptr; }
     batch_scratch s{};
     s.device = ctx.device;
-    const size_t slots = size_t(BATCH_ROWS) * topk;
+    s.rows = want;
+    const bool tiles = tiles_enabled();
+    const size_t slots = size_t(s.rows) * topk;
     const size_t schedule = ggml_cuda_moe_schedule_scratch_size(experts, slots);
-    const size_t integers = 2 * (experts + 1) + slots + schedule;
-    const size_t xq = size_t(BATCH_ROWS) * h, hq = slots * f;
-    const size_t xd = size_t(BATCH_ROWS) * (h / 128), hd = slots * (f / 128);
-    s.bytes = integers * sizeof(int) + xq + hq + (xd + hd + slots * (h + f)) * sizeof(float);
+    const size_t xq = size_t(s.rows) * h, hq = slots * f;
+    const size_t xd = size_t(s.rows) * (h / 128), hd = slots * (f / 128);
+    const size_t integers = 2 * (experts + 1) + slots + schedule + xd + hd;
+    s.bytes = integers * sizeof(int) + xq + hq + (xd + hd + slots * (h + (tiles ? 0 : f))) * sizeof(float);
     CUDA_CHECK(cudaMalloc(&s.base, s.bytes));
     char * p = static_cast<char *>(s.base);
     s.offsets = reinterpret_cast<int *>(p); p += (experts + 1) * sizeof(int);
     s.group_offsets = reinterpret_cast<int *>(p); p += (experts + 1) * sizeof(int);
     s.slots = reinterpret_cast<int *>(p); p += slots * sizeof(int);
     s.schedule = reinterpret_cast<int *>(p); p += schedule * sizeof(int);
+    s.xsum = reinterpret_cast<int *>(p); p += xd * sizeof(int);
+    s.hsum = reinterpret_cast<int *>(p); p += hd * sizeof(int);
     s.xq = reinterpret_cast<int8_t *>(p); p += xq;
     s.hq = reinterpret_cast<int8_t *>(p); p += hq;
     s.xd = reinterpret_cast<float *>(p); p += xd * sizeof(float);
     s.hd = reinterpret_cast<float *>(p); p += hd * sizeof(float);
-    s.hidden = reinterpret_cast<float *>(p); p += slots * f * sizeof(float);
+    if (!tiles) { s.hidden = reinterpret_cast<float *>(p); p += slots * f * sizeof(float); }
     s.down = reinterpret_cast<float *>(p);
     scratch_bytes += s.bytes;
+    GGML_LOG_WARN("%s: device %d: %d-row G128 batch scratch, %.1f MiB (%s kernels)\n", __func__, ctx.device, s.rows, s.bytes / 1048576.0,
+        tiles ? "register-tiled" : "single-tile");
     return &batch_scratches.emplace(key, s).first->second;
 }
 
@@ -609,7 +847,20 @@ void run_batch(ggml_backend_cuda_context & ctx, const ggml_cuda_moe_int4_ffn & f
     const float * rw = static_cast<const float *>(f.weights->data) + size_t(start) * topk;
     float * out = static_cast<float *>(f.dst->data) + size_t(start) * h;
     ggml_cuda_moe_schedule_build(ids, ids_stride, m, topk, experts, s.offsets, s.slots, nullptr, s.schedule, stream);
-    batch_group_offsets<<<1, 256, 0, stream>>>(s.offsets, s.group_offsets, experts);
+    if (tiles_enabled()) {
+        // gate/up blocks are one 128-wide group of 32 routed rows; down blocks four waves of 2 x 4 tiles
+        batch_group_offsets<<<1, 256, 0, stream>>>(s.offsets, s.group_offsets, experts, TILE_ROWS);
+        const int groups = std::min(slots, (slots + TILE_ROWS - 1) / TILE_ROWS + experts);
+        quantize_i8<<<dim3(h / 128, m), 128, 0, stream>>>(x, s.xq, s.xd, h, h * sizeof(float), 1, h * sizeof(float), s.xsum);
+        batch_tiles<true, 2, 2, 4, true><<<dim3(ff / 128, groups), 128, 0, stream>>>(gate, up, s.xq, s.xd, s.xsum,
+                s.offsets, s.group_offsets, s.slots, experts, nullptr, s.hq, s.hd, s.hsum, topk, f.limit);
+        batch_tiles<false, 2, 4, 4, false><<<dim3((h / 16 + 15) / 16, groups), 128, 0, stream>>>(down, {}, s.hq, s.hd, s.hsum,
+                s.offsets, s.group_offsets, s.slots, experts, s.down, nullptr, nullptr, nullptr, topk, 0.0f);
+        reduce_slots<<<dim3((h + 255) / 256, m), 256, 0, stream>>>(s.down, rw, out, h, topk);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+    batch_group_offsets<<<1, 256, 0, stream>>>(s.offsets, s.group_offsets, experts, MAX_ROWS);
     const int groups = std::min(slots, (slots + MAX_ROWS - 1) / MAX_ROWS + experts);
     quantize_i8<<<dim3(h / 128, m), 128, 0, stream>>>(x, s.xq, s.xd, h, h * sizeof(float), 1, h * sizeof(float));
     batch_projection<true><<<dim3((ff + 63) / 64, groups), 128, 0, stream>>>(gate, up, s.xq, s.xd,
@@ -744,7 +995,7 @@ bool ggml_cuda_moe_int4_prepare(ggml_backend_cuda_context & ctx, const ggml_cuda
     }
     pack_us += ggml_time_us() - start;
     if (batch_enabled(f.x->ne[2])) {
-        return get_batch_scratch(ctx, f.gate->ne[0], f.gate->ne[1], f.gate->ne[2], f.ids->ne[0], true) != nullptr;
+        return get_batch_scratch(ctx, f.gate->ne[0], f.gate->ne[1], f.gate->ne[2], f.ids->ne[0], f.x->ne[2], true) != nullptr;
     }
     return get_scratch(ctx, f.gate->ne[0], f.gate->ne[1], true) != nullptr;
 }
@@ -752,7 +1003,7 @@ bool ggml_cuda_moe_int4_prepare(ggml_backend_cuda_context & ctx, const ggml_cuda
 bool ggml_cuda_moe_int4_ready(ggml_backend_cuda_context & ctx, const ggml_cuda_moe_int4_ffn & f) {
     if (!eligible(ctx, f)) { return false; }
     if (batch_enabled(f.x->ne[2])) {
-        if (!get_batch_scratch(ctx, f.gate->ne[0], f.gate->ne[1], f.gate->ne[2], f.ids->ne[0], !capturing(ctx))) { return false; }
+        if (!get_batch_scratch(ctx, f.gate->ne[0], f.gate->ne[1], f.gate->ne[2], f.ids->ne[0], f.x->ne[2], !capturing(ctx))) { return false; }
     } else if (!get_scratch(ctx, f.gate->ne[0], f.gate->ne[1], !capturing(ctx))) { return false; }
     std::lock_guard<std::mutex> lock(state_mutex);
     for (const ggml_tensor * t : {f.gate, f.up, f.down}) { auto * s = find_state(ctx.device, t->data); if (!s || !s->packed) { return false; } }
@@ -762,10 +1013,10 @@ bool ggml_cuda_moe_int4_ready(ggml_backend_cuda_context & ctx, const ggml_cuda_m
 void ggml_cuda_moe_int4_run(ggml_backend_cuda_context & ctx, const ggml_cuda_moe_int4_ffn & f) {
     const int rows = f.x->ne[2];
     if (batch_enabled(rows)) {
-        auto * s = get_batch_scratch(ctx, f.gate->ne[0], f.gate->ne[1], f.gate->ne[2], f.ids->ne[0], false);
+        auto * s = get_batch_scratch(ctx, f.gate->ne[0], f.gate->ne[1], f.gate->ne[2], f.ids->ne[0], rows, false);
         GGML_ASSERT(s);
-        for (int start = 0; start < rows; start += BATCH_ROWS) {
-            run_batch(ctx, f, *s, start, std::min(BATCH_ROWS, rows - start));
+        for (int start = 0; start < rows; start += s->rows) {
+            run_batch(ctx, f, *s, start, std::min(s->rows, rows - start));
         }
         runs++; batch_runs++; batch_rows += rows;
         return;
@@ -916,7 +1167,7 @@ static void moe_int4_pack_host(int k, int n, size_t stride, void * dst, const vo
         for (int r = 0; r < 16; ++r) {
             const size_t gi = size_t(tile * 16 + r) * kgs + kg;
             const uint8_t * g = s + gi * 66;
-            memcpy(scales + gi, g, 2);
+            memcpy(scales + packed_scale_index(k, tile * 16 + r, kg), g, 2);
             for (int sb = 0; sb < 4; ++sb) {
                 uint64_t a, b;
                 memcpy(&a, g + 2 + sb * 16, 8);
