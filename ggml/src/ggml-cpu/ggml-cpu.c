@@ -3779,6 +3779,11 @@ static bool ggml_cpu_moe_fuse_up_gate_match(
     struct ggml_tensor * mm1 = cgraph->nodes[node_n + 1];
     struct ggml_tensor * glu = cgraph->nodes[node_n + 2];
 
+    // an empty node (no output rows in this ubatch) is skipped by the unfused path; the fused one must not run it either
+    if (ggml_is_empty(mm0) || ggml_is_empty(mm1)) {
+        return false;
+    }
+
     if (ggml_get_op_params_i32(glu, 1) != 0 || !glu->src[1]) {
         return false;
     }
