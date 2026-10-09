@@ -317,10 +317,38 @@ static enum ggml_status ggml_backend_cpu_graph_plan_compute(ggml_backend_t backe
     GGML_UNUSED(backend);
 }
 
+// A graph of a few small data-movement nodes (e.g. the expert-cache packet split: an 49 KB copy and an ID mapping) runs on
+// the calling thread: waking the workers costs ~30 us on 48 threads, the work ~2 us (GGML_CPU_SMALL_GRAPH_SERIAL=0: off).
+static bool ggml_backend_cpu_graph_is_small(const struct ggml_cgraph * cgraph) {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CPU_SMALL_GRAPH_SERIAL");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    if (!enabled || cgraph->n_nodes > 8) {
+        return false;
+    }
+    int64_t total = 0;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const struct ggml_tensor * node = cgraph->nodes[i];
+        switch (node->op) {
+            case GGML_OP_NONE: case GGML_OP_RESHAPE: case GGML_OP_VIEW: case GGML_OP_PERMUTE: case GGML_OP_TRANSPOSE:
+                continue;
+            case GGML_OP_DUP: case GGML_OP_CPY: case GGML_OP_CONT: case GGML_OP_GET_ROWS: case GGML_OP_CONCAT:
+            case GGML_OP_CUSTOM:
+                total += ggml_nelements(node);
+                break;
+            default:
+                return false;
+        }
+    }
+    return total <= 65536;
+}
+
 static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
 
-    struct ggml_cplan cplan = ggml_graph_plan(cgraph, cpu_ctx->n_threads, cpu_ctx->threadpool);
+    const int n_threads = ggml_backend_cpu_graph_is_small(cgraph) ? 1 : cpu_ctx->n_threads;
+    struct ggml_cplan cplan = ggml_graph_plan(cgraph, n_threads, cpu_ctx->threadpool);
 
     if (cpu_ctx->work_size < cplan.work_size) {
         delete[] cpu_ctx->work_data;
