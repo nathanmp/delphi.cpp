@@ -1266,6 +1266,8 @@ static char causes[GGML_DEFAULT_GRAPH_SIZE*16 + GGML_SCHED_MAX_SPLITS_DEBUG*GGML
 static int  ggml_backend_sched_stage_spread(ggml_backend_sched_t sched, const struct ggml_tensor * op,
         const struct ggml_tensor * weight, int backend_id);
 static bool ggml_backend_sched_stage_spreading(ggml_backend_sched_t sched);
+static int  ggml_backend_sched_stage_route(ggml_backend_sched_t sched, const struct ggml_tensor * op,
+        const struct ggml_tensor * weight, int cpu_backend_id);
 
 // returns the backend that should be used for the node based on the current locations
 static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, struct ggml_tensor * tensor) {
@@ -1318,6 +1320,12 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
                 int src_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, tensor);
                 // check if a backend with higher prio wants to offload the op
                 if (sched->op_offload && src_backend_id == sched->n_backends - 1 && ggml_backend_buffer_is_host(src->buffer)) {
+                    const int stage_backend_id = ggml_backend_sched_stage_route(sched, tensor, src, src_backend_id);
+                    if (stage_backend_id != -1) {
+                        SET_CAUSE(tensor, stage_backend_id == src_backend_id ? "1.stage.cpu" : "1.stage.gpu");
+                        return stage_backend_id == src_backend_id ? stage_backend_id :
+                            ggml_backend_sched_stage_spread(sched, tensor, src, stage_backend_id);
+                    }
                     const int cost_backend_id = ggml_backend_sched_cost_offload(sched, tensor, src, src_backend_id);
                     if (cost_backend_id != -1) {
                         SET_CAUSE(tensor, cost_backend_id == src_backend_id ? "1.cost.cpu" : "1.cost.gpu");
@@ -3008,6 +3016,7 @@ struct ggml_backend_sched_stage {
     void * lend_user = nullptr;
     int split_weights = 1; // redirected weights per split (GGML_SCHED_STAGE_SPLIT_WEIGHTS)
     bool spread = false;   // GGML_SCHED_STAGE_SPREAD
+    int min_tokens = 512;  // GGML_SCHED_STAGE_MIN_TOKENS
 };
 
 static void ggml_backend_sched_stage_run_job(
@@ -3201,6 +3210,9 @@ static ggml_backend_sched_stage * ggml_backend_sched_stage_new(ggml_backend_sche
     if (const char * e = getenv("GGML_SCHED_STAGE_SPREAD")) {
         stage->spread = atoi(e) != 0;
     }
+    if (const char * e = getenv("GGML_SCHED_STAGE_MIN_TOKENS")) {
+        stage->min_tokens = std::max(0, atoi(e));
+    }
     if (const char * e = getenv("GGML_SCHED_STAGE_SPLIT_WEIGHTS")) {
         stage->split_weights = std::max(1, std::min(stage->n_slots, atoi(e)));
     }
@@ -3381,6 +3393,33 @@ static int ggml_backend_sched_stage_spread(ggml_backend_sched_t sched, const str
 
 static bool ggml_backend_sched_stage_spreading(ggml_backend_sched_t sched) {
     return sched->stage != nullptr && sched->stage->spread;
+}
+
+// GGML_SCHED_STAGE_MIN_TOKENS (default 512): with staging on, a routed-expert multiply (MUL_MAT_ID) on host weights runs on the
+// CPU for a batch of fewer tokens, and on a GPU, which streams the experts, for a wider one. Streaming costs the same for any batch,
+// as all experts cross the link, so a short batch is faster on the CPU. The GPU is the one holding the batch's activations if it
+// can stage, else the first that can. 0 leaves the choice to the offload cost model. -1: not decided here.
+static int ggml_backend_sched_stage_route(ggml_backend_sched_t sched, const struct ggml_tensor * op,
+        const struct ggml_tensor * weight, int cpu_backend_id) {
+    const ggml_backend_sched_stage * stage = sched->stage;
+    if (stage == nullptr || !stage->enabled || stage->min_tokens <= 0 || op->op != GGML_OP_MUL_MAT_ID || op->src[0] != weight) {
+        return -1;
+    }
+    if (op->src[2]->ne[1] < stage->min_tokens) {
+        return cpu_backend_id;
+    }
+    int preferred = -1;
+    ggml_backend_sched_cpu_input_bytes(sched, op, weight, &preferred);
+    if (preferred >= 0 && preferred < cpu_backend_id && stage->rings[preferred].upload != nullptr &&
+            ggml_backend_supports_op(sched->backends[preferred], op)) {
+        return preferred;
+    }
+    for (int b = 0; b < cpu_backend_id; b++) {
+        if (stage->rings[b].upload != nullptr && ggml_backend_supports_op(sched->backends[b], op)) {
+            return b;
+        }
+    }
+    return -1;
 }
 
 static int ggml_backend_sched_stage_split_weights(ggml_backend_sched_t sched) {
