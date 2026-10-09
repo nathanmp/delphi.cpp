@@ -2857,12 +2857,25 @@ struct ggml_backend_sched_stage_item {
     uint64_t seq;                   // job number of the upload
 };
 
+// GGML_SCHED_STAGE_TRACE=<file>: one line per upload job, "slot bytes queued start free issued" in microseconds on the clock
+// of the execution trace (GGML_EXEC_TRACE), so the jobs can be placed against the device spans of the splits
+static int64_t ggml_backend_sched_stage_trace_us(void) {
+#if defined(CLOCK_MONOTONIC_RAW)
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+    return (int64_t) ts.tv_sec*1000000 + ts.tv_nsec/1000;
+#else
+    return ggml_time_us();
+#endif
+}
+
 struct ggml_backend_sched_stage_job {
     int backend_id;
     int slot;
     bool wait_free;
     const void * src;
     size_t size;
+    int64_t t_queued; // GGML_SCHED_STAGE_TRACE
 };
 
 struct ggml_backend_sched_stage_ring {
@@ -2933,12 +2946,20 @@ static void ggml_backend_sched_stage_run_job(
     ggml_backend_sched_stage_ring & ring = stage->rings[job.backend_id];
     ggml_backend_t backend = stage->backends[job.backend_id];
     int64_t t = ggml_time_us();
+    const int64_t t_start = ggml_backend_sched_stage_trace_us();
     auto lap = [&](int64_t & acc) { const int64_t now = ggml_time_us(); acc += now - t; t = now; };
     if (job.wait_free) {
         // a host wait: HIP rejects a copy stream wait on an event of the compute stream while that stream captures
         ggml_backend_event_synchronize(ring.free[job.slot]);
     }
     lap(w->us_free);
+    const int64_t t_free = ggml_backend_sched_stage_trace_us();
+    static FILE * trace = getenv("GGML_SCHED_STAGE_TRACE") ? fopen(getenv("GGML_SCHED_STAGE_TRACE"), "w") : nullptr;
+    struct trace_end {
+        FILE * f; const ggml_backend_sched_stage_job & job; int64_t t_start, t_free;
+        ~trace_end() { if (f) { fprintf(f, "%d %zu %lld %lld %lld %lld\n", job.slot, job.size, (long long) job.t_queued,
+                (long long) t_start, (long long) t_free, (long long) ggml_backend_sched_stage_trace_us()); fflush(f); } }
+    } trace_guard { trace, job, t_start, t_free };
     char * dst = (char *) ring.slots[job.slot];
     if (stage->registrar && stage->registrar->locked(job.src, job.size)) {
         // straight from the page-locked weights
@@ -3240,7 +3261,7 @@ static void ggml_backend_sched_stage_pump(ggml_backend_sched_t sched) {
         ggml_backend_sched_stage_worker * w = stage->workers[item.backend_id].get();
         {
             std::lock_guard<std::mutex> lock(w->mutex);
-            w->jobs.push_back({ item.backend_id, slot, ring.free_recorded[slot], item.input->data, ggml_nbytes(item.input) });
+            w->jobs.push_back({ item.backend_id, slot, ring.free_recorded[slot], item.input->data, ggml_nbytes(item.input), ggml_backend_sched_stage_trace_us() });
             item.seq = w->n_pushed++;
         }
         w->cv_job.notify_one();
