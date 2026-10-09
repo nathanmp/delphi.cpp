@@ -50,6 +50,14 @@ The RDNA4 direct path supports one sequence stream, F16 K/V, 256-wide heads, GQA
 
 Passing indices avoids building and compacting a full-width selection mask. A repeated 32K-context decode suffix improved by about 5% on the tested Qwen deployment, with identical greedy tokens. The real-MTP input was repetitive and had full acceptance, so that result does not establish the gain on arbitrary requests. Small contexts and prefill widths keep the existing path. Summation order can change floating-point results.
 
+## ROCm libraries
+
+| variable | default | effect |
+| --- | --- | --- |
+| `ROCBLAS_USE_HIPBLASLT` | rocBLAS default (hipBLASLt on the R9700 here) | read by rocBLAS, not by delphi.cpp. `0` makes rocBLAS use its own Tensile kernels instead of hipBLASLt |
+
+hipBLASLt can pick a different kernel for the same GEMM in different processes, so results are not bitwise repeatable across runs. For MiMo V2.6 Flash, the F32 router SGEMM came out in two variants (largest difference 1.9e-5); top-k routing amplified this, and perplexity alternated between two values (5.3658 and 5.4084 on the first 8192-token chunk). With `ROCBLAS_USE_HIPBLASLT=0` every run gave the same result, so set it for A/B comparisons that expect bitwise equal outputs. It costs speed on F16 weights: Ling 3.0 tiny F16 pp4096 on an R9700 ran at 2780 instead of 5880 t/s. Qwen3.6-35B-A3B Q4_K_M, Gemma 4 31B Q6_K and MiMo two-GPU prefill ran at the same speed, and MiMo's first 16K request was faster (1280 instead of 1090 t/s), as hipBLASLt's first calls are slow.
+
 ## GPU graphs (CUDA and HIP)
 
 | variable | default | effect |
