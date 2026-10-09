@@ -1259,6 +1259,10 @@ static char causes[GGML_DEFAULT_GRAPH_SIZE*16 + GGML_SCHED_MAX_SPLITS_DEBUG*GGML
 #define GET_CAUSE(node) ""
 #endif
 
+static int  ggml_backend_sched_stage_spread(ggml_backend_sched_t sched, const struct ggml_tensor * op,
+        const struct ggml_tensor * weight, int backend_id);
+static bool ggml_backend_sched_stage_spreading(ggml_backend_sched_t sched);
+
 // returns the backend that should be used for the node based on the current locations
 static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, struct ggml_tensor * tensor) {
     // assign pre-allocated nodes to their backend
@@ -1313,12 +1317,13 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
                     const int cost_backend_id = ggml_backend_sched_cost_offload(sched, tensor, src, src_backend_id);
                     if (cost_backend_id != -1) {
                         SET_CAUSE(tensor, cost_backend_id == src_backend_id ? "1.cost.cpu" : "1.cost.gpu");
-                        return cost_backend_id;
+                        return cost_backend_id == src_backend_id ? cost_backend_id :
+                            ggml_backend_sched_stage_spread(sched, tensor, src, cost_backend_id);
                     }
                     for (int b = 0; b < src_backend_id; b++) {
                         if (ggml_backend_supports_op(sched->backends[b], tensor) && ggml_backend_offload_op(sched->backends[b], tensor)) {
                             SET_CAUSE(tensor, "1.off");
-                            return b;
+                            return ggml_backend_sched_stage_spread(sched, tensor, src, b);
                         }
                     }
                 }
@@ -2159,6 +2164,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     // pass 5: split graph, find tensors that need to be copied
     // views of input copies (ggml_backend_sched_full_view_src), with their split
     std::vector<std::pair<int, struct ggml_tensor *>> view_aliases;
+    std::vector<const struct ggml_tensor *> view_alias_of; // the view each alias stands for
     // tensors whose memory an op other than a view writes (in-place ops, SET_ROWS, CPY into a view): such an op is a view of
     // the tensor with a non-view op
     std::vector<bool> view_src_written;
@@ -2243,9 +2249,17 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                         // the work before this node run meanwhile (a MoE split waits for the other device's experts)
                         int src_backend_id = tensor_backend_id(src);
                         if (src_backend_id != -1 && src_backend_id != cur_backend_id && src_backend_id != sched->n_backends - 1) {
+                            // delphi: with GGML_SCHED_STAGE_SPREAD, no new split for a view of an input or when the split already
+                            // waits for that device (the copies share its wait, and the routed FFN of a layer stays in one split)
+                            const bool spread = ggml_backend_sched_stage_spreading(sched);
+                            const struct ggml_tensor * base = src;
+                            while (spread && base->view_src != NULL) {
+                                base = base->view_src;
+                            }
                             bool is_input = false;
                             for (int k = 0; k < split->n_inputs && !is_input; k++) {
-                                is_input = split->inputs[k] == src;
+                                is_input = split->inputs[k] == src ||
+                                    (spread && (split->inputs[k] == base || tensor_backend_id(split->inputs[k]) == src_backend_id));
                             }
                             if (!is_input) {
                                 need_new_split = true;
@@ -2354,11 +2368,22 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     }
                     node->src[j] = sched_hv_copy(sched, src, cur_backend_id, sched->cur_copy);
                     if (view_src != NULL) {
-                        // the view of the copy is a node of graph_copy (below), so that ggml-alloc keeps the copy while the view is used
-                        struct ggml_tensor * alias = ggml_view_4d(sched->ctx, node->src[j], view->ne[0], view->ne[1], view->ne[2], view->ne[3],
-                                view->nb[1], view->nb[2], view->nb[3], 0);
-                        ggml_format_name(alias, "%s#%s", ggml_backend_name(sched->backends[cur_backend_id]), view->name);
-                        view_aliases.push_back({ i_split, alias });
+                        // the view of the copy is a node of graph_copy (below), so that ggml-alloc keeps the copy while the view is used.
+                        // delphi: one alias per view and split, so that the consumers of a view still share one source tensor (the
+                        // fused routed FFN matches gate and up by their common input)
+                        struct ggml_tensor * alias = NULL;
+                        for (size_t k = 0; k < view_aliases.size() && alias == NULL; k++) {
+                            if (view_aliases[k].first == i_split && view_alias_of[k] == view) {
+                                alias = view_aliases[k].second;
+                            }
+                        }
+                        if (alias == NULL) {
+                            alias = ggml_view_4d(sched->ctx, node->src[j], view->ne[0], view->ne[1], view->ne[2], view->ne[3],
+                                    view->nb[1], view->nb[2], view->nb[3], 0);
+                            ggml_format_name(alias, "%s#%s", ggml_backend_name(sched->backends[cur_backend_id]), view->name);
+                            view_aliases.push_back({ i_split, alias });
+                            view_alias_of.push_back(view);
+                        }
                         node->src[j] = alias;
                     }
                 }
@@ -2978,6 +3003,7 @@ struct ggml_backend_sched_stage {
     ggml_backend_sched_stage_lend_t lend = nullptr;
     void * lend_user = nullptr;
     int split_weights = 1; // redirected weights per split (GGML_SCHED_STAGE_SPLIT_WEIGHTS)
+    bool spread = false;   // GGML_SCHED_STAGE_SPREAD
 };
 
 static void ggml_backend_sched_stage_run_job(
@@ -3168,6 +3194,9 @@ static ggml_backend_sched_stage * ggml_backend_sched_stage_new(ggml_backend_sche
     }
     // one layer's routed gate/up/down per split, while another split's weights can still upload
     stage->split_weights = stage->n_slots >= 6 ? 3 : 1;
+    if (const char * e = getenv("GGML_SCHED_STAGE_SPREAD")) {
+        stage->spread = atoi(e) != 0;
+    }
     if (const char * e = getenv("GGML_SCHED_STAGE_SPLIT_WEIGHTS")) {
         stage->split_weights = std::max(1, std::min(stage->n_slots, atoi(e)));
     }
@@ -3322,6 +3351,32 @@ static bool ggml_backend_sched_stage_redirects(ggml_backend_sched_t sched, const
     ggml_backend_sched_stage * stage = sched->stage;
     return stage != nullptr && stage->enabled && stage->redirect && sched->callback_eval == nullptr &&
         ggml_backend_sched_stage_whole(sched, node, weight, backend_id);
+}
+
+// GGML_SCHED_STAGE_SPREAD=1: a redirected (staged) MUL_MAT_ID whose weight is layer N's ("blk.N.") runs on staging GPU N % n, in backend
+// order, so each GPU's link streams every n-th layer while the others compute; gate/up/down of a layer stay together. Anything else,
+// and weights without a layer number, keep the backend chosen for them.
+static int ggml_backend_sched_stage_spread(ggml_backend_sched_t sched, const struct ggml_tensor * op,
+        const struct ggml_tensor * weight, int backend_id) {
+    ggml_backend_sched_stage * stage = sched->stage;
+    int layer = -1;
+    if (stage == nullptr || !stage->spread || op->op != GGML_OP_MUL_MAT_ID || op->src[0] != weight ||
+            sscanf(weight->name, "blk.%d.", &layer) != 1 || layer < 0 ||
+            !ggml_backend_sched_stage_redirects(sched, op, weight, backend_id)) {
+        return backend_id;
+    }
+    int gpus[GGML_SCHED_MAX_BACKENDS];
+    int n = 0;
+    for (int b = 0; b < sched->n_backends - 1; b++) {
+        if (stage->rings[b].upload != nullptr && ggml_backend_supports_op(sched->backends[b], op)) {
+            gpus[n++] = b;
+        }
+    }
+    return n > 1 ? gpus[layer % n] : backend_id;
+}
+
+static bool ggml_backend_sched_stage_spreading(ggml_backend_sched_t sched) {
+    return sched->stage != nullptr && sched->stage->spread;
 }
 
 static int ggml_backend_sched_stage_split_weights(ggml_backend_sched_t sched) {

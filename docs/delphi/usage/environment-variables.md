@@ -50,6 +50,14 @@ The RDNA4 direct path supports one sequence stream, F16 K/V, 256-wide heads, GQA
 
 Passing indices avoids building and compacting a full-width selection mask. A repeated 32K-context decode suffix improved by about 5% on the tested Qwen deployment, with identical greedy tokens. The real-MTP input was repetitive and had full acceptance, so that result does not establish the gain on arbitrary requests. Small contexts and prefill widths keep the existing path. Summation order can change floating-point results.
 
+## ROCm libraries
+
+| variable | default | effect |
+| --- | --- | --- |
+| `ROCBLAS_USE_HIPBLASLT` | rocBLAS default (hipBLASLt on the R9700 here) | read by rocBLAS, not by delphi.cpp. `0` makes rocBLAS use its own Tensile kernels instead of hipBLASLt |
+
+hipBLASLt can pick a different kernel for the same GEMM in different processes, so results are not bitwise repeatable across runs. For MiMo V2.6 Flash, the F32 router SGEMM came out in two variants (largest difference 1.9e-5); top-k routing amplified this, and perplexity alternated between two values (5.3658 and 5.4084 on the first 8192-token chunk). With `ROCBLAS_USE_HIPBLASLT=0` every run gave the same result, so set it for A/B comparisons that expect bitwise equal outputs. It costs speed on F16 weights: Ling 3.0 tiny F16 pp4096 on an R9700 ran at 2780 instead of 5880 t/s. Qwen3.6-35B-A3B Q4_K_M, Gemma 4 31B Q6_K and MiMo two-GPU prefill ran at the same speed, and MiMo's first 16K request was faster (1280 instead of 1090 t/s), as hipBLASLt's first calls are slow.
+
 ## GPU graphs (CUDA and HIP)
 
 | variable | default | effect |
@@ -66,13 +74,14 @@ With routed experts in host memory (`-cmoe`, `-ncmoe`, `--numa tensors`), a wide
 | --- | --- | --- |
 | `GGML_SCHED_STAGE` | `0` | `1` uploads offloaded host weights ahead of the splits that use them |
 | `GGML_SCHED_STAGE_REDIRECT` | `1` | kernels read staged inputs in their ring slots instead of a copy of them; the slot is freed once the split's work is queued. `0` copies each staged input from its slot first (about 3 ms per expert tensor) |
-| `GGML_SCHED_STAGE_SLOTS` | `4` | device slots, each the size of the largest staged tensor; more slots run further ahead and use more VRAM |
+| `GGML_SCHED_STAGE_SLOTS` | `4` | device slots, each the size of the largest staged tensor; more slots run further ahead and use more VRAM. MiMo V2.6 Flash with 3 slots gave NaN perplexity in 2 of 9 runs (cause unknown, later runs finite); 6 slots were always finite |
 | `GGML_SCHED_STAGE_BOUNCE` | `4` | pinned host bounce buffers; `0` uploads from the weights directly (pageable) |
 | `GGML_SCHED_STAGE_CHUNK_MB` | `64` | size of each bounce buffer |
 | `GGML_SCHED_STAGE_THREADS` | 8 / staging devices, at least 2 | memcpy threads per staging device that fill its bounce buffers |
 | `GGML_SCHED_STAGE_PIN` | `1` | run each device's staging threads on the CPUs next to that device (Linux) |
 | `GGML_SCHED_STAGE_REGISTER` | `0` | `1` page-locks the staged host weight buffers when the ring first stages from them, so uploads go straight from the weights to the device without the bounce buffers |
 | `GGML_SCHED_STAGE_STATS` | `0` | `1` prints where each staging thread spent its time when the scheduler is freed |
+| `GGML_SCHED_STAGE_SPREAD` | `0` | `1` with several staging devices: layer N's staged expert multiplies run on staging device N mod n, so each device's link uploads only its own layers' experts. MiMo V2.6 Flash 16K prefill on two R9700s (attention on ROCm1): 1150-1300 tokens/s, against 1060-1120 on one |
 
 At the start of each graph, the scheduler lists the host weights that its splits will copy whole, in split order. Each staging device has its own background thread, which copies that device's weights in chunks into pinned host buffers, and the device copies each chunk into a slot on a separate stream, so the uploads of later layers overlap the computation of earlier ones. When the scheduler reaches the split, the device copies the slot into the split input. Expert tensors are staged only when the batch is wide enough that nearly every expert is used; for narrower batches the scheduler keeps copying only the used experts, and decode is unaffected. Supported on CUDA and ROCm devices.
 

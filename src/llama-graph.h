@@ -1456,6 +1456,10 @@ struct llm_graph_context {
     void build_sampling() const;
     void build_mtp_device_draft() const;
 
+    // expert-cache routing records, added after the outputs so their CPU split does not stall the GPU layers
+    mutable std::vector<ggml_tensor *> deferred_records;
+    void build_deferred_records() const;
+
     //
     // dense (out)
     //
