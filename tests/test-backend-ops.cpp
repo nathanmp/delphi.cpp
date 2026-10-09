@@ -205,6 +205,28 @@ static void init_tensor_kq_mask(ggml_tensor * tensor, float min = -1.0f, float m
     ggml_backend_tensor_set(tensor, data_f16.data(), 0, data_f16.size()*sizeof(ggml_fp16_t));
 }
 
+// sliding window: the query rows are the last ne1 positions of the ne0 cells, and each sees the n_swa cells up to its own
+static void init_tensor_kq_mask_swa(ggml_tensor * tensor, int64_t n_swa) {
+    GGML_ASSERT(tensor->type == GGML_TYPE_F16);
+
+    GGML_TENSOR_LOCALS( int32_t, ne, tensor, ne);
+
+    std::vector<ggml_fp16_t> data_f16(ne0*ne1*ne2*ne3);
+    for (int64_t i3 = 0; i3 < ne3; i3++) {
+        for (int64_t i2 = 0; i2 < ne2; i2++) {
+            for (int64_t i1 = 0; i1 < ne1; i1++) {
+                const int64_t pos = ne0 - ne1 + i1;
+                for (int64_t i0 = 0; i0 < ne0; i0++) {
+                    const bool visible = i0 <= pos && i0 > pos - n_swa;
+                    data_f16[((i3*ne2 + i2)*ne1 + i1)*ne0 + i0] = ggml_fp32_to_fp16(visible ? 0.0f : -INFINITY);
+                }
+            }
+        }
+    }
+
+    ggml_backend_tensor_set(tensor, data_f16.data(), 0, data_f16.size()*sizeof(ggml_fp16_t));
+}
+
 // edge: every query row of a sequence sees a different causal prefix (query j sees cells < ne0 - (ne1 - 1 - j)),
 // selects a count that cycles through awkward values, and always keeps its newest visible cell
 // (a fully masked row gives NaN on the dense ROCm kernels and 0 on the CPU, so it is not a CPU-comparable case)
@@ -512,6 +534,7 @@ static std::string var_to_str(ggml_scale_mode mode) {
 #define VARS_TO_STR16(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p) VAR_TO_STR(a) + "," + VARS_TO_STR15(b, c, d, e, f, g, h, i, j, k, l, m, n, o, p)
 #define VARS_TO_STR17(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q) VAR_TO_STR(a) + "," + VARS_TO_STR16(b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q)
 #define VARS_TO_STR18(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r) VAR_TO_STR(a) + "," + VARS_TO_STR17(b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r)
+#define VARS_TO_STR19(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s) VAR_TO_STR(a) + "," + VARS_TO_STR18(b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s)
 
 // accept FLT_MAX as infinity
 static bool isinf_or_max(float f) {
@@ -8372,9 +8395,10 @@ struct test_flash_attn_ext : public test_case {
     const bool v_is_view_of_k;
     const int64_t n_kv_max;
     const bool sparse_edge; // sparse mask with per-query causal prefixes and awkward counts
+    const int64_t n_swa; // > 0: causal sliding-window mask of this many cells
 
     std::string vars() override {
-        return VARS_TO_STR18(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k, n_kv_max, sparse_edge);
+        return VARS_TO_STR19(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k, n_kv_max, sparse_edge, n_swa);
     }
 
     double max_nmse_err() override {
@@ -8391,9 +8415,10 @@ struct test_flash_attn_ext : public test_case {
     test_flash_attn_ext(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 32, std::array<int64_t, 2> nr23 = {1, 1}, int64_t kv = 96, int64_t nb = 8,
                         bool mask = true, bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
                         ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3},
-                        bool kv_view = true, bool v_is_view_of_k = false, int64_t n_kv_max = 0, bool sparse_edge = false)
+                        bool kv_view = true, bool v_is_view_of_k = false, int64_t n_kv_max = 0, bool sparse_edge = false, int64_t n_swa = 0)
         : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
-          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), n_kv_max(n_kv_max), sparse_edge(sparse_edge) {}
+          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), n_kv_max(n_kv_max), sparse_edge(sparse_edge),
+          n_swa(n_swa) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
@@ -8468,6 +8493,8 @@ struct test_flash_attn_ext : public test_case {
             } else if (strcmp(t->name, "m") == 0) {
                 if (n_kv_max > 0) {
                     init_tensor_kq_mask_sparse(t, n_kv_max, sparse_edge);
+                } else if (n_swa > 0) {
+                    init_tensor_kq_mask_swa(t, n_swa);
                 } else {
                     init_tensor_kq_mask(t);
                 }
@@ -11806,6 +11833,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 16384,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
 
     // MLA shape: the V cache is a sub-view of the K cache, with quantized KV
+    // sliding-window masks wide enough for the KV range scan (>= 1024 queries or several sequences), MiMo V2 heads among them
+    for (int64_t n_swa : {1, 128, 300}) {
+        test_cases.emplace_back(new test_flash_attn_ext(192, 128, 8, {8, 1}, 2048, 1024, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, false, n_swa));
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {2, 2}, 1280,  200, true, true,  0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, false, n_swa));
+    }
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {8, 1},  113,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {8, 1}, 1024,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {8, 1}, 1024,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));
