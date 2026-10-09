@@ -66,13 +66,14 @@ With routed experts in host memory (`-cmoe`, `-ncmoe`, `--numa tensors`), a wide
 | --- | --- | --- |
 | `GGML_SCHED_STAGE` | `0` | `1` uploads offloaded host weights ahead of the splits that use them |
 | `GGML_SCHED_STAGE_REDIRECT` | `1` | kernels read staged inputs in their ring slots instead of a copy of them; the slot is freed once the split's work is queued. `0` copies each staged input from its slot first (about 3 ms per expert tensor) |
-| `GGML_SCHED_STAGE_SLOTS` | `4` | device slots, each the size of the largest staged tensor; more slots run further ahead and use more VRAM |
+| `GGML_SCHED_STAGE_SLOTS` | `4` | device slots, each the size of the largest staged tensor; more slots run further ahead and use more VRAM. MiMo V2.6 Flash with 3 slots gave NaN perplexity in 2 of 9 runs (cause unknown, later runs finite); 6 slots were always finite |
 | `GGML_SCHED_STAGE_BOUNCE` | `4` | pinned host bounce buffers; `0` uploads from the weights directly (pageable) |
 | `GGML_SCHED_STAGE_CHUNK_MB` | `64` | size of each bounce buffer |
 | `GGML_SCHED_STAGE_THREADS` | 8 / staging devices, at least 2 | memcpy threads per staging device that fill its bounce buffers |
 | `GGML_SCHED_STAGE_PIN` | `1` | run each device's staging threads on the CPUs next to that device (Linux) |
 | `GGML_SCHED_STAGE_REGISTER` | `0` | `1` page-locks the staged host weight buffers when the ring first stages from them, so uploads go straight from the weights to the device without the bounce buffers |
 | `GGML_SCHED_STAGE_STATS` | `0` | `1` prints where each staging thread spent its time when the scheduler is freed |
+| `GGML_SCHED_STAGE_SPREAD` | `0` | `1` with several staging devices: layer N's staged expert multiplies run on staging device N mod n, so each device's link uploads only its own layers' experts. MiMo V2.6 Flash 16K prefill on two R9700s (attention on ROCm1): 1150-1300 tokens/s, against 1060-1120 on one |
 
 At the start of each graph, the scheduler lists the host weights that its splits will copy whole, in split order. Each staging device has its own background thread, which copies that device's weights in chunks into pinned host buffers, and the device copies each chunk into a slot on a separate stream, so the uploads of later layers overlap the computation of earlier ones. When the scheduler reaches the split, the device copies the slot into the split input. Expert tensors are staged only when the batch is wide enough that nearly every expert is used; for narrower batches the scheduler keeps copying only the used experts, and decode is unaffected. Supported on CUDA and ROCm devices.
 
