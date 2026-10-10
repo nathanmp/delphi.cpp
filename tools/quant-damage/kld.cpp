@@ -38,6 +38,9 @@ static void print_usage(const char * exe) {
     printf("  --router       also measure the change of the MoE router logits and expert selection per layer\n");
     printf("  --shard I/N    run every N-th job, starting at I\n");
     printf("  -ngl N         GPU layers (default: 999)\n");
+    printf("  --device LIST  comma-separated backend device names\n");
+    printf("  --numa TYPE    tensors, distribute, isolate or numactl\n");
+    printf("  -cmoe          keep routed experts on the CPU\n");
     printf("  -t N           CPU threads for quantization (default: %d)\n", common_cpu_get_num_math());
     printf("  -o FILE        CSV output (appended)\n");
 }
@@ -112,6 +115,9 @@ int main(int argc, char ** argv) {
     std::vector<std::string> tensor_re, recipes;
     int n_ctx = 512, n_chunks = 16, ngl = 999, shard_i = 0, shard_n = 1;
     bool router = false;
+    bool cpu_moe = false;
+    std::string device_list;
+    common_params runtime;
     int n_threads = common_cpu_get_num_math();
 
     for (int i = 1; i < argc; ++i) {
@@ -131,6 +137,16 @@ int main(int argc, char ** argv) {
         else if (a == "--recipe")    { recipes.push_back(next()); }
         else if (a == "--qtypes")    { qtypes_arg = next(); }
         else if (a == "--router")    { router = true; }
+        else if (a == "--device")    { device_list = next(); }
+        else if (a == "-cmoe" || a == "--cpu-moe") { cpu_moe = true; }
+        else if (a == "--numa") {
+            const std::string value = next();
+            if      (value == "tensors")    { runtime.numa = GGML_NUMA_STRATEGY_TENSORS; }
+            else if (value == "distribute") { runtime.numa = GGML_NUMA_STRATEGY_DISTRIBUTE; }
+            else if (value == "isolate")    { runtime.numa = GGML_NUMA_STRATEGY_ISOLATE; }
+            else if (value == "numactl")    { runtime.numa = GGML_NUMA_STRATEGY_NUMACTL; }
+            else { fprintf(stderr, "error: invalid NUMA strategy %s\n", value.c_str()); return 1; }
+        }
         else if (a == "-ngl")        { ngl = std::stoi(next()); }
         else if (a == "-t")          { n_threads = std::stoi(next()); }
         else if (a == "-o")          { out_path = next(); }
@@ -201,10 +217,30 @@ int main(int argc, char ** argv) {
     }
     fprintf(stderr, "%s: %zu jobs, %zu in this shard\n", __func__, jobs.size(), mine.size());
 
+    common_init();
+    ggml_backend_load_all();
     llama_backend_init();
-    llama_model_params mp = llama_model_default_params();
-    mp.n_gpu_layers = ngl;
-    mp.load_mode = LLAMA_LOAD_MODE_NONE; // tensors on the CPU must be writable
+    llama_numa_init(runtime.numa);
+    if (!device_list.empty()) {
+        for (const auto & name : string_split<std::string>(device_list, ',')) {
+            ggml_backend_dev_t dev = ggml_backend_dev_by_name(name.c_str());
+            if (!dev) {
+                fprintf(stderr, "error: device %s is unavailable\n", name.c_str());
+                return 1;
+            }
+            runtime.devices.push_back(dev);
+        }
+        runtime.devices.push_back(nullptr);
+    }
+    if (cpu_moe) {
+        runtime.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
+        runtime.tensor_buft_overrides.push_back({nullptr, nullptr});
+    }
+    runtime.n_gpu_layers = ngl;
+    runtime.load_mode = LLAMA_LOAD_MODE_NONE; // tensors on the CPU must be writable
+    // A cached repack can retain the previous job's weights after a tensor update.
+    runtime.no_extra_bufts = true;
+    llama_model_params mp = common_model_params_to_llama(runtime);
     llama_model * model = llama_model_load_from_file(model_path.c_str(), mp);
     if (!model) {
         fprintf(stderr, "error: failed to load %s\n", model_path.c_str());
