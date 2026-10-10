@@ -6457,8 +6457,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
 
 #ifdef GGML_USE_HIP
     // delphi: the IQ*_K / IQ*_KS kernels come from ik_llama.cpp, which dropped ROCm; on ROCm they fault, so no op with such an operand
-    // is supported here (the model loader refuses to place these weights on a ROCm device).
+    // is supported here (the model loader refuses to place these weights on a ROCm device). GGML_HIP_IQK=1 enables them for testing.
+    static const bool allow_iqk = [] { const char * e = getenv("GGML_HIP_IQK"); return e && atoi(e) != 0; }();
     for (const ggml_tensor * t : std::initializer_list<const ggml_tensor *>{op, op->src[0], op->src[1], op->src[2]}) {
+        if (allow_iqk) { break; }
         if (!t) { continue; }
         switch (t->type) {
             case GGML_TYPE_IQ2_K: case GGML_TYPE_IQ3_K: case GGML_TYPE_IQ4_K: case GGML_TYPE_IQ5_K: case GGML_TYPE_IQ6_K:
