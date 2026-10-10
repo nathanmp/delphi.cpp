@@ -54,6 +54,8 @@ Prepared inputs include source file size/mtime/metadata, imatrix content hashes,
 
 The built-in timing prior measures each qtype/shape on CPU and the first GPU. `timing.link_bandwidth_gb_s` optionally supplies effective host-to-device bandwidth; the default 12 GB/s is an unmeasured prior. Fixed handoff latency, uniform routes, interpolated tail batches and a single positive scale per regime are V1 approximations. CPU/GPU compute is measured, not derived from one global qtype coefficient. Matched expert gate/up uses `test-backend-ops --custom ...,pair=1` to include SwiGLU and fusion eligibility.
 
+Repeated isolated probes can keep active expert weights in CPU cache. The predictor also bounds CPU time by the bytes fetched from RAM. Its default effective byte rate is derived from the baseline's routed-expert bytes and traced decode CPU span; this incorporates CPU overhead and is not a measurement of peak RAM bandwidth. `timing.cpu_bandwidth_gb_s` can supply an explicit rate instead. The fitted scale and held-out checks remain necessary. Long-prefill transfer predictions use the actual configured `GGML_SCHED_STAGE_MIN_TOKENS` threshold.
+
 CPU expert probes also set `numa_expert=1`. `--numa tensors` alone pins workers but does not select the model loader's flagged expert kernel path. Both the flag and the NUMA mode are required to reproduce that execution contract.
 
 `runtime.depth_tokens` sets the benchmark's existing context depth before each workload; default zero. KV types can use the benchmark's `-ctk`/`-ctv` options in `extra_args`. The benchmark derives its allocation from depth and workload lengths. Models with large lazy engram/per-layer embedding tables are explicitly unsupported until resident-byte accounting is added.

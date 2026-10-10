@@ -13,7 +13,7 @@ sys.path.insert(0, str(ROOT / "tools/auto-quantize"))
 from config import QuantError, capacity, devices, load_config
 from model import classify, merge_imatrices, read_model, tensor_bytes
 from search import dominates, memory, pareto, search
-from timing import Predictor, digest, operation_times, signature
+from timing import Predictor, digest, operation_times, regions, signature, token_counts
 from auto_quantize import verify_output
 import numpy as np
 from gguf import GGUFReader, GGUFWriter
@@ -186,6 +186,21 @@ class Files(unittest.TestCase):
 
 
 class Timing(unittest.TestCase):
+    def test_ram_traffic_prevents_a_hot_probe_from_claiming_a_decode_win(self):
+        config = cfg()
+        model = classify(info(), config)
+        operations = {}
+        for group, members, paired in regions(model):
+            for dtype in group["pool"]:
+                for tokens in set(token_counts(config).values()):
+                    for device in (["CPU", "ROCm1"] if members[0]["expert"] else ["ROCm1"]):
+                        sig = signature(members, paired, dtype, device, tokens, model["top_k"])
+                        operations[digest(sig)] = {"signature": sig, "ms": .01 if dtype == "Q4_0" else .02}
+        baseline = {g["name"]: g["pool"][0] for g in model["groups"]}
+        changed = {g["name"]: "Q4_0" if "Q4_0" in g["pool"] else baseline[g["name"]] for g in model["groups"]}
+        predictor = Predictor(model, config, operations, baseline, {"decode": 12, "short": 200, "long": 1000}, baseline_cpu_ms=10)
+        self.assertGreater(predictor.predict(changed)["decode"], predictor.predict(baseline)["decode"])
+
     def test_real_backend_csv_header_and_quoted_shape(self):
         text = 'backend initialization\n"backend_name","op_name","op_params","test_mode","time_us"\n"CPU","MUL_MAT_GATE_UP","ne=[256,256,8,1],pair=1","perf","120.5"\n'
         self.assertEqual(operation_times(text), [120.5])

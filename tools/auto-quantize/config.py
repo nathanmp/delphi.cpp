@@ -167,9 +167,9 @@ def load_config(path):
             raise QuantError(f"unknown bound {name}")
         number(value, f"bounds.{name}")
     cfg.setdefault("timing", {})
-    if set(cfg["timing"]) - {"link_bandwidth_gb_s"}:
+    if set(cfg["timing"]) - {"link_bandwidth_gb_s", "cpu_bandwidth_gb_s"}:
         raise QuantError("unknown timing inputs")
-    for name in ("link_bandwidth_gb_s",):
+    for name in ("link_bandwidth_gb_s", "cpu_bandwidth_gb_s"):
         if name in cfg["timing"]:
             number(cfg["timing"][name], f"timing.{name}", positive=True)
     return cfg

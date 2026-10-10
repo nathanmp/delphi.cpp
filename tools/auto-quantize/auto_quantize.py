@@ -22,7 +22,7 @@ def inputs(cfg, info):
             "binaries": {name: file_identity(Path(cfg["bindir"]) / name) for name in
                          ("llama-quant-damage", "llama-quantize", "test-backend-ops", "llama-bench")},
             "libraries": [file_identity(p) for p in sorted(Path(cfg["bindir"]).glob("lib*.so*")) if not p.is_symlink()],
-            "runtime": cfg["runtime"], "gpu": gpu(cfg), "ram_routed": "RAM" in cfg["devices"], "cache_mib": cfg["cache_mib"],
+            "runtime": cfg["runtime"], "timing": cfg["timing"], "gpu": gpu(cfg), "ram_routed": "RAM" in cfg["devices"], "cache_mib": cfg["cache_mib"],
             "machine_settings": machine_settings(),
             "inherited_environment": {name: value for name, value in os.environ.items()
                                       if name.startswith(("GGML_", "LLAMA_", "CUDA_", "HIP_", "HSA_", "ROCR_", "OMP_", "LD_LIBRARY_PATH"))}}
@@ -136,11 +136,9 @@ def prepare(cfg, directory, timeout):
     key = digest(inputs(cfg, info))
     snapshot = directory / "prepared.json"
     if snapshot.exists():
-        old = json.loads(snapshot.read_text())
-        if old["input_key"] == key:
-            print(f"Reusing {snapshot}; timing reflects the recorded machine state", flush=True)
-            return old
-        raise QuantError("prepare inputs changed; use a new artifact directory")
+        old = load_prepared(snapshot, cfg)
+        print(f"Reusing {snapshot}; timing reflects the recorded machine state", flush=True)
+        return old
     imatrix = merge_imatrices(cfg["imatrix"], directory / "merged-imatrix.gguf")
     damage = get_damage(info, cfg, directory, imatrix)
     print("Measuring bounded operation signatures", flush=True)
@@ -172,14 +170,27 @@ def load_prepared(path, cfg):
     if data.get("schema") != SCHEMA:
         raise QuantError("unsupported prepared schema")
     info = classify(read_model(cfg["model"]), cfg)
-    if data["input_key"] != digest(inputs(cfg, info)):
-        raise QuantError("model, imatrix, candidates, binary or runtime changed; prepare again")
+    facts = inputs(cfg, info)
+    if data["input_key"] != digest(facts):
+        # Early V1 snapshots omitted the cost-model settings from their key. Upgrade only equivalent inputs.
+        legacy = dict(facts)
+        legacy.pop("timing")
+        if data["input_key"] == digest(legacy) and cfg["timing"] == data["config"].get("timing", {}):
+            data["input_key"] = digest(facts)
+        else:
+            raise QuantError("model, imatrix, candidates, binary, cost model or runtime changed; prepare again")
     return data
 
 
 def predictor_for(data, cfg):
+    baseline = data["baseline"]
+    if "cpu_compute_ms" not in baseline:
+        profile_file = Path(baseline["profile"])
+        profile = json.loads(profile_file.read_text()) if profile_file.exists() else {}
+        baseline["cpu_compute_ms"] = (profile.get("arms", [{}])[0].get("trace", {}).get("analysis", {})
+                                      .get("decode", {}).get("cpu_compute_ms", {}).get("median"))
     predictor = Predictor(data["model"], cfg, data["operations"], data["baseline"]["choices"],
-                          data["baseline"]["measured_ms"], data["slopes"])
+                          data["baseline"]["measured_ms"], data["slopes"], baseline["cpu_compute_ms"])
     predictor.baseline_cost = predictor.cost(data["baseline"]["choices"], data["baseline"]["memory"]["cache_hit_prior"])
     return predictor
 
@@ -203,6 +214,7 @@ def plan(data, cfg, output):
                                "cache hits use a uniform residency prior; cache policy replay is not calibrated",
                                "tail ubatches use interpolation; trace integrity has not been certified",
                                "multiple GPUs use user throughput factors, without pooled capacity or a runtime layout"]}
+    payload["effective_cpu_decode_gb_s"] = (predictor_for(data, cfg).cpu_bytes_per_ms or 0) / 1e6
     write_json(outdir / "frontier.json", payload)
     print(f"{result['status']}: {len(recipes)} nondominated evaluated recipes; {result['evaluated']} evaluations")
     print("recipe       damage        decode t/s  short t/s  long t/s  score")

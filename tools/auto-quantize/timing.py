@@ -183,12 +183,21 @@ def active_experts(count, top_k, tokens):
 
 
 class Predictor:
-    def __init__(self, info, cfg, operations, baseline_choices, measured, slopes=None):
+    def __init__(self, info, cfg, operations, baseline_choices, measured, slopes=None, baseline_cpu_ms=None):
         self.info, self.cfg, self.operations = info, cfg, operations
         self.baseline_choices, self.measured = baseline_choices, measured
         self.slopes = slopes or {regime: 1.0 for regime in measured}
         self.regions = regions(info)
         self.counts = token_counts(cfg)
+        self.cpu_bytes_per_ms = None
+        if "cpu_bandwidth_gb_s" in cfg["timing"]:
+            self.cpu_bytes_per_ms = cfg["timing"]["cpu_bandwidth_gb_s"] * 1e6
+        elif baseline_cpu_ms and baseline_cpu_ms > 0 and "RAM" in cfg["devices"]:
+            types = {name: baseline_choices[g["name"]] for g in info["groups"] for name in g["members"]}
+            active_bytes = sum(tensor_bytes(t["shape"], types[t["name"]]) * min(info["top_k"], t["shape"][2]) / t["shape"][2]
+                               for t in info["tensors"] if t["expert"])
+            if active_bytes:
+                self.cpu_bytes_per_ms = active_bytes / baseline_cpu_ms
         self.baseline_cost = self.cost(baseline_choices, 0)
 
     def lookup(self, members, paired, dtype, device, tokens):
@@ -210,13 +219,17 @@ class Predictor:
                 t = members[0]
                 if t["expert"] and "RAM" in self.cfg["devices"]:
                     cpu_time = self.lookup(members, paired, dtype, "CPU", tokens)
+                    unique = active_experts(t["shape"][2], self.info["top_k"], tokens)
+                    weight_bytes = sum(tensor_bytes(m["shape"], dtype) for m in members) * unique / t["shape"][2]
+                    # Repeated isolated probes keep active weights in cache. A full model also pays for RAM traffic.
+                    if self.cpu_bytes_per_ms:
+                        cpu_time = max(cpu_time, weight_bytes / self.cpu_bytes_per_ms)
                     handoff = 0.02 + 4 * (t["shape"][0] + t["shape"][1] * self.info["top_k"]) * tokens / link
                     local = cpu_time + handoff
                     if tokens <= 16 and hit_fraction > 0:
                         local = (1 - hit_fraction) * cpu_time + hit_fraction * device_time + handoff
-                    if streaming and regime == "long":
-                        unique = active_experts(t["shape"][2], self.info["top_k"], tokens)
-                        weight_bytes = sum(tensor_bytes(m["shape"], dtype) for m in members) * unique / t["shape"][2]
+                    min_tokens = int(self.cfg["runtime"]["env"].get("GGML_SCHED_STAGE_MIN_TOKENS", 512))
+                    if streaming and min_tokens > 0 and tokens >= min_tokens:
                         local = min(local, device_time + weight_bytes / link + 0.02)
                 n_work = self.cfg["runtime"][f"{regime}_tokens"] if regime != "decode" else 1
                 batches, tail = divmod(n_work, tokens)
