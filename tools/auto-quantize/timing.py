@@ -81,7 +81,8 @@ def signature(tensors, paired, dtype, device, tokens, top_k):
     t = tensors[0]
     return {"shape": t["shape"], "dtype": dtype, "device": device, "tokens": tokens,
             "expert": t["expert"], "top_k": top_k if t["expert"] else 1,
-            "broadcast": "ffn_down" not in t["name"], "paired": paired}
+            "broadcast": "ffn_down" not in t["name"], "paired": paired,
+            "numa_expert": t["expert"] and device == "CPU"}
 
 
 def token_counts(cfg):
@@ -161,7 +162,7 @@ def measure_ops(info, cfg, directory, timeout=600):
         shape = "x".join(str(x) for x in sig["shape"])
         spec = f"op={'MUL_MAT_ID' if sig['expert'] else 'MUL_MAT'},type={sig['dtype'].lower()},ne={shape},n={sig['tokens']},weights=zero"
         if sig["expert"]:
-            spec += f",top_k={sig['top_k']},broadcast={int(sig['broadcast'])},dist=uniform,seed=1234"
+            spec += f",top_k={sig['top_k']},broadcast={int(sig['broadcast'])},numa_expert={int(sig['numa_expert'])},dist=uniform,seed=1234"
         if sig["paired"]:
             spec += ",pair=1"
         command = [str(binary), "perf", "-b", sig["device"], "--numa", "tensors", "--threads", str(cfg["runtime"]["threads"]),
