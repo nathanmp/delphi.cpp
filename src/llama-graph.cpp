@@ -2576,15 +2576,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn_cache(
         name_tier(x, t, "packet_x"); name_tier(f, t, "packet_ids"); name_tier(w, t, "packet_w");
         return remote_ins[expert_cache->tier_backend(t)] = { x, f, w };
     };
-    for (int t = 0; t < expert_cache->n_tiers(); ++t) {
-        auto * map = expert_cache->hot_ids(t, il);
-        if (map && expert_cache->tier_backend(t) != expert_cache->backend()) {
-            auto * hot = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, map, remote_input(t).flat), ids->ne[0], ids->ne[1]);
-            name_tier(hot, t, "hot");
-            ggml_build_forward_expand(gf, hot);
-            hots.push_back({ t, hot });
-        }
-    }
 
     using labeler = std::function<void(ggml_tensor *, const char *)>;
     // Each part leaves zeros in the other parts' rows. The GPU parts are built first so that they run while the CPU part does.
@@ -2618,19 +2609,24 @@ ggml_tensor * llm_graph_context::build_moe_ffn_cache(
         return out;
     };
     // Tiers on the layer GPU merge with the CPU part per expert slot. A tier on another GPU reduces there, so that only
-    // [n_embd, n_tokens] crosses back.
+    // [n_embd, n_tokens] crosses back. The local parts come first; each remote GPU's nodes follow in one piece (one split,
+    // which a scheduler worker can submit while this thread runs the CPU part), then the CPU part.
     std::vector<ggml_tensor *> local, remote;
     for (const auto & [t, hot] : hots) {
         const int tier = t;
         const labeler label = [&, tier](ggml_tensor * x, const char * l) { name_tier(x, tier, l); };
-        const bool is_local = expert_cache->tier_backend(t) == expert_cache->backend();
-        auto * d = part(is_local ? cur : remote_input(t).x, hot,
-                expert_cache->bank(t, il, 0), expert_cache->bank(t, il, 1), expert_cache->bank(t, il, 2), label);
-        if (is_local) {
-            local.push_back(d);
-        } else {
-            remote.push_back(reduce(d, remote_input(t).weights, label));
+        local.push_back(part(cur, hot, expert_cache->bank(t, il, 0), expert_cache->bank(t, il, 1), expert_cache->bank(t, il, 2), label));
+    }
+    for (int t = 0; t < expert_cache->n_tiers(); ++t) {
+        auto * map = expert_cache->hot_ids(t, il);
+        if (!map || expert_cache->tier_backend(t) == expert_cache->backend()) {
+            continue;
         }
+        const labeler label = [&, t](ggml_tensor * x, const char * l) { name_tier(x, t, l); };
+        auto * hot = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, map, remote_input(t).flat), ids->ne[0], ids->ne[1]);
+        name_tier(hot, t, "hot");
+        auto * d = part(remote_input(t).x, hot, expert_cache->bank(t, il, 0), expert_cache->bank(t, il, 1), expert_cache->bank(t, il, 2), label);
+        remote.push_back(reduce(d, remote_input(t).weights, label));
     }
     auto * experts = part(cx, ci, gate, up, down, [&](ggml_tensor * x, const char * l) { name(x, l, true); });
     // Merge the per-expert outputs on the GPU (the first local tier first, as before tiers existed).

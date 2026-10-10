@@ -475,6 +475,8 @@ private:
 
     // expert cache: the staging ring borrows the arena instead of allocating its own slots
     void sched_set_stage_lender();
+    void sched_set_workers(ggml_backend_sched_t s);
+    void sched_set_workers_all();
 
     FILE * moe_routing_log = nullptr;
     int64_t moe_routing_log_max_tokens = 16;

@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <mutex>
@@ -880,6 +881,56 @@ struct ggml_backend_sched_offload_decision {
     struct ggml_backend_op_cost gpu;
 };
 
+// delphi: a thread that submits the splits of one GPU backend (ggml_backend_sched_set_worker). For a split it pulls the
+// inputs from the other devices on its own stream, launches the split, pushes the outputs that later splits on other GPUs
+// read (up to the next split on this backend) into landing buffers on their devices, then records done_event.
+// - A pull waits for pull_events[b], recorded on the source backend right after the split that produced the source (or at
+//   the post). Splits on b between that one and the worker's split precede it in graph order, so the allocator keeps the
+//   source alive through them.
+// - The main thread posts the split and moves on. Before it next queues work on a device the job read from or pushed to,
+//   that device waits for done_event (later splits may reuse a source's memory; a consumer copies its input from the
+//   landing buffer).
+struct ggml_backend_sched_worker {
+    typedef bool (*copy_on_t)(ggml_backend_t backend, const struct ggml_tensor * src, struct ggml_tensor * dst);
+    struct copy { struct ggml_tensor * src; struct ggml_tensor * dst; };
+    struct forward { int split_id; int input_id; struct ggml_tensor landing; };
+
+    int backend_id = -1;
+    int cpu = -1;
+    copy_on_t copy_on = nullptr;
+    std::thread thread;
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::atomic<uint64_t> posted { 0 };
+    std::atomic<uint64_t> done { 0 };
+    bool quit = false; // under mutex
+
+    // the job, written by the main thread before posted is raised
+    struct ggml_backend_sched * sched = nullptr;
+    int split_id = -1;
+    int cur_copy = 0;
+    std::vector<int> pull_wait;        // backends whose pull_events the job waits for before the pulls
+    std::vector<int> push_wait;        // backends whose push_events the job waits for before the pushes
+    std::vector<copy> pulls;
+    std::vector<copy> pushes;          // into the landing tensors of `forwarded`
+    std::vector<forward> forwarded;    // the (split, input) pairs that copy their input from a landing buffer
+    std::vector<uint32_t> trace_ids;
+    struct ggml_exec_trace_thread_context trace_ctx = {};
+    enum ggml_status status = GGML_STATUS_SUCCESS;
+
+    // per graph (main thread)
+    std::vector<uint8_t> ok;                  // per split: the worker runs it
+    std::vector<std::pair<int, int>> records; // (split p, backend b): after queuing split p, record pull_events[b]
+    bool recorded[GGML_SCHED_MAX_BACKENDS] = {};
+
+    ggml_backend_event_t pull_events[GGML_SCHED_MAX_BACKENDS] = {};
+    ggml_backend_event_t push_events[GGML_SCHED_MAX_BACKENDS] = {};
+    ggml_backend_event_t done_event = nullptr;                       // on this backend, at the end of a job
+    ggml_backend_event_t pulled_event = nullptr;                     // on this backend, after the pulls of a job
+    bool device_wait[GGML_SCHED_MAX_BACKENDS] = {};                  // main thread: backend b must wait for done_event
+    ggml_backend_buffer_t landing[GGML_SCHED_MAX_BACKENDS] = {};
+};
+
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
@@ -993,6 +1044,9 @@ struct ggml_backend_sched {
     uint64_t trace_split_hash;
     uint64_t trace_cross_backend_edges;
     bool trace_pipeline_parallel_recorded;
+
+    // delphi: backend workers (ggml_backend_sched_set_worker), NULL where none
+    struct ggml_backend_sched_worker * workers[GGML_SCHED_MAX_BACKENDS];
 };
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
@@ -3682,6 +3736,369 @@ void ggml_backend_sched_stage_allow(ggml_backend_sched_t sched, ggml_backend_t b
     }
 }
 
+// delphi: backend workers (see ggml_backend_sched_worker)
+
+static void ggml_backend_sched_worker_run(ggml_backend_sched_worker * w) {
+    ggml_backend_sched_t sched = w->sched;
+    ggml_exec_trace_set_thread_context(w->trace_ctx);
+    ggml_backend_t backend = sched->backends[w->backend_id];
+    struct ggml_backend_sched_split * split = &sched->splits[w->split_id];
+
+    for (int b : w->pull_wait) {
+        ggml_backend_event_wait(backend, w->pull_events[b]);
+    }
+    for (const auto & c : w->pulls) {
+        if (!w->copy_on(backend, c.src, c.dst)) {
+            GGML_ABORT("backend worker: cannot copy %s to %s", c.src->name, ggml_backend_name(backend));
+        }
+    }
+    ggml_backend_event_record(w->pulled_event, backend);
+
+    const uint64_t compute_start = ggml_backend_sched_trace_span_begin();
+    if (ggml_exec_trace_observing()) {
+        ggml_exec_trace_backend_begin(
+                sched->trace_graph_id, w->split_id + 1, w->backend_id + 1,
+                ggml_backend_sched_trace_device_id(sched, w->backend_id),
+                w->trace_ids.data(), split->graph.n_nodes);
+    }
+    w->status = ggml_backend_graph_compute_async(backend, &split->graph);
+    ggml_exec_trace_backend_end();
+    ggml_backend_sched_trace_span_end(
+            sched, compute_start, GGML_EXEC_TRACE_EVENT_BACKEND_SUBMIT, 0, w->split_id, w->backend_id,
+            GGML_EXEC_TRACE_ID_NONE, (uint32_t) w->status, split->i_start, split->i_end);
+    if (sched->events[w->backend_id][w->cur_copy] != NULL) {
+        ggml_backend_event_record(sched->events[w->backend_id][w->cur_copy], backend);
+    }
+
+    for (int b : w->push_wait) {
+        ggml_backend_event_wait(backend, w->push_events[b]);
+    }
+    for (const auto & c : w->pushes) {
+        if (!w->copy_on(backend, c.src, c.dst)) {
+            GGML_ABORT("backend worker: cannot copy %s from %s", c.src->name, ggml_backend_name(backend));
+        }
+    }
+    ggml_backend_event_record(w->done_event, backend);
+}
+
+static void ggml_backend_sched_worker_main(ggml_backend_sched_worker * w) {
+#ifdef __linux__
+    if (w->cpu >= 0) {
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        CPU_SET(w->cpu, &set);
+        if (pthread_setaffinity_np(pthread_self(), sizeof(set), &set) != 0) {
+            GGML_LOG_WARN("%s: cannot pin the worker of %s to CPU %d\n", __func__,
+                    ggml_backend_name(w->sched->backends[w->backend_id]), w->cpu);
+        }
+    }
+#endif
+    // between jobs, spin for a while (decode posts one job per layer), then sleep
+    static const int64_t spin_us = [] {
+        const char * env = getenv("GGML_SCHED_WORKER_SPIN_US");
+        return env != nullptr ? (int64_t) atoll(env) : (int64_t) 2000;
+    }();
+    uint64_t seen = 0;
+    for (;;) {
+        int64_t t0 = -1;
+        for (int i = 0; w->posted.load(std::memory_order_acquire) == seen; ++i) {
+            if ((i & 255) != 255) {
+                continue;
+            }
+            const int64_t t = ggml_time_us();
+            if (t0 < 0) {
+                t0 = t;
+            } else if (t - t0 > spin_us) {
+                std::unique_lock<std::mutex> lock(w->mutex);
+                w->cv.wait(lock, [&] { return w->quit || w->posted.load(std::memory_order_acquire) != seen; });
+                if (w->quit) {
+                    return;
+                }
+            }
+        }
+        seen++;
+        ggml_backend_sched_worker_run(w);
+        w->done.store(seen, std::memory_order_release);
+    }
+}
+
+// wait until the worker has queued all posted jobs (not until the device has run them)
+static void ggml_backend_sched_worker_join(ggml_backend_sched_worker * w) {
+    if (w == nullptr) {
+        return;
+    }
+    const uint64_t target = w->posted.load(std::memory_order_relaxed);
+    while (w->done.load(std::memory_order_acquire) != target) {
+    }
+}
+
+static void ggml_backend_sched_worker_stop(ggml_backend_sched_worker * w) {
+    if (w == nullptr) {
+        return;
+    }
+    ggml_backend_sched_worker_join(w);
+    {
+        std::lock_guard<std::mutex> lock(w->mutex);
+        w->quit = true;
+    }
+    w->cv.notify_one();
+    if (w->thread.joinable()) {
+        w->thread.join();
+    }
+    for (int b = 0; b < GGML_SCHED_MAX_BACKENDS; b++) {
+        if (w->pull_events[b] != NULL) {
+            ggml_backend_event_free(w->pull_events[b]);
+        }
+        if (w->push_events[b] != NULL) {
+            ggml_backend_event_free(w->push_events[b]);
+        }
+    }
+    ggml_backend_event_free(w->done_event);
+    ggml_backend_event_free(w->pulled_event);
+    for (int b = 0; b < GGML_SCHED_MAX_BACKENDS; b++) {
+        if (w->landing[b] != NULL) {
+            // no backend synchronize: at teardown the backends may be gone already (freeing device memory waits anyway)
+            ggml_backend_buffer_free(w->landing[b]);
+        }
+    }
+    delete w;
+}
+
+// before the main thread copies inputs to backend b: the pulls of the jobs that read from b are done. Input copies may write
+// from the host at once, into memory that held a pulled source; waiting for the pulls only (they finish soon after the post)
+// keeps a host-synchronous copy from also waiting for the whole job
+static void ggml_backend_sched_workers_fence_pulls(ggml_backend_sched_t sched, int b) {
+    for (int wb = 0; wb < sched->n_backends; wb++) {
+        ggml_backend_sched_worker * w = sched->workers[wb];
+        if (w != nullptr && w->device_wait[b]) {
+            ggml_backend_sched_worker_join(w);
+            ggml_backend_event_synchronize(w->pulled_event);
+        }
+    }
+}
+
+// before the main thread queues compute on backend b: b waits for the jobs that read from or wrote to it
+static void ggml_backend_sched_workers_fence(ggml_backend_sched_t sched, int b) {
+    for (int wb = 0; wb < sched->n_backends; wb++) {
+        ggml_backend_sched_worker * w = sched->workers[wb];
+        if (w != nullptr && w->device_wait[b]) {
+            ggml_backend_sched_worker_join(w);
+            ggml_backend_event_wait(sched->backends[b], w->done_event);
+            w->device_wait[b] = false;
+        }
+    }
+}
+
+static bool ggml_backend_sched_worker_device_ok(ggml_backend_sched_t sched, ggml_backend_sched_worker * w, int b) {
+    if (b < 0 || b == w->backend_id) {
+        return false;
+    }
+    ggml_backend_t backend = sched->backends[b];
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    return dev != nullptr && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU &&
+           ggml_backend_dev_backend_reg(dev) == ggml_backend_dev_backend_reg(ggml_backend_get_device(sched->backends[w->backend_id])) &&
+           backend->iface.event_wait != NULL && backend->iface.event_record != NULL;
+}
+
+// a split the worker can run: device inputs only (no user inputs, host memory or weights)
+static bool ggml_backend_sched_worker_split_ok(ggml_backend_sched_t sched, ggml_backend_sched_worker * w,
+        const struct ggml_backend_sched_split * split) {
+    for (int i = 0; i < split->n_inputs; i++) {
+        struct ggml_tensor * input = split->inputs[i];
+        ggml_backend_buffer_t buf = input->view_src ? input->view_src->buffer : input->buffer;
+        if ((input->flags & GGML_TENSOR_FLAG_INPUT) || buf == NULL || ggml_backend_buffer_is_host(buf) ||
+                ggml_backend_buffer_get_usage(buf) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+            return false;
+        }
+        const int b = tensor_backend_id(input);
+        if (!ggml_backend_sched_worker_device_ok(sched, w, b) || sched->workers[b] != nullptr) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// post split_id to its worker: the pulls of its inputs, and the pushes of its outputs that later splits on other GPUs read
+// before the next split on this backend
+static void ggml_backend_sched_worker_post(ggml_backend_sched_t sched, ggml_backend_sched_worker * w, int split_id) {
+    ggml_backend_sched_worker_join(w);
+    const struct ggml_backend_sched_split * split = &sched->splits[split_id];
+    w->sched = sched;
+    w->split_id = split_id;
+    w->cur_copy = sched->cur_copy;
+    w->pull_wait.clear();
+    w->push_wait.clear();
+    w->pulls.clear();
+    w->pushes.clear();
+    w->forwarded.clear();
+    auto add = [](std::vector<int> & v, int b) {
+        if (std::find(v.begin(), v.end(), b) == v.end()) {
+            v.push_back(b);
+        }
+    };
+    auto event = [&](ggml_backend_event_t * events, int b) {
+        if (events[b] == NULL) {
+            events[b] = ggml_backend_event_new(ggml_backend_get_device(sched->backends[b]));
+        }
+        return events[b];
+    };
+    for (int i = 0; i < split->n_inputs; i++) {
+        struct ggml_tensor * input = split->inputs[i];
+        add(w->pull_wait, tensor_backend_id(input));
+        w->pulls.push_back({ input, sched_hv_copy(sched, input, w->backend_id, sched->cur_copy) });
+    }
+    size_t landing_size[GGML_SCHED_MAX_BACKENDS] = { 0 };
+    for (int s = split_id + 1; s < sched->n_splits && sched->splits[s].backend_id != w->backend_id; s++) {
+        const struct ggml_backend_sched_split * next = &sched->splits[s];
+        const int b = next->backend_id;
+        if (!ggml_backend_sched_worker_device_ok(sched, w, b)) {
+            continue;
+        }
+        const size_t align = ggml_backend_buft_get_alignment(sched->bufts[b]);
+        for (int i = 0; i < next->n_inputs; i++) {
+            struct ggml_tensor * input = next->inputs[i];
+            if (tensor_backend_id(input) != w->backend_id || (input->flags & GGML_TENSOR_FLAG_INPUT)) {
+                continue;
+            }
+            ggml_backend_sched_worker::forward f = { s, i, *input };
+            f.landing.view_src = NULL;
+            f.landing.view_offs = 0;
+            f.landing.data = (void *) landing_size[b]; // offset, made a pointer below
+            f.landing.buffer = NULL;
+            landing_size[b] += GGML_PAD(ggml_nbytes(input), align);
+            w->forwarded.push_back(f);
+            add(w->push_wait, b);
+        }
+    }
+    for (int b : w->push_wait) {
+        if (w->landing[b] == NULL || ggml_backend_buffer_get_size(w->landing[b]) < landing_size[b]) {
+            if (w->landing[b] != NULL) {
+                ggml_backend_synchronize(sched->backends[b]);
+                ggml_backend_buffer_free(w->landing[b]);
+            }
+            w->landing[b] = ggml_backend_buft_alloc_buffer(sched->bufts[b], std::max<size_t>(landing_size[b], 1 << 20));
+            GGML_ASSERT(w->landing[b] != NULL);
+        }
+    }
+    for (auto & f : w->forwarded) {
+        const int b = sched->splits[f.split_id].backend_id;
+        f.landing.buffer = w->landing[b];
+        f.landing.data = (char *) ggml_backend_buffer_get_base(w->landing[b]) + (size_t) f.landing.data;
+        w->pushes.push_back({ sched->splits[f.split_id].inputs[f.input_id], &f.landing });
+    }
+    // a pull source not recorded after the split that produced it: record now. A push target: its last landing copy and
+    // everything else queued on it before this split
+    for (int b : w->pull_wait) {
+        if (!w->recorded[b]) {
+            ggml_backend_event_record(event(w->pull_events, b), sched->backends[b]);
+        }
+        w->device_wait[b] = true;
+    }
+    for (int b : w->push_wait) {
+        ggml_backend_event_record(event(w->push_events, b), sched->backends[b]);
+        w->device_wait[b] = true;
+    }
+    for (int b = 0; b < sched->n_backends; b++) {
+        w->recorded[b] = false;
+    }
+    if (ggml_exec_trace_observing()) {
+        w->trace_ids.resize(split->graph.n_nodes);
+        for (int j = 0; j < split->graph.n_nodes; ++j) {
+            w->trace_ids[j] = ggml_exec_trace_enabled() ?
+                    ggml_backend_sched_trace_tensor_id(sched, split->graph.nodes[j]) : GGML_EXEC_TRACE_ID_NONE;
+        }
+    }
+    w->trace_ctx = ggml_exec_trace_get_thread_context();
+    w->posted.fetch_add(1, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lock(w->mutex);
+    }
+    w->cv.notify_one();
+}
+
+// per graph: which splits the worker runs, and after which split each of their pull sources is recorded: the last split on
+// the source backend that computes one of the pulled tensors (none found: at the post)
+static void ggml_backend_sched_worker_plan(ggml_backend_sched_t sched, ggml_backend_sched_worker * w) {
+    w->ok.assign(sched->n_splits, 0);
+    w->records.clear();
+    for (int s = 0; s < sched->n_splits; s++) {
+        const struct ggml_backend_sched_split * split = &sched->splits[s];
+        if (split->backend_id != w->backend_id || !ggml_backend_sched_worker_split_ok(sched, w, split)) {
+            continue;
+        }
+        w->ok[s] = 1;
+        int last[GGML_SCHED_MAX_BACKENDS];
+        std::fill(last, last + GGML_SCHED_MAX_BACKENDS, -2); // -2: no input from b, -1: at the post
+        for (int i = 0; i < split->n_inputs; i++) {
+            const struct ggml_tensor * input = split->inputs[i];
+            const int b = tensor_backend_id(split->inputs[i]);
+            int producer = -1;
+            for (int p = s - 1; p >= 0 && producer < 0 && sched->splits[p].backend_id != w->backend_id; p--) {
+                const struct ggml_backend_sched_split * prev = &sched->splits[p];
+                for (int j = 0; prev->backend_id == b && j < prev->graph.n_nodes; j++) {
+                    if (prev->graph.nodes[j] == input || prev->graph.nodes[j] == input->view_src) {
+                        producer = p;
+                        break;
+                    }
+                }
+            }
+            last[b] = last[b] == -1 || producer < 0 ? -1 : std::max(last[b], producer);
+        }
+        for (int b = 0; b < sched->n_backends; b++) {
+            if (last[b] >= 0) {
+                w->records.push_back({ last[b], b });
+            }
+        }
+    }
+}
+
+static const ggml_backend_sched_worker::forward * ggml_backend_sched_worker_forwarded(
+        const ggml_backend_sched_worker * w, int split_id, int input_id) {
+    for (const auto & f : w->forwarded) {
+        if (f.split_id == split_id && f.input_id == input_id) {
+            return &f;
+        }
+    }
+    return nullptr;
+}
+
+void ggml_backend_sched_set_worker(ggml_backend_sched_t sched, ggml_backend_t backend, bool enable, int cpu) {
+    GGML_ASSERT(sched);
+    const int b = ggml_backend_sched_backend_id(sched, backend);
+    if (b < 0) {
+        return;
+    }
+    ggml_backend_sched_worker * w = sched->workers[b];
+    if (w != nullptr && enable && w->cpu == cpu) {
+        return;
+    }
+    if (w != nullptr) {
+        ggml_backend_sched_worker_stop(w);
+        sched->workers[b] = nullptr;
+    }
+    if (!enable) {
+        return;
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    auto copy_on = reg ? (ggml_backend_sched_worker::copy_on_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_copy_on") : nullptr;
+    if (copy_on == nullptr || backend->iface.event_record == NULL || backend->iface.event_wait == NULL) {
+        GGML_LOG_WARN("%s: %s cannot have a worker\n", __func__, ggml_backend_name(backend));
+        return;
+    }
+    w = new ggml_backend_sched_worker();
+    w->backend_id = b;
+    w->cpu = cpu;
+    w->copy_on = copy_on;
+    w->sched = sched;
+    w->done_event = ggml_backend_event_new(dev);
+    w->pulled_event = ggml_backend_event_new(dev);
+    w->thread = std::thread(ggml_backend_sched_worker_main, w);
+    sched->workers[b] = w;
+    GGML_LOG_INFO("%s: splits on %s are submitted by a worker thread%s\n", __func__, ggml_backend_name(backend),
+            cpu >= 0 ? (" on CPU " + std::to_string(cpu)).c_str() : "");
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     bool backends_idle = sched->backends_idle;
@@ -3734,15 +4151,48 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         ggml_backend_sched_stage_begin(sched);
     }
 
+    // delphi: backend workers take graphs that stage nothing (decode), without an eval callback
+    bool workers_on = false;
+    for (int b = 0; b < sched->n_backends; b++) {
+        workers_on |= sched->workers[b] != nullptr;
+    }
+    workers_on = workers_on && !sched->callback_eval && (sched->stage == nullptr || sched->stage->items.empty());
+    for (int b = 0; b < sched->n_backends; b++) {
+        ggml_backend_sched_worker * w = sched->workers[b];
+        if (w != nullptr) {
+            w->forwarded.clear(); // they name splits of the previous graph
+            std::fill(w->recorded, w->recorded + GGML_SCHED_MAX_BACKENDS, false);
+            if (workers_on) {
+                ggml_backend_sched_worker_plan(sched, w);
+            }
+        }
+    }
+
+    struct landed_input { ggml_backend_sched_worker * w; const ggml_backend_sched_worker::forward * f; struct ggml_tensor * input; };
+    std::vector<landed_input> landed;
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
 
+        if (workers_on) {
+            ggml_backend_sched_worker * w = sched->workers[split_backend_id];
+            if (w != nullptr && w->ok[split_id]) {
+                ggml_backend_sched_worker_post(sched, w, split_id);
+                prev_backend_id = split_backend_id;
+                continue;
+            }
+            // this thread queues work on the split backend below
+            ggml_backend_sched_worker_join(w);
+            ggml_backend_sched_workers_fence_pulls(sched, split_backend_id);
+        }
+
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
         if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id &&
                 ggml_backend_sched_splits_share_memory(sched, prev_backend_id, split_backend_id)) {
+            ggml_backend_sched_worker_join(sched->workers[prev_backend_id]);
             const uint64_t wait_start = ggml_backend_sched_trace_span_begin();
             if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
                 ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
@@ -3786,6 +4236,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
+            if (workers_on) {
+                ggml_backend_sched_worker * w = sched->workers[tensor_backend_id(input)];
+                const ggml_backend_sched_worker::forward * f = w != nullptr ? ggml_backend_sched_worker_forwarded(w, split_id, input_id) : nullptr;
+                if (f != nullptr) {
+                    landed.push_back({ w, f, input });
+                    continue; // copied from the landing buffer after the other inputs
+                }
+                ggml_backend_sched_worker_join(w);
+            }
             struct ggml_tensor * input_cpy = sched_hv_copy(sched, input, split_backend_id, sched->cur_copy);
             const uint64_t copy_start = ggml_backend_sched_trace_span_begin();
             const bool observe_copy = copy_start || ggml_exec_trace_integrity_enabled();
@@ -4026,6 +4485,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     input_node_id, input_cpy_node_id, copy_bytes);
         }
 
+        if (workers_on) {
+            // the split backend waits for the jobs it depends on only now, so that the copies above do not wait for them
+            ggml_backend_sched_workers_fence(sched, split_backend_id);
+            for (const auto & l : landed) {
+                if (!l.w->copy_on(split_backend, &l.f->landing, sched_hv_copy(sched, l.input, split_backend_id, sched->cur_copy))) {
+                    GGML_ABORT("backend worker: cannot copy %s on %s", l.input->name, ggml_backend_name(split_backend));
+                }
+            }
+            landed.clear();
+        }
+
         if (input_sync_pending) {
             ggml_backend_synchronize(split_backend);
         }
@@ -4121,12 +4591,48 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        // a pull source of a worker split that follows
+        if (workers_on) {
+            for (int b = 0; b < sched->n_backends; b++) {
+                ggml_backend_sched_worker * w = sched->workers[b];
+                for (size_t r = 0; w != nullptr && r < w->records.size(); r++) {
+                    if (w->records[r].first != split_id) {
+                        continue;
+                    }
+                    const int src = w->records[r].second;
+                    ggml_backend_sched_worker_join(w); // its previous job has waited for the previous record
+                    if (w->pull_events[src] == NULL) {
+                        w->pull_events[src] = ggml_backend_event_new(ggml_backend_get_device(sched->backends[src]));
+                    }
+                    ggml_backend_event_record(w->pull_events[src], sched->backends[src]);
+                    w->recorded[src] = true;
+                }
+            }
+        }
+
         // record the event of this split
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
             ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
         }
 
         prev_backend_id = split_backend_id;
+    }
+
+    // the workers have queued their jobs; the backends they wrote to wait for them before anything that follows
+    for (int b = 0; b < sched->n_backends; b++) {
+        ggml_backend_sched_worker * w = sched->workers[b];
+        if (w == nullptr) {
+            continue;
+        }
+        ggml_backend_sched_worker_join(w);
+        for (int d = 0; d < sched->n_backends; d++) {
+            ggml_backend_sched_workers_fence(sched, d);
+        }
+        if (w->status != GGML_STATUS_SUCCESS) {
+            const enum ggml_status status = w->status;
+            w->status = GGML_STATUS_SUCCESS;
+            return status;
+        }
     }
 
     // mark the end of this graph's use of copy slot cur_copy on every backend that ran a split of it
@@ -4265,6 +4771,10 @@ ggml_backend_sched_t ggml_backend_sched_new(
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
+    }
+    for (int b = 0; b < sched->n_backends; b++) {
+        ggml_backend_sched_worker_stop(sched->workers[b]);
+        sched->workers[b] = nullptr;
     }
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
@@ -4422,6 +4932,9 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
 
 void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
+    for (int i = 0; i < sched->n_backends; i++) {
+        ggml_backend_sched_worker_join(sched->workers[i]);
+    }
     for (int i = 0; i < sched->n_backends; i++) {
         const uint64_t wait_start = ggml_backend_sched_trace_span_begin();
         ggml_backend_synchronize(sched->backends[i]);

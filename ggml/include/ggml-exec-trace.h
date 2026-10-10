@@ -277,6 +277,16 @@ GGML_API uint32_t ggml_exec_trace_ubatch_begin(
         uint32_t n_outputs);
 GGML_API void ggml_exec_trace_ubatch_end(uint32_t ubatch_id, int32_t status);
 
+// The execution, ubatch and phase of the calling thread, so that a helper thread (the scheduler's backend workers) records
+// its events under the same execution.
+struct ggml_exec_trace_thread_context {
+    uint32_t execution_id;
+    uint32_t ubatch_id;
+    enum ggml_exec_trace_execution_phase phase;
+};
+GGML_API struct ggml_exec_trace_thread_context ggml_exec_trace_get_thread_context(void);
+GGML_API void ggml_exec_trace_set_thread_context(struct ggml_exec_trace_thread_context ctx);
+
 GGML_API uint32_t ggml_exec_trace_next_graph_id(void);
 GGML_API uint32_t ggml_exec_trace_next_node_id(void);
 GGML_API uint32_t ggml_exec_trace_next_gpu_graph_id(void);

@@ -7214,10 +7214,42 @@ static void ggml_backend_cuda_trim(ggml_backend_t backend) {
     }
 }
 
+// delphi: queue a copy between two device tensors, on any devices, on the stream of `backend` (the scheduler's backend
+// workers pull their inputs and push their outputs on their own stream; the caller orders it with events). False if the
+// buffers are not CUDA buffers or the devices cannot copy directly.
+static bool ggml_backend_cuda_copy_on(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst) {
+    ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
+    ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
+    if (!ggml_backend_is_cuda(backend) || buf_src == nullptr || buf_dst == nullptr ||
+            !ggml_backend_buffer_is_cuda(buf_src) || !ggml_backend_buffer_is_cuda(buf_dst)) {
+        return false;
+    }
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    const int src_physical = ggml_cuda_get_physical_device(((ggml_backend_cuda_buffer_context *) buf_src->context)->device);
+    const int dst_physical = ggml_cuda_get_physical_device(((ggml_backend_cuda_buffer_context *) buf_dst->context)->device);
+    ggml_cuda_set_device(ctx->device);
+    if (src_physical == dst_physical) {
+        CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, ctx->stream()));
+        return true;
+    }
+#ifdef GGML_CUDA_NO_PEER_COPY
+    return false;
+#else
+    if (ggml_cuda_xdev_stage_wanted(src_physical, dst_physical)) {
+        return false;
+    }
+    CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, dst_physical, src->data, src_physical, ggml_nbytes(dst), ctx->stream()));
+    return true;
+#endif // GGML_CUDA_NO_PEER_COPY
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_cuda_trim") == 0) {
         return (void *) ggml_backend_cuda_trim;
+    }
+    if (strcmp(name, "ggml_backend_copy_on") == 0) {
+        return (void *) ggml_backend_cuda_copy_on;
     }
     if (strcmp(name, "ggml_backend_stage_register") == 0) {
         return (void *) ggml_backend_cuda_stage_register;

@@ -21,6 +21,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -3300,7 +3301,64 @@ llm_graph_result * llama_context::get_gf_res_prev() {
     return res.get();
 }
 
+// delphi: a CPU on the NUMA node of a GPU for its scheduler worker: LLAMA_MOE_CACHE_WORKER_CPU, else the node's last CPU
+// (--numa tensors gives the CPU threads the first CPUs of each node), else -1 (not pinned)
+static int share_worker_cpu(ggml_backend_dev_t dev) {
+    if (const char * env = getenv("LLAMA_MOE_CACHE_WORKER_CPU")) {
+        return atoi(env);
+    }
+    ggml_backend_dev_props props;
+    ggml_backend_dev_get_props(dev, &props);
+    if (props.device_id == nullptr) {
+        return -1;
+    }
+    std::string id = props.device_id;
+    for (auto & c : id) {
+        c = (char) tolower((unsigned char) c);
+    }
+    int node = -1;
+    std::ifstream("/sys/bus/pci/devices/" + id + "/numa_node") >> node;
+    if (node < 0) {
+        return -1;
+    }
+    std::string list;
+    std::ifstream("/sys/devices/system/node/node" + std::to_string(node) + "/cpulist") >> list;
+    const size_t sep = list.find_last_of(",-");
+    const std::string last = sep == std::string::npos ? list : list.substr(sep + 1);
+    return last.empty() ? -1 : atoi(last.c_str());
+}
+
+// delphi: the splits of an expert cache tier on another GPU are submitted by a scheduler worker, so that their host time
+// overlaps the CPU expert part (LLAMA_MOE_CACHE_WORKER=0 turns this off)
+void llama_context::sched_set_workers(ggml_backend_sched_t s) {
+    static const bool enabled = [] { const char * e = getenv("LLAMA_MOE_CACHE_WORKER"); return e == nullptr || atoi(e) != 0; }();
+    if (s == nullptr) {
+        return;
+    }
+    for (auto & b : backends) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(b.get());
+        if (dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            continue;
+        }
+        bool remote = false;
+        for (int t = 0; enabled && expert_cache && t < expert_cache->n_tiers(); ++t) {
+            remote |= expert_cache->tier_backend(t) == b.get() && b.get() != expert_cache->backend();
+        }
+        ggml_backend_sched_set_worker(s, b.get(), remote, remote ? share_worker_cpu(dev) : -1);
+    }
+}
+
+void llama_context::sched_set_workers_all() {
+    sched_set_workers(sched.get());
+    for (auto & slot : graph_slots) {
+        if (slot.sched) {
+            sched_set_workers(slot.sched.get());
+        }
+    }
+}
+
 void llama_context::sched_set_stage_lender() {
+    sched_set_workers(sched.get());
     if (expert_cache) {
         ggml_backend_sched_set_stage_lender(sched.get(), llama_expert_cache::lend, expert_cache.get());
     }
@@ -3403,6 +3461,7 @@ int llama_context::share_add_tier(ggml_backend_dev_t dev, size_t bytes) {
     const int id = expert_cache->add_tier(backend, bytes);
     if (id >= 0) {
         share_gen++;
+        sched_set_workers_all();
     }
     return id;
 }
@@ -3423,6 +3482,7 @@ size_t llama_context::share_drop_tier(int id) {
     graph_alt_reset();
     const size_t bytes = expert_cache->drop_tier(id);
     share_gen++;
+    sched_set_workers_all();
     return bytes;
 }
 
