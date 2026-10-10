@@ -11167,8 +11167,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id_partial(GGML_TYPE_Q4_G128, 16, 6, false, 512, rows, 256));
     }
     // partial MUL_MAT_ID (expert split): broadcast gate/up and per-slot down, few and many tokens
-    for (ggml_type type_a : {GGML_TYPE_Q2_K, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0}) {
-        for (int64_t n : {3, 64, 600}) {
+    // delphi: the expert cache runs partial MUL_MAT_ID on its GPU banks and the host experts, for any expert type
+    for (ggml_type type_a : {GGML_TYPE_Q2_K, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q3_K, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_XS,
+                             GGML_TYPE_MXFP4, GGML_TYPE_IQ2_K, GGML_TYPE_IQ3_K, GGML_TYPE_IQ4_K, GGML_TYPE_IQ5_K,
+                             GGML_TYPE_IQ2_KS, GGML_TYPE_IQ3_KS, GGML_TYPE_IQ4_KS, GGML_TYPE_IQ5_KS}) {
+        for (int64_t n : {1, 3, 64, 600}) {
             test_cases.emplace_back(new test_mul_mat_id_partial(type_a, 16, 6, true,  256, n, 512));
             test_cases.emplace_back(new test_mul_mat_id_partial(type_a, 16, 6, false, 512, n, 256));
         }
