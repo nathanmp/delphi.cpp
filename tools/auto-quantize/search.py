@@ -179,7 +179,21 @@ def search(info, cfg, predictor, baseline_choices):
             frontier = pareto([*frontier, state])
         return state
 
-    beam = [state for key in dict.fromkeys((minimum, baseline, quality)) if (state := evaluate(key)) is not None]
+    # Uniform category mixes keep a small search cap from returning only neighbors of the two extremes.
+    by_name = {t["name"]: t for t in info["tensors"]}
+    seeds = [minimum, baseline, quality]
+    primary_types = sorted({q for g in groups if any(by_name[n]["category"] == "primary" for n in g["members"]) for q in g["pool"]})
+    other_types = sorted({q for g in groups if any(by_name[n]["category"] == "other" and not by_name[n]["preserved"] for n in g["members"])
+                          for q in g["pool"]})
+    for primary in primary_types:
+        for other in other_types or [None]:
+            seed = list(minimum)
+            for i, group in enumerate(groups):
+                dtype = primary if any(by_name[n]["category"] == "primary" for n in group["members"]) else other
+                if dtype in options[i]:
+                    seed[i] = dtype
+            seeds.append(tuple(seed))
+    beam = [state for key in dict.fromkeys(seeds) if (state := evaluate(key)) is not None]
     expanded = set()
     while beam and len(evaluated) < cap:
         new = []
