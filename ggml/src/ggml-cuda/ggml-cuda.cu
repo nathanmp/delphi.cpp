@@ -7191,8 +7191,34 @@ static void ggml_backend_cuda_moe_int4_forget_inside_proc(ggml_backend_t backend
 }
 #endif
 
+// delphi: give the cached device memory of an idle backend back to the driver, so that another process can use it (VRAM sharing
+// between servers). Captured graphs hold the addresses of pool buffers, so they go too. No work may be queued or running.
+static void ggml_backend_cuda_trim(ggml_backend_t backend) {
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(ctx->device);
+    CUDA_CHECK(cudaDeviceSynchronize());
+#ifdef USE_CUDA_GRAPH
+    ctx->cuda_graphs.clear();
+    ctx->graph_key_by_uid.clear();
+#endif
+    for (auto & per_device : ctx->pools) {
+        for (auto & pool : per_device) {
+            pool.reset();
+        }
+    }
+    ggml_cuda_moe_int4_free_scratch(ctx);
+    if (ctx->q8_1_cache_buf != nullptr) {
+        CUDA_CHECK(cudaFree(ctx->q8_1_cache_buf));
+        ctx->q8_1_cache_buf = nullptr;
+        ctx->q8_1_cache_on  = false;
+    }
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_cuda_trim") == 0) {
+        return (void *) ggml_backend_cuda_trim;
+    }
     if (strcmp(name, "ggml_backend_stage_register") == 0) {
         return (void *) ggml_backend_cuda_stage_register;
     }

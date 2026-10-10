@@ -3017,6 +3017,7 @@ struct ggml_backend_sched_stage {
     int split_weights = 1; // redirected weights per split (GGML_SCHED_STAGE_SPLIT_WEIGHTS)
     bool spread = false;   // GGML_SCHED_STAGE_SPREAD
     int min_tokens = 512;  // GGML_SCHED_STAGE_MIN_TOKENS
+    bool blocked[GGML_SCHED_MAX_BACKENDS] = {}; // ggml_backend_sched_stage_allow
 };
 
 static void ggml_backend_sched_stage_run_job(
@@ -3384,7 +3385,7 @@ static int ggml_backend_sched_stage_spread(ggml_backend_sched_t sched, const str
     int gpus[GGML_SCHED_MAX_BACKENDS];
     int n = 0;
     for (int b = 0; b < sched->n_backends - 1; b++) {
-        if (stage->rings[b].upload != nullptr && ggml_backend_supports_op(sched->backends[b], op)) {
+        if (stage->rings[b].upload != nullptr && !stage->blocked[b] && ggml_backend_supports_op(sched->backends[b], op)) {
             gpus[n++] = b;
         }
     }
@@ -3410,16 +3411,18 @@ static int ggml_backend_sched_stage_route(ggml_backend_sched_t sched, const stru
     }
     int preferred = -1;
     ggml_backend_sched_cpu_input_bytes(sched, op, weight, &preferred);
-    if (preferred >= 0 && preferred < cpu_backend_id && stage->rings[preferred].upload != nullptr &&
+    if (preferred >= 0 && preferred < cpu_backend_id && stage->rings[preferred].upload != nullptr && !stage->blocked[preferred] &&
             ggml_backend_supports_op(sched->backends[preferred], op)) {
         return preferred;
     }
+    bool any_blocked = false;
     for (int b = 0; b < cpu_backend_id; b++) {
-        if (stage->rings[b].upload != nullptr && ggml_backend_supports_op(sched->backends[b], op)) {
+        any_blocked |= stage->rings[b].upload != nullptr && stage->blocked[b];
+        if (stage->rings[b].upload != nullptr && !stage->blocked[b] && ggml_backend_supports_op(sched->backends[b], op)) {
             return b;
         }
     }
-    return -1;
+    return any_blocked ? cpu_backend_id : -1;
 }
 
 static int ggml_backend_sched_stage_split_weights(ggml_backend_sched_t sched) {
@@ -3651,6 +3654,32 @@ bool ggml_backend_sched_stage_reclaim(ggml_backend_sched_t sched) {
         }
     }
     return any;
+}
+
+size_t ggml_backend_sched_stage_release(ggml_backend_sched_t sched) {
+    ggml_backend_sched_stage * stage = sched->stage;
+    if (stage == nullptr) {
+        return 0;
+    }
+    ggml_backend_sched_stage_drain(stage);
+    size_t freed = 0;
+    for (auto & ring : stage->rings) {
+        for (int s = 0; s < GGML_SCHED_STAGE_MAX_SLOTS; s++) {
+            freed += ring.buffers[s] != nullptr ? ggml_backend_buffer_get_size(ring.buffers[s]) : 0;
+        }
+        ggml_backend_sched_stage_release_ring(ring);
+    }
+    return freed;
+}
+
+void ggml_backend_sched_stage_allow(ggml_backend_sched_t sched, ggml_backend_t backend, bool allow) {
+    if (sched->stage == nullptr) {
+        return;
+    }
+    const int b = ggml_backend_sched_backend_id(sched, backend);
+    if (b >= 0) {
+        sched->stage->blocked[b] = !allow;
+    }
 }
 
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
