@@ -186,6 +186,16 @@ class Files(unittest.TestCase):
 
 
 class Timing(unittest.TestCase):
+    def test_variable_tied_embedding_includes_the_output_projection(self):
+        model = {"architecture": "olmoe", "n_expert": 8, "top_k": 2,
+                 "tensors": [tensor("token_embd.weight", (256, 256))]}
+        config = cfg(other_qtypes=["Q6_K", "Q8_0"])
+        classify(model, config)
+        self.assertEqual(len(regions(model)), 1)
+        model["tensors"].append(tensor("output.weight", (256, 256)))
+        classify(model, config)
+        self.assertEqual([m[0]["name"] for _, m, _ in regions(model)], ["output.weight"])
+
     def test_ram_traffic_prevents_a_hot_probe_from_claiming_a_decode_win(self):
         config = cfg()
         model = classify(info(), config)

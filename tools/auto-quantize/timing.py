@@ -113,8 +113,8 @@ def regions(info):
         members = [by_name[name] for name in group["members"]]
         if all(t["preserved"] for t in members):
             continue
-        # Token embedding is a row lookup; its near-constant cost belongs to the anchor, not a full vocabulary matmul.
-        if all(t["name"] == "token_embd.weight" for t in members):
+        # A separate embedding is a lookup. A tied output also performs a vocabulary projection when its type varies.
+        if all(t["name"] == "token_embd.weight" for t in members) and ("output.weight" in by_name or len(group["pool"]) == 1):
             continue
         paired = len(members) == 2 and all(t["expert"] for t in members) and members[0]["shape"] == members[1]["shape"]
         if paired:
