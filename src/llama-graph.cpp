@@ -19,6 +19,7 @@
 #include "llama-memory-recurrent.h"
 
 #include <cassert>
+#include <map>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -2529,15 +2530,26 @@ ggml_tensor * llm_graph_context::build_moe_ffn_cache(
         }
     };
     gather(true);
+    bool any_remote = false;
+    for (int t = 0; t < expert_cache->n_tiers(); ++t) {
+        any_remote |= expert_cache->hot_ids(t, il) && expert_cache->tier_backend(t) != expert_cache->backend();
+    }
 
     // One CPU transfer before GPU expert work. Expert IDs are exactly representable as F32. The CPU maps the original IDs to
     // cold IDs and records them for the next membership refresh. The packet is made on the layer GPU: the CPU copies it
-    // synchronously, and on another GPU it would wait for that GPU's queue.
+    // synchronously, and on another GPU it would wait for that GPU's queue. With a tier on another GPU, the packet also
+    // carries the routing weights, so that GPU gets all of its inputs in one copy.
     const int64_t nx = ggml_nelements(cur);
+    const int64_t ni = ggml_nelements(ids);
     auto * fids = ggml_cast(ctx0, flat, GGML_TYPE_F32);
     name(fids, "packet_ids", false);
     auto * packet = ggml_concat(ctx0, ggml_reshape_1d(ctx0, ggml_cont(ctx0, cur), nx), fids, 0);
     name(packet, "packet_src", false);
+    if (any_remote) {
+        auto * w = ggml_is_contiguous(weights) ? weights : ggml_cont(ctx0, weights);
+        packet = ggml_concat(ctx0, packet, ggml_reshape_1d(ctx0, w, ggml_nelements(w)), 0);
+        name(packet, "packet_src", false);
+    }
     auto * input = ggml_dup(ctx0, packet);
     name(input, "packet", true);
     auto * cx = ggml_view_3d(ctx0, input, cur->ne[0], 1, cur->ne[2], cur->ne[0] * sizeof(float), cur->ne[0] * sizeof(float), 0);
@@ -2546,7 +2558,33 @@ ggml_tensor * llm_graph_context::build_moe_ffn_cache(
     name(cx, "input", true); name(ci, "ids", true);
     ggml_build_forward_expand(gf, cx);
     ggml_build_forward_expand(gf, ci);
-    gather(false);
+    // Each GPU with a remote tier copies the packet once and takes its inputs from it.
+    struct remote_in { ggml_tensor * x, * flat, * weights; };
+    std::map<ggml_backend_t, remote_in> remote_ins;
+    auto remote_input = [&](int t) {
+        auto it = remote_ins.find(expert_cache->tier_backend(t));
+        if (it != remote_ins.end()) {
+            return it->second;
+        }
+        auto * rp = ggml_dup(ctx0, packet);
+        name_tier(rp, t, "packet");
+        auto * x = ggml_view_3d(ctx0, rp, cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[0] * sizeof(float),
+                cur->ne[0] * cur->ne[1] * sizeof(float), 0);
+        auto * f = ggml_cast(ctx0, ggml_view_1d(ctx0, rp, ni, nx * sizeof(float)), GGML_TYPE_I32);
+        auto * w = ggml_view_3d(ctx0, rp, weights->ne[0], weights->ne[1], weights->ne[2], weights->ne[0] * sizeof(float),
+                weights->ne[0] * weights->ne[1] * sizeof(float), (nx + ni) * sizeof(float));
+        name_tier(x, t, "packet_x"); name_tier(f, t, "packet_ids"); name_tier(w, t, "packet_w");
+        return remote_ins[expert_cache->tier_backend(t)] = { x, f, w };
+    };
+    for (int t = 0; t < expert_cache->n_tiers(); ++t) {
+        auto * map = expert_cache->hot_ids(t, il);
+        if (map && expert_cache->tier_backend(t) != expert_cache->backend()) {
+            auto * hot = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, map, remote_input(t).flat), ids->ne[0], ids->ne[1]);
+            name_tier(hot, t, "hot");
+            ggml_build_forward_expand(gf, hot);
+            hots.push_back({ t, hot });
+        }
+    }
 
     using labeler = std::function<void(ggml_tensor *, const char *)>;
     // Each part leaves zeros in the other parts' rows. The GPU parts are built first so that they run while the CPU part does.
@@ -2562,8 +2600,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn_cache(
         return d;
     };
     // the weighted sum over the expert slots, as build_moe_ffn does, so that the backend fuses it
-    auto reduce = [&](ggml_tensor * experts, const labeler & label) {
-        experts = ggml_mul(ctx0, experts, weights);
+    auto reduce = [&](ggml_tensor * experts, ggml_tensor * w, const labeler & label) {
+        experts = ggml_mul(ctx0, experts, w);
         label(experts, "weighted");
         ggml_build_forward_expand(gf, experts);
         ggml_tensor * views[LLAMA_MAX_EXPERTS] = {};
@@ -2585,11 +2623,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn_cache(
     for (const auto & [t, hot] : hots) {
         const int tier = t;
         const labeler label = [&, tier](ggml_tensor * x, const char * l) { name_tier(x, tier, l); };
-        auto * d = part(cur, hot, expert_cache->bank(t, il, 0), expert_cache->bank(t, il, 1), expert_cache->bank(t, il, 2), label);
-        if (expert_cache->tier_backend(t) == expert_cache->backend()) {
+        const bool is_local = expert_cache->tier_backend(t) == expert_cache->backend();
+        auto * d = part(is_local ? cur : remote_input(t).x, hot,
+                expert_cache->bank(t, il, 0), expert_cache->bank(t, il, 1), expert_cache->bank(t, il, 2), label);
+        if (is_local) {
             local.push_back(d);
         } else {
-            remote.push_back(reduce(d, label));
+            remote.push_back(reduce(d, remote_input(t).weights, label));
         }
     }
     auto * experts = part(cx, ci, gate, up, down, [&](ggml_tensor * x, const char * l) { name(x, l, true); });
@@ -2598,7 +2638,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn_cache(
         experts = ggml_add(ctx0, d, experts);
         name(experts, "merge", false);
     }
-    ggml_tensor * out = reduce(experts, [&](ggml_tensor * x, const char * l) { name(x, l, false); });
+    ggml_tensor * out = reduce(experts, weights, [&](ggml_tensor * x, const char * l) { name(x, l, false); });
     for (auto * r : remote) {
         out = ggml_add(ctx0, out, r);
         name(out, "remote", false);
