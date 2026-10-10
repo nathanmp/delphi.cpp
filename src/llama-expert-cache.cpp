@@ -556,27 +556,46 @@ bool llama_expert_cache::needs_refresh(int64_t n_tokens, bool is_warmup) {
 bool llama_expert_cache::lend(void * user_data, ggml_backend_t backend, int n_slots, size_t slot_size, void ** slots) {
     auto & c = *static_cast<llama_expert_cache *>(user_data);
     if (n_slots <= 0) { return false; }
-    // The largest group of the tiers on this backend lends. Ring slot j uses the top of bank j % 3, so lending evicts the same
-    // slots in all three banks; a ring slot spans the slots of the smallest of them.
+    // A group of the tiers on this backend lends the top of its banks: the one that evicts the fewest experts (a tier leased for
+    // this prompt is still empty), then the largest. Ring slot j uses the top of bank j % 3, so lending evicts the same slots in
+    // all three banks; a ring slot spans the slots of the smallest of them.
+    const int64_t per_bank = (n_slots + 2) / 3;
+    auto top = [&](const group & g) {
+        const size_t slab = std::min({ g.banks[0]->nb[2], g.banks[1]->nb[2], g.banks[2]->nb[2] });
+        return g.n - per_bank * int64_t((slot_size + slab - 1) / slab);
+    };
+    auto resident_above = [&](const group & g, int64_t lo) {
+        int64_t n = 0;
+        for (int64_t s = g.base + std::max<int64_t>(lo, 0); s < g.base + g.lent_lo; ++s) { n += c.owner_of[s].first >= 0; }
+        return n;
+    };
     tier * lt = nullptr;
     group * lg = nullptr;
+    int64_t best_evict = 0;
     for (auto & t : c.tiers) {
         if (t.backend != backend) { continue; }
         for (auto & g : t.groups) {
-            if (!lg || g.n * g.banks[0]->nb[2] > lg->n * lg->banks[0]->nb[2]) { lt = &t; lg = &g; }
+            if (top(g) <= 0) { continue; }
+            const int64_t evict = resident_above(g, top(g));
+            if (!lg || evict < best_evict || (evict == best_evict && g.n * g.banks[0]->nb[2] > lg->n * lg->banks[0]->nb[2])) {
+                lt = &t; lg = &g; best_evict = evict;
+            }
         }
     }
-    if (!lg) { return false; }
+    if (!lg) {
+        bool any = false;
+        for (const auto & t : c.tiers) { any |= t.backend == backend; }
+        if (any) {
+            LLAMA_LOG_WARN("expert-cache: cannot lend %d staging slots of %.1f MiB: the tiers on %s are too small\n", n_slots,
+                    slot_size / 1048576.0, ggml_backend_name(backend));
+        }
+        return false;
+    }
     c.cancel_async();
     auto & g = *lg;
     const size_t slab = std::min({ g.banks[0]->nb[2], g.banks[1]->nb[2], g.banks[2]->nb[2] });
-    const int64_t per_slot = (slot_size + slab - 1) / slab, per_bank = (n_slots + 2) / 3;
-    const int64_t lo = g.n - per_bank * per_slot;
-    if (lo <= 0) { // a lent slot at the bank base would share the bank's layout state
-        LLAMA_LOG_WARN("expert-cache: cannot lend %d staging slots of %.1f MiB from %lld arena slots on %s\n", n_slots,
-                slot_size / 1048576.0, (long long) g.n, ggml_backend_name(backend));
-        return false;
-    }
+    const int64_t per_slot = (slot_size + slab - 1) / slab;
+    const int64_t lo = top(g); // > 0: a lent slot at the bank base would share the bank's layout state
     int64_t evicted = 0;
     if (lo < g.lent_lo) {
         // Decode graphs read the arena; no queued work may read a slot that the ring now writes.

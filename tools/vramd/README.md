@@ -25,6 +25,7 @@ GPU, the desktop). A server that cannot connect keeps its static memory.
 | `LLAMA_VRAMD_WANT_MIB` | unlimited | cache memory to ask for per GPU |
 | `LLAMA_SHARE_IDLE_COMPUTE_S` | 30 with a daemon | free the compute buffers after this idle time |
 | `LLAMA_SHARE_IDLE_KV_S` | 120 with a daemon | save idle slots to the host prompt cache (`--cache-ram`) and free the KV cache |
+| `LLAMA_VRAMD_IDLE_SHRINK_S` | 600 | give back the cache leases on GPUs other than the home GPU |
 
 The idle timers also work without a daemon (set them explicitly).
 

@@ -65,8 +65,9 @@ class Server:
 
 
 class Daemon:
-    def __init__(self, capacity: dict[str, int], grace: float, deadline: float):
+    def __init__(self, capacity: dict[str, int], grace: float, deadline: float, overhead: int):
         self.capacity = capacity
+        self.overhead = overhead
         self.grace = grace
         self.deadline = deadline
         self.servers: dict[int, Server] = {}
@@ -78,7 +79,8 @@ class Daemon:
     # accounting
 
     def used(self, gpu: str) -> int:
-        resident = sum(s.resident.get(gpu, 0) for s in self.servers.values())
+        # per server and GPU: what it registered, plus the runtime's memory that no lease covers (context, pools, scratch)
+        resident = sum(s.resident.get(gpu, 0) + self.overhead for s in self.servers.values() if gpu in s.resident)
         return resident + sum(l.bytes for l in self.leases.values() if l.gpu == gpu)
 
     def free(self, gpu: str) -> int:
@@ -149,7 +151,7 @@ class Daemon:
 
     def process(self, r: Request) -> None:
         s = r.server
-        if r.gpu not in self.capacity or r.min > self.capacity[r.gpu] - s.resident.get(r.gpu, 0):
+        if r.gpu not in self.capacity or r.min > self.capacity[r.gpu] - s.resident.get(r.gpu, 0) - self.overhead:
             log.info("denied %s %.0f MiB of %s on %s", s.name(), r.min / MiB, r.purpose, r.gpu)
             self.finish(r, 0)
             return
@@ -172,10 +174,17 @@ class Daemon:
             log.info("revoking lease %d (%s, %.0f MiB on %s) for %s", lease.id, lease.server.name(), lease.bytes / MiB, lease.gpu,
                      s.name())
             self.send(lease.server, {"op": "revoke", "lease": lease.id, "deadline_ms": int(self.deadline * 1000)})
-        if coming == 0 and avail >= r.min:
+        if coming > 0:
+            self.wait(r)  # the revoked memory comes back soon
+        elif avail >= r.min:
             self.grant(r, min(avail, r.bytes))  # nothing more to take
+        elif self.priority(r) and any(l.gpu == r.gpu and l.purpose == "cache" and l.server is not s and l.server.phase == "prefill"
+                                      for l in self.leases.values()):
+            self.wait(r)  # revocable once that prompt is done
+        elif r.purpose in ("scratch", "kv"):
+            self.wait(r)  # the server cannot run without it; wait for others to release
         else:
-            self.wait(r)
+            self.finish(r, 0)
 
     def evaluate(self) -> None:
         # requests on a server's own GPU first, then in arrival order
@@ -297,6 +306,7 @@ async def main() -> None:
                     help="memory the servers may use on a GPU in total, e.g. ROCm0=30.5G (MiB without a suffix); repeat per GPU")
     ap.add_argument("--grace", type=float, default=120.0, help="seconds an idle server keeps its cache on other servers' GPUs")
     ap.add_argument("--deadline", type=float, default=10.0, help="seconds before warning about an unanswered revoke")
+    ap.add_argument("--overhead", default="1G", help="memory per server and GPU that leases do not cover (driver context, pools)")
     ap.add_argument("--log", default=None, help="log file (default: stderr)")
     args = ap.parse_args()
     logging.basicConfig(filename=args.log, level=logging.INFO, format="%(asctime)s.%(msecs)03d %(message)s", datefmt="%H:%M:%S")
@@ -304,12 +314,12 @@ async def main() -> None:
     for item in args.gpu:
         name, _, size = item.partition("=")
         capacity[name] = parse_size(size)
-    daemon = Daemon(capacity, args.grace, args.deadline)
+    daemon = Daemon(capacity, args.grace, args.deadline, parse_size(args.overhead))
     if os.path.exists(args.socket):
         os.unlink(args.socket)
     server = await asyncio.start_unix_server(daemon.connection, path=args.socket)
-    log.info("delphi-vramd on %s: %s; grace %.0f s", args.socket, ", ".join(f"{g} {c / MiB:.0f} MiB" for g, c in capacity.items()),
-             args.grace)
+    log.info("delphi-vramd on %s: %s; grace %.0f s, overhead %.0f MiB per server and GPU", args.socket,
+             ", ".join(f"{g} {c / MiB:.0f} MiB" for g, c in capacity.items()), args.grace, daemon.overhead / MiB)
     asyncio.create_task(daemon.tick())
     async with server:
         await server.serve_forever()

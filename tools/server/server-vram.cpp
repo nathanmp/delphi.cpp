@@ -64,9 +64,9 @@ struct server_vram::impl {
 
     phase_t phase = PHASE_IDLE;
     int64_t idle_since_ms = 0;
-    bool compute_released = false, kv_released = false;
+    bool compute_released = false, kv_released = false, shrunk = false;
     std::map<std::string, size_t> scratch_bytes, kv_bytes; // what the released buffers took, to lease back
-    double idle_compute_s = -1, idle_kv_s = -1;
+    double idle_compute_s = -1, idle_kv_s = -1, idle_shrink_s = -1;
     size_t chunk = 0, want = 0, stage_need = 0, min_lease = 0;
     int max_tiers_per_gpu = 2;
 
@@ -430,6 +430,29 @@ struct server_vram::impl {
         VRAM_INF("idle: released %.1f MiB of compute buffers\n", freed / 1048576.0);
     }
 
+    // a long idle: give back the cache on other servers' GPUs
+    void shrink() {
+        for (auto it = leases.begin(); it != leases.end();) {
+            if (it->second.purpose == "cache" && it->second.gpu != home) {
+                if (it->second.tier >= 0) {
+                    llama_share_drop_tier(ctx_tgt, it->second.tier);
+                }
+                common_json r = common_json::object();
+                r["op"] = "release";
+                r["lease"] = it->first;
+                send(r);
+                VRAM_INF("idle: released lease %lld (%.1f MiB on %s)\n", (long long) it->first, it->second.bytes / 1048576.0, it->second.gpu.c_str());
+                it = leases.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        for (const auto & g : gpus) {
+            llama_share_stage_allow(ctx_tgt, g.c_str(), has_tier_for_staging(g));
+        }
+        shrunk = true;
+    }
+
     void release_kv() {
         save_slots();
         for (const auto & g : gpus) {
@@ -531,6 +554,7 @@ void server_vram::init(llama_context * ctx_tgt, llama_context * ctx_dft, const s
     const bool daemon = d->connected();
     d->idle_compute_s = vram_env("LLAMA_SHARE_IDLE_COMPUTE_S", daemon ? 30 : -1);
     d->idle_kv_s      = vram_env("LLAMA_SHARE_IDLE_KV_S", daemon ? 120 : -1);
+    d->idle_shrink_s  = vram_env("LLAMA_VRAMD_IDLE_SHRINK_S", 600);
     if (daemon) {
         // until a prompt leases them, staging uses only GPUs whose tiers can lend
         for (const auto & g : d->gpus) {
@@ -561,6 +585,7 @@ void server_vram::update(phase_t phase) {
     } else {
         d->send_phase("idle");
         d->idle_since_ms = vram_now_ms();
+        d->shrunk = false;
     }
     d->phase = phase;
 }
@@ -579,5 +604,8 @@ void server_vram::idle_tick() {
     }
     if (!d->kv_released && d->idle_kv_s >= 0 && idle_s >= d->idle_kv_s) {
         d->release_kv();
+    }
+    if (!d->shrunk && d->connected() && d->idle_shrink_s >= 0 && idle_s >= d->idle_shrink_s) {
+        d->shrink();
     }
 }

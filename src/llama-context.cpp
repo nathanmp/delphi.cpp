@@ -1015,6 +1015,10 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n",
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
+    if (share_rereserve) {
+        LLAMA_LOG_WARN("%s: compute buffers reserved again in %.1f ms\n", __func__, (t_end_us - t_start_us)/1000.0);
+        share_rereserve = false;
+    }
 }
 
 void llama_context::reserve_max_prefill(
@@ -3375,6 +3379,7 @@ void llama_context::share_reset_scheds() {
             gf_res_reserve->get_max_nodes(), cparams.pipeline_parallel, cparams.op_offload));
     sched_set_stage_lender();
     sched_need_reserve = true;
+    share_rereserve = true;
     if (expert_cache) {
         // the old schedulers dropped their staging rings, lent slots included
         expert_cache->reclaimed();

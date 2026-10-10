@@ -33,8 +33,23 @@ def status(sock: str) -> dict:
     return json.loads(buf)
 
 
+def pid_vram() -> dict[int, int]:
+    """VRAM per process (all GPUs) from rocm-smi, in bytes; empty if unavailable."""
+    try:
+        out = subprocess.run(["rocm-smi", "--showpids"], capture_output=True, text=True, timeout=30).stdout
+    except Exception:
+        return {}
+    res = {}
+    for line in out.splitlines():
+        f = line.split()
+        if len(f) >= 4 and f[0].isdigit() and f[-3].isdigit():
+            res[int(f[0])] = int(f[-3])
+    return res
+
+
 def show(sock: str, title: str) -> dict:
     st = status(sock)
+    vram = pid_vram()
     print(f"--- {title}")
     for g, v in st["gpus"].items():
         print(f"  {g}: used {v['used'] / 2**20:.0f} MiB, free {v['free'] / 2**20:.0f} MiB")
@@ -42,7 +57,9 @@ def show(sock: str, title: str) -> dict:
         if s["home"]:
             leases = [l for l in st["leases"] if l["server"] == s["id"]]
             desc = ", ".join(f"{l['purpose']} {l['bytes'] / 2**20:.0f}@{l['gpu']}" + (" (revoking)" if l["revoking"] else "") for l in leases)
-            print(f"  server {s['id']} {s['model']} home {s['home']} {s['phase']} {s['phase_s']} s: {desc}")
+            accounted = sum(s["resident"].values()) + sum(l["bytes"] for l in leases)
+            phys = f", physical {vram[s['pid']] / 2**20:.0f} MiB vs {accounted / 2**20:.0f} accounted" if s["pid"] in vram else ""
+            print(f"  server {s['id']} home {s['home']} {s['phase']} {s['phase_s']} s{phys}: {desc}")
     if st["pending"]:
         print(f"  pending: {st['pending']}")
     sys.stdout.flush()
@@ -157,6 +174,22 @@ def main() -> None:
         results["a2"] = ta["r"]
         print(f"A (overlapped): {ta['r']['timings']['predicted_per_second']:.1f} t/s decode")
         print(f"A vs B first answer: {same_prefix(results['a1']['content'], rb['content'])} of {len(rb['content'])} chars equal")
+
+        # two new prompts at once: A's waits until B's prompt is done
+        full = open(args.prompt_file, errors="ignore").read()
+        other = full[args.prompt_chars : 2 * args.prompt_chars] or prompt[::-1]
+        tb = {}
+        th = threading.Thread(target=lambda: tb.update(r=complete(pb, other, args.n_predict), t=time.time()))
+        t0 = time.time()
+        th.start()
+        time.sleep(1.5)
+        ra = complete(pa, other[::-1], args.n_predict)
+        t_a = time.time()
+        th.join()
+        print(f"concurrent prompts: B done at {tb['t'] - t0:.1f} s ({tb['r']['timings']['prompt_n']} tokens), "
+              f"A started at 1.5 s, done at {t_a - t0:.1f} s ({ra['timings']['prompt_n']} tokens, "
+              f"{ra['timings']['prompt_per_second']:.0f} t/s once running)")
+        show(sock, "after the concurrent prompts")
 
         time.sleep(max(args.idle_compute, args.idle_kv) + 3)
         show(sock, "both idle past the timers")

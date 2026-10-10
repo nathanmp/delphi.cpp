@@ -410,6 +410,7 @@ private:
     int64_t             share_test_decodes = 0, share_test_releases = 0;
     llama_memory_params mem_params = {};
     bool                memory_released = false;
+    bool                share_rereserve = false; // log the next reservation's time
     std::vector<ggml_backend_dev_t> stage_blocked; // ggml_backend_sched_stage_allow for every new scheduler
     void share_reset_scheds();
 
