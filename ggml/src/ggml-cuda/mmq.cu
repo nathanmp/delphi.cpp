@@ -8,6 +8,9 @@
 #include <cinttypes>
 #include <cstdint>
 
+// delphi: the largest J that ggml_cuda_mmq_get_J_best tries (mmq.cuh); src1 buffers are padded for it
+static constexpr int64_t mmq_J_pad_max = 128;
+
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     switch (args.type_x) {
         case GGML_TYPE_Q1_0:
@@ -164,8 +167,10 @@ void ggml_cuda_mul_mat_q(
     const size_t y_values_per_block = use_native_fp4 ? QK_FP4_MMQ            : QK8_1_MMQ;
 
     if (!ids) {
+        // delphi: the last column tile reads J columns past its start, and ggml_cuda_mmq_get_J_best may pick a J above ne11; upstream
+        // pads only for ne11 rounded down to a multiple of 8. Pad for the largest J it can pick.
         const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * y_block_size/y_values_per_block +
-            ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * sizeof(block_q8_1_mmq);
+            ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, mmq_J_pad_max) * sizeof(block_q8_1_mmq);
         ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
         ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
         if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {
@@ -277,8 +282,9 @@ void ggml_cuda_mul_mat_q(
         return;
     }
 
+    // delphi: as above; ne11 is 1 for a broadcast src1, which gave no padding at all (ROCm memory faults in the full test-backend-ops run)
     const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * y_block_size/y_values_per_block +
-        std::max(ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11), grouped ? GGML_CUDA_MOE_GROUPED_Y_PAD : 0) * sizeof(block_q8_1_mmq);
+        std::max(ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, mmq_J_pad_max), grouped ? GGML_CUDA_MOE_GROUPED_Y_PAD : 0) * sizeof(block_q8_1_mmq);
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
     ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
     if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {
