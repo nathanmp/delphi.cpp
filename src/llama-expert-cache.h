@@ -2,6 +2,7 @@
 
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <memory>
@@ -9,22 +10,25 @@
 
 struct llama_model;
 
-// Experimental GPU-hot / CPU-cold routed experts. Host experts remain authoritative. Layers with the same gate/up/down expert
-// types share one slot arena (a group); each layer gets the same number of slots, and a membership change rewrites slots and
-// maps but never changes a graph. Membership is rebuilt at the first small batch after a
-// prompt, from the routing of the most recent rows, and while a response decodes: every `every` small batches a worker
-// copies the experts that entered the window's top set to a device scratch on its own stream, and a later batch boundary
-// packs them into the slots of the experts that left it. A prompt that streams experts (GGML_SCHED_STAGE=1) borrows the top
-// of the arena for the staging ring; the refresh after the prompt fills it again.
+// Experimental GPU-hot / CPU-cold routed experts. Host experts remain authoritative. The slots live in tiers: device buffers
+// on any GPU, each with one slot arena per combination of gate/up/down expert types (a group). Tier 0 is the static budget
+// (LLAMA_MOE_CACHE_MIB) on the layer GPU; more tiers can be added and dropped at run time (VRAM sharing between servers), which
+// changes the graphs (generation()). Within a tier every layer gets the same number of slots, and a membership change rewrites
+// slots and maps but never changes a graph. Membership is rebuilt at the first small batch after a prompt, from the routing of
+// the most recent rows, and while a response decodes: every `every` small batches a worker copies the experts that entered the
+// window's top set to a device scratch on its own stream, and a later batch boundary packs them into the slots of the experts
+// that left it. A prompt that streams experts (GGML_SCHED_STAGE=1) borrows the top of the largest tier on each staging GPU for
+// the staging ring; the refresh after the prompt fills it again.
 struct llama_expert_cache {
     // Batches with more rows use the original routed experts (and only record their routing).
     static constexpr int64_t max_rows = 16;
+    // run-time tiers; each adds a partial expert pass per layer to the graph
+    static constexpr int max_tiers = 8;
 
     struct entry {
         llama_expert_cache * owner = nullptr;
         int il = -1;
         int group = -1;
-        ggml_tensor * hot_ids = nullptr; // GPU I32 [1, n_expert]: expert -> slot in the group's banks, or -1
         std::vector<int32_t> cold;       // expert -> expert, or -1 when resident
         std::vector<int32_t> slot;       // expert -> global slot, or -1
         std::vector<uint32_t> count;     // selections in the window
@@ -38,31 +42,65 @@ struct llama_expert_cache {
     ~llama_expert_cache();
 
     const entry * layer(int il) const;
+    // true if any tier holds slots: the graph then uses the cache for small batches
+    bool active() const { return !tiers.empty(); }
+    // the layer GPU
     ggml_backend_t backend() const { return gpu; }
-    // gate (0), up (1) or down (2) bank of the layer's group
-    ggml_tensor * bank(int il, int p) const { return groups[layers[il].group].banks[p]; }
+
+    int n_tiers() const { return (int) tiers.size(); }
+    ggml_backend_t tier_backend(int t) const { return tiers[t].backend; }
+    // GPU I32 [1, n_expert] of tier t for layer il: expert -> slot in the tier's bank, or -1. Null if the tier has no slots for
+    // the layer's group.
+    ggml_tensor * hot_ids(int t, int il) const;
+    // gate (0), up (1) or down (2) bank of tier t for the layer's group
+    ggml_tensor * bank(int t, int il, int p) const { return tiers[t].groups[layers[il].group].banks[p]; }
+    // bumped whenever the tiers change: graphs built before must not be reused
+    uint64_t generation() const { return gen; }
+
+    // VRAM sharing: add a tier of up to `bytes` on `backend`, filled at the next refresh. Returns its id, or -1 if the size gives
+    // no slot to every layer or the allocation fails.
+    int add_tier(ggml_backend_t backend, size_t bytes);
+    // Drop tier `id` and free its memory. The caller has synchronized and reclaimed the staging slots of every scheduler.
+    // Returns the bytes freed (0 if there is no such tier).
+    size_t drop_tier(int id);
+    // ids, devices and sizes of the tiers
+    std::vector<std::pair<int, ggml_backend_t>> tier_list() const;
+    size_t tier_bytes(int id) const;
+    // free the decode-time refresh buffers (allocated again when needed); returns the device bytes freed
+    size_t release_scratch();
+    // the caller reclaimed the staging slots outside a refresh: the lent slots are free again
+    void reclaimed();
 
     // CPU op: records the routed ids (F32 [top_k, n_tokens]) unless warmup, and returns I32 ids with resident experts set to -1.
     ggml_tensor * build_cold_ids(ggml_context * ctx, ggml_tensor * ids, int il);
     // CPU op: records the routed ids (I32 [top_k, n_tokens]) of a batch that does not use the arena. Null if not recorded.
     ggml_tensor * build_record(ggml_context * ctx, ggml_tensor * ids, int il);
 
-    // Call before each decoded batch while no graph is running. True at the first small batch after a prompt: then the
-    // caller synchronizes, reclaims lent staging slots from every scheduler, and calls refresh(). Other small batches may
-    // start or apply a decode-time refresh here (applying one synchronizes the GPU).
+    // Call before each decoded batch while no graph is running. True at the first small batch after a prompt (or after a tier
+    // was added): then the caller synchronizes, reclaims lent staging slots from every scheduler, and calls refresh(). Other
+    // small batches may start or apply a decode-time refresh here (applying one synchronizes the GPUs).
     bool needs_refresh(int64_t n_tokens, bool is_warmup);
     void refresh();
 
-    // ggml_backend_sched_stage_lend_t: evict the experts in the top of the arena and lend it as staging slots
+    // ggml_backend_sched_stage_lend_t: evict the experts in the top of the largest tier on `backend` and lend it as staging slots
     static bool lend(void * user_data, ggml_backend_t backend, int n_slots, size_t slot_size, void ** slots);
 
 private:
     struct upload_job { int il, e, s; }; // s: global slot
-    // Layers with one combination of expert types. Its slots are the global slots [base, base + n); local slot = global - base.
+    // Layers with one combination of expert types, in one tier. Its slots are the global slots [base, base + n); local slot =
+    // global - base.
     struct group {
         ggml_tensor * banks[3] = {};
         int64_t base = 0, n = 0;
         int64_t lent_lo = 0; // local slots from lent_lo up are lent to the staging ring
+    };
+    struct tier {
+        int id = -1;
+        ggml_backend_t backend = nullptr;
+        ggml_context_ptr ctx;
+        ggml_backend_buffer_ptr buffer;
+        std::vector<group> groups;          // per type group
+        std::vector<ggml_tensor *> hot_ids; // per layer, null for layers without routed experts
     };
     struct candidate { double score; int il, e; };
     struct async_refresh;
@@ -70,21 +108,34 @@ private:
     std::vector<candidate> select() const;
     size_t max_slab() const;
     bool any_lent() const;
+    // tier index and group of a global slot
+    std::pair<int, int> locate(int64_t s) const { return where[s]; }
+    void renumber();
+    bool make_tier(tier & t, ggml_backend_t backend, size_t bytes);
     void tick();
     void cancel_async();
     void record(entry & l, const char * data, size_t nb0, size_t nb1, int64_t k, int64_t rows, bool is_f32);
     void upload(const std::vector<upload_job> & jobs);
     void push_maps(const std::vector<bool> & changed);
+    void forget(const tier & t) const;
     static void op_cold_ids(ggml_tensor * dst, int ith, int nth, void * userdata);
     static void op_record(ggml_tensor * dst, int ith, int nth, void * userdata);
 
     const llama_model * model = nullptr;
     ggml_backend_t gpu = nullptr;
-    ggml_context_ptr ctx;
-    ggml_backend_buffer_ptr buffer;
-    std::vector<group> groups;
+    std::vector<tier> tiers;
+    int next_tier_id = 0;
+    uint64_t gen = 0;
     std::vector<entry> layers;
+    // type groups (shared by all tiers)
+    const ggml_tensor * shape[3] = {};
+    std::vector<std::array<ggml_type, 3>> group_types;
+    std::vector<int64_t> group_layers;
+    std::vector<size_t> group_bytes;
+    size_t all_layer_bytes = 0;
+    int n_expert = 0;
     std::vector<std::pair<int, int>> owner_of; // global slot -> (layer, expert), or (-1, -1)
+    std::vector<std::pair<int, int>> where;    // global slot -> (tier index, group)
     void (*set_expert)(ggml_backend_t, const ggml_tensor *, int64_t, const void *) = nullptr;
     void (*forget_inside)(ggml_backend_t, const ggml_tensor *) = nullptr;
     ggml_backend_buffer_ptr pinned; // refill bounce buffers
@@ -99,7 +150,7 @@ private:
     std::unique_ptr<async_refresh> async;
     int64_t n_async = 0, n_async_uploaded = 0;
     double async_apply_ms = 0.0;
-    bool pending = false;      // a prompt was processed since the last refresh
+    bool pending = false;      // a prompt was processed (or a tier added) since the last refresh
     bool warmup = false;       // warmup rows are not routing evidence
 
     // Decode hit statistics since the last refresh: routed selections and distinct experts per (ubatch, layer).

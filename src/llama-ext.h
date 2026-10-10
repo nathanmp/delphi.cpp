@@ -19,6 +19,39 @@ LLAMA_API struct ggml_cgraph * llama_graph_reserve(
 // Apply a pending scheduler reserve after changing graph-shaping context flags.
 LLAMA_API void llama_context_sched_reserve(struct llama_context * ctx);
 
+//
+// delphi: VRAM sharing between servers. Call between decodes, from the thread that decodes. Devices are llama device names
+// (e.g. "ROCm1").
+//
+
+// Add an expert cache tier of up to `bytes` on device `dev`, filled at the next small batch. Returns its id, or -1.
+LLAMA_API int32_t llama_share_add_tier(struct llama_context * ctx, const char * dev, size_t bytes);
+// Drop expert cache tier `id`; returns the device bytes freed.
+LLAMA_API size_t  llama_share_drop_tier(struct llama_context * ctx, int32_t id);
+// The tiers: up to n_max ids, sizes and devices; returns the number of tiers.
+LLAMA_API int32_t llama_share_tiers(const struct llama_context * ctx, int32_t * ids, size_t * bytes, const char ** devs, int32_t n_max);
+// Free the compute buffers, the staging slots and the backends' cached memory; the next decode reserves again. Returns the
+// device bytes freed.
+LLAMA_API size_t  llama_share_release_compute(struct llama_context * ctx);
+// Free the memory module (KV cache) after the caller saved what it needs; the next decode, or llama_share_restore_memory,
+// creates it again, empty. Returns the device bytes freed.
+LLAMA_API size_t  llama_share_release_memory(struct llama_context * ctx);
+LLAMA_API bool    llama_share_restore_memory(struct llama_context * ctx);
+LLAMA_API bool    llama_share_memory_released(const struct llama_context * ctx);
+// Allow or forbid staging (GGML_SCHED_STAGE) to device `dev`; forbidden staging keeps the routed experts on the CPU.
+LLAMA_API void    llama_share_stage_allow(struct llama_context * ctx, const char * dev, bool allow);
+// Whether the context has an expert cache (LLAMA_MOE_CACHE_MIB or LLAMA_MOE_CACHE_SHARED), and its layer device.
+LLAMA_API bool         llama_share_has_expert_cache(const struct llama_context * ctx);
+LLAMA_API const char * llama_share_home_device(const struct llama_context * ctx);
+// Device memory of the context on `dev`.
+struct llama_share_usage {
+    size_t model   = 0; // weights
+    size_t context = 0; // memory module (KV)
+    size_t compute = 0; // compute buffers
+    size_t cache   = 0; // expert cache tiers
+};
+LLAMA_API llama_share_usage llama_share_device_usage(const struct llama_context * ctx, const char * dev);
+
 // Get the default ggml_type for a given ftype.
 LLAMA_API ggml_type llama_ftype_get_default_type(llama_ftype ftype);
 

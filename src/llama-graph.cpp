@@ -2283,7 +2283,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         return build_moe_ffn_split(cur, up_exps, gate_exps, down_exps, selected_experts, weights, n_expert, il);
     }
 
-    if (expert_cache && ubatch.n_tokens <= llama_expert_cache::max_rows && expert_cache->layer(il) &&
+    if (expert_cache && expert_cache->active() && ubatch.n_tokens <= llama_expert_cache::max_rows && expert_cache->layer(il) &&
             type_op == LLM_FFN_SILU && !weight_before_ffn && !gate_up_exps &&
             !up_exps_s && !gate_exps_s && !down_exps_s && !up_exps_b && !gate_exps_b && !down_exps_b &&
             (loras == nullptr || loras->empty())) {
@@ -2504,13 +2504,27 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 ggml_tensor * llm_graph_context::build_moe_ffn_cache(
         ggml_tensor * cur, ggml_tensor * ids, ggml_tensor * weights,
         ggml_tensor * up, ggml_tensor * gate, ggml_tensor * down, int il) const {
-    const auto & resident = *expert_cache->layer(il);
+    // Tiers on the layer GPU are named ffn_cache_gpu_*, tiers on another GPU ffn_cache_x<tier>_* (graph_get_cb places them).
     auto name = [&](ggml_tensor * t, const char * label, bool cpu) {
         cb(t, (std::string(cpu ? "ffn_cache_cpu_" : "ffn_cache_gpu_") + label).c_str(), il);
     };
+    auto name_tier = [&](ggml_tensor * t, int tier, const char * label) {
+        if (expert_cache->tier_backend(tier) == expert_cache->backend()) {
+            name(t, label, false);
+        } else {
+            cb(t, (std::string("ffn_cache_x") + std::to_string(tier) + "_" + label).c_str(), il);
+        }
+    };
     auto * flat = ggml_reshape_1d(ctx0, ggml_cont(ctx0, ids), ggml_nelements(ids));
-    auto * hot = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, resident.hot_ids, flat), ids->ne[0], ids->ne[1]);
-    ggml_build_forward_expand(gf, hot);
+    std::vector<std::pair<int, ggml_tensor *>> hots;
+    for (int t = 0; t < expert_cache->n_tiers(); ++t) {
+        if (auto * map = expert_cache->hot_ids(t, il)) {
+            auto * hot = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, map, flat), ids->ne[0], ids->ne[1]);
+            name_tier(hot, t, "hot");
+            ggml_build_forward_expand(gf, hot);
+            hots.push_back({ t, hot });
+        }
+    }
 
     // One CPU transfer before GPU expert work. Expert IDs are exactly representable as F32. The CPU maps the original IDs to
     // cold IDs and records them for the next membership refresh.
@@ -2525,36 +2539,60 @@ ggml_tensor * llm_graph_context::build_moe_ffn_cache(
     ggml_build_forward_expand(gf, cx);
     ggml_build_forward_expand(gf, ci);
 
-    // Each part leaves zeros in the other part's rows. The GPU part is built first so that it runs while the CPU part does.
-    auto part = [&](ggml_tensor * x, ggml_tensor * route, ggml_tensor * gu, ggml_tensor * uu, ggml_tensor * du, bool cpu) {
+    using labeler = std::function<void(ggml_tensor *, const char *)>;
+    // Each part leaves zeros in the other parts' rows. The GPU parts are built first so that they run while the CPU part does.
+    auto part = [&](ggml_tensor * x, ggml_tensor * route, ggml_tensor * gu, ggml_tensor * uu, ggml_tensor * du, const labeler & label) {
         auto * g = ggml_mul_mat_id_partial(ctx0, gu, x, route);
         auto * u = ggml_mul_mat_id_partial(ctx0, uu, x, route);
-        name(g, "gate", cpu); name(u, "up", cpu);
+        label(g, "gate"); label(u, "up");
         auto * a = ggml_swiglu_split(ctx0, g, u);
-        name(a, "swiglu", cpu);
+        label(a, "swiglu");
         auto * d = ggml_mul_mat_id_partial(ctx0, du, a, route);
-        name(d, "down", cpu);
+        label(d, "down");
         ggml_build_forward_expand(gf, d);
         return d;
     };
-    auto * gd = part(cur, hot, expert_cache->bank(il, 0), expert_cache->bank(il, 1), expert_cache->bank(il, 2), false);
-    auto * cd = part(cx, ci, gate, up, down, true);
-
-    // Merge the per-expert outputs on the GPU and reduce them as build_moe_ffn does, so the backend fuses the weighted sum.
-    auto * experts = ggml_add(ctx0, gd, cd);
-    name(experts, "merge", false);
-    experts = ggml_mul(ctx0, experts, weights);
-    name(experts, "weighted", false);
-    ggml_build_forward_expand(gf, experts);
-    ggml_tensor * views[LLAMA_MAX_EXPERTS] = {};
-    for (int64_t j = 0; j < ids->ne[0]; ++j) {
-        views[j] = ggml_view_2d(ctx0, experts, experts->ne[0], ids->ne[1], experts->nb[2], j * experts->nb[1]);
-        ggml_build_forward_expand(gf, views[j]);
+    // the weighted sum over the expert slots, as build_moe_ffn does, so that the backend fuses it
+    auto reduce = [&](ggml_tensor * experts, const labeler & label) {
+        experts = ggml_mul(ctx0, experts, weights);
+        label(experts, "weighted");
+        ggml_build_forward_expand(gf, experts);
+        ggml_tensor * views[LLAMA_MAX_EXPERTS] = {};
+        for (int64_t j = 0; j < ids->ne[0]; ++j) {
+            views[j] = ggml_view_2d(ctx0, experts, experts->ne[0], ids->ne[1], experts->nb[2], j * experts->nb[1]);
+            ggml_build_forward_expand(gf, views[j]);
+        }
+        ggml_tensor * out = views[0];
+        for (int64_t j = 1; j < ids->ne[0]; ++j) {
+            out = ggml_add(ctx0, out, views[j]);
+            label(out, "sum");
+            ggml_build_forward_expand(gf, out);
+        }
+        return out;
+    };
+    // Tiers on the layer GPU merge with the CPU part per expert slot. A tier on another GPU reduces there, so that only
+    // [n_embd, n_tokens] crosses back.
+    std::vector<ggml_tensor *> local, remote;
+    for (const auto & [t, hot] : hots) {
+        const int tier = t;
+        const labeler label = [&, tier](ggml_tensor * x, const char * l) { name_tier(x, tier, l); };
+        auto * d = part(cur, hot, expert_cache->bank(t, il, 0), expert_cache->bank(t, il, 1), expert_cache->bank(t, il, 2), label);
+        if (expert_cache->tier_backend(t) == expert_cache->backend()) {
+            local.push_back(d);
+        } else {
+            remote.push_back(reduce(d, label));
+        }
     }
-    ggml_tensor * out = views[0];
-    for (int64_t j = 1; j < ids->ne[0]; ++j) {
-        out = ggml_add(ctx0, out, views[j]);
-        name(out, "sum", false);
+    auto * experts = part(cx, ci, gate, up, down, [&](ggml_tensor * x, const char * l) { name(x, l, true); });
+    // Merge the per-expert outputs on the GPU (the first local tier first, as before tiers existed).
+    for (auto * d : local) {
+        experts = ggml_add(ctx0, d, experts);
+        name(experts, "merge", false);
+    }
+    ggml_tensor * out = reduce(experts, [&](ggml_tensor * x, const char * l) { name(x, l, false); });
+    for (auto * r : remote) {
+        out = ggml_add(ctx0, out, r);
+        name(out, "remote", false);
         ggml_build_forward_expand(gf, out);
     }
     return out;
