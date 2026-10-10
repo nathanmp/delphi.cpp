@@ -1105,7 +1105,7 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
 
 // find the first buffer type in the list that can use the tensor
 // delphi: weight types that some GPU backends cannot run at all. Placing one there is an error, not a silent CPU fallback:
-// IQ*_K / IQ*_KS (ported from ik_llama.cpp) run on the CPU and CUDA only; Q4_G128 on the CPU and the devices whose backend accepts it.
+// IQ*_K / IQ*_KS (ported from ik_llama.cpp) run on the CPU, CUDA and HIP; Q4_G128 on the CPU and the devices whose backend accepts it.
 static bool is_backend_restricted_type(ggml_type type) {
     switch (type) {
         case GGML_TYPE_IQ2_K: case GGML_TYPE_IQ3_K: case GGML_TYPE_IQ4_K: case GGML_TYPE_IQ5_K: case GGML_TYPE_IQ6_K:
