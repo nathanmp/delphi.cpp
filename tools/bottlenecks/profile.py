@@ -587,7 +587,7 @@ def _parse_json_output(text: str, description: str) -> Any:
 
 
 def _bench_metrics(payload: Any) -> dict[str, Any]:
-    tests = payload.get("tests", []) if isinstance(payload, dict) else []
+    tests = payload if isinstance(payload, list) else payload.get("tests", []) if isinstance(payload, dict) else []
     results = []
     for test in tests:
         if not isinstance(test, dict):
