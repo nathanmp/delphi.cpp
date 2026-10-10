@@ -9,8 +9,9 @@
 
 struct llama_model;
 
-// Experimental GPU-hot / CPU-cold routed experts. Host experts remain authoritative. All layers share one slot arena, so a
-// membership change rewrites slots and maps but never changes a graph. Membership is rebuilt at the first small batch after a
+// Experimental GPU-hot / CPU-cold routed experts. Host experts remain authoritative. Layers with the same gate/up/down expert
+// types share one slot arena (a group); each layer gets the same number of slots, and a membership change rewrites slots and
+// maps but never changes a graph. Membership is rebuilt at the first small batch after a
 // prompt, from the routing of the most recent rows, and while a response decodes: every `every` small batches a worker
 // copies the experts that entered the window's top set to a device scratch on its own stream, and a later batch boundary
 // packs them into the slots of the experts that left it. A prompt that streams experts (GGML_SCHED_STAGE=1) borrows the top
@@ -22,9 +23,10 @@ struct llama_expert_cache {
     struct entry {
         llama_expert_cache * owner = nullptr;
         int il = -1;
-        ggml_tensor * hot_ids = nullptr; // GPU I32 [1, n_expert]: expert -> arena slot, or -1
+        int group = -1;
+        ggml_tensor * hot_ids = nullptr; // GPU I32 [1, n_expert]: expert -> slot in the group's banks, or -1
         std::vector<int32_t> cold;       // expert -> expert, or -1 when resident
-        std::vector<int32_t> slot;       // expert -> arena slot, or -1
+        std::vector<int32_t> slot;       // expert -> global slot, or -1
         std::vector<uint32_t> count;     // selections in the window
         std::vector<float> prior;        // profile selections per row
         std::vector<uint16_t> ring;      // window rows, top_k ids each
@@ -37,9 +39,8 @@ struct llama_expert_cache {
 
     const entry * layer(int il) const;
     ggml_backend_t backend() const { return gpu; }
-    ggml_tensor * gate() const { return banks[0]; }
-    ggml_tensor * up() const { return banks[1]; }
-    ggml_tensor * down() const { return banks[2]; }
+    // gate (0), up (1) or down (2) bank of the layer's group
+    ggml_tensor * bank(int il, int p) const { return groups[layers[il].group].banks[p]; }
 
     // CPU op: records the routed ids (F32 [top_k, n_tokens]) unless warmup, and returns I32 ids with resident experts set to -1.
     ggml_tensor * build_cold_ids(ggml_context * ctx, ggml_tensor * ids, int il);
@@ -56,11 +57,19 @@ struct llama_expert_cache {
     static bool lend(void * user_data, ggml_backend_t backend, int n_slots, size_t slot_size, void ** slots);
 
 private:
-    struct upload_job { int il, e, s; };
+    struct upload_job { int il, e, s; }; // s: global slot
+    // Layers with one combination of expert types. Its slots are the global slots [base, base + n); local slot = global - base.
+    struct group {
+        ggml_tensor * banks[3] = {};
+        int64_t base = 0, n = 0;
+        int64_t lent_lo = 0; // local slots from lent_lo up are lent to the staging ring
+    };
     struct candidate { double score; int il, e; };
     struct async_refresh;
     // the resident set refresh() would choose now, best first
-    std::vector<candidate> select(size_t n_slots) const;
+    std::vector<candidate> select() const;
+    size_t max_slab() const;
+    bool any_lent() const;
     void tick();
     void cancel_async();
     void record(entry & l, const char * data, size_t nb0, size_t nb1, int64_t k, int64_t rows, bool is_f32);
@@ -73,12 +82,11 @@ private:
     ggml_backend_t gpu = nullptr;
     ggml_context_ptr ctx;
     ggml_backend_buffer_ptr buffer;
-    ggml_tensor * banks[3] = {};
+    std::vector<group> groups;
     std::vector<entry> layers;
-    std::vector<std::pair<int, int>> owner_of; // arena slot -> (layer, expert), or (-1, -1)
+    std::vector<std::pair<int, int>> owner_of; // global slot -> (layer, expert), or (-1, -1)
     void (*set_expert)(ggml_backend_t, const ggml_tensor *, int64_t, const void *) = nullptr;
     void (*forget_inside)(ggml_backend_t, const ggml_tensor *) = nullptr;
-    int64_t lent_lo = 0;       // arena slots from lent_lo up are lent to the staging ring
     ggml_backend_buffer_ptr pinned; // refill bounce buffers
     std::vector<int> cpus;          // the CPUs next to the GPU, for the refill threads
 
