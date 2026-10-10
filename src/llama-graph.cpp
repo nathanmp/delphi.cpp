@@ -2517,19 +2517,27 @@ ggml_tensor * llm_graph_context::build_moe_ffn_cache(
     };
     auto * flat = ggml_reshape_1d(ctx0, ggml_cont(ctx0, ids), ggml_nelements(ids));
     std::vector<std::pair<int, ggml_tensor *>> hots;
-    for (int t = 0; t < expert_cache->n_tiers(); ++t) {
-        if (auto * map = expert_cache->hot_ids(t, il)) {
-            auto * hot = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, map, flat), ids->ne[0], ids->ne[1]);
-            name_tier(hot, t, "hot");
-            ggml_build_forward_expand(gf, hot);
-            hots.push_back({ t, hot });
+    auto gather = [&](bool local) {
+        for (int t = 0; t < expert_cache->n_tiers(); ++t) {
+            auto * map = expert_cache->hot_ids(t, il);
+            if (map && (expert_cache->tier_backend(t) == expert_cache->backend()) == local) {
+                auto * hot = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, map, flat), ids->ne[0], ids->ne[1]);
+                name_tier(hot, t, "hot");
+                ggml_build_forward_expand(gf, hot);
+                hots.push_back({ t, hot });
+            }
         }
-    }
+    };
+    gather(true);
 
     // One CPU transfer before GPU expert work. Expert IDs are exactly representable as F32. The CPU maps the original IDs to
-    // cold IDs and records them for the next membership refresh.
+    // cold IDs and records them for the next membership refresh. The packet is made on the layer GPU: the CPU copies it
+    // synchronously, and on another GPU it would wait for that GPU's queue.
     const int64_t nx = ggml_nelements(cur);
-    auto * packet = ggml_concat(ctx0, ggml_reshape_1d(ctx0, ggml_cont(ctx0, cur), nx), ggml_cast(ctx0, flat, GGML_TYPE_F32), 0);
+    auto * fids = ggml_cast(ctx0, flat, GGML_TYPE_F32);
+    name(fids, "packet_ids", false);
+    auto * packet = ggml_concat(ctx0, ggml_reshape_1d(ctx0, ggml_cont(ctx0, cur), nx), fids, 0);
+    name(packet, "packet_src", false);
     auto * input = ggml_dup(ctx0, packet);
     name(input, "packet", true);
     auto * cx = ggml_view_3d(ctx0, input, cur->ne[0], 1, cur->ne[2], cur->ne[0] * sizeof(float), cur->ne[0] * sizeof(float), 0);
@@ -2538,6 +2546,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn_cache(
     name(cx, "input", true); name(ci, "ids", true);
     ggml_build_forward_expand(gf, cx);
     ggml_build_forward_expand(gf, ci);
+    gather(false);
 
     using labeler = std::function<void(ggml_tensor *, const char *)>;
     // Each part leaves zeros in the other parts' rows. The GPU parts are built first so that they run while the CPU part does.
