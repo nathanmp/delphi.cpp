@@ -141,7 +141,7 @@ def measure_ops(info, cfg, directory, timeout=600):
                     sigs[digest(sig)] = sig
     values = {}
     environment = cfg["runtime"]["env"]
-    identity = {"binary": file_identity(binary), "version": subprocess.check_output([str(binary), "--help"], stderr=subprocess.STDOUT).decode()[:80],
+    identity = {"binary": file_identity(binary),
                 "devices": cfg["devices"], "threads": cfg["runtime"]["threads"], "env": environment, "numa": "tensors",
                 "machine_settings": machine_settings()}
     cache_path = directory / "operations.json"

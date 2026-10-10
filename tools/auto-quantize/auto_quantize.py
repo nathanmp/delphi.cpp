@@ -29,7 +29,18 @@ def inputs(cfg, info):
 
 
 def get_damage(info, cfg, directory, imatrix):
+    cache_key = digest({"model": info["identity"], "sampling": cfg["sampling"], "groups": info["groups"],
+                        "imatrices": [file_identity(p, content=True) for p in cfg["imatrix"]],
+                        "binary": file_identity(Path(cfg["bindir"]) / "llama-quant-damage"),
+                        "libraries": [file_identity(p) for p in sorted(Path(cfg["bindir"]).glob("lib*.so*")) if not p.is_symlink()],
+                        "threads": cfg["runtime"]["threads"]})
+    cache_file = directory / "damage-cache.json"
+    if cache_file.exists():
+        cached = json.loads(cache_file.read_text())
+        if cached["key"] == cache_key:
+            return [json.loads(Path(path).read_text()) for path in cached["artifacts"]]
     artifacts = []
+    paths = []
     for category in ("primary", "other"):
         selected = [t for t in info["tensors"] if t["category"] == category and not t["preserved"]
                     and any(q != t["source_dtype"] for q in t["pool"])]
@@ -49,6 +60,8 @@ def get_damage(info, cfg, directory, imatrix):
         run(command, directory / f"damage-{category}.log", cfg["runtime"]["env"])
         artifact = json.loads((directory / f"damage-{category}.json").read_text())
         artifacts.append(artifact)
+        paths.append(str(directory / f"damage-{category}.json"))
+    write_json(cache_file, {"key": cache_key, "artifacts": paths})
     return artifacts
 
 
@@ -338,7 +351,7 @@ def main():
             else:
                 validate(data, cfg, args.mixes, args.output)
                 write_json(args.prepared, data)
-    except (QuantError, OSError, KeyError, json.JSONDecodeError, subprocess.TimeoutExpired) as exc:
+    except (ValueError, OSError, KeyError, OverflowError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
         parser.exit(1, f"error: {exc}\n")
 
 
