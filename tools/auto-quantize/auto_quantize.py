@@ -206,8 +206,11 @@ def plan(data, cfg, output):
         state["tensor_types"] = tensor_plan(data["model"], state["choices"])
         write_json(outdir / f"{state['id']}.json", state)
         recipes.append(state)
+    projection = sum(name != "RAM" for name in cfg["devices"]) > 1 and any(cfg["multi_gpu_speedup_percent"].values())
+    qualified = data["timing_qualified"] and not projection
     payload = {"schema": SCHEMA, "config": cfg, "source": data["model"]["identity"], "prepared": data,
-               "search": result, "recipes": recipes, "timing_qualified": data["timing_qualified"],
+               "search": result, "recipes": recipes, "timing_qualified": qualified,
+               "single_gpu_timing_qualified": data["timing_qualified"], "user_gpu_projection": projection,
                "limitations": ["damage is a local source-relative proxy, not KLD or accuracy",
                                "uniform synthetic routing and fixed route frequencies",
                                "link bandwidth and handoff latency are priors unless supplied",
@@ -223,7 +226,8 @@ def plan(data, cfg, output):
         print(f"{state['id']}  {state['damage']:12.5g}  {1000/times['decode']:10.2f}  "
               f"{1000*cfg['runtime']['short_tokens']/times['short']:9.2f}  "
               f"{1000*cfg['runtime']['long_tokens']/times['long']:8.2f}  {state['score']:.4f}")
-    print(f"Saved {outdir / 'frontier.json'}; predictions are {'qualified on held-out witnesses' if data['timing_qualified'] else 'unqualified estimates'}")
+    status = "user GPU projection from the single-GPU baseline" if projection else "qualified on held-out witnesses" if qualified else "unqualified estimates"
+    print(f"Saved {outdir / 'frontier.json'}; predictions are {status}")
     return payload
 
 
