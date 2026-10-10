@@ -237,6 +237,8 @@ int main(int argc, char ** argv) {
         runtime.tensor_buft_overrides.push_back({nullptr, nullptr});
     }
     runtime.n_gpu_layers = ngl;
+    runtime.cpuparams.n_threads = n_threads;
+    runtime.cpuparams_batch.n_threads = n_threads;
     runtime.load_mode = LLAMA_LOAD_MODE_NONE; // tensors on the CPU must be writable
     // A cached repack can retain the previous job's weights after a tensor update.
     runtime.no_extra_bufts = true;
@@ -263,6 +265,10 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "error: failed to create context\n");
         return 1;
     }
+    // Small CPU graph splits can otherwise create a one-worker temporary pool,
+    // which cannot execute with the tensor NUMA strategy on two nodes.
+    common_threadpools threadpools;
+    threadpools.init(ctx, runtime);
     const llama_vocab * vocab = llama_model_get_vocab(model);
     const int n_vocab = llama_vocab_n_tokens(vocab);
 
