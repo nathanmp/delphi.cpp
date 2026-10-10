@@ -2537,7 +2537,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn_cache(
         ggml_build_forward_expand(gf, d);
         return d;
     };
-    auto * gd = part(cur, hot, expert_cache->gate(), expert_cache->up(), expert_cache->down(), false);
+    auto * gd = part(cur, hot, expert_cache->bank(il, 0), expert_cache->bank(il, 1), expert_cache->bank(il, 2), false);
     auto * cd = part(cx, ci, gate, up, down, true);
 
     // Merge the per-expert outputs on the GPU and reduce them as build_moe_ffn does, so the backend fuses the weighted sum.
