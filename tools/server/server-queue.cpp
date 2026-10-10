@@ -275,6 +275,12 @@ void server_queue::yield_to_queue(std::function<void()> && work) {
     }
 }
 
+void server_queue::wake() {
+    std::unique_lock<std::mutex> lock(mutex_tasks);
+    woken = true;
+    condition_tasks.notify_all();
+}
+
 void server_queue::start_loop(int64_t idle_sleep_ms) {
     running = true;
     time_last_task = ggml_time_ms();
@@ -319,7 +325,8 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
         QUE_DBG("%s", "waiting for new tasks\n");
         while (true) {
             std::unique_lock<std::mutex> lock(mutex_tasks);
-            if (!running || !queue_tasks.empty()) {
+            if (!running || !queue_tasks.empty() || woken) {
+                woken = false;
                 break; // go back to process new tasks or terminate
             }
 
@@ -352,10 +359,15 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
             } else {
                 // wait for new tasks or timeout for checking sleeping condition
                 bool res = condition_tasks.wait_for(lock, max_wait_time, [&]{
-                    return (!queue_tasks.empty() || !running);
+                    return (!queue_tasks.empty() || !running || woken);
                 });
+                woken = false;
                 if (res) {
-                    break; // new task arrived or terminate
+                    break; // new task arrived, woken or terminate
+                }
+                if (callback_idle_tick) {
+                    lock.unlock();
+                    callback_idle_tick();
                 }
                 // otherwise, loop again to check sleeping condition
             }

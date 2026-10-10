@@ -43,6 +43,8 @@ LLAMA_API void    llama_share_stage_allow(struct llama_context * ctx, const char
 // Whether the context has an expert cache (LLAMA_MOE_CACHE_MIB or LLAMA_MOE_CACHE_SHARED), and its layer device.
 LLAMA_API bool         llama_share_has_expert_cache(const struct llama_context * ctx);
 LLAMA_API const char * llama_share_home_device(const struct llama_context * ctx);
+// Device bytes of one staging ring (GGML_SCHED_STAGE=1): the slots that a tier on a staging GPU lends, or 0 without staging.
+LLAMA_API size_t llama_share_stage_bytes(const struct llama_context * ctx);
 // Device memory of the context on `dev`.
 struct llama_share_usage {
     size_t model   = 0; // weights

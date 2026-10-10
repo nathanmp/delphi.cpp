@@ -4846,6 +4846,25 @@ llama_share_usage llama_share_device_usage(const llama_context * ctx, const char
     return res;
 }
 
+size_t llama_share_stage_bytes(const llama_context * ctx) {
+    const char * stage = getenv("GGML_SCHED_STAGE");
+    if (stage == nullptr || atoi(stage) == 0) {
+        return 0;
+    }
+    const char * slots_env = getenv("GGML_SCHED_STAGE_SLOTS");
+    const size_t n_slots = slots_env ? std::max(1, atoi(slots_env)) : 4;
+    size_t largest = 0;
+    for (const auto & l : ctx->get_model().layers) {
+        for (const ggml_tensor * w : { l.ffn_gate_exps, l.ffn_up_exps, l.ffn_down_exps, l.ffn_gate_up_exps }) {
+            if (w != nullptr && w->buffer != nullptr && ggml_backend_buffer_is_host(w->buffer)) {
+                largest = std::max(largest, ggml_nbytes(w));
+            }
+        }
+    }
+    // a ring slot may hold the padded tensor
+    return largest ? n_slots * (largest + (4u << 20)) : 0;
+}
+
 int32_t llama_share_tiers(const llama_context * ctx, int32_t * ids, size_t * bytes, const char ** devs, int32_t n_max) {
     const auto * cache = ctx->share_expert_cache();
     if (!cache) {
