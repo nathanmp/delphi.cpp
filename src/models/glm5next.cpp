@@ -931,7 +931,34 @@ llama_model_glm5next::graph::graph(const llama_model & model, const llm_graph_pa
     inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hc, n_tokens, 1);
     cb(inpL, "hc_init", -1);
 
+    // delphi: the hc_post of a sublayer runs in the HC mix op of the next boundary (build_hc_post_pre); pend_* hold the
+    // hc_post of the last FFN until the next layer
+    ggml_tensor * pend_y    = nullptr;
+    ggml_tensor * pend_res  = nullptr;
+    ggml_tensor * pend_post = nullptr;
+    ggml_tensor * pend_comb = nullptr;
+
     for (int il = 0; il < n_layer; ++il) {
+        ggml_tensor * post = nullptr;
+        ggml_tensor * comb = nullptr;
+
+        if (pend_y) {
+            cur = build_hc_post_pre(pend_y, pend_res, pend_post, pend_comb,
+                    model.layers[il].hc_attn_fn,
+                    model.layers[il].hc_attn_scale,
+                    model.layers[il].hc_attn_base,
+                    &post, &comb, &inpL, il, model.layers[il].attn_norm);
+            cb(inpL, "l_last", il - 1);
+            pend_y = nullptr;
+        } else {
+            cur = build_hc_pre(inpL,
+                    model.layers[il].hc_attn_fn,
+                    model.layers[il].hc_attn_scale,
+                    model.layers[il].hc_attn_base,
+                    &post, &comb, il, model.layers[il].attn_norm);
+        }
+        cb(cur, "attn_norm", il);
+
         if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
             res->t_layer_inp[il] = build_hc_mean(ctx0, inpL);
             cb(res->t_layer_inp[il], "layer_inp", il);
@@ -939,28 +966,18 @@ llama_model_glm5next::graph::graph(const llama_model & model, const llm_graph_pa
         }
 
         ggml_tensor * residual = inpL;
-        ggml_tensor * post = nullptr;
-        ggml_tensor * comb = nullptr;
-
-        cur = build_hc_pre(inpL,
-                model.layers[il].hc_attn_fn,
-                model.layers[il].hc_attn_scale,
-                model.layers[il].hc_attn_base,
-                &post, &comb, il, model.layers[il].attn_norm);
-        cb(cur, "attn_norm", il);
 
         cur = build_layer_attn(model, inp_mem, inp_kp, indexer_scoring, cur, il);
 
-        inpL = build_hc_post(cur, residual, post, comb, il);
-        cb(inpL, "hc_attn_post", il);
-
-        residual = inpL;
-        cur = build_hc_pre(inpL,
+        cur = build_hc_post_pre(cur, residual, post, comb,
                 model.layers[il].hc_ffn_fn,
                 model.layers[il].hc_ffn_scale,
                 model.layers[il].hc_ffn_base,
-                &post, &comb, il, model.layers[il].ffn_norm);
+                &post, &comb, &inpL, il, model.layers[il].ffn_norm);
+        cb(inpL, "hc_attn_post", il);
         cb(cur, "ffn_norm", il);
+
+        residual = inpL;
 
         // expand before the sublayer so op offload does not pull mHC state to the experts
         ggml_build_forward_expand(gf, residual);
@@ -970,9 +987,19 @@ llama_model_glm5next::graph::graph(const llama_model & model, const llm_graph_pa
         cur = build_layer_ffn(model, cur, il);
         cb(cur, "ffn_out", il);
 
-        inpL = build_hc_post(cur, residual, post, comb, il);
-        inpL = build_cvec(inpL, il);
-        cb(inpL, "l_last", il);
+        // the next layer takes the hc_post only on the same device: across devices it would copy y, the residual, post and
+        // comb instead of the new streams, and with the default copy-slot waits of the scheduler (not with
+        // GGML_SCHED_COPY_REUSE_WAIT=1) the results were wrong (GLM-5.3, 3 GPUs, 2026-10-11)
+        if (il + 1 < n_layer && cvec->tensor_for(il) == nullptr && model.dev_layer(il) == model.dev_layer(il + 1)) {
+            pend_y    = cur;
+            pend_res  = residual;
+            pend_post = post;
+            pend_comb = comb;
+        } else {
+            inpL = build_hc_post(cur, residual, post, comb, il);
+            inpL = build_cvec(inpL, il);
+            cb(inpL, "l_last", il);
+        }
     }
 
     if ((size_t) n_layer < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[n_layer]) {

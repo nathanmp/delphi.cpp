@@ -4383,6 +4383,7 @@ struct test_dsv4_hc_mix : public test_dsv4_hc {
     const int64_t   n_embd;
     const int64_t   n_tokens;
     const bool      norm;
+    const bool      post; // ggml_dsv4_hc_mix_post
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -4390,11 +4391,12 @@ struct test_dsv4_hc_mix : public test_dsv4_hc {
     }
 
     std::string vars() override {
-        return VARS_TO_STR4(type_fn, n_embd, n_tokens, norm);
+        return VARS_TO_STR5(type_fn, n_embd, n_tokens, norm, post);
     }
 
-    test_dsv4_hc_mix(ggml_type type_fn = GGML_TYPE_F32, int64_t n_embd = 64, int64_t n_tokens = 5, bool norm = false)
-        : type_fn(type_fn), n_embd(n_embd), n_tokens(n_tokens), norm(norm) {}
+    test_dsv4_hc_mix(ggml_type type_fn = GGML_TYPE_F32, int64_t n_embd = 64, int64_t n_tokens = 5, bool norm = false,
+            bool post = false)
+        : type_fn(type_fn), n_embd(n_embd), n_tokens(n_tokens), norm(norm), post(post) {}
 
     // the mixes stay near the range of a trained model: no saturated sigmoid or softmax
     void initialize_tensors(ggml_context * ctx) override {
@@ -4426,7 +4428,17 @@ struct test_dsv4_hc_mix : public test_dsv4_hc {
             ggml_set_name(norm_w, "norm_w");
         }
 
-        out = ggml_dsv4_hc_mix(ctx, x, fn, scale, base, norm_w, 1e-6f, 1e-6f, 20);
+        if (post) {
+            ggml_tensor * y = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+            ggml_set_name(y, "y");
+            ggml_tensor * post_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, n_tokens);
+            ggml_set_name(post_in, "post_in");
+            ggml_tensor * comb_in = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hc, hc, n_tokens);
+            ggml_set_name(comb_in, "comb_in");
+            out = ggml_dsv4_hc_mix_post(ctx, x, y, post_in, comb_in, fn, scale, base, norm_w, 1e-6f, 1e-6f, 20);
+        } else {
+            out = ggml_dsv4_hc_mix(ctx, x, fn, scale, base, norm_w, 1e-6f, 1e-6f, 20);
+        }
         ggml_set_name(out, "out");
         return out;
     }
@@ -10013,6 +10025,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         test_cases.emplace_back(new test_dsv4_hc_mix(type_fn, 4096, 4));
         test_cases.emplace_back(new test_dsv4_hc_mix(type_fn, 4096, 4, true));
+        for (int64_t n_tokens : {1, 3, 8}) {
+            test_cases.emplace_back(new test_dsv4_hc_mix(type_fn, 64, n_tokens, true, true));
+        }
+        test_cases.emplace_back(new test_dsv4_hc_mix(type_fn, 4096, 4, true, true));
     }
     test_cases.emplace_back(new test_dsv4_hc_mix(GGML_TYPE_F32, 40, 2));       // 1 slice of 40 values in each stream
     test_cases.emplace_back(new test_dsv4_hc_mix(GGML_TYPE_F32, 48, 3, true)); // 2 slices of 24
@@ -12252,6 +12268,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // GLM-5.3 hyper-connection boundary (fn Q8_0)
     for (int n_tokens : {1, 4, 8}) {
         test_cases.emplace_back(new test_dsv4_hc_mix(GGML_TYPE_Q8_0, 4096, n_tokens, true));
+        test_cases.emplace_back(new test_dsv4_hc_mix(GGML_TYPE_Q8_0, 4096, n_tokens, true, true));
     }
 
     // GLM-5.3 router (F32, 288 experts)

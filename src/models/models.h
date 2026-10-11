@@ -1255,6 +1255,22 @@ struct llama_model_deepseek4 : public llama_model_base {
                 int il,
                 ggml_tensor * norm_w = nullptr) const;
 
+        // build_hc_post(y, residual, post_in, comb_in) of the previous sublayer, then build_hc_pre of its result: one op
+        // with the HC mix op. *x_new: the streams after hc_post, the residual of the next sublayer
+        ggml_tensor * build_hc_post_pre(
+                ggml_tensor * y,
+                ggml_tensor * residual,
+                ggml_tensor * post_in,
+                ggml_tensor * comb_in,
+                ggml_tensor * hc_fn,
+                ggml_tensor * hc_scale,
+                ggml_tensor * hc_base,
+                ggml_tensor ** post,
+                ggml_tensor ** comb,
+                ggml_tensor ** x_new,
+                int il,
+                ggml_tensor * norm_w) const;
+
         ggml_tensor * build_hc_post(
                 ggml_tensor * x,
                 ggml_tensor * residual,

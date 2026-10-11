@@ -447,6 +447,50 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_pre(
     return cur;
 }
 
+ggml_tensor * llama_model_deepseek4::graph::build_hc_post_pre(
+        ggml_tensor * y,
+        ggml_tensor * residual,
+        ggml_tensor * post_in,
+        ggml_tensor * comb_in,
+        ggml_tensor * hc_fn,
+        ggml_tensor * hc_scale,
+        ggml_tensor * hc_base,
+        ggml_tensor ** post,
+        ggml_tensor ** comb,
+        ggml_tensor ** x_new,
+        int il,
+        ggml_tensor * norm_w) const {
+    const int64_t hc = hparams.dsv4_hc_mult;
+    const bool f32_cont = [&] {
+        for (const ggml_tensor * t : {y, residual, post_in, comb_in}) {
+            if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t)) {
+                return false;
+            }
+        }
+        return true;
+    }();
+    // delphi: the hc_post of the sublayer and the next boundary in one op; four contiguous parts, the new streams last
+    if (cparams.fused_dsv4_hc_mix && il >= 0 && hc == 4 && f32_cont) {
+        const int64_t nt = residual->ne[2];
+        const size_t  f  = sizeof(float);
+
+        ggml_tensor * mix = ggml_dsv4_hc_mix_post(ctx0, residual, y, post_in, comb_in, hc_fn, hc_scale, hc_base, norm_w,
+                norm_rms_eps, hparams.dsv4_hc_eps, (int32_t) hparams.dsv4_hc_sinkhorn_iters);
+        res->add_fused_node({LLM_FUSED_OP_DSV4_HC_MIX, mix, il});
+        cb(mix, "hc_mix", il);
+
+        *x_new = ggml_view_3d(ctx0, mix, n_embd, hc, nt, n_embd*f, hc*n_embd*f, (n_embd + hc + hc*hc)*nt*f);
+        *post  = ggml_view_2d(ctx0, mix, hc, nt, hc*f, n_embd*nt*f);
+        cb(*post, "hc_post", il);
+        *comb  = ggml_view_3d(ctx0, mix, hc, hc, nt, hc*f, hc*hc*f, (n_embd + hc)*nt*f);
+        cb(*comb, "hc_comb", il);
+        return ggml_view_2d(ctx0, mix, n_embd, nt, n_embd*f, 0);
+    }
+
+    *x_new = build_hc_post(y, residual, post_in, comb_in, il);
+    return build_hc_pre(*x_new, hc_fn, hc_scale, hc_base, post, comb, il, norm_w);
+}
+
 ggml_tensor * llama_model_deepseek4::graph::build_hc_post(
         ggml_tensor * x,
         ggml_tensor * residual,

@@ -2824,6 +2824,24 @@ extern "C" {
             float                 eps,
             int32_t               n_iter);
 
+    // hc_mix_post: ggml_dsv4_hc_post(y, residual, post, comb) of the previous sublayer, then ggml_dsv4_hc_mix of the result,
+    // in one op (delphi). residual [n_embd, hc, n_tokens], y [n_embd, n_tokens], post [hc, n_tokens] and
+    // comb [hc, hc, n_tokens] are contiguous F32. The result has a fourth part after the three of ggml_dsv4_hc_mix:
+    // the new streams [n_embd, hc, n_tokens], the residual of the next sublayer.
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_mix_post(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * residual,
+            struct ggml_tensor  * y,
+            struct ggml_tensor  * post,
+            struct ggml_tensor  * comb,
+            struct ggml_tensor  * fn,
+            struct ggml_tensor  * scale,
+            struct ggml_tensor  * base,
+            struct ggml_tensor  * norm_w,
+            float                 norm_eps,
+            float                 eps,
+            int32_t               n_iter);
+
     // custom operators
 
     typedef void (*ggml_custom1_op_t)(struct ggml_tensor * dst , const struct ggml_tensor * a, int ith, int nth, void * userdata);

@@ -10,7 +10,8 @@
 //    not change between runs). Block 0 computes post and comb like the separate ops; the other blocks pre, then
 //    sum_h pre[h]*x[:, h] and, with a weight, its RMS norm, each for 4*HC_MIX_BLOCK values.
 // This replaces rms_norm, quantize_q8_1, mul_vec_q, the two weight chains, hc_comb, hc_pre and the rms_norm of the layer
-// input: 7 to 9 kernels.
+// input: 7 to 9 kernels. ggml_dsv4_hc_mix_post also replaces the hc_post before it: the part kernel computes the stream
+// from the residual and the sublayer output, and its warp 0 writes it for the final kernel and the next boundary.
 
 static constexpr int HC_MIX_HC          = 4;
 static constexpr int HC_MIX_DIM         = (2 + HC_MIX_HC)*HC_MIX_HC;    // 24 rows of fn
@@ -62,10 +63,26 @@ static __device__ __forceinline__ void hc_mix_load8(const char * row, const int6
     }
 }
 
-template <ggml_type type>
+// ggml_dsv4_hc_post of one value of stream h (x: the residual of token it), in the order of its operations
+static __device__ __forceinline__ float hc_mix_post_value(
+        const float * xt, const float yv, const float * post_t, const float * comb_t, const int h, const int64_t n_embd,
+        const int64_t i) {
+    // dsv4_hc_post_f32 compiles to a product, then one fma per source: written out, so that unrolling does not change it
+    float sum = __fmul_rn(yv, post_t[h]);
+#pragma unroll
+    for (int src = 0; src < HC_MIX_HC; ++src) {
+        sum = __fmaf_rn(xt[src*n_embd + i], comb_t[h + HC_MIX_HC*src], sum);
+    }
+    return sum;
+}
+
+// post: x is the residual, the stream is hc_post(y, x, post_in, comb_in); warp 0 writes it to x_new
+template <ggml_type type, bool post>
 static __global__ void __launch_bounds__(HC_MIX_PART_BLOCK) dsv4_hc_mix_part(
         const float * __restrict__ x, const char * __restrict__ fn, float * __restrict__ part,
-        const int64_t n_embd, const int64_t len, const int64_t stride_x, const int64_t stride_fn) {
+        const int64_t n_embd, const int64_t len, const int64_t stride_x, const int64_t stride_fn,
+        const float * __restrict__ y, const float * __restrict__ post_in, const float * __restrict__ comb_in,
+        float * __restrict__ x_new) {
     const int s    = blockIdx.x;
     const int it   = blockIdx.y;
     const int lane = threadIdx.x % WARP_SIZE;
@@ -73,6 +90,11 @@ static __global__ void __launch_bounds__(HC_MIX_PART_BLOCK) dsv4_hc_mix_part(
 
     const float * xt = x + it*stride_x;
     float * pt = part + ((int64_t) it*gridDim.x + s)*HC_MIX_NPART;
+
+    const float * yt     = post ? y + it*n_embd : nullptr;
+    const float * post_t = post ? post_in + it*HC_MIX_HC : nullptr;
+    const float * comb_t = post ? comb_in + it*HC_MIX_HC*HC_MIX_HC : nullptr;
+    float *       xnt    = post ? x_new + it*HC_MIX_HC*n_embd : nullptr;
 
     if (warp == HC_MIX_PART_NWARPS) {
         float g[HC_MIX_NGRAM];
@@ -84,7 +106,12 @@ static __global__ void __launch_bounds__(HC_MIX_PART_BLOCK) dsv4_hc_mix_part(
             float2 a[HC_MIX_HC];
 #pragma unroll
             for (int h = 0; h < HC_MIX_HC; ++h) {
-                a[h] = *(const float2 *) (xt + h*n_embd + i);
+                if constexpr (post) {
+                    a[h].x = hc_mix_post_value(xt, yt[i + 0], post_t, comb_t, h, n_embd, i + 0);
+                    a[h].y = hc_mix_post_value(xt, yt[i + 1], post_t, comb_t, h, n_embd, i + 1);
+                } else {
+                    a[h] = *(const float2 *) (xt + h*n_embd + i);
+                }
             }
             int k = 0;
 #pragma unroll
@@ -118,11 +145,28 @@ static __global__ void __launch_bounds__(HC_MIX_PART_BLOCK) dsv4_hc_mix_part(
 
     // f: position in the hc*len values of the slice; len % 8 == 0, so 8 values are in one stream
     for (int64_t f = 8*lane; f < HC_MIX_HC*len; f += 8*WARP_SIZE) {
-        const int64_t h = f / len;
-        const int64_t i = h*n_embd + s*len + (f - h*len);
-        const float4 v0 = *(const float4 *) (xt + i);
-        const float4 v1 = *(const float4 *) (xt + i + 4);
-        const float v[8] = {v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w};
+        const int64_t h  = f / len;
+        const int64_t ie = s*len + (f - h*len); // position in the stream
+        const int64_t i  = h*n_embd + ie;
+        float v[8];
+        if constexpr (post) {
+            const float4 y0 = *(const float4 *) (yt + ie);
+            const float4 y1 = *(const float4 *) (yt + ie + 4);
+            const float yv[8] = {y0.x, y0.y, y0.z, y0.w, y1.x, y1.y, y1.z, y1.w};
+#pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                v[k] = hc_mix_post_value(xt, yv[k], post_t, comb_t, (int) h, n_embd, ie + k);
+            }
+            if (warp == 0) {
+                *(float4 *) (xnt + i)     = make_float4(v[0], v[1], v[2], v[3]);
+                *(float4 *) (xnt + i + 4) = make_float4(v[4], v[5], v[6], v[7]);
+            }
+        } else {
+            const float4 v0 = *(const float4 *) (xt + i);
+            const float4 v1 = *(const float4 *) (xt + i + 4);
+            v[0] = v0.x; v[1] = v0.y; v[2] = v0.z; v[3] = v0.w;
+            v[4] = v1.x; v[5] = v1.y; v[6] = v1.z; v[7] = v1.w;
+        }
 #pragma unroll
         for (int r = 0; r < HC_MIX_PART_ROWS; ++r) {
             float w[8];
@@ -314,11 +358,12 @@ bool ggml_cuda_dsv4_hc_mix_supported(const ggml_tensor * op) {
     const bool type_ok = fn->type == GGML_TYPE_F32 || fn->type == GGML_TYPE_F16 || fn->type == GGML_TYPE_BF16 ||
         fn->type == GGML_TYPE_Q8_0;
     // slices of 8 values; 16-byte loads of x, fn, the output and norm_w: 16-byte rows; Q8_0: 8 values never cross a block
-    return type_ok && x->type == GGML_TYPE_F32 && x->ne[1] == HC_MIX_HC && ggml_is_contiguous(x) && x->ne[0] % 8 == 0 &&
+    const bool ok = type_ok && x->type == GGML_TYPE_F32 && x->ne[1] == HC_MIX_HC && ggml_is_contiguous(x) && x->ne[0] % 8 == 0 &&
         fn->nb[0] == ggml_type_size(fn->type) && (fn->type == GGML_TYPE_Q8_0 || fn->nb[1] % 16 == 0) &&
         op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[3]) &&
         (norm_w == nullptr || (norm_w->type == GGML_TYPE_F32 && ggml_is_contiguous(norm_w))) &&
         op->type == GGML_TYPE_F32;
+    return ok; // ggml_dsv4_hc_mix_post: y, post and comb are contiguous F32 (ggml.c)
 }
 
 void ggml_cuda_op_dsv4_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -343,34 +388,45 @@ void ggml_cuda_op_dsv4_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 
     const float * x_d = (const float *) x->data;
     const int64_t stride_x = x->nb[2] / sizeof(float);
+
+    // ggml_dsv4_hc_mix_post: the stream is computed by the part kernel into the fourth part of dst
+    const ggml_tensor * y     = dst->src[5];
+    float *             x_new = (float *) dst->data + (n_embd + HC_MIX_HC + HC_MIX_HC*HC_MIX_HC)*n_tokens;
+    const float *       y_d   = y ? (const float *) y->data : nullptr;
+    const float *       p_d   = y ? (const float *) dst->src[6]->data : nullptr;
+    const float *       c_d   = y ? (const float *) dst->src[7]->data : nullptr;
+    GGML_ASSERT((uintptr_t) x_d % 16 == 0 && (uintptr_t) y_d % 16 == 0); // 16-byte loads
+
     const dim3 grid_part(nslice, n_tokens, 1);
     const dim3 block_part(HC_MIX_PART_BLOCK, 1, 1);
+#define HC_MIX_PART_LAUNCH(type)                                                                                   \
+    if (y) {                                                                                                         \
+        dsv4_hc_mix_part<type, true><<<grid_part, block_part, 0, stream>>>(                                          \
+            x_d, (const char *) fn->data, part.get(), n_embd, n_embd/nslice, stride_x, fn->nb[1], y_d, p_d, c_d, x_new); \
+    } else {                                                                                                         \
+        dsv4_hc_mix_part<type, false><<<grid_part, block_part, 0, stream>>>(                                         \
+            x_d, (const char *) fn->data, part.get(), n_embd, n_embd/nslice, stride_x, fn->nb[1], nullptr, nullptr,  \
+            nullptr, nullptr);                                                                                       \
+    }
     switch (fn->type) {
-        case GGML_TYPE_F32:
-            dsv4_hc_mix_part<GGML_TYPE_F32><<<grid_part, block_part, 0, stream>>>(
-                x_d, (const char *) fn->data, part.get(), n_embd, n_embd/nslice, stride_x, fn->nb[1]);
-            break;
-        case GGML_TYPE_F16:
-            dsv4_hc_mix_part<GGML_TYPE_F16><<<grid_part, block_part, 0, stream>>>(
-                x_d, (const char *) fn->data, part.get(), n_embd, n_embd/nslice, stride_x, fn->nb[1]);
-            break;
-        case GGML_TYPE_BF16:
-            dsv4_hc_mix_part<GGML_TYPE_BF16><<<grid_part, block_part, 0, stream>>>(
-                x_d, (const char *) fn->data, part.get(), n_embd, n_embd/nslice, stride_x, fn->nb[1]);
-            break;
-        case GGML_TYPE_Q8_0:
-            dsv4_hc_mix_part<GGML_TYPE_Q8_0><<<grid_part, block_part, 0, stream>>>(
-                x_d, (const char *) fn->data, part.get(), n_embd, n_embd/nslice, stride_x, fn->nb[1]);
-            break;
+        case GGML_TYPE_F32:  HC_MIX_PART_LAUNCH(GGML_TYPE_F32);  break;
+        case GGML_TYPE_F16:  HC_MIX_PART_LAUNCH(GGML_TYPE_F16);  break;
+        case GGML_TYPE_BF16: HC_MIX_PART_LAUNCH(GGML_TYPE_BF16); break;
+        case GGML_TYPE_Q8_0: HC_MIX_PART_LAUNCH(GGML_TYPE_Q8_0); break;
         default:
             GGML_ABORT("unsupported type %s", ggml_type_name(fn->type));
     }
+#undef HC_MIX_PART_LAUNCH
     CUDA_CHECK(cudaGetLastError());
+
+    // the final kernel reads the stream: x, or the new stream of the part kernel
+    const float * xs_d      = y ? x_new : x_d;
+    const int64_t stride_xs = y ? HC_MIX_HC*n_embd : stride_x;
 
     const int nblocks_pre = (n_embd + 4*HC_MIX_BLOCK - 1) / (4*HC_MIX_BLOCK);
     dsv4_hc_mix_final<<<dim3(n_tokens, 1 + nblocks_pre, 1), HC_MIX_BLOCK, 0, stream>>>(
-        x_d, part.get(), (const float *) scale->data, (const float *) base->data,
+        xs_d, part.get(), (const float *) scale->data, (const float *) base->data,
         norm_w ? (const float *) norm_w->data : nullptr, (float *) dst->data,
-        n_embd, n_tokens, nslice, stride_x, scale->nb[0] / sizeof(float), norm_eps, eps, n_iter);
+        n_embd, n_tokens, nslice, stride_xs, scale->nb[0] / sizeof(float), norm_eps, eps, n_iter);
     CUDA_CHECK(cudaGetLastError());
 }
