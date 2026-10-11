@@ -21,6 +21,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -484,7 +485,7 @@ llama_context::llama_context(
 
     // init the memory module
     if (!hparams.vocab_only) {
-        llama_memory_params params_mem = {
+        mem_params = {
             /*.type_k    =*/ params.type_k,
             /*.type_v    =*/ params.type_v,
             /*.swa_full  =*/ params.swa_full,
@@ -492,7 +493,7 @@ llama_context::llama_context(
             /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
         };
 
-        memory.reset(model.create_memory(params_mem, cparams));
+        memory.reset(model.create_memory(mem_params, cparams));
     }
 
     // init backends
@@ -581,6 +582,20 @@ llama_context::llama_context(
             expert_cache = llama_expert_cache::create(model, backends);
         }
         sched_reserve();
+
+        // LLAMA_MOE_CACHE_TIERS=<dev>:<MiB>[,...]: run-time tiers added at once, for tests without a VRAM sharing daemon
+        if (const char * env = getenv("LLAMA_MOE_CACHE_TIERS"); env && expert_cache) {
+            std::string list = env;
+            for (size_t pos = 0; pos < list.size();) {
+                const size_t end = std::min(list.find(',', pos), list.size());
+                const std::string item = list.substr(pos, end - pos);
+                const size_t colon = item.find(':');
+                if (colon != std::string::npos) {
+                    llama_share_add_tier(this, item.substr(0, colon).c_str(), size_t(atoll(item.c_str() + colon + 1)) << 20);
+                }
+                pos = end + 1;
+            }
+        }
 
         if (!cparams.flash_attn) {
             if (ggml_is_quantized(params.type_v)) {
@@ -1001,6 +1016,10 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n",
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
+    if (share_rereserve) {
+        LLAMA_LOG_WARN("%s: compute buffers reserved again in %.1f ms\n", __func__, (t_end_us - t_start_us)/1000.0);
+        share_rereserve = false;
+    }
 }
 
 void llama_context::reserve_max_prefill(
@@ -2205,6 +2224,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 }
 
 int llama_context::encode(const llama_batch & batch_inp) {
+    if (memory_released) {
+        share_restore_memory();
+    }
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd || batch_inp.embd_tensor);
@@ -2443,6 +2465,22 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch & batch_inp) {
+    if (memory_released) {
+        share_restore_memory();
+    }
+    // LLAMA_MOE_CACHE_TIER_CYCLE=N (test): every N decodes, drop the newest run-time tier and add it again
+    static const int tier_cycle = [] { const char * e = getenv("LLAMA_MOE_CACHE_TIER_CYCLE"); return e ? atoi(e) : 0; }();
+    if (tier_cycle > 0 && expert_cache && ++share_test_decodes % tier_cycle == 0 && expert_cache->n_tiers() > 1) {
+        const auto [id, backend] = expert_cache->tier_list().back();
+        const size_t bytes = expert_cache->tier_bytes(id);
+        share_drop_tier(id);
+        share_add_tier(ggml_backend_get_device(backend), bytes);
+    }
+    // LLAMA_SHARE_TEST_RELEASE_COMPUTE=N (test): every N decodes, release the compute buffers
+    static const int release_cycle = [] { const char * e = getenv("LLAMA_SHARE_TEST_RELEASE_COMPUTE"); return e ? atoi(e) : 0; }();
+    if (release_cycle > 0 && ++share_test_releases % release_cycle == 0) {
+        share_release_compute();
+    }
     GGML_ASSERT(batch_inp.token || batch_inp.embd || batch_inp.embd_tensor);
 
     if (!memory) {
@@ -3220,11 +3258,14 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         res = std::max<uint32_t>(1024u, 12u*model.n_tensors());
     } else {
         res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
-        // Static residency adds a second routed branch and CPU input materialization per layer.
-        if (expert_cache) { res += 64u * model.layers.size(); }
         for (const auto & lora : model.loras) {
             res += lora->get_n_nodes();
         }
+    }
+    // The expert cache adds a CPU branch and its input per layer, and per tier the map gather, three expert multiplies, SwiGLU
+    // and a weighted sum over the expert slots.
+    if (expert_cache) {
+        res += (64u + llama_expert_cache::max_tiers * (16u + 2u * model.hparams.n_expert_used())) * model.layers.size();
     }
 
     uint32_t n_sampling_nodes = 0;
@@ -3260,9 +3301,71 @@ llm_graph_result * llama_context::get_gf_res_prev() {
     return res.get();
 }
 
+// delphi: a CPU on the NUMA node of a GPU for its scheduler worker: LLAMA_MOE_CACHE_WORKER_CPU, else the node's last CPU
+// (--numa tensors gives the CPU threads the first CPUs of each node), else -1 (not pinned)
+static int share_worker_cpu(ggml_backend_dev_t dev) {
+    if (const char * env = getenv("LLAMA_MOE_CACHE_WORKER_CPU")) {
+        return atoi(env);
+    }
+    ggml_backend_dev_props props;
+    ggml_backend_dev_get_props(dev, &props);
+    if (props.device_id == nullptr) {
+        return -1;
+    }
+    std::string id = props.device_id;
+    for (auto & c : id) {
+        c = (char) tolower((unsigned char) c);
+    }
+    int node = -1;
+    std::ifstream("/sys/bus/pci/devices/" + id + "/numa_node") >> node;
+    if (node < 0) {
+        return -1;
+    }
+    std::string list;
+    std::ifstream("/sys/devices/system/node/node" + std::to_string(node) + "/cpulist") >> list;
+    const size_t sep = list.find_last_of(",-");
+    const std::string last = sep == std::string::npos ? list : list.substr(sep + 1);
+    return last.empty() ? -1 : atoi(last.c_str());
+}
+
+// delphi: the splits of an expert cache tier on another GPU are submitted by a scheduler worker, so that their host time
+// overlaps the CPU expert part (LLAMA_MOE_CACHE_WORKER=0 turns this off)
+void llama_context::sched_set_workers(ggml_backend_sched_t s) {
+    static const bool enabled = [] { const char * e = getenv("LLAMA_MOE_CACHE_WORKER"); return e == nullptr || atoi(e) != 0; }();
+    if (s == nullptr) {
+        return;
+    }
+    for (auto & b : backends) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(b.get());
+        if (dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            continue;
+        }
+        bool remote = false;
+        for (int t = 0; enabled && expert_cache && t < expert_cache->n_tiers(); ++t) {
+            remote |= expert_cache->tier_backend(t) == b.get() && b.get() != expert_cache->backend();
+        }
+        ggml_backend_sched_set_worker(s, b.get(), remote, remote ? share_worker_cpu(dev) : -1);
+    }
+}
+
+void llama_context::sched_set_workers_all() {
+    sched_set_workers(sched.get());
+    for (auto & slot : graph_slots) {
+        if (slot.sched) {
+            sched_set_workers(slot.sched.get());
+        }
+    }
+}
+
 void llama_context::sched_set_stage_lender() {
+    sched_set_workers(sched.get());
     if (expert_cache) {
         ggml_backend_sched_set_stage_lender(sched.get(), llama_expert_cache::lend, expert_cache.get());
+    }
+    for (auto & b : backends) {
+        if (std::find(stage_blocked.begin(), stage_blocked.end(), ggml_backend_get_device(b.get())) != stage_blocked.end()) {
+            ggml_backend_sched_stage_allow(sched.get(), b.get(), false);
+        }
     }
 }
 
@@ -3307,6 +3410,172 @@ void llama_context::graph_alt_reset() {
         slot.gf_res_prev_active = nullptr;
     }
     gf_res_prev_active = nullptr;
+}
+
+//
+// delphi: VRAM sharing between servers
+//
+
+// Forget every graph and scheduler; the next decode reserves again. Graphs hold the addresses of compute buffers, KV tensors and
+// expert cache banks.
+void llama_context::share_reset_scheds() {
+    synchronize();
+    graph_alt_reset();
+    for (auto & slot : graph_slots) {
+        slot.sched.reset();
+        for (auto & res : slot.gf_res_prev) {
+            res.reset();
+        }
+    }
+    max_prefill_sched = nullptr;
+    for (auto & res : gf_res_prev) {
+        res.reset();
+    }
+    gf_res_prev_active = nullptr;
+    // a scheduler without buffers: other calls may still use it before the next decode reserves
+    sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
+            gf_res_reserve->get_max_nodes(), cparams.pipeline_parallel, cparams.op_offload));
+    sched_set_stage_lender();
+    sched_need_reserve = true;
+    share_rereserve = true;
+    if (expert_cache) {
+        // the old schedulers dropped their staging rings, lent slots included
+        expert_cache->reclaimed();
+    }
+}
+
+int llama_context::share_add_tier(ggml_backend_dev_t dev, size_t bytes) {
+    if (!expert_cache) {
+        return -1;
+    }
+    ggml_backend_t backend = nullptr;
+    for (auto & b : backends) {
+        if (ggml_backend_get_device(b.get()) == dev) {
+            backend = b.get();
+        }
+    }
+    if (backend == nullptr) {
+        return -1;
+    }
+    synchronize();
+    const int id = expert_cache->add_tier(backend, bytes);
+    if (id >= 0) {
+        share_gen++;
+        sched_set_workers_all();
+    }
+    return id;
+}
+
+size_t llama_context::share_drop_tier(int id) {
+    if (!expert_cache) {
+        return 0;
+    }
+    synchronize();
+    // staging rings may hold slots inside the tier, and graphs its banks
+    ggml_backend_sched_stage_reclaim(sched.get());
+    for (auto & slot : graph_slots) {
+        if (slot.sched) {
+            ggml_backend_sched_stage_reclaim(slot.sched.get());
+        }
+    }
+    expert_cache->reclaimed();
+    graph_alt_reset();
+    const size_t bytes = expert_cache->drop_tier(id);
+    share_gen++;
+    sched_set_workers_all();
+    return bytes;
+}
+
+size_t llama_context::share_release_compute() {
+    const int64_t t0 = ggml_time_us();
+    synchronize();
+    size_t freed = 0;
+    auto count = [&](ggml_backend_sched_t s) {
+        if (s == nullptr) {
+            return;
+        }
+        freed += ggml_backend_sched_stage_release(s);
+        for (auto & b : backends) {
+            if (ggml_backend_dev_type(ggml_backend_get_device(b.get())) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                freed += ggml_backend_sched_get_buffer_size(s, b.get());
+            }
+        }
+    };
+    count(sched.get());
+    for (auto & slot : graph_slots) {
+        count(slot.sched.get());
+    }
+    share_reset_scheds();
+    if (expert_cache) {
+        freed += expert_cache->release_scratch();
+    }
+    // the backends' memory pools, captured graphs and scratch buffers
+    for (auto & b : backends) {
+        auto * dev = ggml_backend_get_device(b.get());
+        auto * reg = ggml_backend_dev_backend_reg(dev);
+        auto * trim = reg ? (void (*)(ggml_backend_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_trim") : nullptr;
+        if (trim != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            trim(b.get());
+        }
+    }
+    LLAMA_LOG_WARN("%s: released %.1f MiB of compute buffers and staging slots in %.1f ms\n", __func__, freed / 1048576.0,
+            (ggml_time_us() - t0) / 1000.0);
+    return freed;
+}
+
+size_t llama_context::share_release_memory() {
+    if (!memory || memory_released || model.arch == LLM_ARCH_GEMMA4_ASSISTANT) {
+        return 0;
+    }
+    synchronize();
+    size_t bytes = 0;
+    for (const auto & [buft, size] : memory->memory_breakdown()) {
+        if (!ggml_backend_buft_is_host(buft)) {
+            bytes += size;
+        }
+    }
+    share_reset_scheds();
+    memory.reset();
+    memory_released = true;
+    LLAMA_LOG_WARN("%s: released %.1f MiB of device memory module (KV) buffers\n", __func__, bytes / 1048576.0);
+    return bytes;
+}
+
+bool llama_context::share_restore_memory() {
+    if (!memory_released) {
+        return true;
+    }
+    const int64_t t0 = ggml_time_us();
+    memory.reset(model.create_memory(mem_params, cparams));
+    memory_released = false;
+    sched_need_reserve = true;
+    LLAMA_LOG_WARN("%s: memory module created again in %.1f ms\n", __func__, (ggml_time_us() - t0) / 1000.0);
+    return memory != nullptr;
+}
+
+void llama_context::share_stage_allow(ggml_backend_dev_t dev, bool allow) {
+    const auto it = std::find(stage_blocked.begin(), stage_blocked.end(), dev);
+    if (allow == (it == stage_blocked.end())) {
+        return;
+    }
+    if (allow) {
+        stage_blocked.erase(it);
+    } else {
+        stage_blocked.push_back(dev);
+    }
+    synchronize();
+    for (auto & b : backends) {
+        if (ggml_backend_get_device(b.get()) != dev) {
+            continue;
+        }
+        ggml_backend_sched_stage_allow(sched.get(), b.get(), allow);
+        for (auto & slot : graph_slots) {
+            if (slot.sched) {
+                ggml_backend_sched_stage_allow(slot.sched.get(), b.get(), allow);
+            }
+        }
+    }
+    share_gen++;
 }
 
 // pack sampler outputs into as few sequences as possible before using sequences without samplers
@@ -3429,7 +3698,7 @@ llm_graph_params llama_context::graph_params(
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
                           llm_graph_type   gtype) const {
-    return {
+    llm_graph_params params = {
         /*.arch        =*/ model.arch,
         /*.hparams     =*/ model.hparams,
         /*.cparams     =*/ cparams,
@@ -3448,6 +3717,8 @@ llm_graph_params llama_context::graph_params(
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
     };
+    params.share_gen = share_gen;
+    return params;
 }
 
 ggml_status llama_context::graph_compute(
@@ -3577,6 +3848,12 @@ llm_graph_cb llama_context::graph_get_cb() const {
             ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend_cpu);
         } else if (cache_gpu && expert_cache) {
             ggml_backend_sched_set_tensor_backend(sched.get(), cur, expert_cache->backend());
+        } else if (expert_cache && strncmp(name, "ffn_cache_x", 11) == 0) {
+            // an expert cache tier on another GPU
+            const int tier = atoi(name + 11);
+            if (tier >= 0 && tier < expert_cache->n_tiers()) {
+                ggml_backend_sched_set_tensor_backend(sched.get(), cur, expert_cache->tier_backend(tier));
+            }
         }
 
         const char * split_tag = strncmp(name, "ffn_moe_x", 9) == 0 ? name + 9 : strncmp(name, "attn_x", 6) == 0 ? name + 6 : nullptr;
@@ -4555,6 +4832,119 @@ void llama_context::perf_reset() {
     t_eval_us   = n_eval = 0;
     t_p_eval_us = n_p_eval = 0;
     n_reused    = 0;
+}
+
+//
+// delphi: VRAM sharing (llama-ext.h)
+//
+
+static ggml_backend_dev_t llama_share_find_dev(const char * name) {
+    for (size_t i = 0; name != nullptr && i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (strcmp(ggml_backend_dev_name(dev), name) == 0) {
+            return dev;
+        }
+    }
+    return nullptr;
+}
+
+int32_t llama_share_add_tier(llama_context * ctx, const char * dev, size_t bytes) {
+    ggml_backend_dev_t d = llama_share_find_dev(dev);
+    return d ? ctx->share_add_tier(d, bytes) : -1;
+}
+
+size_t llama_share_drop_tier(llama_context * ctx, int32_t id) {
+    return ctx->share_drop_tier(id);
+}
+
+size_t llama_share_release_compute(llama_context * ctx) {
+    return ctx->share_release_compute();
+}
+
+size_t llama_share_release_memory(llama_context * ctx) {
+    return ctx->share_release_memory();
+}
+
+bool llama_share_restore_memory(llama_context * ctx) {
+    return ctx->share_restore_memory();
+}
+
+bool llama_share_memory_released(const llama_context * ctx) {
+    return ctx->share_memory_released();
+}
+
+void llama_share_stage_allow(llama_context * ctx, const char * dev, bool allow) {
+    if (ggml_backend_dev_t d = llama_share_find_dev(dev)) {
+        ctx->share_stage_allow(d, allow);
+    }
+}
+
+bool llama_share_has_expert_cache(const llama_context * ctx) {
+    return ctx->share_expert_cache() != nullptr;
+}
+
+const char * llama_share_home_device(const llama_context * ctx) {
+    const auto * cache = ctx->share_expert_cache();
+    return cache ? ggml_backend_dev_name(ggml_backend_get_device(cache->backend())) : nullptr;
+}
+
+llama_share_usage llama_share_device_usage(const llama_context * ctx, const char * dev) {
+    llama_share_usage res = {};
+    ggml_backend_dev_t d = llama_share_find_dev(dev);
+    if (d == nullptr) {
+        return res;
+    }
+    for (const auto & [buft, mb] : ctx->memory_breakdown()) {
+        if (buft != nullptr && ggml_backend_buft_get_device(buft) == d && !ggml_backend_buft_is_host(buft)) {
+            res.model   += mb.model;
+            res.context += mb.context;
+            res.compute += mb.compute;
+        }
+    }
+    if (const auto * cache = ctx->share_expert_cache()) {
+        for (const auto & [id, backend] : cache->tier_list()) {
+            if (ggml_backend_get_device(backend) == d) {
+                res.cache += cache->tier_bytes(id);
+            }
+        }
+    }
+    return res;
+}
+
+size_t llama_share_stage_bytes(const llama_context * ctx) {
+    const char * stage = getenv("GGML_SCHED_STAGE");
+    if (stage == nullptr || atoi(stage) == 0) {
+        return 0;
+    }
+    const char * slots_env = getenv("GGML_SCHED_STAGE_SLOTS");
+    const size_t n_slots = slots_env ? std::max(1, atoi(slots_env)) : 4;
+    size_t largest = 0;
+    for (const auto & l : ctx->get_model().layers) {
+        for (const ggml_tensor * w : { l.ffn_gate_exps, l.ffn_up_exps, l.ffn_down_exps, l.ffn_gate_up_exps }) {
+            if (w != nullptr && w->buffer != nullptr && ggml_backend_buffer_is_host(w->buffer)) {
+                largest = std::max(largest, ggml_nbytes(w));
+            }
+        }
+    }
+    // a ring slot may hold the padded tensor
+    return largest ? n_slots * (largest + (4u << 20)) : 0;
+}
+
+int32_t llama_share_tiers(const llama_context * ctx, int32_t * ids, size_t * bytes, const char ** devs, int32_t n_max) {
+    const auto * cache = ctx->share_expert_cache();
+    if (!cache) {
+        return 0;
+    }
+    int32_t n = 0;
+    for (const auto & [id, backend] : cache->tier_list()) {
+        if (n < n_max) {
+            ids[n] = id;
+            bytes[n] = cache->tier_bytes(id);
+            devs[n] = ggml_backend_dev_name(ggml_backend_get_device(backend));
+        }
+        n++;
+    }
+    return n;
 }
 
 llama_memory_breakdown llama_context::memory_breakdown() const {

@@ -86,6 +86,16 @@ struct llama_context {
     // return true if the memory was updated
     bool memory_update(bool optimize);
 
+    // delphi: VRAM sharing between servers (llama-ext.h). Call between decodes, from the thread that decodes.
+    int    share_add_tier(ggml_backend_dev_t dev, size_t bytes);
+    size_t share_drop_tier(int id);
+    size_t share_release_compute();
+    size_t share_release_memory();
+    bool   share_restore_memory();
+    bool   share_memory_released() const { return memory_released; }
+    void   share_stage_allow(ggml_backend_dev_t dev, bool allow);
+    llama_expert_cache * share_expert_cache() const { return expert_cache.get(); }
+
     enum llama_pooling_type pooling_type() const;
 
     float * get_logits();
@@ -395,6 +405,15 @@ private:
     std::vector<ggml_backend_ptr> backends;
     std::unique_ptr<llama_expert_cache> expert_cache;
 
+    // delphi: VRAM sharing. share_gen changes the graphs (graph reuse); mem_params create the memory module again after a release.
+    uint64_t            share_gen = 0;
+    int64_t             share_test_decodes = 0, share_test_releases = 0;
+    llama_memory_params mem_params = {};
+    bool                memory_released = false;
+    bool                share_rereserve = false; // log the next reservation's time
+    std::vector<ggml_backend_dev_t> stage_blocked; // ggml_backend_sched_stage_allow for every new scheduler
+    void share_reset_scheds();
+
     // training
     ggml_opt_context_t opt_ctx = nullptr;
 
@@ -456,6 +475,8 @@ private:
 
     // expert cache: the staging ring borrows the arena instead of allocating its own slots
     void sched_set_stage_lender();
+    void sched_set_workers(ggml_backend_sched_t s);
+    void sched_set_workers_all();
 
     FILE * moe_routing_log = nullptr;
     int64_t moe_routing_log_max_tokens = 16;

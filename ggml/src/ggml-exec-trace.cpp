@@ -925,6 +925,16 @@ void ggml_exec_trace_ubatch_end(uint32_t ubatch_id, int32_t status) {
     }
 }
 
+struct ggml_exec_trace_thread_context ggml_exec_trace_get_thread_context(void) {
+    return { t_execution_id, t_ubatch_id, t_execution_phase };
+}
+
+void ggml_exec_trace_set_thread_context(struct ggml_exec_trace_thread_context ctx) {
+    t_execution_id = ctx.execution_id;
+    t_ubatch_id = ctx.ubatch_id;
+    t_execution_phase = ctx.phase;
+}
+
 uint32_t ggml_exec_trace_next_graph_id(void) {
     return ggml_exec_trace_observing() ? g_trace.next_graph_id.fetch_add(1, std::memory_order_relaxed) : 0;
 }

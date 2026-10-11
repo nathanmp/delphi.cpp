@@ -333,6 +333,17 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_set_stage_lender(ggml_backend_sched_t sched, ggml_backend_sched_stage_lend_t lend, void * user_data);
     // delphi: wait until no queued work reads or writes the lent slots, and stop using them. Returns true if slots were lent.
     GGML_API bool                 ggml_backend_sched_stage_reclaim(ggml_backend_sched_t sched);
+    // delphi: reclaim, and also free the slots and pinned bounce buffers that the rings allocated themselves (they are allocated
+    // again when a graph stages weights). Returns the device bytes freed.
+    GGML_API size_t               ggml_backend_sched_stage_release(ggml_backend_sched_t sched);
+    // delphi: allow or forbid staging to a backend (default: allowed). Graphs split after the call use only allowed backends;
+    // with none allowed, the routed experts of wide batches stay on the CPU.
+    GGML_API void                 ggml_backend_sched_stage_allow(ggml_backend_sched_t sched, ggml_backend_t backend, bool allow);
+    // delphi: submit the splits of a GPU backend from a helper thread pinned to `cpu` (-1: not pinned), so that the host time
+    // of copying their inputs, launching them and copying their outputs overlaps the splits after them (a remote expert
+    // cache tier runs while the CPU computes its experts). Applies to graphs without staged inputs whose splits on the
+    // backend take only device inputs; other splits run on the calling thread as before. enable=false stops the thread.
+    GGML_API void                 ggml_backend_sched_set_worker(ggml_backend_sched_t sched, ggml_backend_t backend, bool enable, int cpu);
 
     GGML_API int                  ggml_backend_sched_get_n_backends(ggml_backend_sched_t sched);
     GGML_API ggml_backend_t       ggml_backend_sched_get_backend(ggml_backend_sched_t sched, int i);

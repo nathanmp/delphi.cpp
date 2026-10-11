@@ -45,6 +45,9 @@ private:
     std::function<bool(server_task &&, bool)> callback_new_task;
     std::function<void(void)>                 callback_update_slots;
     std::vector<std::function<void(bool)>>    callback_sleeping_state;
+    // delphi: VRAM sharing (server-vram.h)
+    std::function<void(void)>                 callback_idle_tick;
+    bool woken = false;
 
 public:
     ~server_queue() { worker_stop(); }
@@ -76,6 +79,9 @@ public:
 
     // end the start_loop routine
     void terminate();
+
+    // delphi: make a waiting start_loop() run update_slots once (thread-safe)
+    void wake();
 
     /**
      * Main loop consists of these steps:
@@ -134,6 +140,11 @@ public:
     // note: caller will hold mutex_tasks while calling the callbacks
     void on_sleeping_state(std::function<void(bool)> callback) {
         callback_sleeping_state.push_back(std::move(callback));
+    }
+
+    // delphi: register a function called about once a second while the loop waits without tasks (not while sleeping)
+    void on_idle_tick(std::function<void(void)> callback) {
+        callback_idle_tick = std::move(callback);
     }
 
 private:

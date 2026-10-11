@@ -1,4 +1,5 @@
 #include "server-context.h"
+#include "server-vram.h"
 #include "server-chat.h"
 #include "server-common.h"
 #include "server-http.h"
@@ -971,6 +972,8 @@ private:
     float slot_prompt_similarity = 0.0f;
 
     std::string model_name; // name of the loaded model, to be used by API
+
+    server_vram vram; // delphi: VRAM sharing between servers
     std::set<std::string> model_aliases; // additional names for the model
     std::set<std::string> model_tags;    // informational tags
 
@@ -979,6 +982,8 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        vram.free();
+
         spec.reset();
         spec_init.reset();
 
@@ -1456,6 +1461,25 @@ private:
         });
         queue_tasks.on_sleeping_state([this](bool sleeping) {
             handle_sleeping_state(sleeping);
+        });
+        queue_tasks.on_idle_tick([this]() {
+            vram.idle_tick();
+        });
+        vram.init(ctx_tgt, ctx_dft, params_base.devices, model_name, [this]() { queue_tasks.wake(); }, [this]() {
+            // before the KV cache is freed: idle slots go to the host prompt cache (if any) and start empty
+            ckpt_async_sync();
+            for (auto & slot : slots) {
+                if (slot.is_processing() || slot.prompt.tokens.size() == 0) {
+                    continue;
+                }
+                if (prompt_cache) {
+                    slot.prompt_save(*prompt_cache);
+                }
+                slot.prompt_clear();
+            }
+            if (prompt_cache) {
+                prompt_cache->update();
+            }
         });
 
         metrics.init();
@@ -2457,6 +2481,20 @@ private:
             case SERVER_TASK_TYPE_INFILL:
             case SERVER_TASK_TYPE_EMBEDDING:
             case SERVER_TASK_TYPE_RERANK:
+            case SERVER_TASK_TYPE_SLOT_SAVE:
+            case SERVER_TASK_TYPE_SLOT_RESTORE:
+            case SERVER_TASK_TYPE_SLOT_ERASE:
+                vram.wake();
+                break;
+            default:
+                break;
+        }
+
+        switch (task.type) {
+            case SERVER_TASK_TYPE_COMPLETION:
+            case SERVER_TASK_TYPE_INFILL:
+            case SERVER_TASK_TYPE_EMBEDDING:
+            case SERVER_TASK_TYPE_RERANK:
                 {
                     // special case: if input is provided via CLI, tokenize it first
                     // otherwise, no need to tokenize as it's already done inside the HTTP thread
@@ -2876,6 +2914,19 @@ private:
             SRV_INF("avg t_sampl       = %f ms\n", (double) t_sampl / n_sampl / 1000.0);
         }
 #endif
+
+        // delphi: VRAM sharing phase (a prompt may first wait for memory)
+        {
+            server_vram::phase_t phase = server_vram::PHASE_IDLE;
+            for (const auto & slot : slots) {
+                if (slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_WAIT_OTHER) {
+                    phase = server_vram::PHASE_PREFILL;
+                } else if (slot.is_processing() && phase == server_vram::PHASE_IDLE) {
+                    phase = server_vram::PHASE_DECODE;
+                }
+            }
+            vram.update(phase);
+        }
 
         // check if all slots are idle
         {
