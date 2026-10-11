@@ -1,6 +1,7 @@
 # llama-perplexity-impl: perplexity logic, reusable by app
 
 add_library(llama-perplexity-hotswap STATIC hotswap.cpp)
+set_target_properties(llama-perplexity-hotswap PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(llama-perplexity-hotswap PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} PRIVATE ${PROJECT_SOURCE_DIR}/src)
 target_link_libraries(llama-perplexity-hotswap PUBLIC llama-common llama)
 target_compile_features(llama-perplexity-hotswap PUBLIC cxx_std_17)
