@@ -118,6 +118,11 @@ endfunction()
 
 llama_build_and_test(test-quant-rules.cpp)
 
+if(LLAMA_BUILD_TOOLS)
+    llama_build_and_test(test-perplexity-hotswap.cpp)
+    target_link_libraries(test-perplexity-hotswap PRIVATE llama-perplexity-hotswap)
+endif()
+
 # build test-tokenizer-0 target once and add many tests
 llama_build(test-tokenizer-0.cpp)
 
