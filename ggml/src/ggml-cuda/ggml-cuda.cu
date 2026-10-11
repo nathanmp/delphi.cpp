@@ -35,6 +35,7 @@
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
+#include "ggml-cuda/mmvq-q8-tc.cuh"
 #include "ggml-cuda/moe-devsort.cuh"
 #include "ggml-cuda/moe-schedule.cuh"
 #include "ggml-cuda/moe-grouped.cuh"
@@ -2288,6 +2289,13 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_exec_trace_dispatch(dst->op, GGML_EXEC_TRACE_DISPATCH_GPU_MMF,
                 GGML_EXEC_TRACE_DISPATCH_VARIANT_DEFAULT, cc, warp_size);
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
+        return;
+    }
+    // delphi: Q8_0 at speculative verify widths on tensor cores (mmvq-q8-tc.cuh)
+    if (ggml_cuda_mmvq_q8_tc_supported(src0, src1, dst, cc)) {
+        ggml_exec_trace_dispatch(dst->op, GGML_EXEC_TRACE_DISPATCH_GPU_MMVQ,
+                GGML_EXEC_TRACE_DISPATCH_VARIANT_DEFAULT, cc, warp_size);
+        ggml_cuda_mul_mat_vec_q8_tc(ctx, src0, src1, dst);
         return;
     }
     if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {

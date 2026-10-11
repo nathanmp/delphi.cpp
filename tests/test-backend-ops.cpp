@@ -9872,6 +9872,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     std::default_random_engine rng(0);
 
+    // Q8_0 at speculative verify widths: ragged row tiles, both column tiles, 1, 3 and 8 stages of K (mmvq-q8-tc.cu),
+    // and K in slices for few rows (MMVQ); 2100 rows: a ragged last row tile
+    for (int64_t m : {24, 100, 2100, 4096}) {
+        for (int n : {1, 2, 3, 4, 5, 8, 9, 13, 16}) {
+            for (int64_t k : {256, 2048, 6144, 16384}) {
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+            }
+        }
+    }
+    // K in slices for other block sizes: q4_K (256), iq4_xs (256)
+    for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_IQ4_XS}) {
+        for (int n : {1, 3, 8}) {
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 24, n, 16384, {1, 1}, {1, 1}));
+        }
+    }
+
     // unary ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
         for (int v : {0, 1}) {
@@ -12146,6 +12162,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // GLM-5.3 dense Q8_0 projections at verify widths: attn q/k/v (4096 -> 8192), attn_output (16384 -> 4096), KDA output
+    // (8192 -> 4096), shared expert (4096 -> 2048, 2048 -> 4096), hyper-connection mixes (16384 -> 24), KDA f_a/g_a and beta
+    for (auto mk : std::vector<std::pair<int64_t, int64_t>>{{8192, 4096}, {4096, 16384}, {4096, 8192}, {2048, 4096}, {4096, 2048},
+                                                            {24, 16384}, {128, 4096}, {64, 4096}}) {
+        for (int n_tokens : {1, 2, 3, 4, 5, 6, 8, 12, 16}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, mk.first, n_tokens, mk.second, {1, 1}, {1, 1}));
+        }
+    }
+    // GLM-5.3 router (F32, 288 experts)
+    for (int n_tokens : {1, 4, 6, 7, 8, 9, 12, 16}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 288, n_tokens, 4096, {1, 1}, {1, 1}));
+    }
 
     // GLM-5.3 routed gate+up at decode and verify widths: 288 experts, top-8, broadcast activations
     for (ggml_type type : {GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS}) {
