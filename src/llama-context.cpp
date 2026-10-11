@@ -86,6 +86,12 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+static const llm_fused_op_probe llm_fused_op_dsv4_hc_mix_probe = {
+    /*.op               =*/ LLM_FUSED_OP_DSV4_HC_MIX,
+    /*.name             =*/ "fused DeepSeek V4 HC mix",
+    /*.n_tokens_per_seq =*/ 1,
+};
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -276,6 +282,12 @@ llama_context::llama_context(
     cparams.fused_dsv4_hc_comb = true;
     cparams.fused_dsv4_hc_post = true;
     cparams.auto_fhc           = true;
+    // delphi: the hyper-connection mixes in F32 and the norm of the layer input in one op (ggml_dsv4_hc_mix);
+    // LLAMA_FUSED_HC_MIX=0 keeps the separate ops and the q8_1 activations of a quantized hc_fn
+    {
+        const char * LLAMA_FUSED_HC_MIX = getenv("LLAMA_FUSED_HC_MIX");
+        cparams.fused_dsv4_hc_mix = LLAMA_FUSED_HC_MIX == nullptr || atoi(LLAMA_FUSED_HC_MIX) != 0;
+    }
 
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
@@ -751,6 +763,7 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
         resolve(llm_fused_op_dsv4_hc_pre_probe,  cparams.fused_dsv4_hc_pre);
         resolve(llm_fused_op_dsv4_hc_comb_probe, cparams.fused_dsv4_hc_comb);
         resolve(llm_fused_op_dsv4_hc_post_probe, cparams.fused_dsv4_hc_post);
+        resolve(llm_fused_op_dsv4_hc_mix_probe,  cparams.fused_dsv4_hc_mix);
         cparams.auto_fhc = false;
     }
 }

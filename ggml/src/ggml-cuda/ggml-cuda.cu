@@ -35,6 +35,7 @@
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
+#include "ggml-cuda/mmvq-q8-tc.cuh"
 #include "ggml-cuda/moe-devsort.cuh"
 #include "ggml-cuda/moe-schedule.cuh"
 #include "ggml-cuda/moe-grouped.cuh"
@@ -67,6 +68,8 @@
 #include "ggml-cuda/gla.cuh"
 #include "ggml-cuda/gated_delta_net.cuh"
 #include "ggml-cuda/dsv4-hc.cuh"
+#include "ggml-cuda/dsv4-hc-mix.cuh"
+#include "ggml-cuda/mmvq-q8-smallk.cuh"
 #include "ggml-cuda/set.cuh"
 #include "ggml-cuda/set-rows.cuh"
 #include "ggml-cuda/pad_reflect_1d.cuh"
@@ -2290,6 +2293,20 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
         return;
     }
+    // delphi: Q8_0 with a short K, up to 8 columns (mmvq-q8-smallk.cuh)
+    if (ggml_cuda_mmvq_q8_smallk_supported(src0, src1, dst, cc)) {
+        ggml_exec_trace_dispatch(dst->op, GGML_EXEC_TRACE_DISPATCH_GPU_MMVQ,
+                GGML_EXEC_TRACE_DISPATCH_VARIANT_DEFAULT, cc, warp_size);
+        ggml_cuda_mul_mat_vec_q8_smallk(ctx, src0, src1, dst);
+        return;
+    }
+    // delphi: Q8_0 at speculative verify widths on tensor cores (mmvq-q8-tc.cuh)
+    if (ggml_cuda_mmvq_q8_tc_supported(src0, src1, dst, cc)) {
+        ggml_exec_trace_dispatch(dst->op, GGML_EXEC_TRACE_DISPATCH_GPU_MMVQ,
+                GGML_EXEC_TRACE_DISPATCH_VARIANT_DEFAULT, cc, warp_size);
+        ggml_cuda_mul_mat_vec_q8_tc(ctx, src0, src1, dst);
+        return;
+    }
     if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
         ggml_exec_trace_dispatch(dst->op, GGML_EXEC_TRACE_DISPATCH_GPU_MMVQ,
                 GGML_EXEC_TRACE_DISPATCH_VARIANT_DEFAULT, cc, warp_size);
@@ -2840,6 +2857,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_DSV4_HC_POST:
             ggml_cuda_op_dsv4_hc_post(ctx, dst);
+            break;
+        case GGML_OP_DSV4_HC_MIX:
+            ggml_cuda_op_dsv4_hc_mix(ctx, dst);
             break;
         case GGML_OP_ALLREDUCE:
             ggml_cuda_op_allreduce(ctx, dst);
@@ -6937,6 +6957,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 && (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32) &&
                 op->type == GGML_TYPE_F32;
+        case GGML_OP_DSV4_HC_MIX:
+            return ggml_cuda_dsv4_hc_mix_supported(op);
         case GGML_OP_ALLREDUCE: {
             const ggml_cuda_ar_p2p * p2p = ggml_cuda_allreduce_node_p2p(op);
             return p2p != nullptr && ggml_cuda_ar_p2p_supports(p2p, op);

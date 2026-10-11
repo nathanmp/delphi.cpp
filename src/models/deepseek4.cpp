@@ -416,11 +416,35 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_pre(
         ggml_tensor * hc_base,
         ggml_tensor ** post,
         ggml_tensor ** comb,
-        int il) const {
+        int il,
+        ggml_tensor * norm_w) const {
+    // delphi: the mixes, the weights, the reduced stream and its norm in one op; its three parts are contiguous views
+    if (cparams.fused_dsv4_hc_mix && il >= 0 && hparams.dsv4_hc_mult == 4 && ggml_is_contiguous(x)) {
+        const int64_t hc = hparams.dsv4_hc_mult;
+        const int64_t nt = x->ne[2];
+        const size_t  f  = sizeof(float);
+
+        ggml_tensor * mix = ggml_dsv4_hc_mix(ctx0, x, hc_fn, hc_scale, hc_base, norm_w, norm_rms_eps, hparams.dsv4_hc_eps,
+                (int32_t) hparams.dsv4_hc_sinkhorn_iters);
+        res->add_fused_node({LLM_FUSED_OP_DSV4_HC_MIX, mix, il});
+        cb(mix, "hc_mix", il);
+
+        *post = ggml_view_2d(ctx0, mix, hc, nt, hc*f, n_embd*nt*f);
+        cb(*post, "hc_post", il);
+        *comb = ggml_view_3d(ctx0, mix, hc, hc, nt, hc*f, hc*hc*f, (n_embd + hc)*nt*f);
+        cb(*comb, "hc_comb", il);
+        return ggml_view_2d(ctx0, mix, n_embd, nt, n_embd*f, 0);
+    }
+
     ggml_tensor * pre = nullptr;
     build_hc_mixes(x, hc_fn, hc_scale, hc_base, &pre, post, comb, il);
 
-    return build_hc_pre(x, pre, il);
+    ggml_tensor * cur = build_hc_pre(x, pre, il);
+    if (norm_w) {
+        cb(cur, "hc_pre_out", il);
+        cur = build_norm(cur, norm_w, nullptr, LLM_NORM_RMS, il);
+    }
+    return cur;
 }
 
 ggml_tensor * llama_model_deepseek4::graph::build_hc_post(
@@ -1279,10 +1303,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                 model.layers[il].hc_attn_fn,
                 model.layers[il].hc_attn_scale,
                 model.layers[il].hc_attn_base,
-                &post, &comb, il);
-        cb(cur, "hc_attn_pre", il);
-
-        cur = build_norm(cur, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
+                &post, &comb, il, model.layers[il].attn_norm);
         cb(cur, "attn_norm", il);
 
         cur = build_attention(model, inp_dsv4, cur, inp_pos, il);
@@ -1295,15 +1316,12 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                 model.layers[il].hc_ffn_fn,
                 model.layers[il].hc_ffn_scale,
                 model.layers[il].hc_ffn_base,
-                &post, &comb, il);
-        cb(cur, "hc_ffn_pre", il);
+                &post, &comb, il, model.layers[il].ffn_norm);
+        cb(cur, "ffn_norm", il);
 
         ggml_build_forward_expand(gf, residual);
         ggml_build_forward_expand(gf, post);
         ggml_build_forward_expand(gf, comb);
-
-        cur = build_norm(cur, model.layers[il].ffn_norm, nullptr, LLM_NORM_RMS, il);
-        cb(cur, "ffn_norm", il);
 
         const auto & layer = model.layers[il];
         ggml_tensor * selected_experts = nullptr;
@@ -1453,10 +1471,7 @@ llama_model_deepseek4::graph_mtp::graph_mtp(const llama_model & model, const llm
             layer.hc_attn_fn,
             layer.hc_attn_scale,
             layer.hc_attn_base,
-            &post, &comb, il);
-    cb(cur, "mtp_hc_attn_pre", il);
-
-    cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
+            &post, &comb, il, layer.attn_norm);
     cb(cur, "mtp_attn_norm", il);
 
     cur = build_attention(model, inp_attn, cur, inp_pos, il);
@@ -1469,10 +1484,7 @@ llama_model_deepseek4::graph_mtp::graph_mtp(const llama_model & model, const llm
             layer.hc_ffn_fn,
             layer.hc_ffn_scale,
             layer.hc_ffn_base,
-            &post, &comb, il);
-    cb(cur, "mtp_hc_ffn_pre", il);
-
-    cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
+            &post, &comb, il, layer.ffn_norm);
     cb(cur, "mtp_ffn_norm", il);
 
     GGML_ASSERT((uint32_t) il >= hparams.dsv4_hash_layer_count && "DEEPSEEK4 MTP does not support hash-routed MTP blocks");

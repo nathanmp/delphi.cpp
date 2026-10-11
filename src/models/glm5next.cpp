@@ -889,10 +889,7 @@ llama_model_glm5next::graph::graph(const llama_model & model, const llm_graph_pa
                 model.layers[il].hc_attn_fn,
                 model.layers[il].hc_attn_scale,
                 model.layers[il].hc_attn_base,
-                &post, &comb, il);
-        cb(cur, "hc_attn_pre", il);
-
-        cur = build_norm(cur, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
+                &post, &comb, il, model.layers[il].attn_norm);
         cb(cur, "attn_norm", il);
 
         cur = build_layer_attn(model, inp_mem, inp_kp, indexer_scoring, cur, il);
@@ -905,16 +902,13 @@ llama_model_glm5next::graph::graph(const llama_model & model, const llm_graph_pa
                 model.layers[il].hc_ffn_fn,
                 model.layers[il].hc_ffn_scale,
                 model.layers[il].hc_ffn_base,
-                &post, &comb, il);
-        cb(cur, "hc_ffn_pre", il);
+                &post, &comb, il, model.layers[il].ffn_norm);
+        cb(cur, "ffn_norm", il);
 
         // expand before the sublayer so op offload does not pull mHC state to the experts
         ggml_build_forward_expand(gf, residual);
         ggml_build_forward_expand(gf, post);
         ggml_build_forward_expand(gf, comb);
-
-        cur = build_norm(cur, model.layers[il].ffn_norm, nullptr, LLM_NORM_RMS, il);
-        cb(cur, "ffn_norm", il);
 
         cur = build_layer_ffn(model, cur, il);
         cb(cur, "ffn_out", il);

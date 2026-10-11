@@ -2345,6 +2345,39 @@ static void moe_down_q_reduction_packed_switch_fmt(
 
 #endif // GGML_CUDA_MOE_PACKED_AVAILABLE
 
+// delphi: slices of K for MMVQ (see ggml_cuda_mul_mat_vec_q). Slices of at least 1024 values, up to 16 slices, until there
+// are 4 row slices per SM. 1 if the matrix has enough rows. Measured on the CMP 170HX: the second kernel costs ~2 us, so
+// slices pay only from 2 columns and K >= 8192 (24 x 16384: 1.4x at 2 columns, 2.6x at 8; 128 x 4096: 0.75x at 2 columns).
+// Not in the invariant mode: the sums must not change with the width.
+static int mmvq_split_k_count(const int64_t ne00, const int64_t ne01, const int64_t ncols, const int64_t blck, const int nsm) {
+    static const bool disabled = [] {
+        const char * e = getenv("GGML_CUDA_MMVQ_SPLIT_K");
+        return e != nullptr && atoi(e) == 0;
+    }();
+    if (disabled || ggml_cuda_spec_invariant() || ncols < 2 || ne00 < 8192) {
+        return 1;
+    }
+    int nsplit = 1;
+    while (nsplit < 16 && ne01*nsplit < 4*nsm && ne00 % (2*nsplit*std::max<int64_t>(1024, blck)) == 0) {
+        nsplit *= 2;
+    }
+    return nsplit;
+}
+
+// dst[col][row] = sum over the slices s of part[s][col][row], in the order of s
+static __global__ void mmvq_split_k_sum(const float * __restrict__ part, float * __restrict__ dst, const int nsplit,
+        const int64_t nrows, const int64_t n, const int64_t stride_col_dst) {
+    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    float sum = 0.0f;
+    for (int s = 0; s < nsplit; ++s) {
+        sum += part[s*n + i];
+    }
+    dst[(i / nrows)*stride_col_dst + i % nrows] = sum;
+}
+
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {
@@ -2472,6 +2505,24 @@ void ggml_cuda_mul_mat_vec_q(
         GGML_ASSERT(fusion_local.x_scale == nullptr && fusion_local.gate_scale == nullptr);
         mul_mat_vec_q_packed_switch_fmt(packed, (const char *) src0->data, src1_q8_1_ptr, ids_d, fusion_local, dst_d, ne00, ne01,
             ncols_dst, stride_col_y, stride_col_dst, nchannels_y, nchannels_dst, nb02, stride_channel_y, stride_channel_dst, ids_stride, stream);
+        return;
+    }
+
+    // delphi: a matrix with few rows and long rows (hyper-connection mixes, low-rank projections) gives work to few SMs.
+    // Cut K into slices that MMVQ does as channels, then add the slices in order: the result does not change between runs.
+    const int nsplit = ids || fusion || has_row_meta || ne02 != 1 || ne03 != 1 || ne12 != 1 || ne13 != 1 ? 1 :
+        mmvq_split_k_count(ne00, ne01, ncols_dst, ggml_blck_size(src0->type), ggml_cuda_info().devices[ggml_cuda_get_device()].nsm);
+    if (nsplit > 1) {
+        const int64_t ne00_split = ne00/nsplit;
+        ggml_cuda_pool_alloc<float> part(ctx.pool(), nsplit*ne01*ncols_dst);
+        mul_mat_vec_q_switch_type(
+            src0->data, src0->type, src1_q8_1_ptr, nullptr, fusion_local, part.get(), ne00_split,
+            ne01,                  ncols_dst,     s01,  stride_col_y,           ne01,
+            nsplit, nsplit,        nsplit,        ne00_split/ggml_blck_size(src0->type), ne00_split/QK8_1, ne01*ncols_dst,
+            1,                     1,             0,    0,                      0,               0, stream);
+        const int64_t n = ne01*ncols_dst;
+        mmvq_split_k_sum<<<(n + 255)/256, 256, 0, stream>>>(part.get(), dst_d, nsplit, ne01, n, stride_col_dst);
+        CUDA_CHECK(cudaGetLastError());
         return;
     }
 

@@ -1172,6 +1172,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
+    "DSV4_HC_MIX",
     "ALLREDUCE",
 
     "UNARY",
@@ -1190,7 +1191,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1290,6 +1291,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
+    "dsv4_hc_mix(x, fn, scale, base)",
     "allreduce(x)",
 
     "unary(x)",
@@ -1308,7 +1310,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6830,6 +6832,56 @@ struct ggml_tensor * ggml_dsv4_hc_post(
     result->src[1] = residual;
     result->src[2] = post;
     result->src[3] = comb;
+
+    return result;
+}
+
+// ggml_dsv4_hc_mix
+
+struct ggml_tensor * ggml_dsv4_hc_mix(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * fn,
+        struct ggml_tensor  * scale,
+        struct ggml_tensor  * base,
+        struct ggml_tensor  * norm_w,
+        float                 norm_eps,
+        float                 eps,
+        int32_t               n_iter) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(scale->type == GGML_TYPE_F32);
+    GGML_ASSERT(base->type == GGML_TYPE_F32);
+
+    const int64_t n_embd     = x->ne[0];
+    const int64_t hc         = x->ne[1];
+    const int64_t n_tokens   = x->ne[2];
+    const int64_t hc_mix_dim = (2 + hc)*hc;
+
+    GGML_ASSERT(hc == 4);
+    GGML_ASSERT(x->ne[3] == 1);
+    GGML_ASSERT(ggml_is_contiguous(x));
+    GGML_ASSERT(fn->ne[0] == hc*n_embd);
+    GGML_ASSERT(fn->ne[1] == hc_mix_dim);
+    GGML_ASSERT(fn->ne[2] == 1);
+    GGML_ASSERT(fn->ne[3] == 1);
+    GGML_ASSERT(scale->ne[0] >= 3);
+    GGML_ASSERT(ggml_nelements(base) == hc_mix_dim);
+    GGML_ASSERT(n_iter > 0);
+    GGML_ASSERT(norm_w == NULL || (norm_w->type == GGML_TYPE_F32 && ggml_is_contiguous(norm_w) &&
+                ggml_nelements(norm_w) == n_embd));
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (n_embd + hc + hc*hc)*n_tokens);
+
+    ggml_set_op_params_f32(result, 0, norm_eps);
+    ggml_set_op_params_f32(result, 1, eps);
+    ggml_set_op_params_i32(result, 2, n_iter);
+
+    result->op     = GGML_OP_DSV4_HC_MIX;
+    result->src[0] = x;
+    result->src[1] = fn;
+    result->src[2] = scale;
+    result->src[3] = base;
+    result->src[4] = norm_w;
 
     return result;
 }

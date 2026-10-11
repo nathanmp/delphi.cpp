@@ -4377,6 +4377,61 @@ struct test_dsv4_hc_comb : public test_dsv4_hc {
     }
 };
 
+// delphi: rms_norm, mul_mat, the weight chains, hc_comb and hc_pre of a hyper-connection boundary in one op
+struct test_dsv4_hc_mix : public test_dsv4_hc {
+    const ggml_type type_fn;
+    const int64_t   n_embd;
+    const int64_t   n_tokens;
+    const bool      norm;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DSV4_HC_MIX";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR4(type_fn, n_embd, n_tokens, norm);
+    }
+
+    test_dsv4_hc_mix(ggml_type type_fn = GGML_TYPE_F32, int64_t n_embd = 64, int64_t n_tokens = 5, bool norm = false)
+        : type_fn(type_fn), n_embd(n_embd), n_tokens(n_tokens), norm(norm) {}
+
+    // the mixes stay near the range of a trained model: no saturated sigmoid or softmax
+    void initialize_tensors(ggml_context * ctx) override {
+        test_dsv4_hc::initialize_tensors(ctx);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (std::string(ggml_get_name(t)) == "fn") {
+                const float r = 2.0f/sqrtf((float) t->ne[0]);
+                init_tensor_uniform(t, -r, r);
+            }
+        }
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * fn = ggml_new_tensor_2d(ctx, type_fn, hc*n_embd, (2 + hc)*hc);
+        ggml_set_name(fn, "fn");
+
+        ggml_tensor * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 3);
+        ggml_set_name(scale, "scale");
+
+        ggml_tensor * base = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (2 + hc)*hc);
+        ggml_set_name(base, "base");
+
+        ggml_tensor * norm_w = nullptr;
+        if (norm) {
+            norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd);
+            ggml_set_name(norm_w, "norm_w");
+        }
+
+        out = ggml_dsv4_hc_mix(ctx, x, fn, scale, base, norm_w, 1e-6f, 1e-6f, 20);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_dsv4_hc_pre : public test_dsv4_hc {
     const int64_t n_embd;
     const int64_t n_tokens;
@@ -9872,6 +9927,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     std::default_random_engine rng(0);
 
+    // Q8_0 at speculative verify widths: ragged row tiles, both column tiles, 1, 3 and 8 stages of K (mmvq-q8-tc.cu),
+    // and K in slices for few rows (MMVQ); 2100 rows: a ragged last row tile
+    for (int64_t m : {24, 100, 2100, 4096}) {
+        for (int n : {1, 2, 3, 4, 5, 8, 9, 13, 16}) {
+            for (int64_t k : {256, 2048, 6144, 16384}) {
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+            }
+        }
+    }
+    // short K (mmvq-q8-smallk.cu, K = 256 is above): ragged last block of rows
+    for (int64_t k : {64, 128}) {
+        for (int64_t m : {100, 8192}) {
+            for (int n : {1, 3, 8, 9}) {
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+            }
+        }
+    }
+    // K in slices for other block sizes: q4_K (256), iq4_xs (256)
+    for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_IQ4_XS}) {
+        for (int n : {1, 3, 8}) {
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 24, n, 16384, {1, 1}, {1, 1}));
+        }
+    }
+
     // unary ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
         for (int v : {0, 1}) {
@@ -9926,6 +10005,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_snake_fuse(type, {  64,  32, 2, 3}));   // ne[2] > 1 and ne[3] > 1
     }
 
+    for (ggml_type type_fn : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0}) {
+        for (int64_t n_tokens : {1, 3, 8, 33}) {
+            for (bool norm : {false, true}) {
+                test_cases.emplace_back(new test_dsv4_hc_mix(type_fn, 64, n_tokens, norm));
+            }
+        }
+        test_cases.emplace_back(new test_dsv4_hc_mix(type_fn, 4096, 4));
+        test_cases.emplace_back(new test_dsv4_hc_mix(type_fn, 4096, 4, true));
+    }
+    test_cases.emplace_back(new test_dsv4_hc_mix(GGML_TYPE_F32, 40, 2));       // 1 slice of 40 values in each stream
+    test_cases.emplace_back(new test_dsv4_hc_mix(GGML_TYPE_F32, 48, 3, true)); // 2 slices of 24
     test_cases.emplace_back(new test_dsv4_hc_comb(1, 1));
     test_cases.emplace_back(new test_dsv4_hc_comb(17, 4));
     test_cases.emplace_back(new test_dsv4_hc_comb(257, 8));
@@ -12094,6 +12184,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // overflow: n_tokens > K — only the last K snapshots kept.
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   8, 1, 1, false, false, /*K=*/3));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  16, 2, 1, false, false, /*K=*/4));
+    // KDA at head size 128 at verify widths, with and without snapshots.
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 128,  8, 1, 1, false, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 128, 16, 1, 1, false, true,  /*K=*/4));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 128, 17, 1, 1, false, true));
 
     // gdn + cache cpy fusion (K > 1)
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   2, 1, 2));
@@ -12146,6 +12240,35 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // GLM-5.3 dense Q8_0 projections at verify widths: attn q/k/v (4096 -> 8192), attn_output (16384 -> 4096), KDA output
+    // (8192 -> 4096), shared expert (4096 -> 2048, 2048 -> 4096), hyper-connection mixes (16384 -> 24), KDA f_a/g_a and beta
+    for (auto mk : std::vector<std::pair<int64_t, int64_t>>{{8192, 4096}, {4096, 16384}, {4096, 8192}, {2048, 4096}, {4096, 2048},
+                                                            {24, 16384}, {128, 4096}, {64, 4096}}) {
+        for (int n_tokens : {1, 2, 3, 4, 5, 6, 8, 12, 16}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, mk.first, n_tokens, mk.second, {1, 1}, {1, 1}));
+        }
+    }
+    // GLM-5.3 hyper-connection boundary (fn Q8_0)
+    for (int n_tokens : {1, 4, 8}) {
+        test_cases.emplace_back(new test_dsv4_hc_mix(GGML_TYPE_Q8_0, 4096, n_tokens, true));
+    }
+
+    // GLM-5.3 router (F32, 288 experts)
+    for (int n_tokens : {1, 4, 6, 7, 8, 9, 12, 16}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 288, n_tokens, 4096, {1, 1}, {1, 1}));
+    }
+    // GLM-5.3 KDA low-rank gates: f_b, g_b (8192 x 128)
+    for (int n_tokens : {1, 2, 4, 8, 9, 16}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, n_tokens, 128, {1, 1}, {1, 1}));
+    }
+
+    // other router shapes (DeepSeek V4, Qwen3-MoE, Qwen3.5) at the MMVF limit
+    for (int n_tokens : {7, 8}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 256, n_tokens, 7168, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 128, n_tokens, 2048, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 512, n_tokens, 4096, {1, 1}, {1, 1}));
+    }
 
     // GLM-5.3 routed gate+up at decode and verify widths: 288 experts, top-8, broadcast activations
     for (ggml_type type : {GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS}) {
@@ -12621,6 +12744,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));   // Qwen3.5-like: 32 heads, d=128
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 64,  1, 1));   // smaller model
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1, 1, false, true)); // KDA
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 64, 128, 1, 1, 1, false, true)); // GLM-5.3 KDA, verify widths
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 64, 128, 4, 1, 1, false, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 64, 128, 8, 1, 1, false, true));
     // PP: n_seq_tokens=64,256 (prompt processing)
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1));  // PP-64
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 256, 1)); // PP-256

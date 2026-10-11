@@ -604,6 +604,7 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_DSV4_HC_MIX,
         GGML_OP_ALLREDUCE, // in-place sum across devices; only built by the meta backend, op_params are backend-specific
 
         GGML_OP_UNARY,
@@ -2798,6 +2799,30 @@ extern "C" {
             struct ggml_tensor  * residual,
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
+
+    // hc_mix: the coefficients of a hyper-connection boundary and the reduced stream, in one op (delphi).
+    //   x [n_embd, hc, n_tokens] (contiguous), fn [hc*n_embd, (2 + hc)*hc] (F32, F16, BF16 or a quantized type),
+    //   scale [3], base [(2 + hc)*hc], hc == 4
+    //   mixes[j, t] = sum_i fn[i, j]*x[i, t] / sqrt(mean_i x[i, t]^2 + norm_eps)   (i over the hc*n_embd stream values)
+    //   pre[h, t]   = sigmoid(mixes[h, t]*scale[0] + base[h]) + eps
+    //   post[h, t]  = 2*sigmoid(mixes[hc + h, t]*scale[1] + base[hc + h])
+    //   comb        = the result of ggml_dsv4_hc_comb(mixes, scale, base, eps, n_iter)
+    //   -> [(n_embd + hc + hc*hc)*n_tokens], three contiguous parts:
+    //      [n_embd, n_tokens] sum_h pre[h, t]*x[i, h, t], then post [hc, n_tokens], then comb [dst_hc, src_hc, n_tokens]
+    //   norm_w: NULL, or [n_embd] F32: the first part is then rms_norm(sum_h pre[h, t]*x[i, h, t], norm_eps)*norm_w,
+    //   the norm of the layer input
+    //   This is rms_norm, mul_mat, the pre and post weight chains, hc_comb and hc_pre of deepseek4.cpp, with the
+    //   mixes product in F32 instead of the q8_1 activations of a quantized mul_mat.
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_mix(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * fn,
+            struct ggml_tensor  * scale,
+            struct ggml_tensor  * base,
+            struct ggml_tensor  * norm_w,
+            float                 norm_eps,
+            float                 eps,
+            int32_t               n_iter);
 
     // custom operators
 

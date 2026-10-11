@@ -1244,6 +1244,7 @@ struct llama_model_deepseek4 : public llama_model_base {
                 ggml_tensor ** comb,
                 int il) const;
 
+        // with norm_w: the RMS norm of the layer input with weight norm_w
         ggml_tensor * build_hc_pre(
                 ggml_tensor * x,
                 ggml_tensor * hc_fn,
@@ -1251,7 +1252,8 @@ struct llama_model_deepseek4 : public llama_model_base {
                 ggml_tensor * hc_base,
                 ggml_tensor ** post,
                 ggml_tensor ** comb,
-                int il) const;
+                int il,
+                ggml_tensor * norm_w = nullptr) const;
 
         ggml_tensor * build_hc_post(
                 ggml_tensor * x,
