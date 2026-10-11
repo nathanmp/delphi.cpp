@@ -12250,6 +12250,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int n_tokens : {1, 4, 6, 7, 8, 9, 12, 16}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 288, n_tokens, 4096, {1, 1}, {1, 1}));
     }
+    // other router shapes (DeepSeek V4, Qwen3-MoE, Qwen3.5) at the MMVF limit
+    for (int n_tokens : {7, 8}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 256, n_tokens, 7168, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 128, n_tokens, 2048, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 512, n_tokens, 4096, {1, 1}, {1, 1}));
+    }
 
     // GLM-5.3 routed gate+up at decode and verify widths: 288 experts, top-8, broadcast activations
     for (ggml_type type : {GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS}) {

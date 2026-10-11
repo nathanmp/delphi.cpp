@@ -848,7 +848,8 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
                 if (ampere_mma_available(cc)) {
                     if (!mmvf_legacy_limits && src0_small) {
-                        return ne11 <= 7;
+                        // CMP 170HX (GA100), 8 columns, MMVF vs MMF: 288 x 4096 12.2 vs 20.3 us, 256 x 7168 16.0 vs 31.6
+                        return ne11 <= MMVF_MAX_BATCH_SIZE;
                     }
                     return ne11 <= 3;
                 }
