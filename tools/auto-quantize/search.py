@@ -6,7 +6,7 @@ from collections import defaultdict
 
 from config import AXES, QuantError
 from model import tensor_bytes
-from timing import gpu
+from timing import gpu, requires_backend_signature
 
 
 def memory(info, cfg, choices):
@@ -97,7 +97,7 @@ def make_options(info, damage, operations, cfg):
             for value in operations.values():
                 sig = value["signature"]
                 if sig["dtype"] == dtype and any(by_name[n]["shape"] == sig["shape"] and by_name[n]["expert"] == sig["expert"]
-                                                 for n in group["members"]) and value["ms"] is None:
+                                                 for n in group["members"]) and value["ms"] is None and requires_backend_signature(sig, cfg):
                     reason = f"backend rejected {dtype} on {sig['device']}"
             if reason:
                 excluded.append({"group": group["name"], "qtype": dtype, "reason": reason})

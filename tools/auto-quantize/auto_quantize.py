@@ -157,7 +157,7 @@ def prepare(cfg, directory, timeout):
     damage = [] if quality is not None else get_damage(info, cfg, directory, imatrix)
     print("Measuring bounded operation signatures", flush=True)
     operations = measure_ops(info, cfg, directory / "calibration", timeout)
-    excluded = repair_options(info, quality, operations) if quality is not None else make_options(info, damage, operations, cfg)
+    excluded = repair_options(info, quality, operations, cfg) if quality is not None else make_options(info, damage, operations, cfg)
     baseline_choices = {group["name"]: min(group["options"], key=lambda o: (o["bytes"], o["damage"], o["qtype"]))["qtype"]
                         for group in info["groups"]}
     mem = memory(info, cfg, baseline_choices)

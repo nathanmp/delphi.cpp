@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools/auto-quantize"))
 from config import QuantError, capacity, devices, file_identity, load_config, write_json
 from model import classify, merge_imatrices, read_model, tensor_bytes
-from search import dominates, memory, pareto, search
+from search import dominates, make_options, memory, pareto, search
 from quality import apply_quality, load_quality, repair_options, tensor_hash, verify_quality_output
 from timing import Predictor, digest, operation_times, regions, signature, token_counts
 from auto_quantize import tensor_plan, verify_output
@@ -280,7 +280,7 @@ class RepairQuality(unittest.TestCase):
         pairs = [(g, m) for g, m, paired in regions(model) if paired]
         self.assertEqual(len(pairs), 2)
         self.assertTrue(all(g["decision"] == "gate-up" for g, _ in pairs))
-        repair_options(model, table, {})
+        repair_options(model, table, {}, self.config)
         baseline = {g["name"]: g["floor_qtype"] for g in model["groups"]}
         self.assertAlmostEqual(sum(g["options"][0]["damage"] for g in model["groups"]), .2)
         verify_quality_output(model, table, tensor_plan(model, baseline), self.floor)
@@ -358,14 +358,41 @@ class RepairQuality(unittest.TestCase):
         model, table = self.load()
         t = model["tensors"][0]
         sig = signature([t], True, "Q4_K", "CPU", 1, model["top_k"])
-        excluded = repair_options(model, table, {"failed": {"signature": sig, "ms": None}})
+        excluded = repair_options(model, table, {"failed": {"signature": sig, "ms": None}}, self.config)
         self.assertTrue(excluded)
         self.assertEqual(next(g for g in model["groups"] if g["name"] == "gate-up")["pool"], ["Q2_K"])
         self.assertEqual(next(g for g in model["groups"] if g["name"] == "down")["pool"], ["Q2_K", "Q4_K"])
         sig["dtype"] = "Q2_K"
         model, table = self.load()
         with self.assertRaises(QuantError):
-            repair_options(model, table, {"failed": {"signature": sig, "ms": None}})
+            repair_options(model, table, {"failed": {"signature": sig, "ms": None}}, self.config)
+
+    def test_cpu_expert_format_survives_unsupported_gpu_and_stays_on_cpu(self):
+        self.config["runtime"]["env"]["GGML_SCHED_STAGE"] = "1"
+        self.config["runtime"]["env"]["GGML_SCHED_STAGE_MIN_TOKENS"] = "1"
+        model, table = self.load()
+        ops = {}
+        for group, members, paired in regions(model):
+            for dtype in group["pool"]:
+                for n in set(token_counts(self.config).values()):
+                    for device in ("CPU", "ROCm1"):
+                        sig = signature(members, paired, dtype, device, n, model["top_k"])
+                        ops[digest(sig)] = {"signature": sig, "ms": None if device == "ROCm1" else 1.0}
+        self.assertEqual(repair_options(model, table, ops, self.config), [])
+        baseline = {g["name"]: g["floor_qtype"] for g in model["groups"]}
+        predictor = Predictor(model, self.config, ops, baseline, {"decode": 20, "short": 30, "long": 50})
+        self.assertEqual(predictor.predict(baseline), predictor.measured)
+        upgraded = {g["name"]: g["pool"][-1] for g in model["groups"]}
+        self.assertTrue(all(v > 0 for v in predictor.predict(upgraded).values()))
+        # The local metric uses the same placement rule, including a GPU cache's stricter requirement.
+        atomic = classify(read_model(self.source), {**self.config, "other_qtypes": ["F32"]})
+        damage = [{"schema": "delphi.quant-damage/1", "tensors": [
+            {"name": t["name"], "runs": [{"types": [{"qtype": q, "status": "ok", "R": 1.0, "R_se": 0}
+                                                       for q in t["pool"]]}]} for t in atomic["tensors"]]}]
+        self.assertEqual(make_options(atomic, damage, ops, self.config), [])
+        atomic = classify(read_model(self.source), {**self.config, "other_qtypes": ["F32"]})
+        with self.assertRaises(QuantError):
+            make_options(atomic, damage, ops, {**self.config, "cache_mib": 1})
 
 
 if __name__ == "__main__":

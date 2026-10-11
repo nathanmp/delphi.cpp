@@ -38,6 +38,10 @@ def gpu(cfg):
     return next(name for name in cfg["devices"] if name != "RAM")
 
 
+def requires_backend_signature(sig, cfg):
+    return not (sig["expert"] and sig["device"] == gpu(cfg) and "RAM" in cfg["devices"] and not cfg["cache_mib"])
+
+
 def profile_model(cfg, model, output, trace=True):
     r = cfg["runtime"]
     command = [str(Path(cfg["bindir"]) / "llama-bench"), "-m", str(model), "--numa", "tensors", "--device", gpu(cfg),
@@ -202,9 +206,11 @@ class Predictor:
                 self.cpu_bytes_per_ms = active_bytes / baseline_cpu_ms
         self.baseline_cost = self.cost(baseline_choices, 0)
 
-    def lookup(self, members, paired, dtype, device, tokens):
+    def lookup(self, members, paired, dtype, device, tokens, optional=False):
         key = digest(signature(members, paired, dtype, device, tokens, self.info["top_k"]))
         value = self.operations.get(key)
+        if value is not None and value["ms"] is None and optional:
+            return None
         if value is None or value["ms"] is None:
             raise QuantError(f"unmeasured/unsupported signature: {members[0]['name']} {dtype} {device} n={tokens}")
         return value["ms"]
@@ -216,9 +222,11 @@ class Predictor:
         for group, members, paired in self.regions:
             dtype = choices[group.get("decision", group["name"])]
             for regime, tokens in self.counts.items():
-                device_time = self.lookup(members, paired, dtype, gpu(self.cfg), tokens)
-                local = device_time
                 t = members[0]
+                ram_expert = t["expert"] and "RAM" in self.cfg["devices"]
+                device_time = self.lookup(members, paired, dtype, gpu(self.cfg), tokens,
+                                          optional=ram_expert and not self.cfg["cache_mib"])
+                local = device_time
                 if t["expert"] and "RAM" in self.cfg["devices"]:
                     cpu_time = self.lookup(members, paired, dtype, "CPU", tokens)
                     unique = active_experts(t["shape"][2], self.info["top_k"], tokens)
@@ -231,7 +239,7 @@ class Predictor:
                     if tokens <= 16 and hit_fraction > 0:
                         local = (1 - hit_fraction) * cpu_time + hit_fraction * device_time + handoff
                     min_tokens = int(self.cfg["runtime"]["env"].get("GGML_SCHED_STAGE_MIN_TOKENS", 512))
-                    if streaming and min_tokens > 0 and tokens >= min_tokens:
+                    if streaming and min_tokens > 0 and tokens >= min_tokens and device_time is not None:
                         local = min(local, device_time + weight_bytes / link + 0.02)
                 n_work = self.cfg["runtime"][f"{regime}_tokens"] if regime != "decode" else 1
                 batches, tail = divmod(n_work, tokens)

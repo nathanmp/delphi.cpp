@@ -9,7 +9,7 @@ from pathlib import Path
 
 from config import QuantError, file_identity, number
 from model import qtype, read_model, tensor_bytes
-from timing import regions, signature
+from timing import regions, requires_backend_signature, signature
 
 SCHEMA = "delphi.floor-quality/2"
 METHOD = "sum_conditional_repair_kl"
@@ -166,7 +166,7 @@ def apply_quality(info, table):
     return info
 
 
-def repair_options(info, table, operations):
+def repair_options(info, table, operations, cfg):
     by_name = {t["name"]: t for t in info["tensors"]}
     measured_regions = regions(info)
     excluded = []
@@ -174,6 +174,7 @@ def repair_options(info, table, operations):
         options = []
         for dtype in group["pool"]:
             failed = next((v["signature"] for v in operations.values() if v["ms"] is None and v["signature"]["dtype"] == dtype
+                           and requires_backend_signature(v["signature"], cfg)
                            and any(region.get("decision", region["name"]) == group["name"]
                                    and signature(members, paired, dtype, v["signature"]["device"], v["signature"]["tokens"], info["top_k"]) == v["signature"]
                                    for region, members, paired in measured_regions)), None)
