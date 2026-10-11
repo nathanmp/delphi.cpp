@@ -320,6 +320,7 @@ int perplexity_hotswap::reload(const std::string & patch_path, std::string & err
         }
     }
     const int count = pimpl->pending.size();
+    if (count == 0) { pimpl->pending_sources.clear(); }
     pimpl->apply();
     return count;
 } catch (const std::exception & e) {

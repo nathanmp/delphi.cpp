@@ -113,6 +113,16 @@ int main() try {
         CHECK(a->type == GGML_TYPE_F32 && contents(a) != bytes);
         hot.commit();
         CHECK(hot.reload("", error) == 0);
+        gguf_context * empty = gguf_init_empty();
+        CHECK(gguf_write_to_file(empty, base.string().c_str(), false));
+        gguf_free(empty);
+        fs::last_write_time(base, fs::last_write_time(base) + std::chrono::seconds(1));
+        CHECK(hot.reload("", error) == 0);
+        write_patch(base, GGML_TYPE_Q2_K, 2, 0);
+        fs::last_write_time(base, fs::last_write_time(base) + std::chrono::seconds(2));
+        CHECK(hot.reload("", error) == 2);
+        hot.commit();
+        CHECK(hot.reload("", error) == 0);
     }
     CHECK(a->type == GGML_TYPE_F32 && a->data == baseline_data && contents(a) == bytes);
 
