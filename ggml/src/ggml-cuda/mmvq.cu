@@ -396,7 +396,7 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
     return MMVQ_MAX_BATCH_SIZE;
 }
 
-bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
+bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11, int64_t ne01) {
     if (!ggml_is_quantized(type)) {
         return false;
     }
@@ -405,6 +405,32 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
     }
     // k-quants cost more to decode and mvq redoes that per column, so MMQ wins sooner.
     // Only list quant-types MMQ supports, others would fall back to cuBLAS.
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_AMPERE) {
+        // delphi: tuned on CMP 170HX (GA100, few ALU ops per byte). MMVQ decodes the weights again for each column; MMQ
+        // wins sooner when the rows give it more tiles. MMVQ vs MMQ, Q6_K x 4096: 4096 rows equal at 4 columns, 65536 rows
+        // 385 / 361 us at 3 columns, 154880 rows (GLM-5.3 head) 897 / 827 us at 3 and 1770 / 837 us at 8
+        switch (type) {
+            case GGML_TYPE_Q4_K:
+            case GGML_TYPE_Q5_K:
+            case GGML_TYPE_Q6_K:
+                return ne11 <= (ne01 >= 32768 ? 2 : ne01 >= 16384 ? 3 : 4);
+            default:
+                return ne11 <= MMVQ_MAX_BATCH_SIZE;
+        }
+    }
+    if (GGML_CUDA_CC_IS_RDNA4(cc)) {
+        // delphi: tuned on R9700 (gfx1201, 64 CUs). Below 4096 rows MMQ has too few tiles and MMVQ wins up to 8 columns.
+        // MMVQ vs MMQ at 4 columns: Q4_K 16384 x 4096 100 / 74 us, Q6_K 65536 x 4096 531 / 449 us
+        switch (type) {
+            case GGML_TYPE_Q4_K:
+            case GGML_TYPE_Q5_K:
+                return ne11 <= (ne01 >= 16384 ? 2 : ne01 >= 4096 ? 4 : MMVQ_MAX_BATCH_SIZE);
+            case GGML_TYPE_Q6_K:
+                return ne11 <= (ne01 >= 16384 ? 3 : ne01 >= 4096 ? 5 : MMVQ_MAX_BATCH_SIZE);
+            default:
+                return ne11 <= MMVQ_MAX_BATCH_SIZE;
+        }
+    }
     if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_ADA_LOVELACE) {
         switch (type) { // tuned on RTX 4090
             case GGML_TYPE_Q2_K:

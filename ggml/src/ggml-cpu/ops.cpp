@@ -11625,6 +11625,12 @@ void ggml_compute_forward_dsv4_hc_mix(
     float * post = out  + n_embd*n_tokens;
     float * comb = post + hc*n_tokens;
 
+    // ggml_dsv4_hc_mix_post: x is the residual, the stream is hc_post(y, x, post_in, comb_in) in the fourth part
+    const ggml_tensor * y       = dst->src[5];
+    const float *       post_in = y ? (const float *) dst->src[6]->data : nullptr;
+    const float *       comb_in = y ? (const float *) dst->src[7]->data : nullptr;
+    float *             x_new   = comb + hc*hc*n_tokens;
+
     const int ith = params->ith;
     const int nth = params->nth;
 
@@ -11636,6 +11642,22 @@ void ggml_compute_forward_dsv4_hc_mix(
 
     for (int64_t it = it0; it < it1; ++it) {
         const float * xt = (const float *) ((const char *) x->data + it*x->nb[2]);
+
+        // ggml_dsv4_hc_post, in the order of its operations
+        if (y) {
+            const float * yt = (const float *) y->data + it*n_embd;
+            float * xn = x_new + it*hc*n_embd;
+            for (int64_t h = 0; h < hc; ++h) {
+                for (int64_t i0 = 0; i0 < n_embd; ++i0) {
+                    float sum = yt[i0]*post_in[it*hc + h];
+                    for (int64_t src = 0; src < hc; ++src) {
+                        sum += xt[src*n_embd + i0]*comb_in[it*hc*hc + h + hc*src];
+                    }
+                    xn[h*n_embd + i0] = sum;
+                }
+            }
+            xt = xn;
+        }
 
         ggml_float ss = 0.0;
         for (int64_t i = 0; i < hc_dim; ++i) {

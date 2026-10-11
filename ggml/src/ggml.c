@@ -6838,7 +6838,8 @@ struct ggml_tensor * ggml_dsv4_hc_post(
 
 // ggml_dsv4_hc_mix
 
-struct ggml_tensor * ggml_dsv4_hc_mix(
+// extra: elements after the three parts (the new streams of ggml_dsv4_hc_mix_post)
+static struct ggml_tensor * ggml_dsv4_hc_mix_impl(
         struct ggml_context * ctx,
         struct ggml_tensor  * x,
         struct ggml_tensor  * fn,
@@ -6847,7 +6848,8 @@ struct ggml_tensor * ggml_dsv4_hc_mix(
         struct ggml_tensor  * norm_w,
         float                 norm_eps,
         float                 eps,
-        int32_t               n_iter) {
+        int32_t               n_iter,
+        int64_t               extra) {
     GGML_ASSERT(x->type == GGML_TYPE_F32);
     GGML_ASSERT(scale->type == GGML_TYPE_F32);
     GGML_ASSERT(base->type == GGML_TYPE_F32);
@@ -6870,7 +6872,7 @@ struct ggml_tensor * ggml_dsv4_hc_mix(
     GGML_ASSERT(norm_w == NULL || (norm_w->type == GGML_TYPE_F32 && ggml_is_contiguous(norm_w) &&
                 ggml_nelements(norm_w) == n_embd));
 
-    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (n_embd + hc + hc*hc)*n_tokens);
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (n_embd + hc + hc*hc)*n_tokens + extra);
 
     ggml_set_op_params_f32(result, 0, norm_eps);
     ggml_set_op_params_f32(result, 1, eps);
@@ -6882,6 +6884,51 @@ struct ggml_tensor * ggml_dsv4_hc_mix(
     result->src[2] = scale;
     result->src[3] = base;
     result->src[4] = norm_w;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_dsv4_hc_mix(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * fn,
+        struct ggml_tensor  * scale,
+        struct ggml_tensor  * base,
+        struct ggml_tensor  * norm_w,
+        float                 norm_eps,
+        float                 eps,
+        int32_t               n_iter) {
+    return ggml_dsv4_hc_mix_impl(ctx, x, fn, scale, base, norm_w, norm_eps, eps, n_iter, 0);
+}
+
+struct ggml_tensor * ggml_dsv4_hc_mix_post(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * residual,
+        struct ggml_tensor  * y,
+        struct ggml_tensor  * post,
+        struct ggml_tensor  * comb,
+        struct ggml_tensor  * fn,
+        struct ggml_tensor  * scale,
+        struct ggml_tensor  * base,
+        struct ggml_tensor  * norm_w,
+        float                 norm_eps,
+        float                 eps,
+        int32_t               n_iter) {
+    const int64_t n_embd   = residual->ne[0];
+    const int64_t hc       = residual->ne[1];
+    const int64_t n_tokens = residual->ne[2];
+
+    GGML_ASSERT(y->type == GGML_TYPE_F32 && post->type == GGML_TYPE_F32 && comb->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(y) && ggml_is_contiguous(post) && ggml_is_contiguous(comb));
+    GGML_ASSERT(y->ne[0] == n_embd && ggml_nelements(y) == n_embd*n_tokens);
+    GGML_ASSERT(ggml_nelements(post) == hc*n_tokens);
+    GGML_ASSERT(ggml_nelements(comb) == hc*hc*n_tokens);
+
+    struct ggml_tensor * result = ggml_dsv4_hc_mix_impl(ctx, residual, fn, scale, base, norm_w, norm_eps, eps, n_iter,
+            n_embd*hc*n_tokens);
+    result->src[5] = y;
+    result->src[6] = post;
+    result->src[7] = comb;
 
     return result;
 }

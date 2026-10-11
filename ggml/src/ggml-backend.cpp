@@ -2203,6 +2203,15 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             *cur_backend_id = tensor_backend_id(node->view_src);
             SET_CAUSE(node, "4.vsrc");
         }
+        // delphi: a view of a computed tensor stays on the backend of that tensor, also when the user set another backend
+        // for it (llama pins "l_last" to the device of its layer). The data of the view is where the source is computed:
+        // on another backend, the splits that read the view copied it from the wrong backend, synchronized only that
+        // backend and could read the source before it was computed
+        if (node->view_src != NULL && ggml_is_view_op(node->op) && node->view_src->op != GGML_OP_NONE &&
+                tensor_backend_id(node->view_src) != -1 && *cur_backend_id != tensor_backend_id(node->view_src)) {
+            *cur_backend_id = tensor_backend_id(node->view_src);
+            SET_CAUSE(node, "4.vpin");
+        }
         for (int j = 0; j < GGML_MAX_SRC; j++) {
             struct ggml_tensor * src = node->src[j];
             if (src == NULL) {

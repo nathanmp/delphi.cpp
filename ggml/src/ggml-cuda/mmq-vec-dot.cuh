@@ -1106,33 +1106,42 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
     const int i0 = (threadIdx.y / ntx) * rows_per_warp;
 
-    for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += 4) {
+    // delphi: one q8_1 block of y (32 values) per step, two 16-value sub-blocks of x with a scale each. The two integer
+    // products are scaled and added as integers (|C*sc| < 2^24), then converted once, as in the Turing path below. Before,
+    // each 16-value product took two loads from shared memory, a conversion and three float multiplications, and the
+    // VALU work of RDNA4 does not overlap with WMMA (R9700, Q6_K 65536 x 4096 x 512: 7799 -> 6988 us). The scales stay
+    // in shared memory: in registers the J = 128 kernel spilled more. Columns outside, as in the Turing path: 10544 us
+    for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += 2*4) {
         const int k0 = k00 + k01;
 
-        tile_A A[ntx];
+        tile_A A[ntx][2];
 #pragma unroll
         for (int n = 0; n < ntx; ++n) {
-            load_ldmatrix(A[n], x_qs + (i0 + n*tile_A::I)*sram_stride + k0, sram_stride);
+            load_ldmatrix(A[n][0], x_qs + (i0 + n*tile_A::I)*sram_stride + k0,     sram_stride);
+            load_ldmatrix(A[n][1], x_qs + (i0 + n*tile_A::I)*sram_stride + k0 + 4, sram_stride);
         }
 
 #pragma unroll
         for (int j0 = 0; j0 < J; j0 += ntx*tile_C::J) {
-            tile_B B;
-            load_ldmatrix(B, y_qs + j0*MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K);
+            tile_B B[2];
+            load_ldmatrix(B[0], y_qs + j0*MMQ_TILE_Y_K + k01,     MMQ_TILE_Y_K);
+            load_ldmatrix(B[1], y_qs + j0*MMQ_TILE_Y_K + k01 + 4, MMQ_TILE_Y_K);
 
             const int j = j0 + tile_C::get_j(0);
             const float dB = y_df[j*MMQ_TILE_Y_K + k01/QI8_1];
 
 #pragma unroll
             for (int n = 0; n < ntx; ++n) {
-                tile_C C;
-                mma(C, A[n], B);
+                tile_C C[2];
+                mma(C[0], A[n][0], B[0]);
+                mma(C[1], A[n][1], B[1]);
 
 #pragma unroll
                 for (int l = 0; l < tile_C::ne; ++l) {
                     const int i = i0 + n*tile_C::I + tile_C::get_i(l);
-                    const int8_t * sc = (const int8_t *) (x_sc + i*sram_stride + k00/16);
-                    sum[(j0/tile_C::J + n)*tile_C::ne + l] += C.x[l] * sc[k01/4] * x_df[i*sram_stride] * dB;
+                    const char2 sc = ((const char2 *) (x_sc + i*sram_stride + k00/16))[k01/8];
+                    sum[(j0/tile_C::J + n)*tile_C::ne + l] +=
+                        (float) (C[0].x[l]*sc.x + C[1].x[l]*sc.y) * (x_df[i*sram_stride]*dB);
                 }
             }
         }

@@ -1,4 +1,5 @@
 #include "speculative.h"
+#include "speculative-adaptive.h"
 
 #include "common.h"
 #include "ggml.h"
@@ -291,6 +292,13 @@ struct common_speculative_impl {
     int64_t t_begin_us  = 0; // total time spent in refresh of this implementation in microseconds.
     int64_t t_draft_us  = 0; // total time spent in generating drafts in this implementation in microseconds.
     int64_t t_accept_us = 0; // total time spent in accumulation of this implementation in microseconds.
+
+    // adaptive draft depth (--spec-draft-adaptive), driven by common_speculative_draft() and common_speculative_accept()
+    bool    adaptive       = false;
+    int32_t n_min_adaptive = 1;
+    int32_t n_start        = 0;
+    std::vector<common_speculative_adaptive> adaptive_ctrl; // [n_seq]
+    std::vector<int> adaptive_n_last;                       // [n_seq] length of this implementation's last draft, 0 once fed back
 
     common_speculative_impl(common_speculative_type type, uint32_t n_seq, int32_t n_max) : type(type), n_seq(n_seq), n_max(n_max) {}
 
@@ -943,7 +951,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
 
                 result.push_back(id);
 
-                if (params.n_max <= (int) result.size()) {
+                if (params.n_max <= (int) result.size() || (dp.n_max > 0 && dp.n_max <= (int) result.size())) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
@@ -1858,7 +1866,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 result.push_back(id);
 
-                if (params.n_max <= (int) result.size()) {
+                if (params.n_max <= (int) result.size() || (dp.n_max > 0 && dp.n_max <= (int) result.size())) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
@@ -2980,6 +2988,37 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         }
     }
 
+    if (params.draft.adaptive) {
+        for (auto & impl : impls) {
+            switch (impl->type) {
+                case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:
+                case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:
+                case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
+                case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
+                case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
+                    break;
+                default:
+                    continue; // n-gram speculators draft what they find
+            }
+            // n_max is the implementation's cap after its own limits (MTP heads, DFlash block size)
+            if (params.draft.n_min_adaptive < 1 || params.draft.n_min_adaptive > impl->n_max) {
+                throw std::runtime_error(string_format(
+                        "invalid adaptive draft range for %s: n_min_adaptive=%d, n_max=%d (n_min_adaptive must be in [1, n_max])",
+                        common_speculative_type_to_str(impl->type).c_str(), params.draft.n_min_adaptive, impl->n_max));
+            }
+            impl->adaptive       = true;
+            impl->n_min_adaptive = params.draft.n_min_adaptive;
+            impl->n_start        = params.draft.n_start;
+            impl->adaptive_ctrl.assign(n_seq, common_speculative_adaptive());
+            impl->adaptive_n_last.assign(n_seq, 0);
+            for (auto & ctrl : impl->adaptive_ctrl) {
+                ctrl.reset(impl->n_max, impl->n_min_adaptive, impl->n_start);
+            }
+            SPC_TRC("adaptive draft depth for %s: %d..%d, start %d\n", common_speculative_type_to_str(impl->type).c_str(),
+                    impl->n_min_adaptive, impl->n_max, impl->adaptive_ctrl[0].n_cur);
+        }
+    }
+
     if (impls.empty()) {
         SPC_TRC("%s", "no implementations specified for speculative decoding\n");
         return nullptr;
@@ -3080,6 +3119,11 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
         common_time_meas tm(impl->t_begin_us, !impl->gen_perf);
         impl->begin(seq_id, prompt);
         impl->n_call_begin++;
+        if (impl->adaptive) {
+            // a new generation: the depth learned on the previous content is stale
+            impl->adaptive_ctrl[seq_id].reset(impl->n_max, impl->n_min_adaptive, impl->n_start);
+            impl->adaptive_n_last[seq_id] = 0;
+        }
     }
 }
 
@@ -3199,7 +3243,19 @@ void common_speculative_draft(common_speculative * spec) {
 
     const uint64_t t_draft_total = common_spec_ledger_now();
 
+    std::vector<int32_t> n_max_caller;
     for (auto & impl : spec->impls) {
+        if (impl->adaptive) {
+            // cap this round at the adaptive depth through the per-call bound, which every implementation honours
+            n_max_caller.resize(dparams.size());
+            for (size_t s = 0; s < dparams.size(); ++s) {
+                n_max_caller[s] = dparams[s].n_max;
+                const int32_t depth = impl->adaptive_ctrl[s].n_cur;
+                if (dparams[s].drafting && (dparams[s].n_max <= 0 || dparams[s].n_max > depth)) {
+                    dparams[s].n_max = depth;
+                }
+            }
+        }
         {
             common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
             impl->draft(dparams);
@@ -3235,6 +3291,9 @@ void common_speculative_draft(common_speculative * spec) {
 
                     // remember which implementation was used
                     spec->impl_last[seq_id] = impl.get();
+                    if (impl->adaptive) {
+                        impl->adaptive_n_last[seq_id] = (int) result.size();
+                    }
 
                     impl->n_gen_drafts++;
                     impl->n_gen_tokens += result.size();
@@ -3243,6 +3302,12 @@ void common_speculative_draft(common_speculative * spec) {
 
             if (dp.drafting) {
                 n_drafting++;
+            }
+        }
+
+        if (impl->adaptive) {
+            for (size_t s = 0; s < dparams.size(); ++s) {
+                dparams[s].n_max = n_max_caller[s];
             }
         }
 
@@ -3266,6 +3331,32 @@ void common_speculative_draft(common_speculative * spec) {
             n_cand += dp.result ? (uint32_t) dp.result->size() : 0;
         }
         common_spec_ledger_span(COMMON_SPEC_LEDGER_DRAFT, t_draft_total, n_cand);
+    }
+}
+
+// feed one verification result of this implementation's own draft to its adaptive depth controller. A round that
+// replays a draft after a checkpoint restore has no draft of its own (adaptive_n_last == 0), so it is not counted twice.
+static void common_speculative_adaptive_feedback(common_speculative_impl * impl, llama_seq_id seq_id, uint16_t n_accepted) {
+    if (!impl->adaptive || impl->adaptive_n_last[seq_id] <= 0) {
+        return;
+    }
+    auto & ctrl = impl->adaptive_ctrl[seq_id];
+    const int depth_before = ctrl.n_cur;
+    ctrl.update(n_accepted, impl->n_max, impl->n_min_adaptive);
+    if (ctrl.n_cur != depth_before) {
+        SPC_TRC("adaptive draft depth seq %d: %d -> %d (n_draft=%d, n_accepted=%d, n_bucket=%d)\n",
+                (int) seq_id, depth_before, ctrl.n_cur, impl->adaptive_n_last[seq_id], (int) n_accepted, ctrl.n_bucket);
+    }
+    impl->adaptive_n_last[seq_id] = 0;
+}
+
+void common_speculative_accept_partial(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted) {
+    if (spec == nullptr) {
+        return;
+    }
+    common_speculative_impl * impl = spec->impl_last[seq_id];
+    if (impl != nullptr) {
+        common_speculative_adaptive_feedback(impl, seq_id, n_accepted);
     }
 }
 
@@ -3298,6 +3389,8 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
         impl->accept(seq_id, n_accepted, false);
         impl->n_call_accept++;
     }
+
+    common_speculative_adaptive_feedback(impl, seq_id, n_accepted);
 
     // accept with the rest of the implementations, using is_other == true
     for (auto & impl_other : spec->impls) {

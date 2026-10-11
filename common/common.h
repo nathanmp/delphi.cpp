@@ -327,6 +327,11 @@ struct common_params_speculative_draft {
     int32_t n_max = 3; // maximum number of tokens to draft during speculative decoding
     int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding
 
+    // adaptive draft depth (--spec-draft-adaptive): the depth moves within [n_min_adaptive, n_max] with the acceptance
+    bool    adaptive       = false;
+    int32_t n_min_adaptive = 3; // floor of the adaptive depth
+    int32_t n_start        = 0; // adaptive depth at the start of a generation (0: n_max - 3, bounded by the floor)
+
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
 

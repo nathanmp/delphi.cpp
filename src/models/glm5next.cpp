@@ -224,12 +224,15 @@ void llama_model_glm5next::load_arch_tensors(llama_model_loader & ml) {
             layer.ssm_k_conv = create_tensor(tn(LLM_TENSOR_SSM_CONV1D_K, "weight", il), {d_conv, 1, d_inner, 1}, flags);
             layer.ssm_v_conv = create_tensor(tn(LLM_TENSOR_SSM_CONV1D_V, "weight", il), {d_conv, 1, d_inner, 1}, flags);
 
-            layer.ssm_f_a = create_tensor(tn(LLM_TENSOR_SSM_F_A, "weight", il), {n_embd, head_dim}, flags);
-            layer.ssm_f_b = create_tensor(tn(LLM_TENSOR_SSM_F_B, "weight", il), {head_dim, d_inner}, flags);
-            layer.ssm_g_a = create_tensor(tn(LLM_TENSOR_SSM_G_A, "weight", il), {n_embd, head_dim}, flags);
-            layer.ssm_g_b = create_tensor(tn(LLM_TENSOR_SSM_G_B, "weight", il), {head_dim, d_inner}, flags);
-
+            // delphi: q, k, v, the 3 conv weights, and f_a, g_a, beta are created one after the other, so that in one
+            // buffer they are adjacent and build_kda_layer can use each group as one tensor (glm5next_adjacent_rows); the
+            // gate and up weights of the FFNs are too (build_layer_ffn)
+            layer.ssm_f_a  = create_tensor(tn(LLM_TENSOR_SSM_F_A,  "weight", il), {n_embd, head_dim}, flags);
+            layer.ssm_g_a  = create_tensor(tn(LLM_TENSOR_SSM_G_A,  "weight", il), {n_embd, head_dim}, flags);
             layer.ssm_beta = create_tensor(tn(LLM_TENSOR_SSM_BETA, "weight", il), {n_embd, n_head}, flags);
+
+            layer.ssm_f_b = create_tensor(tn(LLM_TENSOR_SSM_F_B, "weight", il), {head_dim, d_inner}, flags);
+            layer.ssm_g_b = create_tensor(tn(LLM_TENSOR_SSM_G_B, "weight", il), {head_dim, d_inner}, flags);
             layer.ssm_a    = create_tensor(tn(LLM_TENSOR_SSM_A,              il), {n_head}, flags);
             layer.ssm_dt_b = create_tensor(tn(LLM_TENSOR_SSM_DT,   "bias",   il), {d_inner}, flags);
 
@@ -301,6 +304,40 @@ void llama_model_glm5next::load_arch_tensors(llama_model_loader & ml) {
 }
 
 // one conv over concatenated q|k|v: keeps the conv state one block for rollback
+// delphi: one weight tensor over tensors that are adjacent in one buffer (same type and row length, created one after
+// the other), so that their products are one mul_mat with the rows in the same order; nullptr when they are not adjacent
+// (mmap, tensor overrides, split buffers). LLAMA_ADJACENT_WEIGHTS=0 disables it.
+static ggml_tensor * glm5next_adjacent_rows(ggml_context * ctx, std::initializer_list<ggml_tensor *> ts) {
+    static const bool enabled = [] {
+        const char * env = std::getenv("LLAMA_ADJACENT_WEIGHTS");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+    if (!enabled) {
+        return nullptr;
+    }
+
+    const ggml_tensor * first = *ts.begin();
+    if (first == nullptr) {
+        return nullptr;
+    }
+    int64_t      nrows = 0;
+    const char * next  = (const char *) first->data;
+    for (const ggml_tensor * t : ts) {
+        if (t == nullptr || t->buffer == nullptr || t->buffer != first->buffer || t->data != next || t->extra != nullptr ||
+                t->view_src != nullptr || t->type != first->type || t->ne[0] != first->ne[0] || !ggml_is_contiguous(t)) {
+            return nullptr;
+        }
+        nrows += ggml_nrows(t);
+        next   = (const char *) t->data + ggml_nbytes(t);
+    }
+
+    ggml_tensor * merged = ggml_new_tensor_2d(ctx, first->type, first->ne[0], nrows);
+    merged->data   = first->data;
+    merged->buffer = first->buffer;
+    ggml_format_name(merged, "%s (adjacent)", first->name);
+    return merged;
+}
+
 ggml_tensor * llama_model_glm5next::graph::build_kda_layer(
         const llama_layer & layer,
         llm_graph_input_rs * inp_rs,
@@ -317,22 +354,29 @@ ggml_tensor * llama_model_glm5next::graph::build_kda_layer(
     // f, g and beta read the layer input, NOT the convolved q/k/v
     ggml_tensor * inp = cur;
 
-    ggml_tensor * Qcur = ggml_mul_mat(ctx0, layer.wq, inp);
-    ggml_tensor * Kcur = ggml_mul_mat(ctx0, layer.wk, inp);
-    ggml_tensor * Vcur = ggml_mul_mat(ctx0, layer.wv, inp);
-
-    ggml_tensor * qkv = ggml_concat(ctx0, ggml_concat(ctx0, Qcur, Kcur, 0), Vcur, 0);
+    ggml_tensor * qkv = nullptr;
+    if (ggml_tensor * wqkv = glm5next_adjacent_rows(ctx0, {layer.wq, layer.wk, layer.wv})) {
+        qkv = ggml_mul_mat(ctx0, wqkv, inp);
+    } else {
+        ggml_tensor * Qcur = ggml_mul_mat(ctx0, layer.wq, inp);
+        ggml_tensor * Kcur = ggml_mul_mat(ctx0, layer.wk, inp);
+        ggml_tensor * Vcur = ggml_mul_mat(ctx0, layer.wv, inp);
+        qkv = ggml_concat(ctx0, ggml_concat(ctx0, Qcur, Kcur, 0), Vcur, 0);
+    }
     qkv = ggml_reshape_3d(ctx0, qkv, 3*d_inner, n_seq_tokens, n_seqs);
     cb(qkv, "kda_qkv", il);
 
     ggml_tensor * conv_states_all = mctx_cur->get_r_l(il);
     ggml_tensor * conv_in = build_conv_state(inp_rs, conv_states_all, qkv, d_conv, 3*d_inner, il);
 
-    ggml_tensor * conv_w = ggml_concat(ctx0,
-            ggml_concat(ctx0,
-                ggml_reshape_2d(ctx0, layer.ssm_q_conv, d_conv, d_inner),
-                ggml_reshape_2d(ctx0, layer.ssm_k_conv, d_conv, d_inner), 1),
-            ggml_reshape_2d(ctx0, layer.ssm_v_conv, d_conv, d_inner), 1);
+    ggml_tensor * conv_w = glm5next_adjacent_rows(ctx0, {layer.ssm_q_conv, layer.ssm_k_conv, layer.ssm_v_conv});
+    if (!conv_w) {
+        conv_w = ggml_concat(ctx0,
+                ggml_concat(ctx0,
+                    ggml_reshape_2d(ctx0, layer.ssm_q_conv, d_conv, d_inner),
+                    ggml_reshape_2d(ctx0, layer.ssm_k_conv, d_conv, d_inner), 1),
+                ggml_reshape_2d(ctx0, layer.ssm_v_conv, d_conv, d_inner), 1);
+    }
 
     // SiLU is applied to the conv output, not to the projections
     ggml_tensor * conv_out = ggml_silu(ctx0, ggml_ssm_conv(ctx0, conv_in, conv_w));
@@ -341,11 +385,11 @@ ggml_tensor * llama_model_glm5next::graph::build_kda_layer(
     const size_t nb_qkv  = ggml_row_size(conv_out->type, 3*d_inner);
     const size_t nb_head = ggml_row_size(conv_out->type, head_dim);
 
-    Qcur = ggml_view_4d(ctx0, conv_out, head_dim, n_head, n_seq_tokens, n_seqs,
+    ggml_tensor * Qcur = ggml_view_4d(ctx0, conv_out, head_dim, n_head, n_seq_tokens, n_seqs,
             nb_head, nb_qkv, nb_qkv*n_seq_tokens, 0);
-    Kcur = ggml_view_4d(ctx0, conv_out, head_dim, n_head, n_seq_tokens, n_seqs,
+    ggml_tensor * Kcur = ggml_view_4d(ctx0, conv_out, head_dim, n_head, n_seq_tokens, n_seqs,
             nb_head, nb_qkv, nb_qkv*n_seq_tokens, ggml_row_size(conv_out->type, d_inner));
-    Vcur = ggml_view_4d(ctx0, conv_out, head_dim, n_head, n_seq_tokens, n_seqs,
+    ggml_tensor * Vcur = ggml_view_4d(ctx0, conv_out, head_dim, n_head, n_seq_tokens, n_seqs,
             nb_head, nb_qkv, nb_qkv*n_seq_tokens, ggml_row_size(conv_out->type, 2*d_inner));
 
     // 1e-6 is the reference's own constant, not the model's norm eps
@@ -356,8 +400,23 @@ ggml_tensor * llama_model_glm5next::graph::build_kda_layer(
 
     // the 1/sqrt(head_dim) query scale is applied inside build_delta_net, after this norm
 
+    // f_a, g_a and beta read the same input: one product when the weights are adjacent
+    ggml_tensor * f_lo    = nullptr;
+    ggml_tensor * g_lo    = nullptr;
+    ggml_tensor * beta_in = nullptr;
+    if (ggml_tensor * w_fgb = glm5next_adjacent_rows(ctx0, {layer.ssm_f_a, layer.ssm_g_a, layer.ssm_beta})) {
+        ggml_tensor * fgb = ggml_mul_mat(ctx0, w_fgb, inp);
+        f_lo    = ggml_view_2d(ctx0, fgb, head_dim, n_tokens, fgb->nb[1], 0);
+        g_lo    = ggml_view_2d(ctx0, fgb, head_dim, n_tokens, fgb->nb[1], ggml_row_size(fgb->type, head_dim));
+        beta_in = ggml_cont(ctx0, ggml_view_2d(ctx0, fgb, n_head, n_tokens, fgb->nb[1], ggml_row_size(fgb->type, 2*head_dim)));
+    } else {
+        f_lo    = ggml_mul_mat(ctx0, layer.ssm_f_a, inp);
+        g_lo    = ggml_mul_mat(ctx0, layer.ssm_g_a, inp);
+        beta_in = ggml_mul_mat(ctx0, layer.ssm_beta, inp);
+    }
+
     // g = lower_bound * sigmoid(exp(A_log)*(f_b(f_a(x)) + dt_bias)); it scales, not clamps
-    ggml_tensor * g = ggml_mul_mat(ctx0, layer.ssm_f_b, ggml_mul_mat(ctx0, layer.ssm_f_a, inp));
+    ggml_tensor * g = ggml_mul_mat(ctx0, layer.ssm_f_b, f_lo);
     g = ggml_add(ctx0, g, layer.ssm_dt_b);
     g = ggml_reshape_3d(ctx0, g, head_dim, n_head, n_tokens);
     g = ggml_mul(ctx0, g, ggml_reshape_3d(ctx0, layer.ssm_a, 1, n_head, 1));
@@ -366,8 +425,7 @@ ggml_tensor * llama_model_glm5next::graph::build_kda_layer(
     g = ggml_reshape_4d(ctx0, g, head_dim, n_head, n_seq_tokens, n_seqs);
     cb(g, "kda_gate", il);
 
-    ggml_tensor * beta = ggml_mul_mat(ctx0, layer.ssm_beta, inp);
-    beta = ggml_sigmoid(ctx0, ggml_reshape_4d(ctx0, beta, 1, n_head, n_seq_tokens, n_seqs));
+    ggml_tensor * beta = ggml_sigmoid(ctx0, ggml_reshape_4d(ctx0, beta_in, 1, n_head, n_seq_tokens, n_seqs));
     cb(beta, "kda_beta", il);
 
     ggml_tensor * ssm_states_all = mctx_cur->get_s_l(il);
@@ -381,7 +439,7 @@ ggml_tensor * llama_model_glm5next::graph::build_kda_layer(
                                               : ggml_cont_3d(ctx0, out, head_dim, n_head, n_tokens);
     cb(o, "kda_scan_out", il);
 
-    ggml_tensor * gate = ggml_mul_mat(ctx0, layer.ssm_g_b, ggml_mul_mat(ctx0, layer.ssm_g_a, inp));
+    ggml_tensor * gate = ggml_mul_mat(ctx0, layer.ssm_g_b, g_lo);
     gate = ggml_reshape_3d(ctx0, gate, head_dim, n_head, n_tokens);
 
     // plain sigmoid gate, not the SiLU that FusedRMSNormGated defaults to
@@ -800,14 +858,37 @@ ggml_tensor * llama_model_glm5next::graph::build_layer_attn(
     return build_dsa_layer(model.layers[il], inp_mem->get_attn(), inp_kp, scoring, cur, il);
 }
 
+// delphi: a SwiGLU FFN whose gate and up weights are adjacent (glm5next_adjacent_rows): one product for both, then the
+// activation of build_ffn on its two halves; nullptr when they are not adjacent
+static ggml_tensor * glm5next_ffn_adjacent(ggml_context * ctx, ggml_tensor * cur, ggml_tensor * gate, ggml_tensor * up,
+        ggml_tensor * down, float limit) {
+    ggml_tensor * w_gu = glm5next_adjacent_rows(ctx, {gate, up});
+    if (w_gu == nullptr || ggml_nrows(gate) != ggml_nrows(up)) {
+        return nullptr;
+    }
+    const int64_t n_ff = ggml_nrows(gate);
+    ggml_tensor * gu = ggml_mul_mat(ctx, w_gu, cur);
+    ggml_tensor * g  = ggml_view_2d(ctx, gu, n_ff, gu->ne[1], gu->nb[1], 0);
+    ggml_tensor * u  = ggml_view_2d(ctx, gu, n_ff, gu->ne[1], gu->nb[1], n_ff*ggml_element_size(gu));
+    ggml_tensor * act = limit > 1e-6f ? ggml_swiglu_clamp(ctx, g, u, limit) : ggml_swiglu_split(ctx, g, u);
+    return ggml_mul_mat(ctx, down, act);
+}
+
 ggml_tensor * llama_model_glm5next::graph::build_layer_ffn(
         const llama_model & model,
         ggml_tensor * cur,
         int il) const {
     const auto & layer = model.layers[il];
 
+    // build_ffn applies the LoRA adapters per weight; at 1 token MMVQ already fuses gate, up and the GLU
+    const bool  adjacent = loras->empty() && ggml_n_dims(cur) == 2 && cur->ne[1] > 1;
+    const float limit    = hparams.swiglu_clamp_shexp[il];
+
     // the leading dense layers clamp like the experts: one Glm5NextTextMLP serves both
     if (il < (int) hparams.n_layer_dense_lead) {
+        if (ggml_tensor * out = adjacent ? glm5next_ffn_adjacent(ctx0, cur, layer.ffn_gate, layer.ffn_up, layer.ffn_down, limit) : nullptr) {
+            return out;
+        }
         return build_ffn(cur,
                 layer.ffn_up,   nullptr, nullptr,
                 layer.ffn_gate, nullptr, nullptr,
@@ -828,11 +909,15 @@ ggml_tensor * llama_model_glm5next::graph::build_layer_ffn(
             (llama_expert_gating_func_type) hparams.expert_gating_func,
             il);
 
-    ggml_tensor * shexp = build_ffn(cur,
-            layer.ffn_up_shexp,   nullptr, nullptr,
-            layer.ffn_gate_shexp, nullptr, nullptr,
-            layer.ffn_down_shexp, nullptr, nullptr,
-            nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
+    ggml_tensor * shexp = adjacent ?
+        glm5next_ffn_adjacent(ctx0, cur, layer.ffn_gate_shexp, layer.ffn_up_shexp, layer.ffn_down_shexp, limit) : nullptr;
+    if (!shexp) {
+        shexp = build_ffn(cur,
+                layer.ffn_up_shexp,   nullptr, nullptr,
+                layer.ffn_gate_shexp, nullptr, nullptr,
+                layer.ffn_down_shexp, nullptr, nullptr,
+                nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
+    }
     cb(shexp, "ffn_shexp", il);
 
     // shared expert unscaled: routed_scaling_factor applies to the routed weights only
@@ -874,7 +959,34 @@ llama_model_glm5next::graph::graph(const llama_model & model, const llm_graph_pa
     inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hc, n_tokens, 1);
     cb(inpL, "hc_init", -1);
 
+    // delphi: the hc_post of a sublayer runs in the HC mix op of the next boundary (build_hc_post_pre); pend_* hold the
+    // hc_post of the last FFN until the next layer
+    ggml_tensor * pend_y    = nullptr;
+    ggml_tensor * pend_res  = nullptr;
+    ggml_tensor * pend_post = nullptr;
+    ggml_tensor * pend_comb = nullptr;
+
     for (int il = 0; il < n_layer; ++il) {
+        ggml_tensor * post = nullptr;
+        ggml_tensor * comb = nullptr;
+
+        if (pend_y) {
+            cur = build_hc_post_pre(pend_y, pend_res, pend_post, pend_comb,
+                    model.layers[il].hc_attn_fn,
+                    model.layers[il].hc_attn_scale,
+                    model.layers[il].hc_attn_base,
+                    &post, &comb, &inpL, il, model.layers[il].attn_norm);
+            cb(inpL, "l_last", il - 1);
+            pend_y = nullptr;
+        } else {
+            cur = build_hc_pre(inpL,
+                    model.layers[il].hc_attn_fn,
+                    model.layers[il].hc_attn_scale,
+                    model.layers[il].hc_attn_base,
+                    &post, &comb, il, model.layers[il].attn_norm);
+        }
+        cb(cur, "attn_norm", il);
+
         if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
             res->t_layer_inp[il] = build_hc_mean(ctx0, inpL);
             cb(res->t_layer_inp[il], "layer_inp", il);
@@ -882,28 +994,18 @@ llama_model_glm5next::graph::graph(const llama_model & model, const llm_graph_pa
         }
 
         ggml_tensor * residual = inpL;
-        ggml_tensor * post = nullptr;
-        ggml_tensor * comb = nullptr;
-
-        cur = build_hc_pre(inpL,
-                model.layers[il].hc_attn_fn,
-                model.layers[il].hc_attn_scale,
-                model.layers[il].hc_attn_base,
-                &post, &comb, il, model.layers[il].attn_norm);
-        cb(cur, "attn_norm", il);
 
         cur = build_layer_attn(model, inp_mem, inp_kp, indexer_scoring, cur, il);
 
-        inpL = build_hc_post(cur, residual, post, comb, il);
-        cb(inpL, "hc_attn_post", il);
-
-        residual = inpL;
-        cur = build_hc_pre(inpL,
+        cur = build_hc_post_pre(cur, residual, post, comb,
                 model.layers[il].hc_ffn_fn,
                 model.layers[il].hc_ffn_scale,
                 model.layers[il].hc_ffn_base,
-                &post, &comb, il, model.layers[il].ffn_norm);
+                &post, &comb, &inpL, il, model.layers[il].ffn_norm);
+        cb(inpL, "hc_attn_post", il);
         cb(cur, "ffn_norm", il);
+
+        residual = inpL;
 
         // expand before the sublayer so op offload does not pull mHC state to the experts
         ggml_build_forward_expand(gf, residual);
@@ -913,9 +1015,18 @@ llama_model_glm5next::graph::graph(const llama_model & model, const llm_graph_pa
         cur = build_layer_ffn(model, cur, il);
         cb(cur, "ffn_out", il);
 
-        inpL = build_hc_post(cur, residual, post, comb, il);
-        inpL = build_cvec(inpL, il);
-        cb(inpL, "l_last", il);
+        // the next layer takes the hc_post only on the same device: across devices it copies y, the residual, post and comb
+        // instead of the new streams, 0.2 to 0.5 ms slower per pass (GLM-5.3, 3 CMP 170HX, 1 to 8 tokens)
+        if (il + 1 < n_layer && cvec->tensor_for(il) == nullptr && model.dev_layer(il) == model.dev_layer(il + 1)) {
+            pend_y    = cur;
+            pend_res  = residual;
+            pend_post = post;
+            pend_comb = comb;
+        } else {
+            inpL = build_hc_post(cur, residual, post, comb, il);
+            inpL = build_cvec(inpL, il);
+            cb(inpL, "l_last", il);
+        }
     }
 
     if ((size_t) n_layer < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[n_layer]) {

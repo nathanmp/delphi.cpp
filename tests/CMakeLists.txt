@@ -117,6 +117,7 @@ function(llama_build_and_test source)
 endfunction()
 
 llama_build_and_test(test-quant-rules.cpp)
+llama_build_and_test(test-speculative-adaptive.cpp)
 
 # build test-tokenizer-0 target once and add many tests
 llama_build(test-tokenizer-0.cpp)
