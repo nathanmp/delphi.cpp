@@ -69,6 +69,7 @@
 #include "ggml-cuda/gated_delta_net.cuh"
 #include "ggml-cuda/dsv4-hc.cuh"
 #include "ggml-cuda/dsv4-hc-mix.cuh"
+#include "ggml-cuda/mmvq-q8-smallk.cuh"
 #include "ggml-cuda/set.cuh"
 #include "ggml-cuda/set-rows.cuh"
 #include "ggml-cuda/pad_reflect_1d.cuh"
@@ -2290,6 +2291,13 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_exec_trace_dispatch(dst->op, GGML_EXEC_TRACE_DISPATCH_GPU_MMF,
                 GGML_EXEC_TRACE_DISPATCH_VARIANT_DEFAULT, cc, warp_size);
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
+        return;
+    }
+    // delphi: Q8_0 with a short K, up to 8 columns (mmvq-q8-smallk.cuh)
+    if (ggml_cuda_mmvq_q8_smallk_supported(src0, src1, dst, cc)) {
+        ggml_exec_trace_dispatch(dst->op, GGML_EXEC_TRACE_DISPATCH_GPU_MMVQ,
+                GGML_EXEC_TRACE_DISPATCH_VARIANT_DEFAULT, cc, warp_size);
+        ggml_cuda_mul_mat_vec_q8_smallk(ctx, src0, src1, dst);
         return;
     }
     // delphi: Q8_0 at speculative verify widths on tensor cores (mmvq-q8-tc.cuh)

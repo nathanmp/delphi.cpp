@@ -9936,6 +9936,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    // short K (mmvq-q8-smallk.cu, K = 256 is above): ragged last block of rows
+    for (int64_t k : {64, 128}) {
+        for (int64_t m : {100, 8192}) {
+            for (int n : {1, 3, 8, 9}) {
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+            }
+        }
+    }
     // K in slices for other block sizes: q4_K (256), iq4_xs (256)
     for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_IQ4_XS}) {
         for (int n : {1, 3, 8}) {
@@ -12250,7 +12258,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int n_tokens : {1, 4, 6, 7, 8, 9, 12, 16}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 288, n_tokens, 4096, {1, 1}, {1, 1}));
     }
-    // GLM-5.3 KDA low-rank gates: f_b, g_b (8192 x 128), f_a, g_a (128 x 4096), beta (64 x 4096)
+    // GLM-5.3 KDA low-rank gates: f_b, g_b (8192 x 128)
     for (int n_tokens : {1, 2, 4, 8, 9, 16}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, n_tokens, 128, {1, 1}, {1, 1}));
     }
