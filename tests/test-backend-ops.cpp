@@ -12250,6 +12250,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int n_tokens : {1, 4, 6, 7, 8, 9, 12, 16}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 288, n_tokens, 4096, {1, 1}, {1, 1}));
     }
+    // GLM-5.3 KDA low-rank gates: f_b, g_b (8192 x 128), f_a, g_a (128 x 4096), beta (64 x 4096)
+    for (int n_tokens : {1, 2, 4, 8, 9, 16}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, n_tokens, 128, {1, 1}, {1, 1}));
+    }
+
     // other router shapes (DeepSeek V4, Qwen3-MoE, Qwen3.5) at the MMVF limit
     for (int n_tokens : {7, 8}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 256, n_tokens, 7168, {1, 1}, {1, 1}));
