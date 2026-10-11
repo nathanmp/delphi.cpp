@@ -187,6 +187,32 @@ class Files(unittest.TestCase):
 
 
 class Timing(unittest.TestCase):
+    def test_forced_staging_counts_the_whole_bank_even_when_cpu_is_faster(self):
+        config = cfg(primary_qtypes=["Q2_K"], runtime={"env": {"GGML_SCHED_STAGE": "1", "GGML_SCHED_STAGE_MIN_TOKENS": "128"},
+                                                      "short_tokens": 8, "long_tokens": 128, "ubatch": 128},
+                     timing={"link_bandwidth_gb_s": .001})
+        raw = info()
+        raw["n_expert"] = 64
+        for t in raw["tensors"]:
+            if len(t["shape"]) == 3:
+                t["shape"][2] = 64
+                t["source_bytes"] = 2 * np.prod(t["shape"]).item()
+        model = classify(raw, config)
+        operations = {}
+        for group, members, paired in regions(model):
+            for dtype in group["pool"]:
+                for n in set(token_counts(config).values()):
+                    for device in (["CPU", "ROCm1"] if members[0]["expert"] else ["ROCm1"]):
+                        sig = signature(members, paired, dtype, device, n, model["top_k"])
+                        operations[digest(sig)] = {"signature": sig, "ms": .01}
+        baseline = {g["name"]: g["pool"][0] for g in model["groups"]}
+        predictor = Predictor(model, config, operations, baseline, {"decode": 12, "short": 200, "long": 1000})
+        staged = predictor.cost(baseline)["long"]
+        banks = sum(tensor_bytes(t["shape"], "Q2_K") for t in model["tensors"] if t["expert"])
+        self.assertAlmostEqual(staged, banks / 1000 + 2 * (.01 + .02) + .01)
+        config["runtime"]["env"]["GGML_SCHED_STAGE"] = "0"
+        self.assertLess(predictor.cost(baseline)["long"], staged)
+
     def test_variable_tied_embedding_includes_the_output_projection(self):
         model = {"architecture": "olmoe", "n_expert": 8, "top_k": 2,
                  "tensors": [tensor("token_embd.weight", (256, 256))]}

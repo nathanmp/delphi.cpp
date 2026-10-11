@@ -15,7 +15,7 @@ from config import AXES, SCHEMA, QuantError, digest, file_identity, load_config,
 from model import classify, merge_imatrices, read_model
 from quality import apply_quality, load_quality, quality_metadata, repair_options, verify_quality_output
 from search import make_options, memory, search
-from timing import Predictor, fit_slopes, gpu, machine_settings, measure_ops, profile_model, profile_times, run
+from timing import MODEL_REVISION, Predictor, fit_slopes, gpu, machine_settings, measure_ops, profile_model, profile_times, run
 
 
 def inputs(cfg, info):
@@ -25,7 +25,8 @@ def inputs(cfg, info):
                          (("llama-quantize", "test-backend-ops", "llama-bench") if "quality" in cfg else
                           ("llama-quant-damage", "llama-quantize", "test-backend-ops", "llama-bench"))},
             "libraries": [file_identity(p) for p in sorted(Path(cfg["bindir"]).glob("lib*.so*")) if not p.is_symlink()],
-            "runtime": cfg["runtime"], "timing": cfg["timing"], "gpu": gpu(cfg), "ram_routed": "RAM" in cfg["devices"], "cache_mib": cfg["cache_mib"],
+            "runtime": cfg["runtime"], "timing": cfg["timing"], "timing_model_revision": MODEL_REVISION,
+            "gpu": gpu(cfg), "ram_routed": "RAM" in cfg["devices"], "cache_mib": cfg["cache_mib"],
             "machine_settings": machine_settings(),
             "inherited_environment": {name: value for name, value in os.environ.items()
                                       if name.startswith(("GGML_", "LLAMA_", "CUDA_", "HIP_", "HSA_", "ROCR_", "OMP_", "LD_LIBRARY_PATH"))}}

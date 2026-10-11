@@ -68,6 +68,8 @@ A RAM-resident expert qtype can remain on CPU when its GPU operation is unsuppor
 
 Repeated isolated probes can keep active expert weights in CPU cache. The predictor also bounds CPU time by the bytes fetched from RAM. Its default effective byte rate is derived from the baseline's routed-expert bytes and traced decode CPU span; this incorporates CPU overhead and is not a measurement of peak RAM bandwidth. `timing.cpu_bandwidth_gb_s` can supply an explicit rate instead. The fitted scale and held-out checks remain necessary. Long-prefill transfer predictions use the actual configured `GGML_SCHED_STAGE_MIN_TOKENS` threshold.
 
+With staging enabled and a positive threshold, the runtime selects the GPU above that threshold and transfers the whole expert bank. The predictor follows that policy even if a CPU estimate would be faster. It estimates compute plus transfer before the fitted workload scale; copy/compute overlap remains an approximation. Timing-model revisions invalidate old prepared calibrations.
+
 CPU expert probes also set `numa_expert=1`. `--numa tensors` alone pins workers but does not select the model loader's flagged expert kernel path. Both the flag and the NUMA mode are required to reproduce that execution contract.
 
 `runtime.depth_tokens` sets the benchmark's existing context depth before each workload; default zero. KV types can use the benchmark's `-ctk`/`-ctv` options in `extra_args`. The benchmark derives its allocation from depth and workload lengths. Models with large lazy engram/per-layer embedding tables are explicitly unsupported until resident-byte accounting is added.

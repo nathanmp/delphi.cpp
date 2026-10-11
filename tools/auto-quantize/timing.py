@@ -16,6 +16,8 @@ from model import tensor_bytes
 sys.path.insert(0, str(ROOT))
 from tools.bottlenecks.profile import BenchArm, Recipe, GPU_SETTING_KEYS, _gpu_state, run_recipe
 
+MODEL_REVISION = 2
+
 
 def machine_settings():
     keys = ("vendor", "pci", *GPU_SETTING_KEYS)
@@ -230,7 +232,8 @@ class Predictor:
                 if t["expert"] and "RAM" in self.cfg["devices"]:
                     cpu_time = self.lookup(members, paired, dtype, "CPU", tokens)
                     unique = active_experts(t["shape"][2], self.info["top_k"], tokens)
-                    weight_bytes = sum(tensor_bytes(m["shape"], dtype) for m in members) * unique / t["shape"][2]
+                    full_weight_bytes = sum(tensor_bytes(m["shape"], dtype) for m in members)
+                    weight_bytes = full_weight_bytes * unique / t["shape"][2]
                     # Repeated isolated probes keep active weights in cache. A full model also pays for RAM traffic.
                     if self.cpu_bytes_per_ms:
                         cpu_time = max(cpu_time, weight_bytes / self.cpu_bytes_per_ms)
@@ -240,7 +243,8 @@ class Predictor:
                         local = (1 - hit_fraction) * cpu_time + hit_fraction * device_time + handoff
                     min_tokens = int(self.cfg["runtime"]["env"].get("GGML_SCHED_STAGE_MIN_TOKENS", 512))
                     if streaming and min_tokens > 0 and tokens >= min_tokens and device_time is not None:
-                        local = min(local, device_time + weight_bytes / link + 0.02)
+                        # The scheduler forces staging above this threshold and copies the whole expert bank.
+                        local = device_time + full_weight_bytes / link + 0.02
                 n_work = self.cfg["runtime"][f"{regime}_tokens"] if regime != "decode" else 1
                 batches, tail = divmod(n_work, tokens)
                 # Tail interpolation is flagged in the output; it does not change the fixed ubatch used for calibration.
