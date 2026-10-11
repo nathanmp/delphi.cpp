@@ -81,7 +81,7 @@ def load_config(path):
         raise QuantError(f"configuration schema must be {SCHEMA}")
     allowed = {"schema", "model", "devices", "reserve", "imatrix", "primary_qtypes", "other_qtypes", "importance",
                "preserve_below_mib", "tie_gate_up", "primary_regex", "pins", "preserve_regex", "allow_requantize",
-               "bindir", "runtime", "sampling", "search", "bounds", "cache_mib", "multi_gpu_speedup_percent", "timing"}
+               "bindir", "runtime", "sampling", "search", "bounds", "cache_mib", "multi_gpu_speedup_percent", "timing", "quality"}
     unknown = set(cfg) - allowed
     if unknown:
         raise QuantError(f"unknown configuration keys: {sorted(unknown)}")
@@ -91,6 +91,10 @@ def load_config(path):
     cfg["model"] = absolute(cfg["model"])
     cfg["bindir"] = absolute(cfg.get("bindir", str(ROOT / "build-auto-quantizer/bin")))
     cfg["imatrix"] = [absolute(p) for p in cfg.get("imatrix", [])]
+    if "quality" in cfg:
+        if not isinstance(cfg["quality"], dict) or set(cfg["quality"]) != {"table"}:
+            raise QuantError("quality must contain only a repair calibration table path")
+        cfg["quality"]["table"] = absolute(cfg["quality"]["table"])
     cfg["devices"] = devices(cfg["devices"])
     cfg["reserve"] = {name: capacity(value) for name, value in cfg.get("reserve", {}).items()}
     if set(cfg["reserve"]) - set(cfg["devices"]):
@@ -163,9 +167,13 @@ def load_config(path):
             raise QuantError(f"search.{name} must be a positive integer")
     cfg.setdefault("bounds", {})
     for name, value in cfg["bounds"].items():
-        if name not in {"max_damage", "min_decode_t_s", "min_short_t_s", "min_long_t_s"}:
+        if name not in {"max_damage", "max_loss", "min_decode_t_s", "min_short_t_s", "min_long_t_s"}:
             raise QuantError(f"unknown bound {name}")
         number(value, f"bounds.{name}")
+    if "max_loss" in cfg["bounds"] and "quality" not in cfg:
+        raise QuantError("max_loss requires a repair calibration table")
+    if "max_damage" in cfg["bounds"] and "quality" in cfg:
+        raise QuantError("use max_loss for repair-score units; max_damage is for the local error metric")
     cfg.setdefault("timing", {})
     if set(cfg["timing"]) - {"link_bandwidth_gb_s", "cpu_bandwidth_gb_s"}:
         raise QuantError("unknown timing inputs")

@@ -159,9 +159,10 @@ def search(info, cfg, predictor, baseline_choices):
         axes = [error, *[times[regime] for regime in AXES[1:]]]
         bounds = cfg["bounds"]
         violation = 0.0
-        if error > bounds.get("max_damage", math.inf):
-            rejected["damage_bound"] += 1
-            violation += error / max(bounds["max_damage"], 1e-12) - 1
+        loss_bound = "max_loss" if "quality" in cfg else "max_damage"
+        if error > bounds.get(loss_bound, math.inf):
+            rejected["loss_bound" if "quality" in cfg else "damage_bound"] += 1
+            violation += error / max(bounds[loss_bound], 1e-12) - 1
         for regime in AXES[1:]:
             rate = 1000 / times[regime] * (1 if regime == "decode" else cfg["runtime"][f"{regime}_tokens"])
             if rate < bounds.get(f"min_{regime}_t_s", 0):
@@ -173,6 +174,8 @@ def search(info, cfg, predictor, baseline_choices):
                  "predicted_ms": times, "memory": mem,
                  "score": sum(w * value / scale for w, value, scale in zip(weights, axes, reference)),
                  "constraint_violation": violation}
+        if "quality" in cfg:
+            state["loss"] = error
         evaluated[key] = state
         if violation == 0:
             feasible.append(state)

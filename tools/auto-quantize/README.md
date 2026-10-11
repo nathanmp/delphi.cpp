@@ -39,6 +39,16 @@ Multiple GGUF imatrices merge raw sums/counts. A single legacy matrix is accepte
 
 `search` accepts `beam`, `evaluations` and `display`. `bounds` accepts `max_damage`, `min_decode_t_s`, `min_short_t_s` and `min_long_t_s`. Speed bounds constrain predictions. The JSON retains all nondominated evaluated recipes even when the console display is capped. Search is bounded and does not guarantee the global frontier.
 
+## Experimental repair quality
+
+Set `"quality": {"table": "repair-table.json"}` to replace local damage with the sum of measured conditional repair KL values. Use `"bounds": {"max_loss": 0.09}` for a ceiling in those proxy units. `max_damage` and `max_loss` apply to different metrics and cannot be interchanged. Repair loss is not a bound on original-relative KLD or a task-accuracy percentage.
+
+The table uses `delphi.floor-quality/2` and `method: sum_conditional_repair_kl`. It contains content identities for every source shard and imatrix, a complete floor tensor manifest, the quality execution policy, and non-overlapping measured groups. Each option records its qtype, exact bytes, mean and per-chunk losses, and the SHA256 of every member tensor payload. Source/imatrix records use `bytes` and `sha256`; the floor also supplies its GGUF `path` and a `tensors` map with `shape`, `qtype`, `bytes` and `sha256`. `execution` records the first `gpu`, `ram_routed` placement, `numa: tensors`, and the calibration command/environment. Draft `/1` tables lack these checks and require export to `/2`.
+
+Prepare reuses the supplied floor and skips local-error sampling. All source, floor and imatrix identities must match. The floor qtype must be an allowed minimum-byte option for each measured group. Unmeasured tensors stay at their recorded floor types; the tool does not combine uncalibrated local scores with repair scores. The category pools, preservation rules and pins must permit that fixed floor. Search changes whole measured groups, while timing keeps the per-layer gate/up pairs. Final encoding verifies every tensor payload against the calibration identities, including unchanged tensors.
+
+CPU-expert/GPU-dense placement is supported. A table collected with GPU-resident experts cannot be used for RAM-routed planning, or the reverse. Scores apply to the recorded quality execution policy; different prefill offload, kernel or cache paths need quality validation. The independent speed profiler retains its configured execution policy. Repair tables do not yet support an expert cache. The table provider remains opt-in and experimental; the default local metric is unchanged.
+
 ## Workflow
 
 ```sh

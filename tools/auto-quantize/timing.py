@@ -109,7 +109,9 @@ def operation_times(text):
 def regions(info):
     by_name = {t["name"]: t for t in info["tensors"]}
     result = []
-    for group in info["groups"]:
+    for group in info.get("execution_groups", info["groups"]):
+        if group.get("quality_fixed"):
+            continue
         members = [by_name[name] for name in group["members"]]
         if all(t["preserved"] for t in members):
             continue
@@ -212,7 +214,7 @@ class Predictor:
         link = self.cfg["timing"].get("link_bandwidth_gb_s", 12) * 1e6  # bytes/ms; prior is explicitly unmeasured
         streaming = str(self.cfg["runtime"]["env"].get("GGML_SCHED_STAGE", "0")) == "1"
         for group, members, paired in self.regions:
-            dtype = choices[group["name"]]
+            dtype = choices[group.get("decision", group["name"])]
             for regime, tokens in self.counts.items():
                 device_time = self.lookup(members, paired, dtype, gpu(self.cfg), tokens)
                 local = device_time
