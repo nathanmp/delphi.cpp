@@ -1015,9 +1015,8 @@ llama_model_glm5next::graph::graph(const llama_model & model, const llm_graph_pa
         cur = build_layer_ffn(model, cur, il);
         cb(cur, "ffn_out", il);
 
-        // the next layer takes the hc_post only on the same device: across devices it would copy y, the residual, post and
-        // comb instead of the new streams, and with the default copy-slot waits of the scheduler (not with
-        // GGML_SCHED_COPY_REUSE_WAIT=1) the results were wrong (GLM-5.3, 3 GPUs, 2026-10-11)
+        // the next layer takes the hc_post only on the same device: across devices it copies y, the residual, post and comb
+        // instead of the new streams, 0.2 to 0.5 ms slower per pass (GLM-5.3, 3 CMP 170HX, 1 to 8 tokens)
         if (il + 1 < n_layer && cvec->tensor_for(il) == nullptr && model.dev_layer(il) == model.dev_layer(il + 1)) {
             pend_y    = cur;
             pend_res  = residual;
