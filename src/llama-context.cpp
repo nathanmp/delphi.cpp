@@ -282,11 +282,11 @@ llama_context::llama_context(
     cparams.fused_dsv4_hc_comb = true;
     cparams.fused_dsv4_hc_post = true;
     cparams.auto_fhc           = true;
-    // delphi: LLAMA_FUSED_HC_MIX=1 computes the hyper-connection mixes in F32 and the norm of the layer input in one op
-    // (ggml_dsv4_hc_mix); the default keeps the separate ops and the q8_1 activations of a quantized hc_fn
+    // delphi: the hyper-connection mixes in F32 and the norm of the layer input in one op (ggml_dsv4_hc_mix);
+    // LLAMA_FUSED_HC_MIX=0 keeps the separate ops and the q8_1 activations of a quantized hc_fn
     {
         const char * LLAMA_FUSED_HC_MIX = getenv("LLAMA_FUSED_HC_MIX");
-        cparams.fused_dsv4_hc_mix = LLAMA_FUSED_HC_MIX != nullptr && atoi(LLAMA_FUSED_HC_MIX) != 0;
+        cparams.fused_dsv4_hc_mix = LLAMA_FUSED_HC_MIX == nullptr || atoi(LLAMA_FUSED_HC_MIX) != 0;
     }
 
     // with causal attention, the batch size is limited by the context size
