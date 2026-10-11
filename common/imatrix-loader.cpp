@@ -116,9 +116,15 @@ bool common_imatrix_load(const std::string & fname, common_imatrix & imatrix) {
     imatrix.chunk_size   = (chunk_size_key  != -1) ? gguf_get_val_u32(ctx_gguf, chunk_size_key)  : 0;
 
     const std::string in_sum2_suffix{ ".in_sum2" };
+    const std::string in_sum_suffix{ ".in_sum" };
     const std::string counts_suffix{ ".counts" };
 
-    std::map<std::string, std::pair<struct ggml_tensor *, struct ggml_tensor *>> sums_counts_for;
+    struct sum_tensors {
+        struct ggml_tensor * in_sum2 = nullptr;
+        struct ggml_tensor * counts  = nullptr;
+        struct ggml_tensor * in_sum  = nullptr;
+    };
+    std::map<std::string, sum_tensors> sums_counts_for;
 
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
         std::string name = cur->name;
@@ -126,16 +132,19 @@ bool common_imatrix_load(const std::string & fname, common_imatrix & imatrix) {
         if (name.empty()) { continue; }
 
         if (string_remove_suffix(name, in_sum2_suffix)) {
-            sums_counts_for[std::move(name)].first = cur;
+            sums_counts_for[std::move(name)].in_sum2 = cur;
         } else if (string_remove_suffix(name, counts_suffix)) {
-            sums_counts_for[std::move(name)].second = cur;
+            sums_counts_for[std::move(name)].counts = cur;
+        } else if (string_remove_suffix(name, in_sum_suffix)) {
+            sums_counts_for[std::move(name)].in_sum = cur;
         }
     }
 
     for (const auto & sc : sums_counts_for) {
         const std::string &        name    = sc.first;
-        const struct ggml_tensor * in_sum2 = sc.second.first;
-        const struct ggml_tensor * counts  = sc.second.second;
+        const struct ggml_tensor * in_sum2 = sc.second.in_sum2;
+        const struct ggml_tensor * counts  = sc.second.counts;
+        const struct ggml_tensor * in_sum  = sc.second.in_sum;
 
         if (!in_sum2 || !counts) {
             LOG_ERR("%s: mismatched sums and counts for %s\n", __func__, name.c_str());
@@ -151,6 +160,13 @@ bool common_imatrix_load(const std::string & fname, common_imatrix & imatrix) {
             return false;
         }
 
+        if (in_sum && (in_sum->type != GGML_TYPE_F32 || ggml_nelements(in_sum) != ggml_nelements(in_sum2))) {
+            LOG_ERR("%s: invalid activation sums for %s\n", __func__, name.c_str());
+            gguf_free(ctx_gguf);
+            ggml_free(ctx);
+            return false;
+        }
+
         auto & e = imatrix.entries[name];
 
         const int64_t nval    = ggml_nelements(in_sum2);
@@ -159,6 +175,9 @@ bool common_imatrix_load(const std::string & fname, common_imatrix & imatrix) {
         e.sums.resize(nval);
         for (int64_t j = 0; j < nval; ++j) {
             e.sums[j] = ((const float *) in_sum2->data)[j];
+        }
+        if (in_sum) {
+            e.activations.assign((const float *) in_sum->data, (const float *) in_sum->data + nval);
         }
 
         e.counts.resize(ncounts);

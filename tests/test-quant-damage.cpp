@@ -422,6 +422,46 @@ static void test_gguf_reader() {
 }
 
 // file fingerprint: stable, content-sensitive
+static void test_imatrix_means() {
+    const char * path = "test-quant-damage-imatrix.gguf";
+    for (int mode = 0; mode < 4; ++mode) {
+        ggml_context * ctx = ggml_init({ 1 << 20, nullptr, false });
+        gguf_context * g = gguf_init_empty();
+        ggml_tensor * sums = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, 2);
+        ggml_tensor * counts = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, 2);
+        ggml_set_name(sums, "test.weight.in_sum2");
+        ggml_set_name(counts, "test.weight.counts");
+        for (int j = 0; j < 8; ++j) { ((float *) sums->data)[j] = 10.0f + j; }
+        ((float *) counts->data)[0] = 2.0f;
+        ((float *) counts->data)[1] = 3.0f;
+        gguf_add_tensor(g, sums);
+        gguf_add_tensor(g, counts);
+        if (mode != 0) {
+            ggml_tensor * means = ggml_new_tensor_2d(ctx, mode == 3 ? GGML_TYPE_F16 : GGML_TYPE_F32, mode == 2 ? 3 : 4, 2);
+            ggml_set_name(means, "test.weight.in_sum");
+            memset(means->data, 0, ggml_nbytes(means));
+            if (mode == 1) {
+                for (int j = 0; j < 8; ++j) { ((float *) means->data)[j] = -2.0f + j; }
+            }
+            gguf_add_tensor(g, means);
+        }
+        CHECK(gguf_write_to_file(g, path, false));
+        gguf_free(g);
+        ggml_free(ctx);
+        common_imatrix im;
+        const bool loaded = common_imatrix_load(path, im);
+        CHECK(loaded == (mode < 2));
+        if (loaded) {
+            const auto & e = im.entries.at("test.weight");
+            CHECK(e.counts == std::vector<int64_t>({ 2, 3 }));
+            CHECK(e.sums.size() == 8 && e.sums[7] == 17.0f);
+            CHECK(e.activations.size() == (mode == 1 ? 8 : 0));
+            if (mode == 1) { CHECK(e.activations[0] == -2.0f && e.activations[7] == 5.0f); }
+        }
+    }
+    std::remove(path);
+}
+
 static void test_hash_file() {
     const char * path = "test-quant-damage-hash.bin";
     {
@@ -559,6 +599,7 @@ int main() {
     test_imatrix_indexing();
     test_roundtrip_and_locality();
     test_gguf_reader();
+    test_imatrix_means();
     test_hash_file();
     test_tie_combine();
     test_certainty_rows();
