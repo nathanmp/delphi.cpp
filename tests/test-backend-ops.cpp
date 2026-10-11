@@ -4377,6 +4377,61 @@ struct test_dsv4_hc_comb : public test_dsv4_hc {
     }
 };
 
+// delphi: rms_norm, mul_mat, the weight chains, hc_comb and hc_pre of a hyper-connection boundary in one op
+struct test_dsv4_hc_mix : public test_dsv4_hc {
+    const ggml_type type_fn;
+    const int64_t   n_embd;
+    const int64_t   n_tokens;
+    const bool      norm;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DSV4_HC_MIX";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR4(type_fn, n_embd, n_tokens, norm);
+    }
+
+    test_dsv4_hc_mix(ggml_type type_fn = GGML_TYPE_F32, int64_t n_embd = 64, int64_t n_tokens = 5, bool norm = false)
+        : type_fn(type_fn), n_embd(n_embd), n_tokens(n_tokens), norm(norm) {}
+
+    // the mixes stay near the range of a trained model: no saturated sigmoid or softmax
+    void initialize_tensors(ggml_context * ctx) override {
+        test_dsv4_hc::initialize_tensors(ctx);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (std::string(ggml_get_name(t)) == "fn") {
+                const float r = 2.0f/sqrtf((float) t->ne[0]);
+                init_tensor_uniform(t, -r, r);
+            }
+        }
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * fn = ggml_new_tensor_2d(ctx, type_fn, hc*n_embd, (2 + hc)*hc);
+        ggml_set_name(fn, "fn");
+
+        ggml_tensor * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 3);
+        ggml_set_name(scale, "scale");
+
+        ggml_tensor * base = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (2 + hc)*hc);
+        ggml_set_name(base, "base");
+
+        ggml_tensor * norm_w = nullptr;
+        if (norm) {
+            norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd);
+            ggml_set_name(norm_w, "norm_w");
+        }
+
+        out = ggml_dsv4_hc_mix(ctx, x, fn, scale, base, norm_w, 1e-6f, 1e-6f, 20);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_dsv4_hc_pre : public test_dsv4_hc {
     const int64_t n_embd;
     const int64_t n_tokens;
@@ -9942,6 +9997,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_snake_fuse(type, {  64,  32, 2, 3}));   // ne[2] > 1 and ne[3] > 1
     }
 
+    for (ggml_type type_fn : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0}) {
+        for (int64_t n_tokens : {1, 3, 8, 33}) {
+            for (bool norm : {false, true}) {
+                test_cases.emplace_back(new test_dsv4_hc_mix(type_fn, 64, n_tokens, norm));
+            }
+        }
+        test_cases.emplace_back(new test_dsv4_hc_mix(type_fn, 4096, 4));
+        test_cases.emplace_back(new test_dsv4_hc_mix(type_fn, 4096, 4, true));
+    }
+    test_cases.emplace_back(new test_dsv4_hc_mix(GGML_TYPE_F32, 40, 2));       // 1 slice of 40 values in each stream
+    test_cases.emplace_back(new test_dsv4_hc_mix(GGML_TYPE_F32, 48, 3, true)); // 2 slices of 24
     test_cases.emplace_back(new test_dsv4_hc_comb(1, 1));
     test_cases.emplace_back(new test_dsv4_hc_comb(17, 4));
     test_cases.emplace_back(new test_dsv4_hc_comb(257, 8));
@@ -12110,6 +12176,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // overflow: n_tokens > K — only the last K snapshots kept.
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   8, 1, 1, false, false, /*K=*/3));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  16, 2, 1, false, false, /*K=*/4));
+    // KDA at head size 128 at verify widths, with and without snapshots.
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 128,  8, 1, 1, false, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 128, 16, 1, 1, false, true,  /*K=*/4));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 128, 17, 1, 1, false, true));
 
     // gdn + cache cpy fusion (K > 1)
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   2, 1, 2));
@@ -12171,6 +12241,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, mk.first, n_tokens, mk.second, {1, 1}, {1, 1}));
         }
     }
+    // GLM-5.3 hyper-connection boundary (fn Q8_0)
+    for (int n_tokens : {1, 4, 8}) {
+        test_cases.emplace_back(new test_dsv4_hc_mix(GGML_TYPE_Q8_0, 4096, n_tokens, true));
+    }
+
     // GLM-5.3 router (F32, 288 experts)
     for (int n_tokens : {1, 4, 6, 7, 8, 9, 12, 16}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 288, n_tokens, 4096, {1, 1}, {1, 1}));
@@ -12650,6 +12725,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));   // Qwen3.5-like: 32 heads, d=128
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 64,  1, 1));   // smaller model
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1, 1, false, true)); // KDA
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 64, 128, 1, 1, 1, false, true)); // GLM-5.3 KDA, verify widths
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 64, 128, 4, 1, 1, false, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 64, 128, 8, 1, 1, false, true));
     // PP: n_seq_tokens=64,256 (prompt processing)
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1));  // PP-64
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 256, 1)); // PP-256
