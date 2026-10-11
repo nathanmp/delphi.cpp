@@ -15,7 +15,7 @@ from model import classify, merge_imatrices, read_model, tensor_bytes
 from search import dominates, make_options, memory, pareto, search
 from quality import apply_quality, load_quality, repair_options, tensor_hash, verify_quality_output
 from timing import Predictor, digest, operation_times, regions, signature, token_counts
-from auto_quantize import tensor_plan, verify_output
+from auto_quantize import tensor_plan, verify_output, witness_choices
 import numpy as np
 from gguf import GGUFReader, GGUFWriter, GGMLQuantizationType
 
@@ -363,6 +363,22 @@ class RepairQuality(unittest.TestCase):
             write_json(config_path, changed)
             with self.assertRaises(QuantError):
                 load_config(config_path)
+
+    def test_uniform_witness_keeps_unmeasured_experts_and_dense_weights_at_floor(self):
+        group = self.table["groups"][1]
+        frozen = group["members"].pop()
+        for option in group["options"]:
+            del option["tensor_sha256"][frozen]
+            option["bytes"] = sum(tensor_bytes(self.table["floor"]["tensors"][n]["shape"], option["qtype"]) for n in group["members"])
+        model, table = self.load()
+        repair_options(model, table, {}, self.config)
+        baseline = {g["name"]: g["floor_qtype"] for g in model["groups"]}
+        choices = witness_choices(model, baseline, {"primary": "Q4_K", "other": "Q6_K"})
+        self.assertEqual(choices[frozen], "Q2_K")
+        self.assertEqual(choices["output.weight"], "F32")
+        self.assertEqual(choices["gate-up"], "Q4_K")
+        with self.assertRaises(QuantError):
+            witness_choices(model, baseline, {"overrides": {frozen: "Q4_K"}})
 
     def test_rejects_changed_imatrix_and_encoded_payload(self):
         imatrix = self.root / "imatrix.gguf"

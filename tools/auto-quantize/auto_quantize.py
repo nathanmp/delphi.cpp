@@ -259,6 +259,28 @@ def plan(data, cfg, output):
     return payload
 
 
+def witness_choices(info, baseline, spec):
+    choices = dict(baseline)
+    by_name = {t["name"]: t for t in info["tensors"]}
+    for group in info["groups"]:
+        # Category witnesses change calibrated groups only. Other floor tensors must stay fixed.
+        if "execution_groups" in info and "repair_options" not in group:
+            continue
+        selected = spec.get("primary" if any(by_name[n]["category"] == "primary" for n in group["members"]) else "other")
+        if selected and all(not by_name[n]["preserved"] for n in group["members"]):
+            selected = selected.upper()
+            if selected not in group["pool"]:
+                raise QuantError(f"witness selects unmeasured type {selected}: {group['name']}")
+            choices[group["name"]] = selected
+    for pattern, dtype in spec.get("overrides", {}).items():
+        for group in info["groups"]:
+            if re.search(pattern, group["name"]):
+                if dtype.upper() not in group["pool"]:
+                    raise QuantError(f"witness override is outside group pool: {group['name']}")
+                choices[group["name"]] = dtype.upper()
+    return choices
+
+
 def validate(data, cfg, specification, directory):
     directory = Path(directory).resolve()
     directory.mkdir(parents=True, exist_ok=True)
@@ -270,20 +292,7 @@ def validate(data, cfg, specification, directory):
         name = spec["name"]
         if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
             raise QuantError("validation names must be filename-safe")
-        choices = dict(data["baseline"]["choices"])
-        for group in data["model"]["groups"]:
-            selected = spec.get("primary" if any(t["category"] == "primary" for t in data["model"]["tensors"] if t["name"] in group["members"]) else "other")
-            if selected and all(not t["preserved"] for t in data["model"]["tensors"] if t["name"] in group["members"]):
-                selected = selected.upper()
-                if selected not in group["pool"]:
-                    raise QuantError(f"witness selects unmeasured type {selected}: {group['name']}")
-                choices[group["name"]] = selected
-        for pattern, dtype in spec.get("overrides", {}).items():
-            for group in data["model"]["groups"]:
-                if re.search(pattern, group["name"]):
-                    if dtype.upper() not in group["pool"]:
-                        raise QuantError(f"witness override is outside group pool: {group['name']}")
-                    choices[group["name"]] = dtype.upper()
+        choices = witness_choices(data["model"], data["baseline"]["choices"], spec)
         mem = memory(data["model"], cfg, choices)
         mix_key = digest(choices)
         if mix_key in seen_mixes:
