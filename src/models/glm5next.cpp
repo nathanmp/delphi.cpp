@@ -225,7 +225,8 @@ void llama_model_glm5next::load_arch_tensors(llama_model_loader & ml) {
             layer.ssm_v_conv = create_tensor(tn(LLM_TENSOR_SSM_CONV1D_V, "weight", il), {d_conv, 1, d_inner, 1}, flags);
 
             // delphi: q, k, v, the 3 conv weights, and f_a, g_a, beta are created one after the other, so that in one
-            // buffer they are adjacent and build_kda_layer can use each group as one tensor (glm5next_adjacent_rows)
+            // buffer they are adjacent and build_kda_layer can use each group as one tensor (glm5next_adjacent_rows); the
+            // gate and up weights of the FFNs are too (build_layer_ffn)
             layer.ssm_f_a  = create_tensor(tn(LLM_TENSOR_SSM_F_A,  "weight", il), {n_embd, head_dim}, flags);
             layer.ssm_g_a  = create_tensor(tn(LLM_TENSOR_SSM_G_A,  "weight", il), {n_embd, head_dim}, flags);
             layer.ssm_beta = create_tensor(tn(LLM_TENSOR_SSM_BETA, "weight", il), {n_embd, n_head}, flags);
@@ -857,14 +858,37 @@ ggml_tensor * llama_model_glm5next::graph::build_layer_attn(
     return build_dsa_layer(model.layers[il], inp_mem->get_attn(), inp_kp, scoring, cur, il);
 }
 
+// delphi: a SwiGLU FFN whose gate and up weights are adjacent (glm5next_adjacent_rows): one product for both, then the
+// activation of build_ffn on its two halves; nullptr when they are not adjacent
+static ggml_tensor * glm5next_ffn_adjacent(ggml_context * ctx, ggml_tensor * cur, ggml_tensor * gate, ggml_tensor * up,
+        ggml_tensor * down, float limit) {
+    ggml_tensor * w_gu = glm5next_adjacent_rows(ctx, {gate, up});
+    if (w_gu == nullptr || ggml_nrows(gate) != ggml_nrows(up)) {
+        return nullptr;
+    }
+    const int64_t n_ff = ggml_nrows(gate);
+    ggml_tensor * gu = ggml_mul_mat(ctx, w_gu, cur);
+    ggml_tensor * g  = ggml_view_2d(ctx, gu, n_ff, gu->ne[1], gu->nb[1], 0);
+    ggml_tensor * u  = ggml_view_2d(ctx, gu, n_ff, gu->ne[1], gu->nb[1], n_ff*ggml_element_size(gu));
+    ggml_tensor * act = limit > 1e-6f ? ggml_swiglu_clamp(ctx, g, u, limit) : ggml_swiglu_split(ctx, g, u);
+    return ggml_mul_mat(ctx, down, act);
+}
+
 ggml_tensor * llama_model_glm5next::graph::build_layer_ffn(
         const llama_model & model,
         ggml_tensor * cur,
         int il) const {
     const auto & layer = model.layers[il];
 
+    // build_ffn applies the LoRA adapters per weight; at 1 token MMVQ already fuses gate, up and the GLU
+    const bool  adjacent = loras->empty() && ggml_n_dims(cur) == 2 && cur->ne[1] > 1;
+    const float limit    = hparams.swiglu_clamp_shexp[il];
+
     // the leading dense layers clamp like the experts: one Glm5NextTextMLP serves both
     if (il < (int) hparams.n_layer_dense_lead) {
+        if (ggml_tensor * out = adjacent ? glm5next_ffn_adjacent(ctx0, cur, layer.ffn_gate, layer.ffn_up, layer.ffn_down, limit) : nullptr) {
+            return out;
+        }
         return build_ffn(cur,
                 layer.ffn_up,   nullptr, nullptr,
                 layer.ffn_gate, nullptr, nullptr,
@@ -885,11 +909,15 @@ ggml_tensor * llama_model_glm5next::graph::build_layer_ffn(
             (llama_expert_gating_func_type) hparams.expert_gating_func,
             il);
 
-    ggml_tensor * shexp = build_ffn(cur,
-            layer.ffn_up_shexp,   nullptr, nullptr,
-            layer.ffn_gate_shexp, nullptr, nullptr,
-            layer.ffn_down_shexp, nullptr, nullptr,
-            nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
+    ggml_tensor * shexp = adjacent ?
+        glm5next_ffn_adjacent(ctx0, cur, layer.ffn_gate_shexp, layer.ffn_up_shexp, layer.ffn_down_shexp, limit) : nullptr;
+    if (!shexp) {
+        shexp = build_ffn(cur,
+                layer.ffn_up_shexp,   nullptr, nullptr,
+                layer.ffn_gate_shexp, nullptr, nullptr,
+                layer.ffn_down_shexp, nullptr, nullptr,
+                nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
+    }
     cb(shexp, "ffn_shexp", il);
 
     // shared expert unscaled: routed_scaling_factor applies to the routed weights only
