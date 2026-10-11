@@ -12282,8 +12282,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // k-quants at verify widths (MMVQ or MMQ): mid and small matrices
     for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
         for (int n_tokens : {2, 3, 4, 5, 6, 8}) {
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 16384, n_tokens, 4096, {1, 1}, {1, 1}));
             test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 4096, n_tokens, 4096, {1, 1}, {1, 1}));
             test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 2048, n_tokens, 4096, {1, 1}, {1, 1}));
+        }
+    }
+
+    // dense GPU-resident weights by type (65536 x 4096, larger than the 64 MiB last-level cache of RDNA4): Q6_K against
+    // Q8_0 and the 4-5 bit types
+    for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_XS}) {
+        for (int n_tokens : {1, 2, 3, 4, 5, 6, 8, 16, 512}) {
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 65536, n_tokens, 4096, {1, 1}, {1, 1}));
         }
     }
 

@@ -2307,7 +2307,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_vec_q8_tc(ctx, src0, src1, dst);
         return;
     }
-    if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
+    if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11, src0->ne[1])) {
         ggml_exec_trace_dispatch(dst->op, GGML_EXEC_TRACE_DISPATCH_GPU_MMVQ,
                 GGML_EXEC_TRACE_DISPATCH_VARIANT_DEFAULT, cc, warp_size);
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
