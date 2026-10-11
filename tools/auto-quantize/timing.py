@@ -14,7 +14,7 @@ from config import ROOT, QuantError, digest, file_identity, write_json
 from model import tensor_bytes
 
 sys.path.insert(0, str(ROOT))
-from tools.bottlenecks.profile import BenchArm, Recipe, GPU_SETTING_KEYS, _gpu_state, run_recipe
+from tools.bottlenecks.profile import BenchArm, Recipe, ProfileError, GPU_SETTING_KEYS, _gpu_state, run_recipe
 
 MODEL_REVISION = 2
 
@@ -55,9 +55,13 @@ def profile_model(cfg, model, output, trace=True):
     environment = dict(r["env"])
     environment["LLAMA_MOE_CACHE_MIB"] = str(int(cfg["cache_mib"]))
     arm = BenchArm(name="plain", command=tuple(command), model_paths=(str(model),), env=environment,
-                   trace_mode="submit" if trace else "off", trace_prefill_target_tokens=r["long_tokens"])
+                   trace_mode="submit" if trace else "off", trace_max_events=r["trace_max_events"],
+                   trace_prefill_target_tokens=r["long_tokens"])
     recipe = Recipe(name="auto-quantize", description="Fixed V1 short/long prefill and decode with one model load.", arms=(arm,))
-    result = run_recipe(recipe, Path(output).with_suffix(".artifacts"))
+    try:
+        result = run_recipe(recipe, Path(output).with_suffix(".artifacts"))
+    except ProfileError as exc:
+        raise QuantError(str(exc)) from exc
     write_json(output, result)
     return result
 

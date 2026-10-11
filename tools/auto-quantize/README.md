@@ -74,6 +74,8 @@ CPU expert probes also set `numa_expert=1`. `--numa tensors` alone pins workers 
 
 `runtime.depth_tokens` sets the benchmark's existing context depth before each workload; default zero. KV types can use the benchmark's `-ctk`/`-ctv` options in `extra_args`. The benchmark derives its allocation from depth and workload lengths. Models with large lazy engram/per-layer embedding tables are explicitly unsupported until resident-byte accounting is added.
 
+`runtime.trace_max_events` sets the profiler trace capacity; default 1048576. Increase it for larger models or workloads if the profiler reports dropped events. A truncated trace is rejected rather than used for CPU calibration.
+
 ## Cache and multiple GPUs
 
 With RAM supplied, routed experts remain authoritative in RAM and dense weights stay on the first GPU. `cache_mib` enables the existing first-GPU expert cache; default zero. Cache group rounding, maps, device scratch and pinned refill buffers are counted. Backend allocator/repack overhead and unprovided runtime allowances still need runtime validation. Cache hit predictions currently use a uniform residency prior, not a measured temporal-policy replay; validate cache-enabled mixes separately. Partial cache paths have different fusion eligibility.

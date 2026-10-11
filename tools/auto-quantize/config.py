@@ -128,7 +128,7 @@ def load_config(path):
     runtime = cfg["runtime"]
     defaults = {"threads": 32, "depth_tokens": 0, "batch": 2048, "ubatch": 512, "short_tokens": 128,
                 "long_tokens": 4096, "decode_tokens": 256, "repetitions": 3,
-                "env": {}, "extra_args": []}
+                "trace_max_events": 1_048_576, "env": {}, "extra_args": []}
     if set(runtime) - set(defaults):
         raise QuantError(f"unknown runtime keys: {sorted(set(runtime) - set(defaults))}")
     for name, default in defaults.items():
@@ -139,6 +139,8 @@ def load_config(path):
                 raise QuantError(f"{name} must be an integer")
     if runtime["ubatch"] > runtime["batch"]:
         raise QuantError("ubatch must not exceed batch")
+    if runtime["trace_max_events"] > 128 * 1024 * 1024:
+        raise QuantError("trace_max_events exceeds the native tracer limit")
     protected = {"-m", "--model", "--device", "--numa", "-ngl", "--gpu-layers", "-cmoe", "--cpu-moe", "--port",
                  "-c", "--ctx-size", "-b", "--batch-size", "-ub", "--ubatch-size", "-t", "--threads", "--parallel",
                  "-p", "--n-prompt", "-n", "--n-gen", "-pg", "-r", "--repetitions", "-d", "--n-depth",
