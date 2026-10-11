@@ -80,7 +80,9 @@ static void concat_cont_cuda(const T * x,
 }
 
 // non-contiguous kernel (slow)
-template <typename T, int dim>
+// flat: rows shorter than a block (delphi: the conv input of the recurrent layers, 3 + n_tokens values per channel);
+// one thread per element, so a block does many rows. Else one block per row.
+template <typename T, int dim, bool flat>
 static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
     concat_non_cont(
         const char * src0,
@@ -103,7 +105,7 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
           uint64_t   nb12,
           uint64_t   nb13,
            int64_t   ne0,
-           int64_t /*ne1*/,
+           int64_t   ne1,
            int64_t /*ne2*/,
            int64_t /*ne3*/,
           uint64_t   nb0,
@@ -114,11 +116,16 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
 
     const int64_t i3 = blockIdx.z;
     const int64_t i2 = blockIdx.y;
-    const int64_t i1 = blockIdx.x;
+
+    const int64_t i_flat = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    const int64_t i1     = flat ? i_flat / ne0 : blockIdx.x;
+    const int64_t i0_beg = flat ? i_flat - i1*ne0 : threadIdx.x;
+    const int64_t i0_end = flat ? (i1 < ne1 ? i0_beg + 1 : i0_beg) : ne0;
+    const int64_t i0_inc = flat ? 1 : blockDim.x;
 
     const T * x;
 
-    for (int64_t i0 = threadIdx.x; i0 < ne0; i0 += blockDim.x) {
+    for (int64_t i0 = i0_beg; i0 < i0_end; i0 += i0_inc) {
         if (i0 < ne00 && i1 < ne01 && i2 < ne02 && i3 < ne03) {
             x = (const T *)(src0 + i3*nb03 + i2*nb02 + i1*nb01 + i0*nb00);
         } else {
@@ -163,9 +170,11 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
     } else {
         GGML_ASSERT(!ggml_is_quantized(src0->type));
 
-        dim3 grid_dim(dst->ne[1], dst->ne[2], dst->ne[3]);
+        const bool flat = dst->ne[0] < CUDA_CONCAT_BLOCK_SIZE;
+        const dim3 grid_dim(flat ? (dst->ne[0]*dst->ne[1] + CUDA_CONCAT_BLOCK_SIZE - 1)/CUDA_CONCAT_BLOCK_SIZE : dst->ne[1], dst->ne[2], dst->ne[3]);
         auto launch_kernel = [&](auto dim) {
-            concat_non_cont<T, dim><<<grid_dim, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(
+            auto kernel = flat ? concat_non_cont<T, dim, true> : concat_non_cont<T, dim, false>;
+            kernel<<<grid_dim, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(
                 (const char *) src0->data, (const char *) src1->data, (char *) dst->data,
                 src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
                 src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
