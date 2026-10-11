@@ -12275,6 +12275,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int n_tokens : {1, 4, 6, 7, 8, 9, 12, 16}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 288, n_tokens, 4096, {1, 1}, {1, 1}));
     }
+    // GLM-5.3 output head (Q6_K, 154880 x 4096): all positions of a speculative verify need logits
+    for (int n_tokens : {1, 2, 3, 4, 5, 6, 8, 9, 16}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 154880, n_tokens, 4096, {1, 1}, {1, 1}));
+    }
+    // k-quants at verify widths (MMVQ or MMQ): mid and small matrices
+    for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+        for (int n_tokens : {2, 3, 4, 5, 6, 8}) {
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 4096, n_tokens, 4096, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 2048, n_tokens, 4096, {1, 1}, {1, 1}));
+        }
+    }
+
     // GLM-5.3 KDA low-rank gates: f_b, g_b (8192 x 128)
     for (int n_tokens : {1, 2, 4, 8, 9, 16}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, n_tokens, 128, {1, 1}, {1, 1}));
