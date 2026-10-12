@@ -181,10 +181,6 @@ struct perplexity_hotswap::impl {
                     buft != ggml_backend_dev_host_buffer_type(device) && !is_numa)) {
                     throw std::runtime_error("split or repacked buffer unsupported: " + name);
                 }
-                if (original.type == GGML_TYPE_NVFP4 || disk->type == GGML_TYPE_NVFP4 ||
-                    original.type == GGML_TYPE_Q4_G128 || disk->type == GGML_TYPE_Q4_G128) {
-                    throw std::runtime_error("scaled or upload-transformed format unsupported: " + name);
-                }
                 ggml_context_ptr ctx(ggml_init({ ggml_tensor_overhead(), nullptr, true }));
                 ggml_tensor * replacement = ggml_new_tensor(ctx.get(), disk->type, GGML_MAX_DIMS, disk->ne);
                 replacement->flags = original.flags;
