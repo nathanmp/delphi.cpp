@@ -2284,7 +2284,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         return build_moe_ffn_split(cur, up_exps, gate_exps, down_exps, selected_experts, weights, n_expert, il);
     }
 
-    if (expert_cache && expert_cache->active() && ubatch.n_tokens <= llama_expert_cache::max_rows && expert_cache->layer(il) &&
+    if (expert_cache && expert_cache->active() && ubatch.n_tokens <= expert_cache->graph_rows() && expert_cache->layer(il) &&
             type_op == LLM_FFN_SILU && !weight_before_ffn && !gate_up_exps &&
             !up_exps_s && !gate_exps_s && !down_exps_s && !up_exps_b && !gate_exps_b && !down_exps_b &&
             (loras == nullptr || loras->empty())) {
@@ -2541,11 +2541,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn_cache(
     // carries the routing weights, so that GPU gets all of its inputs in one copy.
     const int64_t nx = ggml_nelements(cur);
     const int64_t ni = ggml_nelements(ids);
+    // A prompt batch (graph_rows()) reduces every part where it runs: each GPU part is then one complete routed FFN that the
+    // backend fuses into its batch kernels, and the CPU part sends [n_embd, n_tokens] instead of every expert slot. The CPU
+    // then needs the routing weights, so the packet carries them.
+    const bool prompt = ids->ne[1] > llama_expert_cache::max_rows;
     auto * fids = ggml_cast(ctx0, flat, GGML_TYPE_F32);
     name(fids, "packet_ids", false);
     auto * packet = ggml_concat(ctx0, ggml_reshape_1d(ctx0, ggml_cont(ctx0, cur), nx), fids, 0);
     name(packet, "packet_src", false);
-    if (any_remote) {
+    if (any_remote || prompt) {
         auto * w = ggml_is_contiguous(weights) ? weights : ggml_cont(ctx0, weights);
         packet = ggml_concat(ctx0, packet, ggml_reshape_1d(ctx0, w, ggml_nelements(w)), 0);
         name(packet, "packet_src", false);
@@ -2615,7 +2619,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn_cache(
     for (const auto & [t, hot] : hots) {
         const int tier = t;
         const labeler label = [&, tier](ggml_tensor * x, const char * l) { name_tier(x, tier, l); };
-        local.push_back(part(cur, hot, expert_cache->bank(t, il, 0), expert_cache->bank(t, il, 1), expert_cache->bank(t, il, 2), label));
+        auto * d = part(cur, hot, expert_cache->bank(t, il, 0), expert_cache->bank(t, il, 1), expert_cache->bank(t, il, 2), label);
+        (prompt ? remote : local).push_back(prompt ? reduce(d, weights, label) : d);
     }
     for (int t = 0; t < expert_cache->n_tiers(); ++t) {
         auto * map = expert_cache->hot_ids(t, il);
@@ -2629,12 +2634,20 @@ ggml_tensor * llm_graph_context::build_moe_ffn_cache(
         remote.push_back(reduce(d, remote_input(t).weights, label));
     }
     auto * experts = part(cx, ci, gate, up, down, [&](ggml_tensor * x, const char * l) { name(x, l, true); });
-    // Merge the per-expert outputs on the GPU (the first local tier first, as before tiers existed).
-    for (auto * d : local) {
-        experts = ggml_add(ctx0, d, experts);
-        name(experts, "merge", false);
+    ggml_tensor * out = nullptr;
+    if (prompt) {
+        auto * cw = ggml_view_3d(ctx0, input, weights->ne[0], weights->ne[1], weights->ne[2], weights->ne[0] * sizeof(float),
+                weights->ne[0] * weights->ne[1] * sizeof(float), (nx + ni) * sizeof(float));
+        name(cw, "weights", true);
+        out = reduce(experts, cw, [&](ggml_tensor * x, const char * l) { name(x, l, true); });
+    } else {
+        // Merge the per-expert outputs on the GPU (the first local tier first, as before tiers existed).
+        for (auto * d : local) {
+            experts = ggml_add(ctx0, d, experts);
+            name(experts, "merge", false);
+        }
+        out = reduce(experts, weights, [&](ggml_tensor * x, const char * l) { name(x, l, false); });
     }
-    ggml_tensor * out = reduce(experts, weights, [&](ggml_tensor * x, const char * l) { name(x, l, false); });
     for (auto * r : remote) {
         out = ggml_add(ctx0, out, r);
         name(out, "remote", false);

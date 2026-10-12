@@ -20,8 +20,12 @@ struct llama_model;
 // that left it. A prompt that streams experts (GGML_SCHED_STAGE=1) borrows the top of the largest tier on each staging GPU for
 // the staging ring; the refresh after the prompt fills it again.
 struct llama_expert_cache {
-    // Batches with more rows use the original routed experts (and only record their routing).
+    // Batches with more rows are prompt batches: they use the original routed experts (and only record their routing), unless
+    // they have at most graph_rows() rows.
     static constexpr int64_t max_rows = 16;
+    // Most rows of a batch that runs the cache graph. LLAMA_MOE_CACHE_PROMPT_ROWS raises it above max_rows, so that prompt
+    // batches the CPU runs (below GGML_SCHED_STAGE_MIN_TOKENS) also run their hot experts on the GPU beside the CPU part.
+    int64_t graph_rows() const { return std::max(max_rows, prompt_rows); }
     // run-time tiers; each adds a partial expert pass per layer to the graph
     static constexpr int max_tiers = 8;
 
@@ -143,6 +147,8 @@ private:
 
     int64_t window = 256;      // rows; 0 keeps every row, negative never refreshes
     bool record_prompts = true;
+    int64_t prompt_rows = 0;   // LLAMA_MOE_CACHE_PROMPT_ROWS, see graph_rows()
+    int64_t prompt_hit_sel = 0, prompt_all_sel = 0;
     double hysteresis = 1.0;   // score bonus of a resident expert
     int64_t every = 8;         // small batches between decode-time refreshes; 0 refreshes only after prompts
     int64_t max_async = 32;    // experts per decode-time refresh (device scratch and pinned buffer: 3 slabs each)
