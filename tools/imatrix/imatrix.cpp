@@ -83,7 +83,6 @@ private:
     int32_t                                m_last_chunk = 0;
     std::vector<char>                      m_src1_data;
     std::vector<char>                      m_ids; // the expert ids from ggml_mul_mat_id
-    bool                                   m_collect_means = false;
 };
 
 // remove any prefix and suffixes from the name
