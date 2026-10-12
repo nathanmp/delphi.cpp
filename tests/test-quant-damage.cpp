@@ -521,7 +521,9 @@ static void test_certainty_rows() {
     fprintf(stderr, "  hot rows hold %.1f%% of D\n", 100.0 * Dhot / Dtot);
     CHECK(Dhot > 0.15 * Dtot);
 
-    double max_err_on = 0.0, max_err_off = 0.0;
+    // the remaining error is the sampling error of the ordinary rows; the imatrix-aware MXFP4 exponent search makes their
+    // damage more variable, so check it against the reported standard error as well as a loose absolute bound
+    double max_err_on = 0.0, max_err_off = 0.0, max_z_on = 0.0;
     for (int s = 0; s < 8; ++s) {
         p.seed = 200 + s;
         p.certainty_factor = 8.0;
@@ -532,9 +534,11 @@ static void test_certainty_rows() {
         const double eoff = std::fabs(off.types[0].weighted[0].rel.value - x) / x;
         max_err_on = std::max(max_err_on, eon);
         max_err_off = std::max(max_err_off, eoff);
+        max_z_on = std::max(max_z_on, std::fabs(on.types[0].weighted[0].rel.value - x) / on.types[0].weighted[0].rel.se);
     }
-    fprintf(stderr, "  certainty rows: worst error %.3f%% on, %.1f%% off\n", max_err_on*100.0, max_err_off*100.0);
-    CHECK(max_err_on < 0.03);
+    fprintf(stderr, "  certainty rows: worst error %.3f%% on (%.2f s.e.), %.1f%% off\n", max_err_on*100.0, max_z_on, max_err_off*100.0);
+    CHECK(max_err_on < 0.06);
+    CHECK(max_z_on < 4.0);
     CHECK(max_err_off > 0.10);
 }
 
