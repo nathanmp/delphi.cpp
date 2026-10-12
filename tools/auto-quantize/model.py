@@ -45,7 +45,8 @@ def read_model(path):
         paths = [Path(f"{match[1]}-{i:05d}-of-{count:05d}.gguf") for i in range(1, count + 1)]
     arch = field("general.architecture")
     info = {"architecture": arch, "n_expert": int(field(f"{arch}.expert_count", 0)),
-            "top_k": int(field(f"{arch}.expert_used_count", 1)), "tensors": [], "files": []}
+            "top_k": int(field(f"{arch}.expert_used_count", 1)), "n_layer": int(field(f"{arch}.block_count", 0)),
+            "nextn": int(field(f"{arch}.nextn_predict_layers", 0)), "tensors": [], "files": []}
     seen = set()
     for index, p in enumerate(paths):
         reader = first if index == 0 else GGUFReader(p)
@@ -84,6 +85,8 @@ def classify(info, cfg):
         t["category"] = "primary" if primary else "other"
         t["expert"] = bool(re.search(r"\.ffn_(gate|up|down|gate_up)_exps\.weight$", name))
         t["layer"] = int(re.match(r"blk\.([0-9]+)\.", name)[1]) if name.startswith("blk.") else -1
+        # Multi-token-prediction layers follow the main layers; perplexity and the main decode path do not run them.
+        t["mtp"] = info.get("nextn", 0) > 0 and t["layer"] >= info["n_layer"] - info["nextn"]
         preserve = (len(shape) < 2 or not name.endswith("weight") or t["source_bytes"] < cfg["preserve_below_mib"] * (1 << 20)
                     or any(part in name for part in PRESERVE)
                     or (info["architecture"] == "glm5next" and any(part in name for part in GLM_PRESERVE))

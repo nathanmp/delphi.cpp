@@ -1,10 +1,11 @@
-"""Independent memory constraints and deterministic bounded Pareto search."""
+"""Independent memory constraints and a knapsack search over the precision/speed trade-off."""
 from __future__ import annotations
 
 import math
 from collections import defaultdict
 
 from config import AXES, QuantError
+from knapsack import solve
 from model import tensor_bytes
 from timing import gpu, requires_backend_signature
 
@@ -125,27 +126,58 @@ def pareto(states):
     return result
 
 
-def search(info, cfg, predictor, baseline_choices):
-    groups = info["groups"]
-    options = [{o["qtype"]: o for o in group["options"]} for group in groups]
-    baseline = tuple(baseline_choices[group["name"]] for group in groups)
-    minimum = tuple(min(o.values(), key=lambda x: (x["bytes"], x["damage"], x["qtype"]))["qtype"] for o in options)
-    quality = tuple(min(o.values(), key=lambda x: (x["damage"], x["bytes"], x["qtype"]))["qtype"] for o in options)
-    baseline_damage = sum(o[q]["damage"] for o, q in zip(options, baseline))
-    reference = [baseline_damage or sum(o[q]["damage"] for o, q in zip(options, minimum)) or 1.0,
-                 *[predictor.measured[regime] for regime in AXES[1:]]]
-    weights = [cfg["importance"][axis] for axis in AXES]
-    evaluated, feasible, rejected, frontier = {}, [], defaultdict(int), []
-    cap = cfg["search"]["evaluations"]
+def device_of(info, cfg, group):
+    by_name = {t["name"]: t for t in info["tensors"]}
+    return "RAM" if by_name[group["members"][0]]["expert"] and "RAM" in cfg["devices"] else gpu(cfg)
 
-    def evaluate(key):
+
+def search(info, cfg, predictor, baseline_choices, model=None):
+    """Recipes on the precision/speed trade-off within the device budgets.
+
+    Loss is the predicted KL of the quality model, or the summed local error without one. Both are separable over
+    groups (the model at a fixed composition point), and so are the anchored time predictions without an expert cache.
+    For each loss multiplier theta, an exact multiple-choice knapsack per device minimizes
+    theta * loss / loss_ref + sum_regime importance * time / time_ref; theta = the precision importance is the linearized
+    score. A sweep of theta gives the supported points, walks between neighbouring solutions add the recipes between
+    them, and bisection finds the edges of the bounds. Every candidate is then evaluated exactly."""
+    groups = info["groups"]
+    options = {g["name"]: {o["qtype"]: o for o in g["options"]} for g in groups}
+    baseline_memory = memory(info, cfg, baseline_choices)
+    placement = {g["name"]: device_of(info, cfg, g) for g in groups}
+    budgets = {d: baseline_memory["headroom_bytes"][d] + sum(options[n][baseline_choices[n]]["bytes"]
+                                                             for n, dev in placement.items() if dev == d)
+               for d in cfg["devices"]}
+    costs = predictor.group_costs()
+    multi = sum(name != "RAM" for name in cfg["devices"]) > 1
+    scale = {r: predictor.slopes[r] / ((1 + cfg["multi_gpu_speedup_percent"][r] / 100) if multi else 1) for r in AXES[1:]}
+    weights = cfg["importance"]
+
+    # MTP layers do not run in the main model; the local metric ignores them too, so they stay at the floor
+    by_name = {t["name"]: t for t in info["tensors"]}
+    mtp = {g["name"] for g in groups if any(by_name[n].get("mtp") for n in g["members"])}
+
+    def local(n, q):
+        return 0.0 if n in mtp else options[n][q]["damage"]
+
+    def loss_of(choices):
+        if model is not None:
+            return model.predict(choices)["loss"]
+        return sum(local(n, q) for n, q in choices.items())
+
+    loss_ref = loss_of(baseline_choices) or 1.0
+    reference = [loss_ref, *[predictor.measured[regime] for regime in AXES[1:]]]
+    time_terms = {n: {q: sum(weights[r] * scale[r] * costs[n][q][r] / predictor.measured[r] for r in AXES[1:])
+                      if n in costs else 0.0 for q in options[n]} for n in options}
+    bounds = cfg["bounds"]
+    loss_bound = "max_loss" if model is not None else "max_damage"
+    evaluated, feasible, rejected, frontier = {}, [], defaultdict(int), []
+
+    def evaluate(choices):
         nonlocal frontier
+        key = tuple(choices[g["name"]] for g in groups)
         if key in evaluated:
             return evaluated[key]
-        if len(evaluated) >= cap:
-            return None
         evaluated[key] = None
-        choices = {group["name"]: q for group, q in zip(groups, key)}
         try:
             mem = memory(info, cfg, choices)
             if any(value < 0 for value in mem["headroom_bytes"].values()):
@@ -155,92 +187,106 @@ def search(info, cfg, predictor, baseline_choices):
         except QuantError as exc:
             rejected[str(exc)] += 1
             return None
-        error = sum(o[q]["damage"] for o, q in zip(options, key))
-        axes = [error, *[times[regime] for regime in AXES[1:]]]
-        bounds = cfg["bounds"]
+        loss = loss_of(choices)
+        axes = [loss, *[times[regime] for regime in AXES[1:]]]
         violation = 0.0
-        loss_bound = "max_loss" if "quality" in cfg else "max_damage"
-        if error > bounds.get(loss_bound, math.inf):
-            rejected["loss_bound" if "quality" in cfg else "damage_bound"] += 1
-            violation += error / max(bounds[loss_bound], 1e-12) - 1
+        if loss > bounds.get(loss_bound, math.inf):
+            rejected["loss_bound" if model is not None else "damage_bound"] += 1
+            violation += loss / max(bounds[loss_bound], 1e-12) - 1
         for regime in AXES[1:]:
             rate = 1000 / times[regime] * (1 if regime == "decode" else cfg["runtime"][f"{regime}_tokens"])
             if rate < bounds.get(f"min_{regime}_t_s", 0):
                 rejected["speed_bound"] += 1
                 violation += bounds[f"min_{regime}_t_s"] / rate - 1
-        state = {"key": key, "choices": choices, "axes": axes, "damage": error,
-                 "sampling_se": (math.sqrt(sum(o[q]["sampling_se"] ** 2 for o, q in zip(options, key)))
-                                 if all(o[q]["sampling_se"] is not None for o, q in zip(options, key)) else None),
+        state = {"key": key, "choices": dict(choices), "axes": axes, "loss": loss,
+                 "damage": sum(options[n][q]["damage"] for n, q in choices.items()),
+                 "sampling_se": (math.sqrt(sum(options[n][q]["sampling_se"] ** 2 for n, q in choices.items()))
+                                 if all(options[n][q]["sampling_se"] is not None for n, q in choices.items()) else None),
                  "predicted_ms": times, "memory": mem,
-                 "score": sum(w * value / scale for w, value, scale in zip(weights, axes, reference)),
+                 "score": sum(w * value / s for w, value, s in zip([weights[a] for a in AXES], axes, reference)),
                  "constraint_violation": violation}
-        if "quality" in cfg:
-            state["loss"] = error
+        if model is not None:
+            state["composition_u"] = model.predict(choices)["u"]
         evaluated[key] = state
         if violation == 0:
             feasible.append(state)
             frontier = pareto([*frontier, state])
         return state
 
-    # Uniform category mixes keep a small search cap from returning only neighbors of the two extremes.
-    by_name = {t["name"]: t for t in info["tensors"]}
-    seeds = [minimum, baseline, quality]
-    primary_types = sorted({q for g in groups if any(by_name[n]["category"] == "primary" for n in g["members"]) for q in g["pool"]})
-    other_types = sorted({q for g in groups if any(by_name[n]["category"] == "other" and not by_name[n]["preserved"] for n in g["members"])
-                          for q in g["pool"]})
-    for primary in primary_types:
-        for other in other_types or [None]:
-            seed = list(minimum)
-            for i, group in enumerate(groups):
-                dtype = primary if any(by_name[n]["category"] == "primary" for n in group["members"]) else other
-                if dtype in options[i]:
-                    seed[i] = dtype
-            seeds.append(tuple(seed))
-    beam = [state for key in dict.fromkeys(seeds) if (state := evaluate(key)) is not None]
-    expanded = set()
-    while beam and len(evaluated) < cap:
-        new = []
-        for state in beam:
-            key = state["key"]
-            if key in expanded:
-                continue
-            expanded.add(key)
-            moves = []
-            for i, option in enumerate(options):
-                for q in sorted(option):
-                    if q != key[i]:
-                        changed = list(key)
-                        changed[i] = q
-                        moves.append(tuple(changed))
-            # A budget-neutral swap can reach a state behind an infeasible one-tensor upgrade.
-            upgrades, downgrades = [], []
-            for i, option in enumerate(options):
-                for q, value in option.items():
-                    delta = value["bytes"] - option[key[i]]["bytes"]
-                    if delta > 0:
-                        upgrades.append((i, q, delta))
-                    elif delta < 0:
-                        downgrades.append((i, q, delta))
-            for i, q, delta in upgrades[:64]:
-                for j, qj, dj in downgrades[:64]:
-                    if i != j and delta + dj <= 0:
-                        changed = list(key)
-                        changed[i], changed[j] = q, qj
-                        moves.append(tuple(changed))
-            for key in moves:
-                if len(evaluated) >= cap:
-                    break
-                if (value := evaluate(key)) is not None:
-                    new.append(value)
-        candidates = {state["key"]: state for state in [*new, *frontier] if state["key"] not in expanded}
-        if not candidates:
-            break
-        candidates = list(candidates.values())
-        winners = [min(candidates, key=lambda s: (s["constraint_violation"], s["axes"][axis], s["score"], s["key"])) for axis in range(4)]
-        winners.extend(sorted(candidates, key=lambda s: (s["constraint_violation"], s["score"], s["key"]))[:cfg["search"]["beam"]])
-        beam = list({state["key"]: state for state in winners}.values())[:cfg["search"]["beam"]]
-    minimum_memory = memory(info, cfg, {g["name"]: q for g, q in zip(groups, minimum)})
+    def solve_for(theta):
+        """Knapsack recipe for a loss multiplier; the model's composition point is iterated to a fixed point."""
+        marginal, previous = 1.0, None
+        for _ in range(8):
+            picked = {}
+            for device, budget in budgets.items():
+                names = [n for n, d in placement.items() if d == device]
+                if not names:
+                    continue
+                table = {}
+                for n in names:
+                    table[n] = []
+                    for q, o in options[n].items():
+                        if model is not None:
+                            loss = -model.kl_floor * marginal * model.gain(n, q)
+                        else:
+                            loss = local(n, q)
+                        # a byte tie-breaker keeps groups without a gain or time difference at the smaller type
+                        table[n].append((o["bytes"], theta * loss / loss_ref + time_terms[n][q] + 1e-9 * o["bytes"] / max(1, budget), q))
+                result = solve(table, budget)
+                if result is None:
+                    return None
+                picked.update(result[0])
+            if model is None or picked == previous:
+                return picked
+            previous = picked
+            marginal = model.marginal(model.predict(picked)["u"])
+        return picked
+
+    def separable(n, q, marginal):
+        if model is not None:
+            return -model.kl_floor * marginal * model.gain(n, q) / loss_ref
+        return local(n, q) / loss_ref
+
+    thetas = sorted({0.0, weights["precision"], *(2.0 ** k for k in range(-10, 11))})
+    states = []
+    for theta in thetas:
+        choices = solve_for(theta)
+        states.append((theta, evaluate(choices) if choices is not None else None))
+    # Sweep solutions are the supported points of the trade-off only. Walk from each solution to the next one group at
+    # a time, most loss reduction per unit of time first, so recipes between them are also evaluated.
+    solved = [s for _, s in states if s is not None]
+    for a, b in zip(solved, solved[1:]):
+        marginal = model.marginal(model.predict(a["choices"])["u"]) if model is not None else 1.0
+        changes = []
+        for n, q in b["choices"].items():
+            p = a["choices"][n]
+            if p != q:
+                dl = separable(n, q, marginal) - separable(n, p, marginal)
+                dt = time_terms[n][q] - time_terms[n][p]
+                changes.append((dl / dt if dt > 1e-15 else -math.inf if dl < 0 else math.inf, n, q))
+        current = dict(a["choices"])
+        for _, n, q in sorted(changes)[:-1]:
+            current[n] = q
+            evaluate(current)
+    # The loss decreases and the time increases with theta, so each bound has one edge on the sweep.
+    for (t0, s0), (t1, s1) in zip(states, states[1:]):
+        if s0 is None or s1 is None or (s0["constraint_violation"] == 0) == (s1["constraint_violation"] == 0):
+            continue
+        lo, hi, ok_hi = t0, t1, s1["constraint_violation"] == 0
+        for _ in range(12):
+            mid = (lo + hi) / 2 if lo > 0 else hi / 2
+            choices = solve_for(mid)
+            state = evaluate(choices) if choices is not None else None
+            if state is None:
+                break
+            if (state["constraint_violation"] == 0) == ok_hi:
+                hi = mid
+            else:
+                lo = mid
+    minimum = {g["name"]: min(options[g["name"]].values(), key=lambda o: (o["bytes"], o["damage"], o["qtype"]))["qtype"] for g in groups}
+    minimum_memory = memory(info, cfg, minimum)
     infeasible_minimum = any(value < 0 for value in minimum_memory["headroom_bytes"].values()) and not cfg["cache_mib"]
     return {"frontier": sorted(frontier, key=lambda s: (s["score"], s["key"])), "evaluated": len(evaluated),
-            "feasible": len(feasible), "rejected": dict(rejected), "cap_reached": len(evaluated) >= cap,
-            "reference_scales": reference, "status": "ok" if frontier else ("infeasible_minimum_bytes" if infeasible_minimum else "search_exhausted")}
+            "feasible": len(feasible), "rejected": dict(rejected), "cap_reached": False,
+            "budgets_bytes": budgets, "reference_scales": reference,
+            "status": "ok" if frontier else ("infeasible_minimum_bytes" if infeasible_minimum else "no_feasible_recipe")}

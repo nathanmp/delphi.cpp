@@ -1,6 +1,6 @@
-# Offline auto-quantizer V1
+# Offline auto-quantizer
 
-`auto_quantize.py` chooses tensor qtypes under independent usable GPU/RAM budgets. It reuses `llama-quant-damage`, `test-backend-ops` and the bottleneck profiler. The damage objective is a sum of local source-relative errors; it is not predicted KLD or accuracy. Speed starts from a measured full-model baseline and measured operation signatures. Predictions remain marked unqualified until held-out validation passes.
+`auto_quantize.py` chooses tensor qtypes under independent usable GPU/RAM budgets. It starts from the minimum-byte floor recipe and spends the budget on upgrades. It reuses `llama-quant-damage`, `test-backend-ops`, `llama-perplexity` (with tensor hotswap) and the bottleneck profiler. With a calibrated quality table, the loss is the predicted KL against teacher logits of the source model. Without a table, the loss is a sum of local source-relative errors, which is a proxy only. Speed starts from a measured full-model baseline and measured operation signatures. Predictions remain marked unqualified until held-out validation passes.
 
 Run with a Python environment that has the repository's `gguf-py` package installed. Build `llama-quant-damage`, `llama-quantize`, `llama-bench` and `test-backend-ops`, plus the required device backend. Use a dedicated build directory.
 
@@ -37,23 +37,50 @@ Multiple GGUF imatrices merge raw sums/counts. A single legacy matrix is accepte
 
 `sampling` accepts `samples`, `max_samples`, `seed` and `row_stats`. The default estimator reads each selected tensor once for row statistics. Set `row_stats: false` to sample without that pass, with the estimator's documented accuracy limitations.
 
-`search` accepts `beam`, `evaluations` and `display`. `bounds` accepts `max_damage`, `min_decode_t_s`, `min_short_t_s` and `min_long_t_s`. Speed bounds constrain predictions. The JSON retains all nondominated evaluated recipes even when the console display is capped. Search is bounded and does not guarantee the global frontier.
+`search` accepts `display`. `bounds` accepts `max_loss` (with a quality table), `max_damage` (without one), `min_decode_t_s`, `min_short_t_s` and `min_long_t_s`. Speed bounds constrain predictions. The JSON retains all nondominated evaluated recipes even when the console display is capped.
 
-## Experimental repair quality
+The search uses the fact that loss and time are sums over groups (the loss at a fixed composition point, the time without an expert cache). For a loss multiplier theta, an exact multiple-choice knapsack per device minimizes `theta * loss / loss_floor + sum(importance * time / time_baseline)` within the byte budget of that device. A sweep of theta gives the supported points of the trade-off. Walks between neighbouring sweep solutions add recipes between them, and bisection finds the edges of the bounds. Every candidate is then evaluated with the full memory and timing models. The cost does not depend on the number of candidate qtypes beyond the knapsack table size.
 
-Set `"quality": {"table": "repair-table.json"}` to replace local damage with the sum of measured conditional repair KL values. Use `"bounds": {"max_loss": 0.09}` for a ceiling in those proxy units. `max_damage` and `max_loss` apply to different metrics and cannot be interchanged. Repair loss is not a bound on original-relative KLD or a task-accuracy percentage.
+## Calibrated quality
 
-The table uses `delphi.floor-quality/2` and `method: sum_conditional_repair_kl`. It contains content identities for every source shard and imatrix, a complete floor tensor manifest, the quality execution policy, and non-overlapping measured groups. Each option records its qtype, exact bytes, mean and per-chunk losses, and the SHA256 of every member tensor payload. Source/imatrix records use `bytes` and `sha256`; the floor also supplies its GGUF `path` and a `tensors` map with `shape`, `qtype`, `bytes` and `sha256`. `execution` records the first `gpu`, `ram_routed` placement, `numa: tensors`, and the calibration command/environment. Draft `/1` tables lack these checks and require export to `/2`.
+The quality model predicts the KL of a recipe against teacher logits of the source model, relative to the floor recipe. Per decision group g with role r (routed or dense gate/up, down, shared experts, attention, other kinds) at depth x:
 
-Prepare reuses the supplied floor and skips local-error sampling. All source, floor and imatrix identities must match. The floor qtype must be an allowed minimum-byte option for each measured group. Unmeasured tensors stay at their recorded floor types; the tool does not combine uncalibrated local scores with repair scores. The category pools, preservation rules and pins must permit that fixed floor. Search changes whole measured groups, while timing keeps the per-layer gate/up pairs. Final encoding verifies every tensor payload against the calibration identities, including unchanged tensors.
+```text
+gain_g(q) = s_r(x) * (R_g(floor)^gamma_r - R_g(q)^gamma_r),   s_r(x) = exp(a0 + a1 x + a2 x^2)
+G = sum_g gain_g(q_g),   u = G / G_full,   KL = KL_floor * (1 - kappa(u) G),   kappa(u) = 1 + (kinf - 1)(1 - exp(-u / u0))
+```
 
-CPU-expert/GPU-dense placement is supported. A table collected with GPU-resident experts cannot be used for RAM-routed planning, or the reverse. Scores apply to the recorded quality execution policy; different prefill offload, kernel or cache paths need quality validation. The independent speed profiler retains its configured execution policy. Repair tables do not yet support an expert cache. The table provider remains opt-in and experimental; the default local metric is unchanged.
+R is the sampled local relative error of `llama-quant-damage`, summed over the group members. Qtypes enter only through R. A qtype that the calibration did not probe needs no extra passes: prepare samples its R and the table predicts its KL. kappa describes the measured super-additive composition of upgrades. MTP layers do not affect the main-model KL; they stay at the floor unless `pins` set them.
+
+Calibrate after prepare. Calibration requires an imatrix: without activation statistics, R is a weight-space error, and it misranks layers inside a band (OLMoE-1B-7B without an imatrix: chi2/dof 8.6).
+
+```json
+"calibration": {"text": "/data/calibration.txt", "chunks": 64, "context": 512}
+```
+
+```sh
+python tools/auto-quantize/auto_quantize.py calibrate --config config.json --prepared /tmp/autoq-prepared/prepared.json --output /tmp/autoq-quality
+```
+
+The command:
+
+1. Computes teacher logits from the source model with `llama-perplexity --kl-divergence-base`, unless `calibration.teacher` names an existing file. With RAM-routed experts, it keeps experts in RAM (`-cmoe`) and uses a batch of 16 chunks (`calibration.batch` overrides), so the source does not need to fit in VRAM. Set `GGML_SCHED_STAGE=1` in `runtime.env` to stream the experts to the GPU once per batch.
+2. Selects two probe qtypes from the sampled damage: top (smallest local error) and mid (error nearest the geometric mean of the floor and top errors). `calibration.probe_qtypes` overrides them as `[mid, top]`. It encodes two probe models (all modelled groups at the probe qtype, the rest at the floor).
+3. Measures the probes in persistent hotswap sessions on the floor model, paired with the floor on the same tokens: per role, `bands` contiguous layer bands (default 10) upgraded to top and to mid; `recipes - 2` random mixed recipes (default 8 in total); and the two probe models as uniform recipes. This is `2 x bands x roles + recipes` passes, independent of the number of candidate qtypes and of the layer count. Each session has recompute and restore controls that must reproduce the floor bitwise.
+4. Fits the parameters (weighted least squares on the paired per-chunk gains) and writes `quality.json` (`delphi.floor-quality/3`).
+
+By default the sessions use the deployment placement (first GPU, `-cmoe` with RAM-routed experts, `--numa tensors`). `calibration.devices` can list other GPUs for faster full-offload sessions, one session per device. The execution path changes the numerics slightly; the table records the command. The hotswap session keeps the previous patch until it commits, so it restores the floor before a large patch. Patch files and probe models need temporary space of about two model sizes at the probe qtypes.
+
+Set `"quality": {"table": "/tmp/autoq-quality/quality.json"}` for plan and validate. The table must match the prepared source, imatrices, sampled damage and floor recipe. `bounds.max_loss` is a ceiling on the predicted KL. It is a model estimate on the calibration text with the recorded teacher, not a bound on other text or on task accuracy. Expert caches need separate calibration and are not supported with a table.
+
+Results on Qwen3.6-35B-A3B (floor Q2_K experts, Q8_0 rest), deployment ROCm2 + RAM with CPU experts: calibration took 24.5 minutes (48 passes of 16K scored tokens). On separate text, predicted KL was within 0.98-1.06 of measured KL for five of six witnesses, including qtypes that were not probed (1.14 for one witness). The plan picks had 3.4 % +- 1.5 and 13.1 % +- 2.6 lower measured KL than picks by the summed local error at +2.2 and +4.2 GB of expert budget over the floor. At +9.2 GB both picks were equal within the noise (+3.0 % +- 5.3); both were 18-20 % better than uniform Q4_K. OLMoE-1B-7B with an imatrix fitted all 21 probes within one standard error.
 
 ## Workflow
 
 ```sh
 python tools/auto-quantize/auto_quantize.py inspect --config config.json
 python tools/auto-quantize/auto_quantize.py prepare --config config.json --output /tmp/autoq-prepared
+python tools/auto-quantize/auto_quantize.py calibrate --config config.json --prepared /tmp/autoq-prepared/prepared.json --output /tmp/autoq-quality
 python tools/auto-quantize/auto_quantize.py plan --config config.json --prepared /tmp/autoq-prepared/prepared.json --output /tmp/autoq-frontier
 python tools/auto-quantize/auto_quantize.py encode --frontier /tmp/autoq-frontier/frontier.json --recipe recipe-000 --output /models/selected.gguf
 ```
@@ -66,7 +93,7 @@ The built-in timing prior measures each qtype/shape on CPU and the first GPU. `t
 
 A RAM-resident expert qtype can remain on CPU when its GPU operation is unsupported. Long prefill then uses its CPU estimate. GPU support is required for dense/GPU-resident weights and expert caches. Missing measurements still require calibration; an explicitly unsupported GPU signature does not exclude a supported CPU expert format.
 
-Repeated isolated probes can keep active expert weights in CPU cache. The predictor also bounds CPU time by the bytes fetched from RAM. Its default effective byte rate is derived from the baseline's routed-expert bytes and traced decode CPU span; this incorporates CPU overhead and is not a measurement of peak RAM bandwidth. `timing.cpu_bandwidth_gb_s` can supply an explicit rate instead. The fitted scale and held-out checks remain necessary. Long-prefill transfer predictions use the actual configured `GGML_SCHED_STAGE_MIN_TOKENS` threshold.
+Repeated isolated decode probes can keep their few active expert weights in CPU cache. For batches of at most 16 tokens, the predictor also bounds CPU time by the bytes fetched from RAM; larger batched probes read most of the bank and already include that traffic. Its default effective byte rate is derived from the baseline's routed-expert bytes and traced decode CPU span; this incorporates CPU overhead and is not a measurement of peak RAM bandwidth. `timing.cpu_bandwidth_gb_s` can supply an explicit rate instead. The fitted scale and held-out checks remain necessary. Long-prefill transfer predictions use the actual configured `GGML_SCHED_STAGE_MIN_TOKENS` threshold.
 
 With staging enabled and a positive threshold, the runtime selects the GPU above that threshold and transfers the whole expert bank. The predictor follows that policy even if a CPU estimate would be faster. It estimates compute plus transfer before the fitted workload scale; copy/compute overlap remains an approximation. Timing-model revisions invalidate old prepared calibrations.
 
@@ -97,7 +124,8 @@ Use a small model and supply two fit mixes and at least two distinct held-out mi
   {"name": "fit-q4k", "role": "fit", "primary": "Q4_K"},
   {"name": "fit-q6k", "role": "fit", "primary": "Q6_K"},
   {"name": "hold-q4zero", "role": "holdout", "primary": "Q4_0"},
-  {"name": "hold-mixed", "role": "holdout", "primary": "Q4_K", "overrides": {"ffn_down_exps": "Q6_K"}}
+  {"name": "hold-mixed", "role": "holdout", "primary": "Q4_K", "overrides": {"ffn_down_exps": "Q6_K"}},
+  {"name": "hold-planned", "role": "holdout", "recipe": "/tmp/autoq-frontier/recipe-000.json"}
 ]
 ```
 
@@ -105,6 +133,6 @@ Use a small model and supply two fit mixes and at least two distinct held-out mi
 python tools/auto-quantize/auto_quantize.py validate --config config.json --prepared /tmp/autoq-prepared/prepared.json --mixes mixes.json --output /tmp/autoq-validation
 ```
 
-The command encodes and profiles only those mixes, fits one scale per regime from fit mixes, then records held-out relative error and material rank reversals. The initial gate requires at most 15% relative error in every held-out regime and no reversed ordering for measured differences of at least 5%. A failed fit or gate keeps predictions unqualified. The report saves exact profiler commands, binary/model identities and raw artifacts. This is plain `llama-bench` execution prediction at the configured depth; server overhead and speculative acceptance are not calibrated. Trace integrity and a final output-quality/memory witness remain separate release checks.
+A `recipe` entry uses the choices of a plan recipe file. The command encodes and profiles only those mixes, fits one scale per regime from fit mixes, then records held-out relative error and material rank reversals. With a quality table, it also measures the KL of every mix against the table's teacher and reports predicted against measured KL. The quality gate requires at most 15 % relative error and no reversed ordering for measured differences of at least 5 %. The initial gate requires at most 15% relative error in every held-out regime and no reversed ordering for measured differences of at least 5%. A failed fit or gate keeps predictions unqualified. The report saves exact profiler commands, binary/model identities and raw artifacts. This is plain `llama-bench` execution prediction at the configured depth; server overhead and speculative acceptance are not calibrated. Trace integrity and a final memory witness remain separate release checks.
 
 Run offline invariants with `python tests/test-auto-quantize.py` and estimator checks with `test-quant-damage`.

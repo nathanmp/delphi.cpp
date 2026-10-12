@@ -16,7 +16,7 @@ from model import tensor_bytes
 sys.path.insert(0, str(ROOT))
 from tools.bottlenecks.profile import BenchArm, Recipe, ProfileError, GPU_SETTING_KEYS, _gpu_state, run_recipe
 
-MODEL_REVISION = 2
+MODEL_REVISION = 3
 
 
 def machine_settings():
@@ -123,7 +123,8 @@ def regions(info):
         if group.get("quality_fixed"):
             continue
         members = [by_name[name] for name in group["members"]]
-        if all(t["preserved"] for t in members):
+        # MTP layers do not run in the profiled main-model workloads
+        if all(t["preserved"] for t in members) or all(t.get("mtp") for t in members):
             continue
         # A separate embedding is a lookup. A tied output also performs a vocabulary projection when its type varies.
         if all(t["name"] == "token_embd.weight" for t in members) and ("output.weight" in by_name or len(group["pool"]) == 1):
@@ -221,38 +222,59 @@ class Predictor:
             raise QuantError(f"unmeasured/unsupported signature: {members[0]['name']} {dtype} {device} n={tokens}")
         return value["ms"]
 
-    def cost(self, choices, hit_fraction=0):
-        result = {regime: 0.0 for regime in self.counts}
+    def region_cost(self, members, paired, dtype, hit_fraction=0):
+        """{regime: ms} of one execution region at dtype; cost() sums these over the regions."""
+        result = {}
         link = self.cfg["timing"].get("link_bandwidth_gb_s", 12) * 1e6  # bytes/ms; prior is explicitly unmeasured
         streaming = str(self.cfg["runtime"]["env"].get("GGML_SCHED_STAGE", "0")) == "1"
+        for regime, tokens in self.counts.items():
+            t = members[0]
+            ram_expert = t["expert"] and "RAM" in self.cfg["devices"]
+            device_time = self.lookup(members, paired, dtype, gpu(self.cfg), tokens,
+                                      optional=ram_expert and not self.cfg["cache_mib"])
+            local = device_time
+            if t["expert"] and "RAM" in self.cfg["devices"]:
+                cpu_time = self.lookup(members, paired, dtype, "CPU", tokens)
+                unique = active_experts(t["shape"][2], self.info["top_k"], tokens)
+                full_weight_bytes = sum(tensor_bytes(m["shape"], dtype) for m in members)
+                weight_bytes = full_weight_bytes * unique / t["shape"][2]
+                # Repeated isolated decode probes keep their few active experts in cache; a full model also pays for
+                # RAM traffic. Batched probes read most of the bank and already include it, and the rate is derived
+                # from the decode span (with its overheads), so the bound applies to small batches only.
+                if self.cpu_bytes_per_ms and tokens <= 16:
+                    cpu_time = max(cpu_time, weight_bytes / self.cpu_bytes_per_ms)
+                handoff = 0.02 + 4 * (t["shape"][0] + t["shape"][1] * self.info["top_k"]) * tokens / link
+                local = cpu_time + handoff
+                if tokens <= 16 and hit_fraction > 0:
+                    local = (1 - hit_fraction) * cpu_time + hit_fraction * device_time + handoff
+                min_tokens = int(self.cfg["runtime"]["env"].get("GGML_SCHED_STAGE_MIN_TOKENS", 512))
+                if streaming and min_tokens > 0 and tokens >= min_tokens and device_time is not None:
+                    # The scheduler forces staging above this threshold and copies the whole expert bank.
+                    local = device_time + full_weight_bytes / link + 0.02
+            n_work = self.cfg["runtime"][f"{regime}_tokens"] if regime != "decode" else 1
+            batches, tail = divmod(n_work, tokens)
+            # Tail interpolation is flagged in the output; it does not change the fixed ubatch used for calibration.
+            result[regime] = local * (batches + tail / tokens)
+        return result
+
+    def cost(self, choices, hit_fraction=0):
+        result = {regime: 0.0 for regime in self.counts}
         for group, members, paired in self.regions:
-            dtype = choices[group.get("decision", group["name"])]
-            for regime, tokens in self.counts.items():
-                t = members[0]
-                ram_expert = t["expert"] and "RAM" in self.cfg["devices"]
-                device_time = self.lookup(members, paired, dtype, gpu(self.cfg), tokens,
-                                          optional=ram_expert and not self.cfg["cache_mib"])
-                local = device_time
-                if t["expert"] and "RAM" in self.cfg["devices"]:
-                    cpu_time = self.lookup(members, paired, dtype, "CPU", tokens)
-                    unique = active_experts(t["shape"][2], self.info["top_k"], tokens)
-                    full_weight_bytes = sum(tensor_bytes(m["shape"], dtype) for m in members)
-                    weight_bytes = full_weight_bytes * unique / t["shape"][2]
-                    # Repeated isolated probes keep active weights in cache. A full model also pays for RAM traffic.
-                    if self.cpu_bytes_per_ms:
-                        cpu_time = max(cpu_time, weight_bytes / self.cpu_bytes_per_ms)
-                    handoff = 0.02 + 4 * (t["shape"][0] + t["shape"][1] * self.info["top_k"]) * tokens / link
-                    local = cpu_time + handoff
-                    if tokens <= 16 and hit_fraction > 0:
-                        local = (1 - hit_fraction) * cpu_time + hit_fraction * device_time + handoff
-                    min_tokens = int(self.cfg["runtime"]["env"].get("GGML_SCHED_STAGE_MIN_TOKENS", 512))
-                    if streaming and min_tokens > 0 and tokens >= min_tokens and device_time is not None:
-                        # The scheduler forces staging above this threshold and copies the whole expert bank.
-                        local = device_time + full_weight_bytes / link + 0.02
-                n_work = self.cfg["runtime"][f"{regime}_tokens"] if regime != "decode" else 1
-                batches, tail = divmod(n_work, tokens)
-                # Tail interpolation is flagged in the output; it does not change the fixed ubatch used for calibration.
-                result[regime] += local * (batches + tail / tokens)
+            for regime, ms in self.region_cost(members, paired, choices[group.get("decision", group["name"])], hit_fraction).items():
+                result[regime] += ms
+        return result
+
+    def group_costs(self, hit_fraction=0):
+        """{decision group: {qtype: {regime: ms}}} for every region-bearing group; cost() is the sum over groups."""
+        result = {}
+        for group, members, paired in self.regions:
+            name = group.get("decision", group["name"])
+            entry = result.setdefault(name, {})
+            for dtype in group["pool"]:
+                ms = self.region_cost(members, paired, dtype, hit_fraction)
+                total = entry.setdefault(dtype, {regime: 0.0 for regime in self.counts})
+                for regime, value in ms.items():
+                    total[regime] += value
         return result
 
     def predict(self, choices, hit_fraction=0):

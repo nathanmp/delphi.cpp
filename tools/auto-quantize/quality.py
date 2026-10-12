@@ -1,22 +1,29 @@
-"""Conditional repair scores with fixed floor weights and whole-group decisions."""
+"""Teacher-relative quality model: predicted KL of a recipe from local damage and a calibrated floor-relative table.
+
+Per decision group g with role r and layer l, relative to the floor recipe:
+
+    gain_g(q) = s_r(l) * (M_g(floor)**gamma_r - M_g(q)**gamma_r),   log s_r piecewise linear in the layer l
+    G = sum_g gain_g(q_g),  u = G / G_full,  gain = kappa(u) * G,  kappa(u) = 1 + (kinf - 1) * (1 - exp(-u / u0))
+    KL(recipe) = KL_floor * (1 - gain)
+
+M is the sampled local relative error R of llama-quant-damage, summed over the group members (zero at the source
+type). log s_r is given at knots (the centres of the calibration bands of the role) and is constant outside them.
+G_full is G with every modelled group at the source type. The calibrate command fits the parameters to measured
+KL against teacher logits; qtypes enter only through M, so new candidate qtypes need no extra calibration passes.
+"""
 from __future__ import annotations
 
-import copy
 import hashlib
 import json
 import math
+import re
 from pathlib import Path
 
-from config import QuantError, file_identity, number
-from model import qtype, read_model, tensor_bytes
-from timing import regions, requires_backend_signature, signature
+from config import QuantError, digest, file_identity, number
 
-SCHEMA = "delphi.floor-quality/2"
-METHOD = "sum_conditional_repair_kl"
-
-
-def shape4(shape):
-    return list(shape) + [1] * (4 - len(shape))
+SCHEMA = "delphi.floor-quality/3"
+METHOD = "composed_smooth_sensitivity"
+METRIC = "R"
 
 
 def tensor_hash(tensor):
@@ -33,187 +40,173 @@ def tensor_hash(tensor):
     return h.hexdigest()
 
 
-def check_hash(value, name):
-    if not isinstance(value, str) or len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
-        raise QuantError(f"missing or invalid SHA256: {name}")
+def role_of(name):
+    """Sensitivity role of a tensor: routed or dense FFN gate/up ('gu') and down ('dn'), shared experts, attention,
+    recurrent (ssm) projections, other per-layer kinds by name, and whole-model tensors by name."""
+    m = re.match(r"blk\.[0-9]+\.(.+)\.weight$", name)
+    if not m:
+        return name.removesuffix(".weight")
+    kind = m[1]
+    if kind.endswith("_shexp"):
+        return "shexp"
+    if re.fullmatch(r"ffn_(gate|up|gate_up)(_exps)?", kind):
+        return "gu"
+    if re.fullmatch(r"ffn_down(_exps)?", kind):
+        return "dn"
+    if kind.startswith("attn_"):
+        return "attn"
+    if kind.startswith("ssm_"):
+        return "ssm"
+    return kind
+
+
+def damage_records(damage):
+    """{(tensor, qtype): sampled local relative error} from prepared llama-quant-damage artifacts."""
+    records = {}
+    for artifact in damage:
+        if artifact.get("schema") != "delphi.quant-damage/1":
+            raise QuantError("unsupported damage schema")
+        for t in artifact["tensors"]:
+            for q in (t["runs"][0]["types"] if t.get("runs") else []):
+                if q["status"] == "ok" and q.get(METRIC) is not None:
+                    records[t["name"], q["qtype"].upper()] = q[METRIC]
+    return records
+
+
+def damage_digest(damage):
+    return digest(sorted([name, qtype, value] for (name, qtype), value in damage_records(damage).items()))
+
+
+def sensitivity(knots, log_s, layer):
+    """exp of the piecewise linear interpolation of log_s over knots, constant outside the knots."""
+    if len(knots) == 1 or layer <= knots[0]:
+        return math.exp(log_s[0])
+    if layer >= knots[-1]:
+        return math.exp(log_s[-1])
+    i = next(k for k in range(1, len(knots)) if layer <= knots[k])
+    t = (layer - knots[i - 1]) / (knots[i] - knots[i - 1])
+    return math.exp((1 - t) * log_s[i - 1] + t * log_s[i])
+
+
+def modelled_groups(info, floor):
+    """Decision groups whose qtype can change, with role and layer; preserved-only and MTP groups are skipped."""
+    by_name = {t["name"]: t for t in info["tensors"]}
+    result = []
+    for group in info["groups"]:
+        members = [by_name[n] for n in group["members"]]
+        # MTP layers do not affect the main-model KL; they stay at the floor unless pinned.
+        if len(group["pool"]) < 2 or all(t["preserved"] for t in members) or any(t.get("mtp") for t in members):
+            continue
+        result.append({"name": group["name"], "members": group["members"], "role": role_of(group["members"][0]),
+                       "layer": members[0]["layer"], "floor": floor[group["name"]], "pool": group["pool"]})
+    return result
+
+
+class LossModel:
+    def __init__(self, info, table, damage):
+        self.table = table
+        self.records = damage_records(damage)
+        self.by_name = {t["name"]: t for t in info["tensors"]}
+        self.n_layer = table["n_layer"]
+        self.roles = table["roles"]
+        self.kinf, self.u0 = table["composition"]["kappa_inf"], table["composition"]["u0"]
+        self.kl_floor = table["floor"]["kl"]
+        self.groups = {g["name"]: g for g in modelled_groups(info, table["floor"]["choices"])}
+        for g in self.groups.values():
+            if g["role"] not in self.roles:
+                raise QuantError(f"quality table has no sensitivity for role {g['role']}: {g['name']}")
+            g["scale"] = self.sensitivity(g["role"], g["layer"])
+        self.cache = {}
+        self.full = sum(self.contribution(g, g["floor"]) - self.contribution(g, None) for g in self.groups.values())
+        if not self.full > 0:
+            raise QuantError("quality table predicts no gain for a full repair")
+
+    def sensitivity(self, role, layer):
+        return sensitivity(self.roles[role]["knots"], self.roles[role]["log_s"], layer)
+
+    def metric(self, group, qtype):
+        total = 0.0
+        for name in group["members"]:
+            t = self.by_name[name]
+            if t["preserved"] or qtype is None or qtype == t["source_dtype"]:
+                continue
+            value = self.records.get((name, qtype))
+            if value is None:
+                raise QuantError(f"no sampled damage for {name} {qtype}")
+            total += value
+        return total
+
+    def contribution(self, group, qtype):
+        key = (group["name"], qtype)
+        if key not in self.cache:
+            gamma = self.roles[group["role"]]["gamma"]
+            self.cache[key] = group["scale"] * self.metric(group, qtype) ** gamma
+        return self.cache[key]
+
+    def gain(self, name, qtype):
+        g = self.groups.get(name)
+        if g is None:
+            return 0.0
+        return self.contribution(g, g["floor"]) - self.contribution(g, qtype)
+
+    def kappa(self, u):
+        return 1 + (self.kinf - 1) * (1 - math.exp(-u / self.u0))
+
+    def marginal(self, u):
+        """d(kappa(u) G)/dG at u: the composed value of one unit of additive gain."""
+        return self.kappa(u) + u * (self.kinf - 1) * math.exp(-u / self.u0) / self.u0
+
+    def predict(self, choices):
+        g = sum(self.gain(name, choices[name]) for name in self.groups)
+        u = g / self.full
+        return {"loss": self.kl_floor * (1 - self.kappa(u) * g), "gain": g, "u": u}
 
 
 def check_files(expected, paths, label):
     if len(expected) != len(paths):
-        raise QuantError(f"repair calibration {label} count differs")
+        raise QuantError(f"quality table {label} count differs")
     for record, path in zip(expected, paths):
-        check_hash(record.get("sha256"), label)
         actual = file_identity(path, content=True)
-        if record.get("bytes") != actual["bytes"] or record["sha256"] != actual["sha256"]:
-            raise QuantError(f"repair calibration {label} content changed: {path}")
+        if record.get("bytes") != actual["bytes"] or record.get("sha256") != actual["sha256"]:
+            raise QuantError(f"quality table {label} content changed: {path}")
 
 
-def load_quality(info, cfg):
+def load_quality(info, cfg, prepared):
+    """The calibrated table of cfg['quality'], checked against the prepared source, imatrices, floor and damage."""
     if "quality" not in cfg:
         return None
     path = Path(cfg["quality"]["table"])
     table = json.loads(path.read_text())
-    if table.get("schema") != SCHEMA or table.get("method") != METHOD:
-        raise QuantError(f"repair table must use {SCHEMA} and {METHOD}; draft tables need a full floor manifest")
+    if table.get("schema") != SCHEMA or table.get("method") != METHOD or table.get("metric") != METRIC:
+        raise QuantError(f"quality table must use {SCHEMA}, {METHOD} and metric {METRIC}; recalibrate older tables")
     check_files(table["source_files"], [f["path"] for f in info["files"]], "source")
     check_files(table["imatrices"], cfg["imatrix"], "imatrix")
-    execution = table["execution"]
-    leading = next(device for device in cfg["devices"] if device != "RAM")
-    if execution.get("gpu") != leading or execution.get("ram_routed") != ("RAM" in cfg["devices"]):
-        raise QuantError("repair calibration placement differs; collect scores with the selected GPU and CPU-expert policy")
-    if execution.get("numa") != "tensors":
-        raise QuantError("repair calibration must record --numa tensors")
+    if table["damage"] != damage_digest(prepared["damage"]):
+        raise QuantError("quality table was fitted to different sampled damage; calibrate with this prepared directory")
+    if table["floor"]["choices"] != prepared["baseline"]["choices"]:
+        raise QuantError("quality table floor differs from the prepared minimum-byte baseline")
     if cfg["cache_mib"]:
-        raise QuantError("repair quality with an expert cache needs separate calibration and is not implemented")
-    floor = table["floor"]
-    check_hash(floor.get("sha256"), "floor")
-    floor["path"] = str((path.parent / floor["path"]).resolve())
-    by_name = {t["name"]: t for t in info["tensors"]}
-    if set(floor["tensors"]) != set(by_name):
-        raise QuantError("repair floor must describe every source tensor")
-    for name, entry in floor["tensors"].items():
-        t = by_name[name]
-        dtype = qtype(entry["qtype"])
-        if shape4(entry["shape"]) != shape4(t["shape"]) or entry["bytes"] != tensor_bytes(t["shape"], dtype):
-            raise QuantError(f"repair floor shape/size differs: {name}")
-        check_hash(entry.get("sha256"), name)
-        if dtype not in t["pool"]:
-            raise QuantError(f"repair floor type {dtype} is outside configured candidates/preservation: {name}")
-    names, members = set(), set()
-    if not table["groups"]:
-        raise QuantError("repair table contains no measured groups")
-    for group in table["groups"]:
-        name = group["name"]
-        if not isinstance(name, str) or not name or name in names or name in by_name:
-            raise QuantError(f"duplicate or conflicting repair group name: {name}")
-        names.add(name)
-        selected = group["members"]
-        if not selected or len(set(selected)) != len(selected) or set(selected) - set(by_name) or members.intersection(selected):
-            raise QuantError(f"missing, duplicate, overlapping or unknown repair members: {name}")
-        members.update(selected)
-        for atomic in info["groups"]:
-            overlap = set(atomic["members"]).intersection(selected)
-            if overlap and overlap != set(atomic["members"]):
-                raise QuantError(f"repair group splits a configured gate/up tie: {name}")
-        floor_types = {floor["tensors"][n]["qtype"] for n in selected}
-        if len(floor_types) != 1:
-            raise QuantError(f"repair group has mixed floor qtypes: {name}")
-        seen = set()
-        for option in group["options"]:
-            dtype = qtype(option["qtype"])
-            if dtype in seen:
-                raise QuantError(f"duplicate repair qtype: {name} {dtype}")
-            seen.add(dtype)
-            number(option["loss"], f"repair loss {name} {dtype}")
-            losses = option["chunk_losses"]
-            if not losses:
-                raise QuantError(f"repair option needs chunk losses: {name} {dtype}")
-            for loss in losses:
-                number(loss, "repair chunk loss")
-            if not math.isclose(option["loss"], sum(losses) / len(losses), rel_tol=1e-8, abs_tol=1e-12):
-                raise QuantError(f"repair mean differs from chunk losses: {name} {dtype}")
-            if option["bytes"] != sum(tensor_bytes(by_name[n]["shape"], dtype) for n in selected):
-                raise QuantError(f"repair option byte count differs: {name} {dtype}")
-            if set(option["tensor_sha256"]) != set(selected):
-                raise QuantError(f"repair option payload identities are incomplete: {name} {dtype}")
-            for tensor_name, value in option["tensor_sha256"].items():
-                check_hash(value, tensor_name)
-            if dtype in floor_types and any(option["tensor_sha256"][n] != floor["tensors"][n]["sha256"] for n in selected):
-                raise QuantError(f"repair floor option payload differs: {name}")
-        if not floor_types.issubset(seen):
-            raise QuantError(f"repair group lacks its floor option: {name}")
+        raise QuantError("quality tables with an expert cache need separate calibration and are not implemented")
+    for role, entry in table["roles"].items():
+        knots, values = entry["knots"], entry["log_s"]
+        if not knots or len(knots) != len(values) or any(b <= a for a, b in zip(knots, knots[1:])):
+            raise QuantError(f"quality role {role} needs increasing knots with one log sensitivity each")
+        for value in [*knots, *values]:
+            if not isinstance(value, (int, float)) or not math.isfinite(value):
+                raise QuantError(f"quality role {role} knots and sensitivities must be finite")
+        number(entry["gamma"], f"quality role {role} gamma", positive=True)
+    number(table["composition"]["kappa_inf"], "kappa_inf", minimum=1)
+    number(table["composition"]["u0"], "u0", positive=True)
+    number(table["floor"]["kl"], "floor KL", positive=True)
     table["identity"] = file_identity(path, content=True)
     return table
-
-
-def apply_quality(info, table):
-    """Keep execution pairs, but couple search decisions at the measured granularity."""
-    if table is None:
-        return info
-    by_name = {t["name"]: t for t in info["tensors"]}
-    decisions, owner = [], {}
-    for measured in table["groups"]:
-        members = measured["members"]
-        pool = set.intersection(*(set(by_name[n]["pool"]) for n in members))
-        options = [copy.deepcopy(o) for o in measured["options"] if o["qtype"] in pool]
-        floor_type = table["floor"]["tensors"][members[0]]["qtype"]
-        if not options or floor_type != min(options, key=lambda o: (o["bytes"], o["loss"], o["qtype"]))["qtype"]:
-            raise QuantError(f"repair floor is not the minimum-byte legal option: {measured['name']}")
-        decision = {"name": measured["name"], "members": list(members), "pool": [o["qtype"] for o in options],
-                    "repair_options": options, "floor_qtype": floor_type}
-        decisions.append(decision)
-        owner.update({n: decision for n in members})
-    execution = []
-    for atomic in info["groups"]:
-        group = copy.deepcopy(atomic)
-        decision = owner.get(group["members"][0])
-        if decision is None:
-            fixed = {table["floor"]["tensors"][n]["qtype"] for n in group["members"]}
-            if len(fixed) != 1:
-                raise QuantError(f"repair floor conflicts with a gate/up tie: {group['name']}")
-            dtype = fixed.pop()
-            decision = {"name": group["name"], "members": group["members"], "pool": [dtype], "floor_qtype": dtype}
-            decisions.append(decision)
-            # Fixed work cancels in the baseline-anchored predictor. Repair mode does not use cache-hit changes.
-            group["quality_fixed"] = True
-        group["decision"] = decision["name"]
-        group["pool"] = decision["pool"]
-        execution.append(group)
-        for n in group["members"]:
-            by_name[n]["pool"] = decision["pool"]
-    info["execution_groups"] = execution
-    info["groups"] = decisions
-    return info
-
-
-def repair_options(info, table, operations, cfg):
-    by_name = {t["name"]: t for t in info["tensors"]}
-    measured_regions = regions(info)
-    excluded = []
-    for group in info["groups"]:
-        options = []
-        for dtype in group["pool"]:
-            failed = next((v["signature"] for v in operations.values() if v["ms"] is None and v["signature"]["dtype"] == dtype
-                           and requires_backend_signature(v["signature"], cfg)
-                           and any(region.get("decision", region["name"]) == group["name"]
-                                   and signature(members, paired, dtype, v["signature"]["device"], v["signature"]["tokens"], info["top_k"]) == v["signature"]
-                                   for region, members, paired in measured_regions)), None)
-            if failed:
-                excluded.append({"group": group["name"], "qtype": dtype, "reason": f"backend rejected {dtype} on {failed['device']}"})
-                continue
-            measured = next((o for o in group.get("repair_options", []) if o["qtype"] == dtype), None)
-            options.append({"qtype": dtype, "damage": measured["loss"] if measured else 0.0, "sampling_se": None,
-                            "bytes": sum(tensor_bytes(by_name[n]["shape"], dtype) for n in group["members"])})
-        if group["floor_qtype"] not in {o["qtype"] for o in options}:
-            raise QuantError(f"repair floor has an unsupported operation signature: {group['name']}")
-        group["options"] = options
-        group["pool"] = [o["qtype"] for o in options]
-    for group in info["execution_groups"]:
-        group["pool"] = next(g["pool"] for g in info["groups"] if g["name"] == group["decision"])
-    return excluded
-
-
-def verify_quality_output(info, table, types, output):
-    if table is None:
-        return
-    expected = {n: entry["sha256"] for n, entry in table["floor"]["tensors"].items()}
-    for group in table["groups"]:
-        dtype = types[group["members"][0]]
-        if any(types[n] != dtype for n in group["members"]):
-            raise QuantError(f"encoded recipe splits repair group: {group['name']}")
-        option = next((o for o in group["options"] if o["qtype"] == dtype), None)
-        if option is None:
-            raise QuantError(f"encoded recipe uses unmeasured repair type: {group['name']} {dtype}")
-        expected.update(option["tensor_sha256"])
-    for tensor in read_model(output)["tensors"]:
-        if tensor_hash(tensor) != expected[tensor["name"]]:
-            raise QuantError(f"encoded tensor differs from repair calibration payload: {tensor['name']}")
 
 
 def quality_metadata(table):
     if table is None:
         return {"metric": "sum_local_R", "units": "local source-relative error", "qualification": "proxy"}
-    return {"metric": METHOD, "units": "conditional repair KL sum", "qualification": "experimental",
-            "table": table["identity"], "execution": table["execution"],
-            "scope": "whole measured groups on the recorded floor and quality execution policy",
-            "ceiling": "max_loss constrains the proxy; it is not an upper bound on original-relative KLD or task accuracy"}
+    return {"metric": METHOD, "units": "predicted KL against the teacher on the calibration text",
+            "table": table["identity"], "execution": table["execution"], "teacher": table["teacher"],
+            "floor_kl": table["floor"]["kl"], "fit": {k: table["fit"][k] for k in ("chi2_dof", "passes")},
+            "scope": "the recorded calibration text, teacher and execution policy",
+            "ceiling": "max_loss constrains the predicted KL; it is a model estimate, not a bound"}

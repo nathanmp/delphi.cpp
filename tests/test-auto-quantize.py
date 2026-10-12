@@ -13,7 +13,8 @@ sys.path.insert(0, str(ROOT / "tools/auto-quantize"))
 from config import QuantError, capacity, devices, file_identity, load_config, write_json
 from model import classify, merge_imatrices, read_model, tensor_bytes
 from search import dominates, make_options, memory, pareto, search
-from quality import apply_quality, load_quality, repair_options, tensor_hash, verify_quality_output
+from quality import LossModel, damage_digest, load_quality, modelled_groups, role_of
+from calibrate import Fit, design, probe_qtypes
 from timing import Predictor, digest, operation_times, regions, signature, token_counts
 from auto_quantize import tensor_plan, verify_output, witness_choices
 import numpy as np
@@ -26,7 +27,7 @@ def cfg(**changes):
               "preserve_below_mib": 0, "tie_gate_up": True,
               "runtime": {"env": {}, "short_tokens": 8, "long_tokens": 128, "ubatch": 128},
               "importance": {"precision": .25, "decode": .25, "short": .25, "long": .25},
-              "search": {"beam": 16, "evaluations": 1000}, "bounds": {}, "timing": {},
+              "search": {"display": 8}, "bounds": {}, "timing": {},
               "multi_gpu_speedup_percent": {"decode": 0, "short": 0, "long": 0}}
     result.update(changes)
     return result
@@ -114,9 +115,12 @@ class Frontier(unittest.TestCase):
                                                             for n in g["members"])} for q in g["pool"]]
         class Fake:
             measured = {"decode": 3, "short": 4, "long": 5}
+            slopes = {"decode": 1, "short": 1, "long": 1}
             def predict(self, choices, hit_fraction):
                 n = list(choices.values()).count("Q4_0")
                 return {"decode": 3 + n, "short": 4 + n, "long": 5 + n}
+            def group_costs(self):
+                return {g["name"]: {q: {r: float(q == "Q4_0") for r in self.measured} for q in g["pool"]} for g in model["groups"]}
         baseline = {g["name"]: g["pool"][0] for g in model["groups"]}
         return model, Fake(), baseline
 
@@ -139,12 +143,36 @@ class Frontier(unittest.TestCase):
         self.assertTrue(result["frontier"])
         self.assertTrue(all(s["damage"] <= 3 for s in result["frontier"]))
 
-    def test_budget_failure_and_evaluation_cap(self):
+    def test_budget_failure_and_byte_budget(self):
         model, predictor, baseline = self.fixture()
         self.assertEqual(search(model, cfg(devices={"ROCm1": 1, "RAM": 1}), predictor, baseline)["status"], "infeasible_minimum_bytes")
-        result = search(model, cfg(search={"beam": 2, "evaluations": 1}), predictor, baseline)
-        self.assertEqual(result["evaluated"], 1)
-        self.assertTrue(result["cap_reached"])
+        # RAM for the floor experts plus one upgraded group only
+        floor = memory(model, cfg(), baseline)["used_bytes"]["RAM"]
+        step = min(sum(tensor_bytes(next(t["shape"] for t in model["tensors"] if t["name"] == n), "Q4_0") -
+                       tensor_bytes(next(t["shape"] for t in model["tensors"] if t["name"] == n), "Q2_K") for n in g["members"])
+                   for g in model["groups"] if "Q4_0" in g["pool"])
+        result = search(model, cfg(devices={"ROCm1": 1 << 30, "RAM": floor + step}), predictor, baseline)
+        self.assertTrue(result["frontier"])
+        self.assertTrue(all(list(s["choices"].values()).count("Q4_0") <= 1 for s in result["frontier"]))
+
+
+class Knapsack(unittest.TestCase):
+    def test_exact_against_brute_force(self):
+        from knapsack import solve
+        rng = np.random.default_rng(5)
+        for trial in range(40):
+            groups = {f"g{i}": [(int(rng.integers(1, 40)), float(rng.normal()), f"q{k}") for k in range(3)] for i in range(5)}
+            budget = int(rng.integers(20, 120))
+            best = None
+            for combo in itertools.product(*(groups[n] for n in sorted(groups))):
+                if sum(o[0] for o in combo) <= budget and (best is None or sum(o[1] for o in combo) < best - 1e-12):
+                    best = sum(o[1] for o in combo)
+            result = solve(groups, budget, max_units=1 << 16)
+            if best is None:
+                self.assertIsNone(result)
+                continue
+            self.assertAlmostEqual(result[2], best)
+            self.assertLessEqual(result[1], budget)
 
 
 class Files(unittest.TestCase):
@@ -253,188 +281,179 @@ class Timing(unittest.TestCase):
         self.assertEqual(predictor.predict({}), {"decode": 10, "short": 100, "long": 300})
 
 
-class RepairQuality(unittest.TestCase):
+class Quality(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
-        self.source, self.floor, self.higher = [self.root / f"{name}.gguf" for name in ("source", "floor", "higher")]
-        names = [f"blk.{layer}.ffn_{role}_exps.weight" for layer in range(2) for role in ("gate", "up", "down")]
-        for path, dtype, width in ((self.source, "F32", 256), (self.floor, "Q2_K", 84), (self.higher, "Q4_K", 144)):
-            writer = GGUFWriter(str(path), "olmoe")
-            writer.add_uint32("olmoe.expert_count", 8)
-            writer.add_uint32("olmoe.expert_used_count", 2)
-            for name in names:
-                data = np.zeros((8, 256, width), dtype=np.float32 if dtype == "F32" else np.uint8)
-                writer.add_tensor(name, data, raw_dtype=GGMLQuantizationType[dtype])
-            writer.add_tensor("output.weight", np.ones((256, 256), dtype=np.float32))
-            writer.write_header_to_file()
-            writer.write_kv_data_to_file()
-            writer.write_tensors_to_file()
-            writer.close()
-        floors = {t["name"]: {"shape": t["shape"], "qtype": t["source_dtype"], "bytes": t["source_bytes"], "sha256": tensor_hash(t)}
-                  for t in read_model(self.floor)["tensors"]}
-        higher = {t["name"]: t for t in read_model(self.higher)["tensors"]}
-        groups = []
-        for role in ("gate-up", "down"):
-            members = [n for n in names if ("down" in n) == (role == "down")]
-            options = []
-            for dtype, loss in (("Q2_K", .1), ("Q4_K", .02)):
-                options.append({"qtype": dtype, "loss": loss, "chunk_losses": [loss * .9, loss * 1.1],
-                                "bytes": sum(tensor_bytes(floors[n]["shape"], dtype) for n in members),
-                                "tensor_sha256": {n: floors[n]["sha256"] if dtype == "Q2_K" else tensor_hash(higher[n]) for n in members}})
-            groups.append({"name": role, "members": members, "options": options})
-        self.table = {"schema": "delphi.floor-quality/2", "method": "sum_conditional_repair_kl",
+        self.source = self.root / "source.gguf"
+        writer = GGUFWriter(str(self.source), "olmoe")
+        writer.add_uint32("olmoe.expert_count", 8)
+        writer.add_uint32("olmoe.expert_used_count", 2)
+        for layer in range(4):
+            for role in ("gate", "up", "down"):
+                writer.add_tensor(f"blk.{layer}.ffn_{role}_exps.weight", np.zeros((8, 256, 256), dtype=np.float32))
+        writer.add_tensor("output.weight", np.ones((256, 256), dtype=np.float32))
+        writer.write_header_to_file()
+        writer.write_kv_data_to_file()
+        writer.write_tensors_to_file()
+        writer.close()
+        self.config = cfg(primary_qtypes=["Q2_K", "Q4_K", "Q6_K"], other_qtypes=["F32"], imatrix=[],
+                          quality={"table": str(self.root / "quality.json")})
+        self.model = classify(read_model(str(self.source)), self.config)
+        levels = {"Q2_K": .1, "Q4_K": .02, "Q6_K": .004}
+        self.damage = [{"schema": "delphi.quant-damage/1", "tensors": [
+            {"name": t["name"], "runs": [{"types": [{"qtype": q, "status": "ok", "R": levels[q] * (1 + t["layer"] / 4), "R_se": 0}
+                                                     for q in levels]}]} for t in self.model["tensors"] if t["expert"]]}]
+        self.floor = {g["name"]: "Q2_K" if len(g["pool"]) > 1 else g["pool"][0] for g in self.model["groups"]}
+        self.prepared = {"damage": self.damage, "baseline": {"choices": self.floor}}
+        self.table = {"schema": "delphi.floor-quality/3", "method": "composed_smooth_sensitivity", "metric": "R",
                       "source_files": [file_identity(self.source, content=True)], "imatrices": [],
-                      "floor": {**file_identity(self.floor, content=True), "tensors": floors},
-                      "execution": {"gpu": "ROCm1", "ram_routed": True, "numa": "tensors"}, "groups": groups}
-        self.path = self.root / "table.json"
-        self.config = cfg(primary_qtypes=["Q2_K", "Q4_K"], other_qtypes=["F32", "Q6_K"],
-                          quality={"table": str(self.path)}, imatrix=[])
+                      "damage": damage_digest(self.damage), "floor": {"choices": self.floor, "kl": .1},
+                      "teacher": {}, "execution": {"devices": ["ROCm1"]}, "n_layer": 4,
+                      "roles": {"gu": {"knots": [0.5, 2.5], "log_s": [-2.0, -1.8], "gamma": 1.0},
+                                "dn": {"knots": [0.5, 2.5], "log_s": [-1.6, -1.9], "gamma": 0.8}},
+                      "composition": {"kappa_inf": 1.5, "u0": 0.3}, "fit": {"chi2_dof": 1.0, "passes": 10}}
 
-    def load(self, table=None, config=None):
-        write_json(self.path, self.table if table is None else table)
-        config = self.config if config is None else config
-        model = classify(read_model(self.source), config)
-        table = load_quality(model, config)
-        return apply_quality(model, table), table
+    def load(self, table=None, config=None, prepared=None):
+        write_json(self.root / "quality.json", self.table if table is None else table)
+        return load_quality(self.model, self.config if config is None else config, self.prepared if prepared is None else prepared)
 
-    def test_groups_keep_execution_pairs_and_freeze_unmeasured_weights(self):
-        model, table = self.load()
-        self.assertEqual(len(model["groups"]), 3)
-        self.assertEqual(next(g for g in model["groups"] if g["name"] == "output.weight")["pool"], ["F32"])
-        pairs = [(g, m) for g, m, paired in regions(model) if paired]
-        self.assertEqual(len(pairs), 2)
-        self.assertTrue(all(g["decision"] == "gate-up" for g, _ in pairs))
-        repair_options(model, table, {}, self.config)
-        baseline = {g["name"]: g["floor_qtype"] for g in model["groups"]}
-        self.assertAlmostEqual(sum(g["options"][0]["damage"] for g in model["groups"]), .2)
-        verify_quality_output(model, table, tensor_plan(model, baseline), self.floor)
-        ops = {}
-        for group, members, paired in regions(model):
-            for dtype in group["pool"]:
-                for n in set(token_counts(self.config).values()):
-                    for device in (["CPU", "ROCm1"] if members[0]["expert"] else ["ROCm1"]):
-                        sig = signature(members, paired, dtype, device, n, model["top_k"])
-                        ops[digest(sig)] = {"signature": sig, "ms": 1 if dtype == "Q2_K" else 2}
-        predictor = Predictor(model, self.config, ops, baseline, {"decode": 20, "short": 30, "long": 50})
-        self.config["bounds"] = {"max_loss": .13}
-        result = search(model, self.config, predictor, baseline)
-        self.assertTrue(result["frontier"])
-        self.assertTrue(all(s["loss"] <= .13 and s["damage"] == s["loss"] for s in result["frontier"]))
-        self.assertTrue(all(s["memory"]["used_bytes"]["RAM"] > 0 for s in result["frontier"]))
-        self.assertEqual(set(result["frontier"][0]["choices"]), {"gate-up", "down", "output.weight"})
+    def test_roles_and_modelled_groups(self):
+        self.assertEqual([role_of(n) for n in ("blk.3.ffn_gate_exps.weight", "blk.3.ffn_down_exps.weight", "blk.1.ffn_up_shexp.weight",
+                                                "blk.0.attn_q.weight", "blk.2.ffn_gate.weight", "output.weight")],
+                         ["gu", "dn", "shexp", "attn", "gu", "output"])
+        groups = modelled_groups(self.model, self.floor)
+        self.assertEqual(len(groups), 8)
+        self.assertEqual({g["role"] for g in groups}, {"gu", "dn"})
 
-    def test_rejects_split_ties_overlap_bad_loss_and_wrong_bytes(self):
-        changes = []
-        bad = copy.deepcopy(self.table); bad["groups"][0]["members"].pop(); changes.append(bad)
-        bad = copy.deepcopy(self.table); bad["groups"][1]["members"].append(bad["groups"][0]["members"][0]); changes.append(bad)
-        bad = copy.deepcopy(self.table); bad["groups"][0]["options"][0]["loss"] = float("nan"); changes.append(bad)
-        bad = copy.deepcopy(self.table); bad["groups"][0]["options"][0]["bytes"] += 1; changes.append(bad)
-        bad = copy.deepcopy(self.table); bad["groups"][0]["options"].pop(0); changes.append(bad)
-        for table in changes:
-            self.path.write_text(json.dumps(table))
-            model = classify(read_model(self.source), self.config)
+    def test_mtp_layers_are_not_modelled_and_recipes_are_witnesses(self):
+        raw = read_model(str(self.source))
+        raw["n_layer"], raw["nextn"] = 4, 1
+        model = classify(raw, self.config)
+        groups = modelled_groups(model, self.floor)
+        self.assertEqual(len(groups), 6)
+        self.assertTrue(all(g["layer"] < 3 for g in groups))
+        recipe = self.root / "recipe.json"
+        planned = dict(self.floor, **{g["name"]: "Q6_K" for g in groups})
+        write_json(recipe, {"choices": planned})
+        self.assertEqual(witness_choices(model, self.floor, {"recipe": str(recipe), "overrides": {"blk.0.ffn_down": "Q4_K"}}),
+                         dict(planned, **{"blk.0.ffn_down_exps.weight": "Q4_K"}))
+        write_json(recipe, {"choices": dict(planned, **{"output.weight": "Q4_K"})})
+        with self.assertRaises(QuantError):
+            witness_choices(model, self.floor, {"recipe": str(recipe)})
+
+    def test_floor_prediction_composition_and_bounds(self):
+        loss = LossModel(self.model, self.load(), self.damage)
+        self.assertAlmostEqual(loss.predict(self.floor)["loss"], .1)
+        upgraded = [dict(self.floor, **{g: q for g in loss.groups}) for q in ("Q4_K", "Q6_K")]
+        values = [loss.predict(c) for c in upgraded]
+        self.assertGreater(.1, values[0]["loss"])
+        self.assertGreater(values[0]["loss"], values[1]["loss"])
+        self.assertTrue(0 < values[0]["u"] < values[1]["u"] < 1)
+        # the composed gain grows faster than the additive gain
+        self.assertGreater(1 - values[1]["loss"] / .1, values[1]["gain"])
+        # numerical derivative of the composed gain
+        u = .4
+        h = 1e-6
+        composed = lambda v: loss.kappa(v) * v
+        self.assertAlmostEqual(loss.marginal(u), (composed(u + h) - composed(u - h)) / (2 * h), places=5)
+
+    def test_rejects_changed_damage_floor_source_and_cache(self):
+        self.load()
+        bad_knots = {**self.table["roles"], "gu": {"knots": [2.5, 0.5], "log_s": [-2.0, -1.8], "gamma": 1.0}}
+        for table in (dict(self.table, roles=bad_knots), dict(self.table, damage="0" * 64), dict(self.table, floor={"choices": {**self.floor, "blk.0.ffn_down_exps.weight": "Q4_K"}, "kl": .1}),
+                      dict(self.table, schema="delphi.floor-quality/2"), dict(self.table, composition={"kappa_inf": .5, "u0": .3})):
             with self.assertRaises(QuantError):
-                load_quality(model, self.config)
-
-    def test_rejects_changed_source_and_cpu_gpu_policy(self):
-        for change in ({"devices": {"ROCm1": 1 << 30}}, {"devices": {"CUDA0": 1 << 30, "RAM": 1 << 30}}, {"cache_mib": 1}):
-            with self.assertRaises(QuantError):
-                self.load(config={**self.config, **change})
+                self.load(table)
+        with self.assertRaises(QuantError):
+            self.load(config={**self.config, "cache_mib": 1})
         with self.source.open("r+b") as stream:
-            stream.seek(read_model(self.source)["tensors"][0]["offset"])
+            stream.seek(read_model(str(self.source))["tensors"][0]["offset"])
             stream.write(b"\x01")
         with self.assertRaises(QuantError):
             self.load()
 
-    def test_repair_configuration_uses_explicit_loss_units(self):
-        base = {"schema": "delphi.auto-quantize/1", "model": str(self.source), "devices": "ROCm1:16000,RAM:16000",
-                "primary_qtypes": ["Q2_K", "Q4_K"], "other_qtypes": ["F32"],
-                "quality": {"table": "table.json"}, "bounds": {"max_loss": .09}}
-        config_path = self.root / "config.json"
-        write_json(config_path, base)
-        parsed = load_config(config_path)
-        self.assertEqual(parsed["quality"]["table"], str(self.path))
-        self.assertEqual(parsed["bounds"]["max_loss"], .09)
-        for changed in ({**base, "bounds": {"max_damage": .09}},
-                        {k: v for k, v in base.items() if k != "quality"},
-                        {**base, "quality": {"table": "table.json", "metric": "accuracy"}}):
-            write_json(config_path, changed)
-            with self.assertRaises(QuantError):
-                load_config(config_path)
-
-    def test_uniform_witness_keeps_unmeasured_experts_and_dense_weights_at_floor(self):
-        group = self.table["groups"][1]
-        frozen = group["members"].pop()
-        for option in group["options"]:
-            del option["tensor_sha256"][frozen]
-            option["bytes"] = sum(tensor_bytes(self.table["floor"]["tensors"][n]["shape"], option["qtype"]) for n in group["members"])
-        model, table = self.load()
-        repair_options(model, table, {}, self.config)
-        baseline = {g["name"]: g["floor_qtype"] for g in model["groups"]}
-        choices = witness_choices(model, baseline, {"primary": "Q4_K", "other": "Q6_K"})
-        self.assertEqual(choices[frozen], "Q2_K")
-        self.assertEqual(choices["output.weight"], "F32")
-        self.assertEqual(choices["gate-up"], "Q4_K")
-        with self.assertRaises(QuantError):
-            witness_choices(model, baseline, {"overrides": {frozen: "Q4_K"}})
-
-    def test_rejects_changed_imatrix_and_encoded_payload(self):
-        imatrix = self.root / "imatrix.gguf"
-        imatrix.write_bytes(b"original")
-        self.table["imatrices"] = [file_identity(imatrix, content=True)]
-        self.config["imatrix"] = [str(imatrix)]
-        model, table = self.load()
-        types = {n: t["qtype"] for n, t in table["floor"]["tensors"].items()}
-        with self.floor.open("r+b") as stream:
-            stream.seek(read_model(self.floor)["tensors"][0]["offset"])
-            stream.write(b"\x01")
-        with self.assertRaises(QuantError):
-            verify_quality_output(model, table, types, self.floor)
-        imatrix.write_bytes(b"modified")
-        with self.assertRaises(QuantError):
-            self.load()
-
-    def test_rejects_unsupported_cpu_floor_and_excludes_only_upgrade(self):
-        model, table = self.load()
-        t = model["tensors"][0]
-        sig = signature([t], True, "Q4_K", "CPU", 1, model["top_k"])
-        excluded = repair_options(model, table, {"failed": {"signature": sig, "ms": None}}, self.config)
-        self.assertTrue(excluded)
-        self.assertEqual(next(g for g in model["groups"] if g["name"] == "gate-up")["pool"], ["Q2_K"])
-        self.assertEqual(next(g for g in model["groups"] if g["name"] == "down")["pool"], ["Q2_K", "Q4_K"])
-        sig["dtype"] = "Q2_K"
-        model, table = self.load()
-        with self.assertRaises(QuantError):
-            repair_options(model, table, {"failed": {"signature": sig, "ms": None}}, self.config)
-
-    def test_cpu_expert_format_survives_unsupported_gpu_and_stays_on_cpu(self):
-        self.config["runtime"]["env"]["GGML_SCHED_STAGE"] = "1"
-        self.config["runtime"]["env"]["GGML_SCHED_STAGE_MIN_TOKENS"] = "1"
-        model, table = self.load()
+    def test_knapsack_search_respects_loss_ceiling_and_budget(self):
+        config = dict(self.config, bounds={"max_loss": .06})
+        loss = LossModel(self.model, self.load(), self.damage)
+        damage = self.damage
+        make_options(self.model, damage, {}, config)
         ops = {}
-        for group, members, paired in regions(model):
+        for group, members, paired in regions(self.model):
             for dtype in group["pool"]:
-                for n in set(token_counts(self.config).values()):
-                    for device in ("CPU", "ROCm1"):
-                        sig = signature(members, paired, dtype, device, n, model["top_k"])
-                        ops[digest(sig)] = {"signature": sig, "ms": None if device == "ROCm1" else 1.0}
-        self.assertEqual(repair_options(model, table, ops, self.config), [])
-        baseline = {g["name"]: g["floor_qtype"] for g in model["groups"]}
-        predictor = Predictor(model, self.config, ops, baseline, {"decode": 20, "short": 30, "long": 50})
-        self.assertEqual(predictor.predict(baseline), predictor.measured)
-        upgraded = {g["name"]: g["pool"][-1] for g in model["groups"]}
+                for n in set(token_counts(config).values()):
+                    for device in (["CPU", "ROCm1"] if members[0]["expert"] else ["ROCm1"]):
+                        sig = signature(members, paired, dtype, device, n, self.model["top_k"])
+                        ops[digest(sig)] = {"signature": sig, "ms": {"Q2_K": 1, "Q4_K": 2, "Q6_K": 3}.get(dtype, 1)}
+        predictor = Predictor(self.model, config, ops, self.floor, {"decode": 20, "short": 30, "long": 50})
+        result = search(self.model, config, predictor, self.floor, loss)
+        self.assertTrue(result["frontier"])
+        self.assertTrue(all(s["loss"] <= .06 for s in result["frontier"]))
+        self.assertTrue(all(abs(s["loss"] - loss.predict(s["choices"])["loss"]) < 1e-12 for s in result["frontier"]))
+        # the fastest recipe that meets the ceiling is found at the edge of the bound
+        fastest = min(result["frontier"], key=lambda s: s["axes"][1])
+        self.assertGreater(fastest["loss"], .04)
+
+    def test_fit_recovers_a_known_model(self):
+        groups = modelled_groups(self.model, self.floor)
+        records = {(t["name"], q["qtype"]): q["R"] for t in self.damage[0]["tensors"] for q in t["runs"][0]["types"]}
+        fit = Fit(groups, records, 4, 4)
+        knots = [0.0, 1.0, 2.0, 3.0]
+        truth = {"gu": {"knots": knots, "log_s": [-2.0, -1.9, -1.7, -1.4], "gamma": 1.1},
+                 "dn": {"knots": knots, "log_s": [-1.0, -1.8, -1.9, -2.0], "gamma": 0.7}}
+        jobs = design(groups, "Q4_K", "Q6_K", {"bands": 4, "recipes": 8, "seed": 3})
+        observations = [(j["choices"], float(y), .002) for j, y in zip(jobs, fit.predict(truth, 1.6, .4, [j["choices"] for j in jobs]))]
+        params, kinf, u0, chi2 = fit.fit(observations)
+        predicted = fit.predict(params, kinf, u0, [o[0] for o in observations])
+        self.assertLess(np.max(np.abs(predicted - np.array([o[1] for o in observations]))), .004)
+        self.assertAlmostEqual(params["gu"]["gamma"], 1.1, delta=.15)
+        # a step at the first down band survives the smoothness penalty
+        self.assertGreater(params["dn"]["log_s"][0] - params["dn"]["log_s"][1], .4)
+
+    def test_design_cost_is_independent_of_the_candidate_count(self):
+        groups = modelled_groups(self.model, self.floor)
+        jobs = design(groups, "Q4_K", "Q6_K", {"bands": 2, "recipes": 5, "seed": 1})
+        self.assertEqual(sum(1 for j in jobs if "band" in j["label"]), 2 * 2 * 2)
+        self.assertEqual(sum(1 for j in jobs if "direct" in j), 2)
+        more = [dict(g, pool=g["pool"] + ["Q5_K", "Q8_0"]) for g in groups]
+        self.assertEqual(len(design(more, "Q4_K", "Q6_K", {"bands": 2, "recipes": 5, "seed": 1})), len(jobs))
+        records = {(t["name"], q["qtype"]): q["R"] for t in self.damage[0]["tensors"] for q in t["runs"][0]["types"]}
+        self.assertEqual(probe_qtypes(groups, records, {"probe_qtypes": None}), ("Q4_K", "Q6_K"))
+
+    def test_configuration(self):
+        base = {"schema": "delphi.auto-quantize/1", "model": str(self.source), "devices": "ROCm1:16000,RAM:16000",
+                "primary_qtypes": ["Q2_K", "Q4_K"], "other_qtypes": ["F32"], "quality": {"table": "quality.json"},
+                "bounds": {"max_loss": .09}, "calibration": {"text": "eval.txt", "devices": ["CUDA0", "CUDA1"]}}
+        path = self.root / "config.json"
+        write_json(path, base)
+        parsed = load_config(path)
+        self.assertEqual(parsed["calibration"]["text"], str(self.root / "eval.txt"))
+        self.assertEqual(parsed["calibration"]["bands"], 10)
+        for changed in ({**base, "bounds": {"max_damage": .09}}, {k: v for k, v in base.items() if k != "quality"},
+                        {**base, "calibration": {"recipes": 1}}, {**base, "calibration": {"devices": ["RAM"]}},
+                        {**base, "calibration": {"batch": 1000}}, {**base, "search": {"beam": 4}}):
+            write_json(path, changed)
+            with self.assertRaises(QuantError):
+                load_config(path)
+
+    def test_cpu_expert_format_survives_unsupported_gpu(self):
+        config = dict(self.config, runtime=dict(self.config["runtime"], env={"GGML_SCHED_STAGE": "1", "GGML_SCHED_STAGE_MIN_TOKENS": "1"}))
+        ops = {}
+        for group, members, paired in regions(self.model):
+            for dtype in group["pool"]:
+                for n in set(token_counts(config).values()):
+                    for device in (["CPU", "ROCm1"] if members[0]["expert"] else ["ROCm1"]):
+                        sig = signature(members, paired, dtype, device, n, self.model["top_k"])
+                        ops[digest(sig)] = {"signature": sig, "ms": None if device == "ROCm1" and members[0]["expert"] else 1.0}
+        self.assertEqual(make_options(self.model, self.damage, ops, config), [])
+        predictor = Predictor(self.model, config, ops, self.floor, {"decode": 20, "short": 30, "long": 50})
+        self.assertEqual(predictor.predict(self.floor), predictor.measured)
+        upgraded = {g["name"]: g["pool"][-1] for g in self.model["groups"]}
         self.assertTrue(all(v > 0 for v in predictor.predict(upgraded).values()))
-        # The local metric uses the same placement rule, including a GPU cache's stricter requirement.
-        atomic = classify(read_model(self.source), {**self.config, "other_qtypes": ["F32"]})
-        damage = [{"schema": "delphi.quant-damage/1", "tensors": [
-            {"name": t["name"], "runs": [{"types": [{"qtype": q, "status": "ok", "R": 1.0, "R_se": 0}
-                                                       for q in t["pool"]]}]} for t in atomic["tensors"]]}]
-        self.assertEqual(make_options(atomic, damage, ops, self.config), [])
-        atomic = classify(read_model(self.source), {**self.config, "other_qtypes": ["F32"]})
+        model = classify(read_model(str(self.source)), config)
         with self.assertRaises(QuantError):
-            make_options(atomic, damage, ops, {**self.config, "cache_mib": 1})
+            make_options(model, self.damage, ops, {**config, "cache_mib": 1})
 
 
 if __name__ == "__main__":

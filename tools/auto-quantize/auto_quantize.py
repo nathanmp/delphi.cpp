@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline V1 quantization advisor: inspect, prepare, plan, encode and validate."""
+"""Offline quantization advisor: inspect, prepare, calibrate, plan, encode and validate."""
 from __future__ import annotations
 
 import argparse
@@ -13,7 +13,8 @@ from pathlib import Path
 
 from config import AXES, SCHEMA, QuantError, digest, file_identity, load_config, write_json
 from model import classify, merge_imatrices, read_model
-from quality import apply_quality, load_quality, quality_metadata, repair_options, verify_quality_output
+from calibrate import calibrate, per_chunk, perplexity_command, run_direct
+from quality import LossModel, load_quality, quality_metadata
 from search import make_options, memory, search
 from timing import MODEL_REVISION, Predictor, fit_slopes, gpu, machine_settings, measure_ops, profile_model, profile_times, run
 
@@ -22,23 +23,18 @@ def inputs(cfg, info):
     result = {"model": info["identity"], "imatrix": [file_identity(path, content=True) for path in cfg["imatrix"]],
             "sampling": cfg["sampling"], "groups": info["groups"],
             "binaries": {name: file_identity(Path(cfg["bindir"]) / name) for name in
-                         (("llama-quantize", "test-backend-ops", "llama-bench") if "quality" in cfg else
-                          ("llama-quant-damage", "llama-quantize", "test-backend-ops", "llama-bench"))},
+                         ("llama-quant-damage", "llama-quantize", "test-backend-ops", "llama-bench")},
             "libraries": [file_identity(p) for p in sorted(Path(cfg["bindir"]).glob("lib*.so*")) if not p.is_symlink()],
             "runtime": cfg["runtime"], "timing": cfg["timing"], "timing_model_revision": MODEL_REVISION,
             "gpu": gpu(cfg), "ram_routed": "RAM" in cfg["devices"], "cache_mib": cfg["cache_mib"],
             "machine_settings": machine_settings(),
             "inherited_environment": {name: value for name, value in os.environ.items()
                                       if name.startswith(("GGML_", "LLAMA_", "CUDA_", "HIP_", "HSA_", "ROCR_", "OMP_", "LD_LIBRARY_PATH"))}}
-    if "quality" in cfg:
-        result["quality"] = file_identity(cfg["quality"]["table"], content=True)
     return result
 
 
 def configured_model(cfg):
-    info = classify(read_model(cfg["model"]), cfg)
-    table = load_quality(info, cfg)
-    return apply_quality(info, table), table
+    return classify(read_model(cfg["model"]), cfg)
 
 
 def get_damage(info, cfg, directory, imatrix):
@@ -108,6 +104,7 @@ def verify_output(info, types, output, check_preserved=True):
 
 
 def encode(info, cfg, choices, imatrix, output, quality=None):
+    """Write the recipe with llama-quantize and verify every planned type; quality is metadata for the record."""
     output = Path(output).resolve()
     if output.exists():
         raise QuantError(f"output already exists: {output}")
@@ -127,11 +124,10 @@ def encode(info, cfg, choices, imatrix, output, quality=None):
     print(f"Encoding {output.name}", flush=True)
     run(command, output.with_suffix(".encode.log"), cfg["runtime"]["env"])
     verify_output(info, types, partial)
-    verify_quality_output(info, quality, types, partial)
     partial.replace(output)
     write_json(output.with_suffix(".encode.json"), {"command": command, "types": types, "source": info["identity"],
                                                   "output": file_identity(output), "verified_preserved_payloads": True,
-                                                  "quality": quality_metadata(quality)})
+                                                  "quality": quality})
     return str(output)
 
 
@@ -143,7 +139,7 @@ def prepare(cfg, directory, timeout):
     for device in cfg["devices"]:
         if device != "RAM" and not re.search(r"\b" + re.escape(device) + r"\b", listed):
             raise QuantError(f"unavailable device {device}")
-    info, quality = configured_model(cfg)
+    info = configured_model(cfg)
     if any("engram_embd" in t["name"] or "per_layer_token_embd" in t["name"] for t in info["tensors"]):
         raise QuantError("lazy-table residency planning needs explicit resident-byte accounting and is not implemented")
     if len([name for name in cfg["devices"] if name != "RAM"]) > 1 and "RAM" not in cfg["devices"]:
@@ -155,10 +151,10 @@ def prepare(cfg, directory, timeout):
         print(f"Reusing {snapshot}; timing reflects the recorded machine state", flush=True)
         return old
     imatrix = merge_imatrices(cfg["imatrix"], directory / "merged-imatrix.gguf")
-    damage = [] if quality is not None else get_damage(info, cfg, directory, imatrix)
+    damage = get_damage(info, cfg, directory, imatrix)
     print("Measuring bounded operation signatures", flush=True)
     operations = measure_ops(info, cfg, directory / "calibration", timeout)
-    excluded = repair_options(info, quality, operations, cfg) if quality is not None else make_options(info, damage, operations, cfg)
+    excluded = make_options(info, damage, operations, cfg)
     baseline_choices = {group["name"]: min(group["options"], key=lambda o: (o["bytes"], o["damage"], o["qtype"]))["qtype"]
                         for group in info["groups"]}
     mem = memory(info, cfg, baseline_choices)
@@ -167,14 +163,6 @@ def prepare(cfg, directory, timeout):
     baseline = directory / "baseline.gguf"
     if baseline.exists():
         verify_output(info, tensor_plan(info, baseline_choices), baseline)
-        verify_quality_output(info, quality, tensor_plan(info, baseline_choices), baseline)
-    elif quality is not None:
-        baseline = Path(quality["floor"]["path"])
-        identity = file_identity(baseline, content=True)
-        if identity["sha256"] != quality["floor"]["sha256"]:
-            raise QuantError("repair floor content changed")
-        verify_output(info, tensor_plan(info, baseline_choices), baseline)
-        verify_quality_output(info, quality, tensor_plan(info, baseline_choices), baseline)
     else:
         encode(info, cfg, baseline_choices, imatrix, baseline)
     print("Profiling baseline short/long prefill and decode", flush=True)
@@ -184,8 +172,6 @@ def prepare(cfg, directory, timeout):
               "baseline": {"path": str(baseline), "choices": baseline_choices, "measured_ms": profile_times(profile, cfg),
                            "memory": mem, "profile": str(directory / "baseline-profile.json")},
               "slopes": {regime: 1.0 for regime in AXES[1:]}, "timing_qualified": False}
-    if quality is not None:
-        result["quality"] = quality
     write_json(snapshot, result)
     return result
 
@@ -194,7 +180,7 @@ def load_prepared(path, cfg):
     data = json.loads(Path(path).read_text())
     if data.get("schema") != SCHEMA:
         raise QuantError("unsupported prepared schema")
-    info, quality = configured_model(cfg)
+    info = configured_model(cfg)
     facts = inputs(cfg, info)
     if data["input_key"] != digest(facts):
         # Early V1 snapshots omitted the cost-model settings from their key. Upgrade only equivalent inputs.
@@ -220,8 +206,15 @@ def predictor_for(data, cfg):
     return predictor
 
 
+def loss_model(data, cfg):
+    table = load_quality(data["model"], cfg, data)
+    return (LossModel(data["model"], table, data["damage"]) if table is not None else None), table
+
+
 def plan(data, cfg, output):
-    result = search(data["model"], cfg, predictor_for(data, cfg), data["baseline"]["choices"])
+    model, table = loss_model(data, cfg)
+    predictor = predictor_for(data, cfg)
+    result = search(data["model"], cfg, predictor, data["baseline"]["choices"], model)
     outdir = Path(output).resolve()
     outdir.mkdir(parents=True, exist_ok=True)
     recipes = []
@@ -236,36 +229,42 @@ def plan(data, cfg, output):
     payload = {"schema": SCHEMA, "config": cfg, "source": data["model"]["identity"], "prepared": data,
                "search": result, "recipes": recipes, "timing_qualified": qualified,
                "single_gpu_timing_qualified": data["timing_qualified"], "user_gpu_projection": projection,
-               "quality": quality_metadata(data.get("quality")),
-               "limitations": ["repair loss is an experimental conditional KL sum, not a bound on original KLD or accuracy" if "quality" in cfg else "damage is a local source-relative proxy, not KLD or accuracy",
+               "quality": quality_metadata(table),
+               "limitations": ["loss is the calibrated model's predicted KL against the teacher on the calibration text, not a bound" if table else "loss is a local source-relative proxy, not KLD or accuracy",
                                "uniform synthetic routing and fixed route frequencies",
                                "link bandwidth and handoff latency are priors unless supplied",
                                "cache hits use a uniform residency prior; cache policy replay is not calibrated",
                                "tail ubatches use interpolation; trace integrity has not been certified",
                                "multiple GPUs use user throughput factors, without pooled capacity or a runtime layout"]}
-    payload["effective_cpu_decode_gb_s"] = (predictor_for(data, cfg).cpu_bytes_per_ms or 0) / 1e6
+    payload["effective_cpu_decode_gb_s"] = (predictor.cpu_bytes_per_ms or 0) / 1e6
     write_json(outdir / "frontier.json", payload)
-    print(f"{result['status']}: {len(recipes)} nondominated evaluated recipes; {result['evaluated']} evaluations")
-    print(f"recipe       {'repair loss' if 'quality' in cfg else 'damage':12s}  decode t/s  short t/s  long t/s  score")
+    print(f"{result['status']}: {len(recipes)} nondominated recipes; {result['evaluated']} evaluations")
+    print(f"recipe       {'pred. KL' if table else 'local R':>10s}  decode t/s  short t/s  long t/s  score")
     for state in recipes[:cfg["search"]["display"]]:
         times = state["predicted_ms"]
-        print(f"{state['id']}  {state['damage']:12.5g}  {1000/times['decode']:10.2f}  "
+        print(f"{state['id']}  {state['loss']:10.5g}  {1000/times['decode']:10.2f}  "
               f"{1000*cfg['runtime']['short_tokens']/times['short']:9.2f}  "
               f"{1000*cfg['runtime']['long_tokens']/times['long']:8.2f}  {state['score']:.4f}")
     status = "user GPU projection from the single-GPU baseline" if projection else "qualified on held-out witnesses" if qualified else "unqualified estimates"
-    print(f"Saved {outdir / 'frontier.json'}; predictions are {status}")
-    if "quality" in cfg:
-        print("Quality uses whole-group conditional repair KL; max_loss is a proxy ceiling, not an original-KLD bound")
+    print(f"Saved {outdir / 'frontier.json'}; timing predictions are {status}")
+    if table:
+        print(f"Predicted KL is against the teacher on the calibration text (floor {table['floor']['kl']:.5f}); max_loss is a model ceiling, not a bound")
     return payload
 
 
 def witness_choices(info, baseline, spec):
     choices = dict(baseline)
     by_name = {t["name"]: t for t in info["tensors"]}
+    if "recipe" in spec:
+        # a planned recipe file (plan output) as the witness, before any overrides
+        recipe = json.loads(Path(spec["recipe"]).read_text())["choices"]
+        if set(recipe) != set(choices):
+            raise QuantError(f"witness recipe groups differ from the prepared model: {spec['recipe']}")
+        for group in info["groups"]:
+            if recipe[group["name"]] not in group["pool"]:
+                raise QuantError(f"witness recipe type is outside the group pool: {group['name']}")
+        choices.update(recipe)
     for group in info["groups"]:
-        # Category witnesses change calibrated groups only. Other floor tensors must stay fixed.
-        if "execution_groups" in info and "repair_options" not in group:
-            continue
         selected = spec.get("primary" if any(by_name[n]["category"] == "primary" for n in group["members"]) else "other")
         if selected and all(not by_name[n]["preserved"] for n in group["members"]):
             selected = selected.upper()
@@ -281,9 +280,25 @@ def witness_choices(info, baseline, spec):
     return choices
 
 
+def witness_loss(cfg, table, model, directory, name, timeout=7200):
+    """Measured KL of a witness model against the table's teacher, with the calibration execution policy."""
+    tokens = directory / f"{name}-kl.f32"
+    if not tokens.exists():
+        teacher = table["teacher"]
+        c = dict(cfg["calibration"], text=teacher["text"]["path"], chunks=teacher["chunks"], context=teacher["context"])
+        command = perplexity_command(cfg, c, model, table["execution"]["devices"][0], teacher["path"])
+        print(f"Measuring witness {name} KL against the teacher", flush=True)
+        partial = directory / f"{name}-kl.partial.f32"
+        run_direct(command, partial, directory / f"{name}-kl.log", cfg["runtime"]["env"], timeout)
+        partial.replace(tokens)
+    chunks = per_chunk(tokens, table["teacher"]["chunks"])
+    return float(chunks.mean()), float(chunks.std(ddof=1) / len(chunks) ** 0.5)
+
+
 def validate(data, cfg, specification, directory):
     directory = Path(directory).resolve()
     directory.mkdir(parents=True, exist_ok=True)
+    loss, table = loss_model(data, cfg)
     specs = json.loads(Path(specification).read_text())
     witnesses, seen_mixes = [], set()
     for spec in specs:
@@ -303,9 +318,8 @@ def validate(data, cfg, specification, directory):
         model = directory / f"{name}.gguf"
         if model.exists():
             verify_output(data["model"], tensor_plan(data["model"], choices), model)
-            verify_quality_output(data["model"], data.get("quality"), tensor_plan(data["model"], choices), model)
         else:
-            encode(data["model"], cfg, choices, data["imatrix"], model, data.get("quality"))
+            encode(data["model"], cfg, choices, data["imatrix"], model, quality_metadata(table))
         profile_file = directory / f"{name}-profile.json"
         if profile_file.exists():
             profile = json.loads(profile_file.read_text())
@@ -314,6 +328,9 @@ def validate(data, cfg, specification, directory):
             profile = profile_model(cfg, model, profile_file)
         witnesses.append({"name": name, "role": spec["role"], "choices": choices, "hit_fraction": mem["cache_hit_prior"],
                           "measured": profile_times(profile, cfg), "profile": str(profile_file)})
+        if table is not None:
+            kl, se = witness_loss(cfg, table, model, directory, name)
+            witnesses[-1]["loss"] = {"measured": kl, "se": se, "predicted": loss.predict(choices)["loss"]}
     # Witnesses execute on the leading GPU. Extra-GPU factors remain assumptions, not measurements.
     single_cfg = copy.deepcopy(cfg)
     single_cfg["multi_gpu_speedup_percent"] = {regime: 0 for regime in AXES[1:]}
@@ -349,6 +366,17 @@ def validate(data, cfg, specification, directory):
                                 all(max(w["relative_error"].values()) <= 0.15 for w in holdout))
     report = {"schema": SCHEMA, "slopes": data["slopes"], "fit_error": fit_error, "rank_errors": rank_errors,
               "timing_qualified": data["timing_qualified"], "witnesses": witnesses}
+    if table is not None:
+        # Every witness is held out from the quality fit, which used only probe recipes.
+        quality_ranks = [{"a": a["name"], "b": b["name"]} for i, a in enumerate(witnesses) for b in witnesses[i + 1:]
+                         if abs(a["loss"]["measured"] / b["loss"]["measured"] - 1) >= 0.05 and
+                         (a["loss"]["measured"] - b["loss"]["measured"]) * (a["loss"]["predicted"] - b["loss"]["predicted"]) < 0]
+        errors = [abs(w["loss"]["predicted"] / w["loss"]["measured"] - 1) for w in witnesses]
+        report["quality"] = {"rank_errors": quality_ranks, "max_relative_error": max(errors),
+                             "qualified": not quality_ranks and max(errors) <= 0.15}
+        for w in witnesses:
+            print(f"  {w['name']}: KL measured {w['loss']['measured']:.5f} +- {w['loss']['se']:.5f}, predicted {w['loss']['predicted']:.5f}")
+        print(f"Witness quality gate: {'passed' if report['quality']['qualified'] else 'not passed'}")
     write_json(directory / "validation.json", report)
     print(f"Held-out timing gate: {'passed' if data['timing_qualified'] else 'not passed'}")
     return report
@@ -357,12 +385,12 @@ def validate(data, cfg, specification, directory):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("inspect", "prepare", "plan", "validate"):
+    for name in ("inspect", "prepare", "calibrate", "plan", "validate"):
         p = sub.add_parser(name)
         p.add_argument("--config", type=Path, required=True)
-        if name in ("prepare", "plan", "validate"):
+        if name in ("prepare", "calibrate", "plan", "validate"):
             p.add_argument("--output", type=Path, required=True)
-        if name in ("plan", "validate"):
+        if name in ("calibrate", "plan", "validate"):
             p.add_argument("--prepared", type=Path, required=True)
         if name == "prepare":
             p.add_argument("--measurement-seconds", type=float, default=600)
@@ -382,17 +410,17 @@ def main():
             info = frontier["prepared"]["model"]
             if read_model(cfg["model"])["identity"] != info["identity"]:
                 raise QuantError("source model changed since planning")
-            current, quality = configured_model(cfg)
+            current = configured_model(cfg)
             if digest(inputs(cfg, current)) != frontier["prepared"]["input_key"]:
                 raise QuantError("encoder, imatrix or runtime inputs changed since planning")
             recipe = next((r for r in frontier["recipes"] if r["id"] == args.recipe), None)
             if recipe is None:
                 raise QuantError(f"unknown recipe {args.recipe}")
-            encode(info, cfg, recipe["choices"], frontier["prepared"]["imatrix"], args.output, quality)
+            encode(info, cfg, recipe["choices"], frontier["prepared"]["imatrix"], args.output, frontier["quality"])
             return
         cfg = load_config(args.config)
         if args.command == "inspect":
-            info, quality = configured_model(cfg)
+            info = configured_model(cfg)
             print(json.dumps({"model": info["architecture"], "devices_bytes": cfg["devices"],
                               "classification": {c: sum(t["source_bytes"] for t in info["tensors"] if t["category"] == c)
                                                  for c in ("primary", "other")}, "groups": info["groups"]}, indent=2))
@@ -400,7 +428,14 @@ def main():
             prepare(cfg, args.output, args.measurement_seconds)
         else:
             data = load_prepared(args.prepared, cfg)
-            if args.command == "plan":
+            if args.command == "calibrate":
+                if not cfg["calibration"]["text"]:
+                    raise QuantError("calibration.text is required")
+                if not data["imatrix"]:
+                    # Without activation statistics R is a weight-space error and misranks groups inside a band.
+                    raise QuantError("calibration needs an imatrix so that the sampled local error is activation-weighted")
+                calibrate(data, cfg, args.output, encode, verify_output)
+            elif args.command == "plan":
                 plan(data, cfg, args.output)
             else:
                 validate(data, cfg, args.mixes, args.output)
