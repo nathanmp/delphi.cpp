@@ -732,27 +732,35 @@ void llama_expert_cache::upload(const std::vector<upload_job> & jobs) {
     }
     static const int per_half = [] { const char * e = getenv("LLAMA_MOE_CACHE_REFILL_SLABS"); return e ? std::max(1, atoi(e)) : 32; }();
     static const char * env_threads = getenv("LLAMA_MOE_CACHE_REFILL_THREADS");
-    // Under --numa tensors (experts in CPU_NUMA buffers) an expert stores its rows node by node, in node order. Thread t then
-    // copies part t of each slab and runs on the node that holds that part, so that it reads local memory; at least 2
-    // threads per node. Else all threads run next to the GPU, which at NPS4 is one quadrant that reads 7/8 of the data from
-    // other nodes. LLAMA_MOE_CACHE_REFILL_NUMA=0 keeps them next to the GPU.
-    static const std::vector<std::vector<int>> node_cpus = [] {
-        const char * e = getenv("LLAMA_MOE_CACHE_REFILL_NUMA");
-        return e && atoi(e) == 0 ? std::vector<std::vector<int>>() : numa_node_cpus();
-    }();
+    // Under --numa tensors (experts in CPU_NUMA buffers) the pinned staging buffer next to the GPU is one node's memory, which
+    // at NPS4 is one quadrant: its 2 channels take all copy writes and all upload reads. The buffer is then interleaved over
+    // the nodes instead (LLAMA_MOE_CACHE_REFILL_INTERLEAVE=0 keeps it next to the GPU).
+    // An expert stores its rows node by node, in node order. With LLAMA_MOE_CACHE_REFILL_NUMA=1, thread t copies part t of
+    // each slab and runs on the node that holds that part (at least 2 threads per node), so that it reads local memory. By
+    // default all threads run next to the GPU.
+    static const std::vector<std::vector<int>> node_cpus = numa_node_cpus();
+    static const bool stage_interleave = [] { const char * e = getenv("LLAMA_MOE_CACHE_REFILL_INTERLEAVE"); return !e || atoi(e) != 0; }();
+    static const bool pin_nodes = [] { const char * e = getenv("LLAMA_MOE_CACHE_REFILL_NUMA"); return e && atoi(e) != 0; }();
     const ggml_tensor * src0 = model->layers[jobs[0].il].ffn_gate_exps;
     const int n_nodes = (int) node_cpus.size();
     const bool numa = n_nodes > 1 && src0->buffer && strcmp(ggml_backend_buffer_name(src0->buffer), "CPU_NUMA") == 0;
+    const bool by_node = numa && pin_nodes;
     int n_threads = env_threads ? std::max(1, atoi(env_threads)) : 8;
-    if (numa && !env_threads) { n_threads = std::max(n_threads, 2 * n_nodes); }
-    if (numa) { n_threads = (n_threads + n_nodes - 1) / n_nodes * n_nodes; }
+    if (by_node && !env_threads) { n_threads = std::max(n_threads, 2 * n_nodes); }
+    if (by_node) { n_threads = (n_threads + n_nodes - 1) / n_nodes * n_nodes; }
     ggml_backend_dev_t dev0 = ggml_backend_get_device(gpu);
     if (cpus.empty()) { cpus = local_cpus(dev0); }
     if (!pinned) {
-        // allocate (and first-touch) the pinned buffer next to the GPU
+        ggml_backend_buffer_type_t buft = ggml_backend_dev_host_buffer_type(dev0);
+        if (buft && numa && stage_interleave) {
+            auto * numa_buft_fn = (ggml_backend_buffer_type_t (*)(void))
+                ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev0), "ggml_backend_host_numa_buffer_type");
+            if (numa_buft_fn) { buft = numa_buft_fn(); }
+        }
+        // allocate (and first-touch) the pinned buffer next to the GPU, unless its pages are interleaved
         std::thread([&] {
             pin_thread(cpus);
-            if (auto * buft = ggml_backend_dev_host_buffer_type(dev0)) { pinned.reset(ggml_backend_buft_alloc_buffer(buft, 2 * per_half * bytes)); }
+            if (buft) { pinned.reset(ggml_backend_buft_alloc_buffer(buft, 2 * per_half * bytes)); }
             if (pinned) { memset(ggml_backend_buffer_get_base(pinned.get()), 0, 2 * per_half * bytes); }
         }).join();
         if (!pinned) { throw std::runtime_error("expert-cache: cannot allocate pinned refill buffers"); }
@@ -777,7 +785,7 @@ void llama_expert_cache::upload(const std::vector<upload_job> & jobs) {
         std::vector<std::thread> workers;
         for (int t = 0; t < n_threads; ++t) {
             workers.emplace_back([&, t] {
-                pin_thread(numa ? node_cpus[t * n_nodes / n_threads] : cpus);
+                pin_thread(by_node ? node_cpus[t * n_nodes / n_threads] : cpus);
                 int64_t seen = -1;
                 for (;;) {
                     {
