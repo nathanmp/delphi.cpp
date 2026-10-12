@@ -1027,6 +1027,23 @@ struct ggml_cuda_type_traits<GGML_TYPE_Q4_0> {
     static constexpr int bs = sizeof(block_q4_0);
 };
 
+// delphi: four groups of 32 values in the nibble layout of Q4_0 under one BF16 scale
+#define QR4_G128 QR4_0
+#define QI4_G128 (QK4_G128 / (4 * QR4_G128))
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q4_G128> {
+    static constexpr int qk = QK4_G128;
+    static constexpr int qr = QR4_G128;
+    static constexpr int qi = QI4_G128;
+    static constexpr int bs = sizeof(block_q4_g128);
+};
+
+// The scale of a Q4_G128 block (BF16 bits) as F32.
+static __device__ __forceinline__ float ggml_cuda_q4_g128_scale(const uint16_t d) {
+    return __uint_as_float((uint32_t) d << 16);
+}
+
 template<>
 struct ggml_cuda_type_traits<GGML_TYPE_Q4_1> {
     static constexpr int qk = QK4_1;

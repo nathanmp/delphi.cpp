@@ -523,31 +523,6 @@ __global__ void __launch_bounds__(MOE_INT4_CVT_THREADS) moe_int4_packed_to_q4_0(
     }
 }
 
-// The same conversion from the row-major layout of the file: one thread per (expert, column, group of 128), so that consecutive
-// threads read and write consecutive bytes.
-__global__ void moe_int4_rowmajor_to_q4_0(const char * __restrict__ src, const int64_t nb1, const int64_t nb2, const int64_t k,
-        const int64_t n, const int64_t n_experts, char * __restrict__ dst, const int64_t dnb1, const int64_t dnb2) {
-    const int64_t groups = k / 128;
-    const int64_t total  = n_experts * n * groups;
-    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < total; i += (int64_t) gridDim.x * blockDim.x) {
-        const int64_t g = i % groups, rest = i / groups;
-        const int64_t col = rest % n, e = rest / n;
-        const block_q4_g128 * blk = reinterpret_cast<const block_q4_g128 *>(src + e * nb2 + col * nb1) + g;
-        const uint16_t d = blk->d;
-        for (int b = 0; b < 4; ++b) {
-            const char * qs = reinterpret_cast<const char *>(blk->qs) + 16 * b;
-            uint8_t q[16];
-#pragma unroll
-            for (int j = 0; j < 16; j += 2) {
-                const uint16_t v = *reinterpret_cast<const uint16_t *>(qs + j);
-                q[j] = (uint8_t) (v & 0xff);
-                q[j + 1] = (uint8_t) (v >> 8);
-            }
-            moe_int4_write_q4_0(dst + e * dnb2 + col * dnb1 + (g * 4 + b) * sizeof(block_q4_0), d, q);
-        }
-    }
-}
-
 // ---- launch ------------------------------------------------------------------------------------------------------------------
 
 template <int R, int CR, int TW, int KK, int NN, bool W13>
@@ -749,7 +724,6 @@ static void moe_int4_prime(const int device) {
     CUDA_CHECK(cudaFuncGetAttributes(&attr, moe_dec_act<KSPLIT13>));
     CUDA_CHECK(cudaFuncGetAttributes(&attr, moe_int4_sum));
     CUDA_CHECK(cudaFuncGetAttributes(&attr, moe_int4_packed_to_q4_0));
-    CUDA_CHECK(cudaFuncGetAttributes(&attr, moe_int4_rowmajor_to_q4_0));
     CUDA_CHECK(cudaFuncGetAttributes(&attr, pf_hist));
     CUDA_CHECK(cudaFuncGetAttributes(&attr, pf_scan));
     CUDA_CHECK(cudaFuncGetAttributes(&attr, pf_scatter));
@@ -846,8 +820,8 @@ bool ggml_cuda_moe_int4_type_supported(int device) {
     return GGML_CUDA_CC_IS_NVIDIA(cc);
 }
 
-ggml_type ggml_cuda_moe_int4_dispatch_type(const ggml_tensor * src0) {
-    return src0->type == GGML_TYPE_Q4_G128 ? GGML_TYPE_Q4_0 : src0->type;
+bool ggml_cuda_moe_int4_is_packed(int device, const void * data) {
+    return moe_int4_is_packed(device, data);
 }
 
 bool ggml_cuda_moe_int4_prepare(ggml_backend_cuda_context & ctx, const ggml_cuda_moe_int4_ffn & f) {
@@ -998,14 +972,9 @@ void ggml_cuda_moe_int4_shadow(ggml_backend_cuda_context & ctx, const ggml_tenso
     const size_t  dnb1 = (size_t) (k / 32) * sizeof(block_q4_0), dnb2 = dnb1 * n;
     char * q = storage.alloc(dnb2 * e);
     cudaStream_t stream = ctx.stream();
-    if (moe_int4_is_packed(ctx.device, src0->data)) {
-        GGML_ASSERT(n % 64 == 0 && e <= 65535);
-        moe_int4_packed_to_q4_0<<<dim3((unsigned int) (n / 64), (unsigned int) e), MOE_INT4_CVT_THREADS, 0, stream>>>((const char *) src0->data, src0->nb[2], k, n, q, dnb1, dnb2);
-    } else {
-        const int64_t total = e * n * (k / 128);
-        const unsigned int grid = (unsigned int) std::min<int64_t>((total + 255) / 256, 1 << 20);
-        moe_int4_rowmajor_to_q4_0<<<grid, 256, 0, stream>>>((const char *) src0->data, src0->nb[1], src0->nb[2], k, n, e, q, dnb1, dnb2);
-    }
+    // ROWMAJOR weights take the ordinary kernels directly
+    GGML_ASSERT(moe_int4_is_packed(ctx.device, src0->data) && n % 64 == 0 && e <= 65535);
+    moe_int4_packed_to_q4_0<<<dim3((unsigned int) (n / 64), (unsigned int) e), MOE_INT4_CVT_THREADS, 0, stream>>>((const char *) src0->data, src0->nb[2], k, n, q, dnb1, dnb2);
     CUDA_CHECK(cudaGetLastError());
 
     src0_q = *src0;
@@ -1023,7 +992,7 @@ void ggml_cuda_moe_int4_shadow(ggml_backend_cuda_context & ctx, const ggml_tenso
         moe_int4_shadows_wide.fetch_add(1);
         moe_int4_log_once(MOE_INT4_REFUSE_COUNT + 1, "MUL_MAT_ID with INT4 weights and more than 16 rows: ordinary path on a Q4_0 conversion of the experts");
     } else {
-        moe_int4_log_once(MOE_INT4_REFUSE_COUNT + 1, "MUL_MAT_ID with INT4 weights outside a matched region (fusion off, other layout): ordinary path on a Q4_0 conversion of the experts");
+        moe_int4_log_once(MOE_INT4_REFUSE_COUNT + 1, "MUL_MAT_ID with packed INT4 weights outside a matched region (fusion off, other layout): ordinary path on a Q4_0 conversion of the experts");
     }
 }
 
@@ -1129,8 +1098,9 @@ bool ggml_cuda_moe_int4_type_supported(int device) {
     return false;
 }
 
-ggml_type ggml_cuda_moe_int4_dispatch_type(const ggml_tensor * src0) {
-    return src0->type;
+bool ggml_cuda_moe_int4_is_packed(int device, const void * data) {
+    GGML_UNUSED_VARS(device, data);
+    return false;
 }
 
 bool ggml_cuda_moe_int4_prepare(ggml_backend_cuda_context & ctx, const ggml_cuda_moe_int4_ffn & ffn) {

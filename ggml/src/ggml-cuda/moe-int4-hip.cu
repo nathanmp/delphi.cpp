@@ -977,10 +977,6 @@ bool ggml_cuda_moe_int4_type_supported(int device) {
     return GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[device].cc);
 }
 
-ggml_type ggml_cuda_moe_int4_dispatch_type(const ggml_tensor * src0) {
-    return src0->type == GGML_TYPE_Q4_G128 ? GGML_TYPE_Q4_0 : src0->type;
-}
-
 void ggml_hip_moe_int4_prepare_graph(ggml_backend_cuda_context & ctx, const ggml_cgraph * graph) {
     if (!have_g128.load(std::memory_order_relaxed) && !ggml_cuda_moe_int4_enabled()) { return; }
     for (int i = 0; i < graph->n_nodes; ++i) {
