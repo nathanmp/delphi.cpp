@@ -1,6 +1,7 @@
 #include "arg.h"
 #include "common.h"
 #include "fit.h"
+#include "hotswap.h"
 #include "log.h"
 #include "llama.h"
 
@@ -8,12 +9,15 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cinttypes>
 #include <clocale>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <fstream>
+#include <filesystem>
 #include <mutex>
 #include <random>
 #include <sstream>
@@ -1693,7 +1697,8 @@ static void multiple_choice_score(llama_context * ctx, const common_params & par
     LOG_INF("\n");
 }
 
-static void kl_divergence(llama_context * ctx, const common_params & params) {
+static void kl_divergence(llama_context * ctx, const common_params & params, bool * success = nullptr) {
+    if (success) { *success = false; }
     const llama_model * model = llama_get_model(ctx);
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
@@ -1913,6 +1918,7 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
     std::sort(kld_values.begin(), kld_values.end());
     std::sort(p_diff_values.begin(), p_diff_values.end());
 
+    if (success) { *success = std::isfinite(kld.sum_kld) && std::isfinite(kld.sum_nll) && std::isfinite(kld.sum_nll_base); }
     LOG("====== Perplexity statistics ======\n");
 
     auto log_ppl = mean_and_uncertainty(kld.sum_nll, kld.sum_nll2, kld.count);
@@ -2044,18 +2050,73 @@ int llama_perplexity(int argc, char ** argv) {
         params.n_ctx += params.ppl_stride/2;
     }
 
+    const char * hot_env = std::getenv("LLAMA_HOTSWAP_ENABLED");
+    const char * hot_ctrl = std::getenv("LLAMA_HOTSWAP_CONTROL_FILE");
+    const char * hot_stat = std::getenv("LLAMA_HOTSWAP_STATUS_FILE");
+    const bool hot_enabled = hot_env && *hot_env && std::strcmp(hot_env, "0") != 0;
+    const std::string control = hot_ctrl ? hot_ctrl : "";
+    const std::string status = hot_stat ? hot_stat : "";
+    const bool hot_signal = hot_enabled && !control.empty();
+    if (hot_enabled) {
+        if (control.empty() != status.empty() || (!control.empty() &&
+            std::filesystem::absolute(control) == std::filesystem::absolute(status))) {
+            LOG_ERR("hotswap: control and status must be distinct files, supplied together\n");
+            return 1;
+        }
+        if (params.split_mode != LLAMA_SPLIT_MODE_LAYER || !params.lora_adapters.empty() ||
+            !params.control_vectors.empty() || params.sampling.backend_sampling ||
+            params.hellaswag || params.winogrande || params.multiple_choice ||
+            std::getenv("LLAMA_PERPLEXITY_PRE_RELOAD_SCRIPT")) {
+            LOG_ERR("hotswap: supports PPL/KLD, layer split, and no adapters or pre-reload script\n");
+            return 1;
+        }
+        // Original buffers must remain raw and immutable so restore is exact.
+        params.no_extra_bufts = true;
+        params.load_mode = LLAMA_LOAD_MODE_NONE;
+        params.lazy_mode = LLAMA_LAZY_MODE_OFF;
+        params.fit_params = false;
+        LOG_INF("hotswap: fixed placement, resident weights, raw buffers; inference contexts are recreated after changes\n");
+        if (hot_signal) {
+            std::error_code error;
+            std::filesystem::remove(control, error);
+            if (!perplexity_hotswap_write_status(status, "loading", 0, 0)) { return 1; }
+        }
+    }
+
     llama_backend_init();
     llama_numa_init(params.numa);
+    if (hot_enabled) { perplexity_hotswap_clear_packed(); }
 
     // load the model and apply lora adapter, if any
-    auto llama_init = common_init_from_params(params);
+    auto llama_init = common_init_from_params(params, hot_enabled);
 
     auto * model = llama_init->model();
     auto * ctx   = llama_init->context();
+    std::unique_ptr<perplexity_hotswap> hot;
+    struct hot_context {
+        common_threadpools pools;
+        llama_context_ptr context;
+        hot_context(llama_model * model, const common_params & params) {
+            context.reset(llama_init_from_model(model, common_context_params_to_llama(params)));
+            if (context) { pools.init(context.get(), params); }
+        }
+    };
+    std::unique_ptr<hot_context> resident;
 
     if (model == nullptr) {
         LOG_ERR("%s: unable to load model\n", __func__);
         return 1;
+    }
+
+    if (hot_enabled) {
+        hot.reset(new perplexity_hotswap);
+        std::string error;
+        if (!hot->init(model, params.model.path, error)) {
+            LOG_ERR("hotswap: %s\n", error.c_str());
+            return 1;
+        }
+        resident.reset(new hot_context(model, params));
+        ctx = resident->context.get();
     }
 
     if (ctx == nullptr) {
@@ -2076,22 +2137,95 @@ int llama_perplexity(int argc, char ** argv) {
         LOG_INF("%s\n", common_params_get_system_info(params).c_str());
     }
 
-    struct results_perplexity results;
-    if (params.hellaswag) {
-        hellaswag_score(ctx, params);
-    } else if (params.winogrande) {
-        winogrande_score(ctx, params);
-    } else if (params.multiple_choice) {
-        multiple_choice_score(ctx, params);
-    } else if (params.kl_divergence) {
-        kl_divergence(ctx, params);
-    } else {
-        results = perplexity(ctx, params, n_ctx);
-    }
+    int64_t iteration = 1, sequence = 0;
+    bool terminate = false;
+    do {
+        if (hot_signal && !perplexity_hotswap_write_status(status, "computing", iteration, sequence)) { return 1; }
+        bool success = true;
+        struct results_perplexity results;
+        if (params.hellaswag) {
+            hellaswag_score(ctx, params);
+        } else if (params.winogrande) {
+            winogrande_score(ctx, params);
+        } else if (params.multiple_choice) {
+            multiple_choice_score(ctx, params);
+        } else if (params.kl_divergence) {
+            kl_divergence(ctx, params, &success);
+        } else {
+            results = perplexity(ctx, params, n_ctx);
+            success = std::isfinite(results.ppl_value) && results.ppl_value > 0;
+        }
+        LOG("\n");
+        llama_perf_context_print(ctx);
+        common_memory_breakdown_print(ctx);
+        if (!hot_enabled) { break; }
+        if (!success) {
+            LOG_ERR("hotswap: evaluation failed; no valid result published\n");
+            if (hot_signal) { perplexity_hotswap_write_status(status, "error", iteration, sequence); }
+            return 1;
+        }
+        fflush(stdout);
+        fflush(stderr);
+        if (hot_signal && !perplexity_hotswap_write_status(status, "done", iteration, sequence)) { return 1; }
+        while (true) {
+            perplexity_hotswap_command command;
+            if (hot_signal) {
+                if (!perplexity_hotswap_read_command(control, command)) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    continue;
+                }
+                if (command.sequence >= 0 && command.sequence <= sequence) {
+                    LOG_WRN("hotswap: ignored stale command sequence %" PRId64 "\n", command.sequence);
+                    continue;
+                }
+                if (command.sequence >= 0) { sequence = command.sequence; }
+            } else {
+                command.action = "reload";
+            }
+            LOG_INF("hotswap: command %s %" PRId64 "\n", command.action.c_str(), sequence);
+            if (command.action == "exit" || command.action == "quit" || command.action == "stop") {
+                terminate = true;
+                if (!perplexity_hotswap_write_status(status, "exiting", iteration, sequence)) { return 1; }
+                break;
+            }
+            if (command.action == "compute") { break; }
+            if (command.action != "reload" && command.action != "restore") {
+                LOG_ERR("hotswap: unknown command %s\n", command.action.c_str());
+                if (!perplexity_hotswap_write_status(status, "command_failed", iteration, sequence)) { return 1; }
+                continue;
+            }
+            llama_synchronize(ctx);
+            std::string error;
+            const int changed = command.action == "restore" ? hot->restore(error) : hot->reload(command.path, error);
+            if (changed <= 0) {
+                LOG_WRN("hotswap: reload failed: %s\n", error.empty() ? "no tensor changed" : error.c_str());
+                if (!hot_signal) { terminate = true; break; }
+                if (!perplexity_hotswap_write_status(status, "reload_failed", iteration, sequence)) { return 1; }
+                continue;
+            }
+            resident.reset();
+            perplexity_hotswap_clear_packed();
+            resident.reset(new hot_context(model, params));
+            if (!resident->context) {
+                hot->rollback();
+                resident.reset(new hot_context(model, params));
+                ctx = resident->context.get();
+                if (!ctx || !hot_signal) { return 1; }
+                LOG_ERR("hotswap: context creation failed; previous tensors restored\n");
+                if (!perplexity_hotswap_write_status(status, "reload_failed", iteration, sequence)) { return 1; }
+                continue;
+            }
+            hot->commit();
+            ctx = resident->context.get();
+            break;
+        }
+        ++iteration;
+        if (!terminate) { llama_perf_context_reset(ctx); }
+    } while (!terminate);
 
-    LOG("\n");
-    llama_perf_context_print(ctx);
-    common_memory_breakdown_print(ctx);
+    resident.reset();
+    if (hot_enabled) { perplexity_hotswap_clear_packed(); }
+    hot.reset();
 
     llama_backend_free();
 
