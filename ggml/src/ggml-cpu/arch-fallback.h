@@ -8,6 +8,7 @@
 #define ggml_vec_dot_q4_g128_q8_0_generic ggml_vec_dot_q4_g128_q8_0
 #define ggml_vec_dot_q4_g128_q8_0_rows_generic ggml_vec_dot_q4_g128_q8_0_rows
 #define ggml_q4_g128_panel_generic ggml_q4_g128_panel
+#define ggml_gemm_q4_g128_panels_generic ggml_gemm_q4_g128_panels
 #endif
 
 #if defined(GGML_CPU_GENERIC)

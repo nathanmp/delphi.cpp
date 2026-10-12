@@ -824,6 +824,100 @@ void ggml_vec_dot_q4_g128_q8_0_rows(int n, float * GGML_RESTRICT s, const void *
 #endif
 }
 
+#if defined(__AVX2__)
+// Most activation rows of one GEMM tile. Zen 2 issues vpmaddubsw and vpmaddwd on one pipe only, so a tile costs 6 of them
+// per row and group however it is blocked; 4 to 8 rows measure alike (single core: 49 GMAC/s against 27 for the rows kernel).
+#define G128_GEMM_TILE 8
+
+// One weight row against R GEMM panels. The four nibble vectors of a group are decoded once for all R rows; two vpmaddubsw
+// results (16-bit, |sum| <= 7680) are added before the widening vpmaddwd. The zero-point term is one dot of the group weight
+// scales with the panel's per-group terms at the end.
+static inline __attribute__((always_inline)) void g128_gemm_tile(int n, float * GGML_RESTRICT out, const block_q4_g128 * GGML_RESTRICT x,
+        const char * const * panels, const int R) {
+    const int ng = n / QK4_G128;
+    const __m256i m4     = _mm256_set1_epi8(0xF);
+    const __m256i ones16 = _mm256_set1_epi16(1);
+    float dw[GGML_Q4_G128_GEMM_MAX_GROUPS];
+    __m256 acc[G128_GEMM_TILE];
+    for (int r = 0; r < R; ++r) {
+        acc[r] = _mm256_setzero_ps();
+    }
+
+    for (int g = 0; g < ng; ++g) {
+        const ggml_bf16_t d16 = { x[g].d };
+        dw[g] = GGML_BF16_TO_FP32(d16);
+        const __m256 dwv = _mm256_set1_ps(dw[g]);
+        const __m256i l0 = _mm256_loadu_si256((const __m256i *) x[g].qs);
+        const __m256i l1 = _mm256_loadu_si256((const __m256i *) (x[g].qs + 32));
+        const __m256i w0 = _mm256_and_si256(l0, m4);
+        const __m256i w1 = _mm256_and_si256(_mm256_srli_epi16(l0, 4), m4);
+        const __m256i w2 = _mm256_and_si256(l1, m4);
+        const __m256i w3 = _mm256_and_si256(_mm256_srli_epi16(l1, 4), m4);
+        for (int r = 0; r < R; ++r) {
+            const __m256i * c  = (const __m256i *) (panels[r] + (size_t) g * GGML_Q4_G128_GEMM_GROUP_SIZE);
+            const float   * dy = (const float *) (c + 4);
+            const __m256i s0 = _mm256_madd_epi16(_mm256_add_epi16(_mm256_maddubs_epi16(w0, _mm256_loadu_si256(c)),
+                                                                  _mm256_maddubs_epi16(w1, _mm256_loadu_si256(c + 1))), ones16);
+            const __m256i s1 = _mm256_madd_epi16(_mm256_add_epi16(_mm256_maddubs_epi16(w2, _mm256_loadu_si256(c + 2)),
+                                                                  _mm256_maddubs_epi16(w3, _mm256_loadu_si256(c + 3))), ones16);
+            const __m256 t = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s1), _mm256_loadu_ps(dy + 8),
+                                             _mm256_mul_ps(_mm256_cvtepi32_ps(s0), _mm256_loadu_ps(dy)));
+            acc[r] = _mm256_fmadd_ps(t, dwv, acc[r]);
+        }
+    }
+
+    for (int r = 0; r < R; ++r) {
+        const float * zp = (const float *) (panels[r] + (size_t) ng * GGML_Q4_G128_GEMM_GROUP_SIZE);
+        __m256 z = _mm256_setzero_ps();
+        int g = 0;
+        for (; g + 8 <= ng; g += 8) {
+            z = _mm256_fmadd_ps(_mm256_loadu_ps(dw + g), _mm256_loadu_ps(zp + g), z);
+        }
+        float zs = hsum_float_8(z);
+        for (; g < ng; ++g) {
+            zs += dw[g] * zp[g];
+        }
+        out[r] = hsum_float_8(acc[r]) - zs;
+    }
+}
+#endif
+
+void ggml_gemm_q4_g128_panels(int n, const void * GGML_RESTRICT vx, size_t bx, int nr, const void * const * panels, float * const * dst, int ny) {
+#if defined(__AVX2__)
+    assert(n % QK4_G128 == 0);
+    GGML_ASSERT(n / QK4_G128 <= GGML_Q4_G128_GEMM_MAX_GROUPS);
+    // Balanced tiles (9 rows run as 4 + 5, not 8 + 1). Tiles are the outer loop: a tile's panels stay in L1/L2 while the
+    // weight rows, read from memory for the first tile, come from L2 for the next ones.
+    const int ntiles = (ny + G128_GEMM_TILE - 1) / G128_GEMM_TILE;
+    int r0 = 0;
+    for (int t = 0; t < ntiles; ++t) {
+        const int R = (ny - r0) / (ntiles - t);
+        const char * const * p = (const char * const *) panels + r0;
+        for (int i = 0; i < nr; ++i) {
+            const block_q4_g128 * x = (const block_q4_g128 *) ((const char *) vx + i * bx);
+            float out[G128_GEMM_TILE];
+            switch (R) {
+                case 1: g128_gemm_tile(n, out, x, p, 1); break;
+                case 2: g128_gemm_tile(n, out, x, p, 2); break;
+                case 3: g128_gemm_tile(n, out, x, p, 3); break;
+                case 4: g128_gemm_tile(n, out, x, p, 4); break;
+                case 5: g128_gemm_tile(n, out, x, p, 5); break;
+                case 6: g128_gemm_tile(n, out, x, p, 6); break;
+                case 7: g128_gemm_tile(n, out, x, p, 7); break;
+                case 8: g128_gemm_tile(n, out, x, p, 8); break;
+                default: GGML_ABORT("G128 GEMM tile of %d rows", R);
+            }
+            for (int r = 0; r < R; ++r) {
+                dst[r0 + r][i] = out[r];
+            }
+        }
+        r0 += R;
+    }
+#else
+    ggml_gemm_q4_g128_panels_generic(n, vx, bx, nr, panels, dst, ny);
+#endif
+}
+
 void ggml_vec_dot_q4_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     const int qk = QK8_0;
     const int nb = n / qk;

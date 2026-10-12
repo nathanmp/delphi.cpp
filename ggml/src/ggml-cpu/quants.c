@@ -300,6 +300,83 @@ void ggml_vec_dot_q4_g128_q8_0_rows_generic(int n, float * GGML_RESTRICT s, cons
     }
 }
 
+// Half h of a group holds blocks a = 2h and b = 2h + 1 as 64 codes: a[0..15], b[0..15], a[16..31], b[16..31]. Byte j of the
+// weights qs[32h .. 32h + 31] then multiplies code j with its low nibble and code 32 + j with its high nibble, and int32 lanes
+// 0-3 of the kernel sum block a, lanes 4-7 block b.
+void ggml_q4_g128_gemm_panel(int n, const void * GGML_RESTRICT vy, void * GGML_RESTRICT panel) {
+    assert(n % QK4_G128 == 0);
+    const block_q8_0 * GGML_RESTRICT y = vy;
+    const int ng = n / QK4_G128;
+    char * p = panel;
+    float * zp = (float *) (p + (size_t) ng * GGML_Q4_G128_GEMM_GROUP_SIZE);
+
+    for (int g = 0; g < ng; ++g) {
+        int8_t * codes = (int8_t *) (p + (size_t) g * GGML_Q4_G128_GEMM_GROUP_SIZE);
+        float  * scale = (float *) (codes + QK4_G128);
+        float z = 0.0f;
+        for (int h = 0; h < 2; ++h) {
+            const block_q8_0 * a = y + 4 * g + 2 * h;
+            const block_q8_0 * b = a + 1;
+            memcpy(codes + 64 * h,      a->qs,      16);
+            memcpy(codes + 64 * h + 16, b->qs,      16);
+            memcpy(codes + 64 * h + 32, a->qs + 16, 16);
+            memcpy(codes + 64 * h + 48, b->qs + 16, 16);
+            const float da = GGML_CPU_FP16_TO_FP32(a->d);
+            const float db = GGML_CPU_FP16_TO_FP32(b->d);
+            int sa = 0;
+            int sb = 0;
+            for (int k = 0; k < QK8_0; ++k) {
+                sa += a->qs[k];
+                sb += b->qs[k];
+            }
+            for (int l = 0; l < 4; ++l) {
+                scale[8 * h + l]     = da;
+                scale[8 * h + 4 + l] = db;
+            }
+            // the weights are unsigned nibbles with zero point 8
+            z += 8.0f * (da * sa + db * sb);
+        }
+        zp[g] = z;
+    }
+}
+
+void ggml_gemm_q4_g128_panels_generic(int n, const void * GGML_RESTRICT vx, size_t bx, int nr, const void * const * panels, float * const * dst, int ny) {
+    assert(n % QK4_G128 == 0);
+    const int ng = n / QK4_G128;
+
+    for (int i = 0; i < nr; ++i) {
+        const block_q4_g128 * x = (const block_q4_g128 *) ((const char *) vx + i * bx);
+        for (int r = 0; r < ny; ++r) {
+            const char  * p  = panels[r];
+            const float * zp = (const float *) (p + (size_t) ng * GGML_Q4_G128_GEMM_GROUP_SIZE);
+            float sumf = 0.0f;
+            for (int g = 0; g < ng; ++g) {
+                const int8_t * codes = (const int8_t *) (p + (size_t) g * GGML_Q4_G128_GEMM_GROUP_SIZE);
+                const float  * scale = (const float *) (codes + QK4_G128);
+                const ggml_bf16_t d16 = { x[g].d };
+                const float dw = GGML_BF16_TO_FP32(d16);
+                float sumg = 0.0f;
+                for (int h = 0; h < 2; ++h) {
+                    int sa = 0;
+                    int sb = 0;
+                    for (int j = 0; j < 32; ++j) {
+                        const uint8_t q = x[g].qs[32 * h + j];
+                        const int v = (q & 15) * codes[64 * h + j] + (q >> 4) * codes[64 * h + 32 + j];
+                        if (j < 16) {
+                            sa += v;
+                        } else {
+                            sb += v;
+                        }
+                    }
+                    sumg += scale[8 * h] * sa + scale[8 * h + 4] * sb;
+                }
+                sumf += dw * (sumg - zp[g]);
+            }
+            dst[r][i] = sumf;
+        }
+    }
+}
+
 void ggml_vec_dot_q4_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     const int qk = QK8_0;
     const int nb = n / qk;
