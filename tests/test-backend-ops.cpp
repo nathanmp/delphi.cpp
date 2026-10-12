@@ -11267,7 +11267,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         // past the per-expert row count at which the weights are repacked
         test_cases.emplace_back(new test_mul_mat_id_pool(type_a, GGML_TYPE_F32, 128, 4, 8, false, 256, 128, 256));
     }
-    for (int64_t rows : {1, 3, 6}) {
+    // 64 and 300 rows: prompt batches that run the expert cache (LLAMA_MOE_CACHE_PROMPT_ROWS) and the CPU G128 GEMM
+    for (int64_t rows : {1, 3, 6, 64, 300}) {
         for (int mask : {0, 1, 2}) { test_cases.emplace_back(new test_g128_partial_ffn(rows, mask)); }
         test_cases.emplace_back(new test_mul_mat_id_partial(GGML_TYPE_Q4_G128, 16, 6, true, 256, rows, 512));
         test_cases.emplace_back(new test_mul_mat_id_partial(GGML_TYPE_Q4_G128, 16, 6, false, 512, rows, 256));
@@ -12529,6 +12530,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+
+    // MiMo V2.6 Flash routed experts (G128): gate/up and down at prefill batch sizes below the staging threshold
+    for (int bs : {1, 3, 32, 128, 300, 512}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_G128, GGML_TYPE_F32, 256, 8, true, 2048, bs, 4096));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_G128, GGML_TYPE_F32, 256, 8, false, 4096, bs, 2048));
+    }
+    // the expert cache's GPU part for MiMo: ~28 resident experts per layer, about half of the selections hit
+    for (int bs : {1, 3, 16, 64, 300}) {
+        test_cases.emplace_back(new test_mul_mat_id_partial(GGML_TYPE_Q4_G128, 32, 8, true, 2048, bs, 4096));
+        test_cases.emplace_back(new test_mul_mat_id_partial(GGML_TYPE_Q4_G128, 32, 8, false, 4096, bs, 2048));
+    }
 
     // gpt-oss-20b
     for (int bs : {1, 4, 8, 512}) {

@@ -1820,6 +1820,28 @@ static size_t ggml_cpu_g128_panels_size(int64_t ne00) {
     return GGML_Q4_G128_MAX_ROWS * GGML_PAD(GGML_Q4_G128_PANEL_SIZE(ne00), 64);
 }
 
+// GGML_CPU_G128_GEMM: fewest rows (tokens) of one expert that run the G128 tile GEMM, 0 = off. Fewer rows (decode, MTP
+// verification) keep the rows kernel, whose results are bitwise those of single-row decode.
+static int ggml_cpu_g128_gemm_min_rows(void) {
+#if defined(__AVX2__)
+    static int rows = -1;
+    if (rows < 0) {
+        const char * env = getenv("GGML_CPU_G128_GEMM");
+        rows = env ? MAX(0, atoi(env)) : 4;
+    }
+    return rows;
+#else
+    return 0;
+#endif
+}
+
+// A G128 MUL_MAT_ID with enough tokens for an expert to reach the GEMM: every src1 row also gets a GEMM panel.
+static bool ggml_cpu_g128_gemm_node(const struct ggml_tensor * node) {
+    const int min_rows = ggml_cpu_g128_gemm_min_rows();
+    return min_rows > 0 && ggml_cpu_g128_rows_supported(node->src[0]) && node->src[1]->type == GGML_TYPE_F32 &&
+        node->src[2]->ne[1] >= min_rows && node->src[0]->ne[0] / QK4_G128 <= GGML_Q4_G128_GEMM_MAX_GROUPS;
+}
+
 static void ggml_compute_forward_mul_mat_id_one_chunk(
     struct ggml_tensor * dst,
     const struct ggml_tensor * src0,
@@ -1835,7 +1857,8 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
     const size_t row_size,
     const bool src1_cont,
     const void * wdata,
-    char * g128_panels) {
+    char * g128_panels,
+    const char * gemm_panels) {
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -1843,6 +1866,25 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
 
     ggml_vec_dot_t    const vec_dot      = type_traits_cpu[type].vec_dot;
     enum ggml_type    const vec_dot_type = type_traits_cpu[type].vec_dot_type;
+
+    if (gemm_panels && ir1_end - ir1_start >= ggml_cpu_g128_gemm_min_rows()) {
+        // G128 tile GEMM over this expert's rows, in blocks of up to 64 rows
+        const size_t panel_size = GGML_Q4_G128_GEMM_PANEL_SIZE(ne10);
+        for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += 64) {
+            const int ny = (int) MIN(64, ir1_end - iir1);
+            const void * panels[64];
+            float * dsts[64];
+            for (int r = 0; r < ny; ++r) {
+                const struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, iir1 + r);
+                const int64_t i11 = row_mapping.i1 % ne11;
+                const int64_t i12 = row_mapping.i2;
+                panels[r] = gemm_panels + (i11 + i12*ne11)*panel_size;
+                dsts[r] = (float *) ((char *) dst->data + (row_mapping.i1*nb1 + i12*nb2)) + ir0_start;
+            }
+            ggml_gemm_q4_g128_panels(ne00, src0_cur + ir0_start*nb01, nb01, (int) (ir0_end - ir0_start), panels, dsts, ny);
+        }
+        return;
+    }
 
     if (g128_panels) {
         // Decode each weight row once for up to GGML_Q4_G128_MAX_ROWS of this expert's tokens (MTP verification and small
@@ -2019,6 +2061,17 @@ static void ggml_compute_forward_mul_mat_id_impl(
         g128_panels = (char *) incr_ptr_aligned(&wdata_cur, nth * size, 64) + (size_t) params->ith * size;
     }
 
+    // G128 GEMM panels of every src1 row, one copy per node (the work buffer is planned with use_ref unknown, as for IQP)
+    const bool g128_gemm_node = ggml_cpu_g128_gemm_node(dst);
+    const bool g128_gemm = g128_gemm_node && !params->use_ref;
+    const size_t gemm_panel_size = GGML_Q4_G128_GEMM_PANEL_SIZE(ne10);
+    const size_t gemm_node_stride = g128_gemm_node ? ggml_nrows(src1) * gemm_panel_size : 0;
+    char * gemm_panels = NULL;
+
+    if (g128_gemm_node) {
+        gemm_panels = (char *) incr_ptr_aligned(&wdata_cur, gemm_node_stride * n_nodes, 64) + numa_node * gemm_node_stride;
+    }
+
     GGML_ASSERT(params->wsize >= (size_t)((char *) wdata_cur - (char *) params->wdata));
 
     const int64_t prof_t_quant = prof ? ggml_time_us() : 0;
@@ -2045,6 +2098,19 @@ static void ggml_compute_forward_mul_mat_id_impl(
             }
         }
 #else
+        if (g128_gemm) {
+            // whole rows per worker: a worker makes the GEMM panel of each of its Q8_0 rows, so no barrier is needed between
+            const int64_t nr1 = ne11*ne12*ne13;
+            for (int64_t ir = work_ith; ir < nr1; ir += work_nth) {
+                const int64_t i11 = ir % ne11;
+                const int64_t i12 = (ir / ne11) % ne12;
+                const int64_t i13 = ir / (ne11*ne12);
+                void * q = wdata + i13*nbw3 + i12*nbw2 + i11*nbw1;
+                from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11), q, ne10);
+                ggml_q4_g128_gemm_panel(ne10, q, gemm_panels + ir*gemm_panel_size);
+            }
+        } else
+
         for (int64_t i13 = 0; i13 < ne13; ++i13) {
             for (int64_t i12 = 0; i12 < ne12; ++i12) {
                 for (int64_t i11 = 0; i11 < ne11; ++i11) {
@@ -2266,7 +2332,7 @@ static void ggml_compute_forward_mul_mat_id_impl(
             ggml_compute_forward_mul_mat_id_one_chunk(
                 dst, src0, src1, ids, cur_a,
                 ir0_start, ir0_end, ir1_start, ir1_end,
-                src0_cur, matrix_rows, row_size, src1_cont, wdata, g128_panels
+                src0_cur, matrix_rows, row_size, src1_cont, wdata, g128_panels, g128_gemm ? gemm_panels : NULL
             );
             if (g128_fused) {
                 // the same rows of up, then SwiGLU over them: one node and one barrier instead of three
@@ -2274,7 +2340,7 @@ static void ggml_compute_forward_mul_mat_id_impl(
                     fuse_up, fuse_up->src[0], src1, ids, cur_a,
                     ir0_start, ir0_end, ir1_start, ir1_end,
                     (const char *) fuse_up->src[0]->data + cur_a * fuse_up->src[0]->nb[2],
-                    matrix_rows, row_size, src1_cont, wdata, g128_panels
+                    matrix_rows, row_size, src1_cont, wdata, g128_panels, g128_gemm ? gemm_panels : NULL
                 );
                 for (int64_t ir1 = ir1_start; ir1 < ir1_end; ++ir1) {
                     const struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, ir1);
@@ -3601,6 +3667,10 @@ struct ggml_cplan ggml_graph_plan(
                         // G128 activation panels, one set per thread
                         if (ggml_cpu_g128_rows_supported(src0)) {
                             cur += n_tasks * ggml_cpu_g128_panels_size(src0->ne[0]) + 64;
+                        }
+                        // G128 GEMM panels of every src1 row, one copy per node
+                        if (ggml_cpu_g128_gemm_node(node)) {
+                            cur += ggml_nrows(src1) * GGML_Q4_G128_GEMM_PANEL_SIZE(src1->ne[0]) * n_nodes + 64;
                         }
                     } break;
                 case GGML_OP_OUT_PROD:

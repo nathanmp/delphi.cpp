@@ -127,6 +127,7 @@ std::unique_ptr<llama_expert_cache> llama_expert_cache::create(
     result->model = &model;
     if (const char * env = getenv("LLAMA_MOE_CACHE_WINDOW")) { result->window = atoll(env); }
     if (const char * env = getenv("LLAMA_MOE_CACHE_PREFILL")) { result->record_prompts = atoi(env) != 0; }
+    if (const char * env = getenv("LLAMA_MOE_CACHE_PROMPT_ROWS")) { result->prompt_rows = std::max(0LL, atoll(env)); }
     if (const char * env = getenv("LLAMA_MOE_CACHE_HYSTERESIS")) { result->hysteresis = std::max(0.0, atof(env)); }
     if (const char * env = getenv("LLAMA_MOE_CACHE_EVERY")) { result->every = std::max(0LL, atoll(env)); }
     if (const char * env = getenv("LLAMA_MOE_CACHE_ASYNC_EXPERTS")) { result->max_async = std::max(1LL, atoll(env)); }
@@ -408,6 +409,10 @@ llama_expert_cache::~llama_expert_cache() {
                 (long long) n_refresh, (long long) n_uploaded, refresh_ms, (long long) n_async, (long long) n_async_uploaded,
                 async_apply_ms, all_sel ? 100.0 * hit_sel / all_sel : 0.0, all_distinct ? 100.0 * hit_distinct / all_distinct : 0.0);
     }
+    if (prompt_all_sel) {
+        LLAMA_LOG_WARN("expert-cache: prompt batches of %lld+ rows: %.1f%% of %lld selections on the GPU\n",
+                (long long) max_rows + 1, 100.0 * prompt_hit_sel / prompt_all_sel, (long long) prompt_all_sel);
+    }
 }
 
 size_t llama_expert_cache::release_scratch() {
@@ -476,11 +481,13 @@ void llama_expert_cache::op_cold_ids(ggml_tensor * dst, int ith, int nth, void *
     const ggml_tensor * ids = dst->src[0];
     const int64_t k = ids->ne[0], rows = ids->ne[1];
     const bool warmup = c.warmup;
-    if (!warmup && c.window >= 0) {
+    // a prompt batch (graph_rows()) is recorded as op_record does, and its hits are counted apart from the decode hits
+    const bool prompt = rows > max_rows;
+    if (!warmup && c.window >= 0 && (!prompt || c.record_prompts)) {
         c.record(l, (const char *) ids->data, ids->nb[0], ids->nb[1], k, rows, true);
     }
     if (!warmup && c.dump) {
-        c.dump_record(l.il, 0, rows, k, (const char *) ids->data, ids->nb[0], ids->nb[1], true);
+        c.dump_record(l.il, prompt ? 1 : 0, rows, k, (const char *) ids->data, ids->nb[0], ids->nb[1], true);
     }
     // Hit statistics: selections, and distinct experts, because the CPU reads each expert once per ubatch.
     c.stamp_gen++;
@@ -491,6 +498,11 @@ void llama_expert_cache::op_cold_ids(ggml_tensor * dst, int ith, int nth, void *
             const int32_t v = l.cold[e];
             *reinterpret_cast<int32_t *>((char *) dst->data + r * dst->nb[1] + j * dst->nb[0]) = v;
             if (warmup) { continue; }
+            if (prompt) {
+                c.prompt_all_sel++;
+                c.prompt_hit_sel += v < 0;
+                continue;
+            }
             c.all_sel++;
             c.hit_sel += v < 0;
             if (c.stamp[e] != c.stamp_gen) {

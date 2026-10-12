@@ -850,6 +850,11 @@ void run_batch(ggml_backend_cuda_context & ctx, const ggml_cuda_moe_int4_ffn & f
     const float * x = static_cast<const float *>(f.x->data) + size_t(start) * h;
     const float * rw = static_cast<const float *>(f.weights->data) + size_t(start) * topk;
     float * out = static_cast<float *>(f.dst->data) + size_t(start) * h;
+    if (f.partial) {
+        // the schedule skips out-of-range ids (another part's experts), so their down rows are never written: the slot
+        // reduction must read zeros there
+        CUDA_CHECK(cudaMemsetAsync(s.down, 0, size_t(slots) * h * sizeof(float), stream));
+    }
     ggml_cuda_moe_schedule_build(ids, ids_stride, m, topk, experts, s.offsets, s.slots, nullptr, s.schedule, stream);
     if (tiles_enabled()) {
         // gate/up blocks are one 128-wide group of 32 routed rows; down blocks four waves of 2 x 4 tiles
@@ -880,7 +885,7 @@ bool eligible(ggml_backend_cuda_context & ctx, const ggml_cuda_moe_int4_ffn & f)
     if (!ggml_cuda_moe_int4_type_supported(ctx.device) || !supported_weight(f.gate) || !supported_weight(f.up) ||
             !supported_weight(f.down) || !f.x || !f.ids || !f.weights || !f.dst) { return false; }
     const int h = f.gate->ne[0], ff = f.gate->ne[1], e = f.gate->ne[2], topk = f.ids->ne[0], m = f.x->ne[2];
-    if (h % 128 || ff % 128 || topk < 2 || topk > MAX_TOPK || m < 1 || (f.partial && m > MAX_ROWS) ||
+    if (h % 128 || ff % 128 || topk < 2 || topk > MAX_TOPK || m < 1 ||
             f.up->ne[0] != h || f.up->ne[1] != ff || f.up->ne[2] != e ||
             f.down->ne[0] != ff || f.down->ne[1] != h || f.down->ne[2] != e) { return false; }
     for (const ggml_tensor * t : {f.gate, f.up, f.down}) {
