@@ -11,8 +11,9 @@ import time
 
 
 class HotswapSession:
-    def __init__(self, command, output, timeout=600):
+    def __init__(self, command, output, timeout=600, env=None):
         self.output = Path(output)
+        self.env = dict(env or {})
         self.output.mkdir(parents=True, exist_ok=True)
         self.control = self.output / "control"
         self.status = self.output / "status"
@@ -53,7 +54,7 @@ class HotswapSession:
 
     def start(self):
         self.stream = self.log.open("wb", buffering=0)
-        env = os.environ | {
+        env = os.environ | self.env | {
             "LLAMA_HOTSWAP_ENABLED": "1",
             "LLAMA_HOTSWAP_CONTROL_FILE": str(self.control.resolve()),
             "LLAMA_HOTSWAP_STATUS_FILE": str(self.status.resolve()),
