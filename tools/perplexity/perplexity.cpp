@@ -1915,6 +1915,17 @@ static void kl_divergence(llama_context * ctx, const common_params & params, boo
 
     if (kld.count < 100) return; // we do not wish to do statistics on so few values
 
+    // LLAMA_KLD_TOKENS_FILE: write the per-token KL divergence (float32, in chunk order) for paired comparisons
+    if (const char * path = std::getenv("LLAMA_KLD_TOKENS_FILE")) {
+        FILE * f = fopen(path, "wb");
+        if (!f || fwrite(kld_values.data(), sizeof(float), kld_values.size(), f) != kld_values.size()) {
+            LOG_ERR("%s: failed to write %s\n", __func__, path);
+        }
+        if (f) {
+            fclose(f);
+        }
+    }
+
     std::sort(kld_values.begin(), kld_values.end());
     std::sort(p_diff_values.begin(), p_diff_values.end());
 
