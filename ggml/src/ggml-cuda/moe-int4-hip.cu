@@ -1343,7 +1343,9 @@ void ggml_cuda_moe_int4_stage_prepare(ggml_backend_cuda_context & ctx, ggml_tens
     std::lock_guard<std::mutex> lock(state_mutex);
     weight_state * s = find_state(ctx.device, t->data);
     GGML_ASSERT(s && s->stride == size_t(t->nb[2]) && s->experts == t->ne[2]);
-    GGML_ASSERT(s->k == t->ne[0] && s->n == t->ne[1]);
+    // a slot holds tensors of different shapes with the same expert size (gate/up [k, n] and down [n, k]): it describes the newest
+    s->k = int(t->ne[0]);
+    s->n = int(t->ne[1]);
     const cudaStream_t stream = ctx.stream();
     if (staged_packed.erase({ctx.device, t->data}) > 0) {
         if (!s->packed) {
