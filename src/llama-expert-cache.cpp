@@ -650,14 +650,11 @@ void llama_expert_cache::push_maps(const std::vector<bool> & changed) {
     }
 }
 
-// The CPUs next to the GPU, from sysfs; empty if unknown. Copies from them reach ~30 GB/s instead of ~18 GB/s unpinned.
-static std::vector<int> local_cpus(ggml_backend_dev_t dev) {
+// A sysfs list such as "0-7,16-23"; empty if the file cannot be read.
+static std::vector<int> read_cpulist(const std::string & path) {
     std::vector<int> cpus;
 #ifdef __linux__
-    ggml_backend_dev_props props = {};
-    ggml_backend_dev_get_props(dev, &props);
-    if (!props.device_id) { return cpus; }
-    std::ifstream f(std::string("/sys/bus/pci/devices/") + props.device_id + "/local_cpulist");
+    std::ifstream f(path);
     std::string list;
     if (!std::getline(f, list)) { return cpus; }
     size_t pos = 0;
@@ -669,6 +666,30 @@ static std::vector<int> local_cpus(ggml_backend_dev_t dev) {
         for (int c = first; c <= last && c < CPU_SETSIZE; ++c) { cpus.push_back(c); }
         pos = end + 1;
     }
+#else
+    GGML_UNUSED(path);
+#endif
+    return cpus;
+}
+
+// The CPUs of each NUMA node that has CPUs, in node order, from sysfs; empty if unknown.
+static std::vector<std::vector<int>> numa_node_cpus() {
+    std::vector<std::vector<int>> nodes;
+    for (int n : read_cpulist("/sys/devices/system/node/online")) {
+        auto cpus = read_cpulist("/sys/devices/system/node/node" + std::to_string(n) + "/cpulist");
+        if (!cpus.empty()) { nodes.push_back(std::move(cpus)); }
+    }
+    return nodes;
+}
+
+// The CPUs next to the GPU, from sysfs; empty if unknown. Copies from them reach ~30 GB/s instead of ~18 GB/s unpinned.
+static std::vector<int> local_cpus(ggml_backend_dev_t dev) {
+    std::vector<int> cpus;
+#ifdef __linux__
+    ggml_backend_dev_props props = {};
+    ggml_backend_dev_get_props(dev, &props);
+    if (!props.device_id) { return cpus; }
+    cpus = read_cpulist(std::string("/sys/bus/pci/devices/") + props.device_id + "/local_cpulist");
 #else
     GGML_UNUSED(dev);
 #endif
@@ -710,14 +731,37 @@ void llama_expert_cache::upload(const std::vector<upload_job> & jobs) {
         return;
     }
     static const int per_half = [] { const char * e = getenv("LLAMA_MOE_CACHE_REFILL_SLABS"); return e ? std::max(1, atoi(e)) : 32; }();
-    static const int n_threads = [] { const char * e = getenv("LLAMA_MOE_CACHE_REFILL_THREADS"); return e ? std::max(1, atoi(e)) : 8; }();
+    static const char * env_threads = getenv("LLAMA_MOE_CACHE_REFILL_THREADS");
+    // Two options for --numa tensors (experts in CPU_NUMA buffers), off by default; for NPS4 set both (MiMo V2.6 Flash, NPS4:
+    // refresh 210 -> ~150 ms per prompt; NPS1 is bound by the PCIe upload and not measured with them).
+    // The pinned staging buffer next to the GPU is one node's memory, which at NPS4 is one quadrant: its 2 channels take all
+    // copy writes and all upload reads. LLAMA_MOE_CACHE_REFILL_INTERLEAVE=1 interleaves it over the nodes instead.
+    // An expert stores its rows node by node, in node order. With LLAMA_MOE_CACHE_REFILL_NUMA=1, thread t copies part t of
+    // each slab and runs on the node that holds that part (at least 2 threads per node), so that it reads local memory. By
+    // default all threads run next to the GPU.
+    static const std::vector<std::vector<int>> node_cpus = numa_node_cpus();
+    static const bool stage_interleave = [] { const char * e = getenv("LLAMA_MOE_CACHE_REFILL_INTERLEAVE"); return e && atoi(e) != 0; }();
+    static const bool pin_nodes = [] { const char * e = getenv("LLAMA_MOE_CACHE_REFILL_NUMA"); return e && atoi(e) != 0; }();
+    const ggml_tensor * src0 = model->layers[jobs[0].il].ffn_gate_exps;
+    const int n_nodes = (int) node_cpus.size();
+    const bool numa = n_nodes > 1 && src0->buffer && strcmp(ggml_backend_buffer_name(src0->buffer), "CPU_NUMA") == 0;
+    const bool by_node = numa && pin_nodes;
+    int n_threads = env_threads ? std::max(1, atoi(env_threads)) : 8;
+    if (by_node && !env_threads) { n_threads = std::max(n_threads, 2 * n_nodes); }
+    if (by_node) { n_threads = (n_threads + n_nodes - 1) / n_nodes * n_nodes; }
     ggml_backend_dev_t dev0 = ggml_backend_get_device(gpu);
     if (cpus.empty()) { cpus = local_cpus(dev0); }
     if (!pinned) {
-        // allocate (and first-touch) the pinned buffer next to the GPU
+        ggml_backend_buffer_type_t buft = ggml_backend_dev_host_buffer_type(dev0);
+        if (buft && numa && stage_interleave) {
+            auto * numa_buft_fn = (ggml_backend_buffer_type_t (*)(void))
+                ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev0), "ggml_backend_host_numa_buffer_type");
+            if (numa_buft_fn) { buft = numa_buft_fn(); }
+        }
+        // allocate (and first-touch) the pinned buffer next to the GPU, unless its pages are interleaved
         std::thread([&] {
             pin_thread(cpus);
-            if (auto * buft = ggml_backend_dev_host_buffer_type(dev0)) { pinned.reset(ggml_backend_buft_alloc_buffer(buft, 2 * per_half * bytes)); }
+            if (buft) { pinned.reset(ggml_backend_buft_alloc_buffer(buft, 2 * per_half * bytes)); }
             if (pinned) { memset(ggml_backend_buffer_get_base(pinned.get()), 0, 2 * per_half * bytes); }
         }).join();
         if (!pinned) { throw std::runtime_error("expert-cache: cannot allocate pinned refill buffers"); }
@@ -742,7 +786,7 @@ void llama_expert_cache::upload(const std::vector<upload_job> & jobs) {
         std::vector<std::thread> workers;
         for (int t = 0; t < n_threads; ++t) {
             workers.emplace_back([&, t] {
-                pin_thread(cpus);
+                pin_thread(by_node ? node_cpus[t * n_nodes / n_threads] : cpus);
                 int64_t seen = -1;
                 for (;;) {
                     {
@@ -751,11 +795,12 @@ void llama_expert_cache::upload(const std::vector<upload_job> & jobs) {
                         if (stop) { return; }
                         seen = batch;
                     }
-                    const size_t part = (bytes / n_threads + 63) & ~size_t(63);
-                    const size_t off = std::min(bytes, t * part), len = std::min(bytes, off + part) - off;
                     for (size_t i = 0; i < n; ++i) {
+                        // parts of each slab's own size, so that part t matches the rows of the same node in every slab
                         const size_t size = slabs[first + i].bank->nb[2];
-                        if (off < size) { memcpy(dst + i * bytes + off, slabs[first + i].src + off, std::min(len, size - off)); }
+                        const size_t part = ((size + n_threads - 1) / n_threads + 63) & ~size_t(63);
+                        const size_t off = std::min(size, t * part), len = std::min(size, off + part) - off;
+                        if (len > 0) { memcpy(dst + i * bytes + off, slabs[first + i].src + off, len); }
                     }
                     {
                         std::lock_guard<std::mutex> lock(mutex);
