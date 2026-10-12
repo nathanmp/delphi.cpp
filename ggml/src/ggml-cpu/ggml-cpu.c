@@ -41,6 +41,7 @@
 #include <signal.h>
 #if defined(__gnu_linux__)
 #include <linux/mempolicy.h>
+#include <sys/mman.h>
 #include <syscall.h>
 #include <unistd.h>
 #endif
@@ -548,6 +549,15 @@ typedef pthread_mutex_t    ggml_mutex_t;
 
 #endif
 
+// --numa tensors: the state of one node's workers, in that node's memory (ggml_numa_node_state_alloc)
+struct ggml_numa_node_state {
+    atomic_int GGML_CACHE_ALIGN n_barrier;        // ggml_numa_node_barrier
+    atomic_int GGML_CACHE_ALIGN n_barrier_passed; // also the generation of the node's MUL_MAT_ID work (piece stealing)
+    atomic_int GGML_CACHE_ALIGN frontier;         // highest expert the node's own workers have started in this op, or -1
+    size_t   scratch_size;
+    uint8_t * scratch;                            // node-local MUL_MAT_ID work memory, see ggml_numa_mmid_layout
+};
+
 // Threadpool def
 struct ggml_threadpool {
     ggml_mutex_t mutex;       // mutex for cond.var
@@ -575,6 +585,12 @@ struct ggml_threadpool {
     enum ggml_status ec;
 
     int32_t timeline_call;    // GGML_CPU_TIMELINE record of the running graph compute, or -1
+
+    // --numa tensors only (numa_n_nodes is 0 otherwise)
+    int numa_n_nodes;
+    int numa_node_workers[GGML_NUMA_MAX_NODES];
+    int numa_steal_order[GGML_NUMA_MAX_NODES][GGML_NUMA_MAX_NODES]; // the other nodes, nearest first
+    struct ggml_numa_node_state * numa_state[GGML_NUMA_MAX_NODES];
 };
 
 // Per-thread state
@@ -635,6 +651,7 @@ struct ggml_numa_nodes {
     uint32_t total_cpus; // hardware threads on system
     uint32_t current_node; // node on which main process is execting
     double tp_share[GGML_NUMA_MAX_NODES]; // GGML_NUMA_STRATEGY_TENSORS column-split weights
+    uint32_t distance[GGML_NUMA_MAX_NODES][GGML_NUMA_MAX_NODES]; // SLIT distance between nodes[i] and nodes[j] (tensor mode)
 #if defined(__gnu_linux__)
     cpu_set_t cpuset; // cpuset from numactl
 #else
@@ -736,6 +753,31 @@ static void ggml_numa_init_tp_shares(void) {
     GGML_LOG_CONT("\n");
 }
 
+#if defined(__gnu_linux__)
+// Distances between the active nodes, from /sys/devices/system/node/nodeN/distance (one value per system node).
+// If a file cannot be read, a node is at 10 from itself and at 20 from the others.
+static void ggml_numa_init_distances(void) {
+    const uint32_t n_nodes = g_state.numa.n_nodes;
+    for (uint32_t i = 0; i < n_nodes; ++i) {
+        uint32_t row[GGML_NUMA_MAX_NODES];
+        uint32_t n_row = 0;
+        char path[256];
+        snprintf(path, sizeof(path), "/sys/devices/system/node/node%u/distance", g_state.numa.nodes[i].id);
+        FILE * f = fopen(path, "r");
+        if (f) {
+            while (n_row < GGML_NUMA_MAX_NODES && fscanf(f, "%u", &row[n_row]) == 1) {
+                ++n_row;
+            }
+            fclose(f);
+        }
+        for (uint32_t j = 0; j < n_nodes; ++j) {
+            const uint32_t id = g_state.numa.nodes[j].id;
+            g_state.numa.distance[i][j] = id < n_row ? row[id] : (i == j ? 10 : 20);
+        }
+    }
+}
+#endif
+
 void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
     if (g_state.numa.n_nodes > 0) {
         fprintf(stderr, "ggml_numa_init: NUMA already initialized\n");
@@ -834,6 +876,7 @@ void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
             GGML_LOG_CONT("\n");
         }
         ggml_numa_init_tp_shares();
+        ggml_numa_init_distances();
     }
 
     if (ggml_is_numa()) {
@@ -870,6 +913,110 @@ uint32_t ggml_numa_get_node_count(void) {
 void ggml_numa_tp_row_range_for_node(
         uint32_t node, int64_t n_rows, int64_t align, int64_t * row_start, int64_t * row_end) {
     ggml_numa_tp_row_range(g_state.numa.tp_share, g_state.numa.n_nodes, node, n_rows, align, row_start, row_end);
+}
+
+// GGML_NUMA_NODE_LOCAL=0: MUL_MAT_ID under --numa tensors keeps its per-node data in the shared work buffer and waits for
+// all nodes after the src1 conversion (A/B). It also turns off GGML_NUMA_STEAL.
+static bool ggml_numa_node_local_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char * env = getenv("GGML_NUMA_NODE_LOCAL");
+        enabled = env ? atoi(env) != 0 : 1;
+    }
+    return enabled != 0;
+}
+
+// GGML_NUMA_STEAL=0: a node that has no more pieces of an expert does not take pieces of the other nodes (A/B).
+static bool ggml_numa_steal_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char * env = getenv("GGML_NUMA_STEAL");
+        enabled = env ? atoi(env) != 0 : 1;
+    }
+    return enabled != 0;
+}
+
+#if defined(__gnu_linux__)
+// Anonymous pages that fault in on `node` (MPOL_PREFERRED: another node if this one is full), whoever touches them first.
+static void * ggml_numa_node_mmap(uint32_t node, size_t size) {
+    void * data = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (data == MAP_FAILED) {
+        return NULL;
+    }
+    unsigned long node_mask = 1UL << g_state.numa.nodes[node].id;
+    if (syscall(SYS_mbind, data, size, MPOL_PREFERRED, &node_mask, sizeof(node_mask) * CHAR_BIT, 0) != 0) {
+        GGML_LOG_WARN("numa tensors: mbind of %zu bytes to node %u failed: %s\n",
+                size, g_state.numa.nodes[node].id, strerror(errno));
+    }
+    return data;
+}
+
+static void ggml_numa_node_munmap(void * data, size_t size) {
+    if (data && munmap(data, size) != 0) {
+        GGML_LOG_ERROR("numa tensors: munmap failed: %s\n", strerror(errno));
+    }
+}
+#else
+static void * ggml_numa_node_mmap(uint32_t node, size_t size) {
+    UNUSED(node);
+    return calloc(1, size);
+}
+
+static void ggml_numa_node_munmap(void * data, size_t size) {
+    UNUSED(size);
+    free(data);
+}
+#endif
+
+static struct ggml_numa_node_state * ggml_numa_node_state_alloc(uint32_t node) {
+    struct ggml_numa_node_state * st = ggml_numa_node_mmap(node, sizeof(struct ggml_numa_node_state));
+    if (st) {
+        atomic_store_explicit(&st->n_barrier, 0, memory_order_relaxed);
+        atomic_store_explicit(&st->n_barrier_passed, 0, memory_order_relaxed);
+        atomic_store_explicit(&st->frontier, -1, memory_order_relaxed);
+        st->scratch_size = 0;
+        st->scratch = NULL;
+    }
+    return st;
+}
+
+static void ggml_numa_node_state_free(struct ggml_numa_node_state * st) {
+    if (st) {
+        ggml_numa_node_munmap(st->scratch, st->scratch_size);
+        ggml_numa_node_munmap(st, sizeof(struct ggml_numa_node_state));
+    }
+}
+
+// Make the node's scratch at least `size` bytes. Call only while no worker runs.
+static void ggml_numa_node_scratch_reserve(struct ggml_numa_node_state * st, uint32_t node, size_t size) {
+    if (st->scratch_size >= size) {
+        return;
+    }
+    size = GGML_PAD(size + size / 2, 4096); // grow by half again, so a slowly growing batch does not remap every time
+    ggml_numa_node_munmap(st->scratch, st->scratch_size);
+    st->scratch = ggml_numa_node_mmap(node, size);
+    st->scratch_size = st->scratch ? size : 0;
+}
+
+// Barrier of one node's workers: it does not wait for the other nodes. Each pass increments n_barrier_passed, also when
+// the node has only one worker.
+static void ggml_numa_node_barrier(struct ggml_numa_node_state * st, int n_workers) {
+    const int n_passed = atomic_load_explicit(&st->n_barrier_passed, memory_order_relaxed);
+
+    if (atomic_fetch_add_explicit(&st->n_barrier, 1, memory_order_seq_cst) == n_workers - 1) {
+        atomic_store_explicit(&st->n_barrier, 0, memory_order_relaxed);
+        atomic_fetch_add_explicit(&st->n_barrier_passed, 1, memory_order_seq_cst);
+        return;
+    }
+
+    while (atomic_load_explicit(&st->n_barrier_passed, memory_order_relaxed) == n_passed) {
+        ggml_thread_cpu_relax();
+    }
+#ifdef GGML_TSAN_ENABLED
+    atomic_fetch_add_explicit(&st->n_barrier_passed, 0, memory_order_seq_cst);
+#else
+    atomic_thread_fence(memory_order_seq_cst);
+#endif
 }
 
 #if defined(__gnu_linux__)
@@ -1971,6 +2118,144 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
     return ptr;
 }
 
+// --numa tensors: where a MUL_MAT_ID node keeps its per-node data in each node's scratch (ggml_numa_node_state). All nodes
+// use the same offsets, so a node can find the chunk counters of another node.
+struct ggml_numa_mmid_layout {
+    size_t src1;   // src1 converted to vec_dot_type (empty when src1 has that type)
+    size_t gemm;   // G128 GEMM panels of every src1 row (empty without the G128 GEMM)
+    size_t counts; // matrix_row_counts [n_as]
+    size_t rows;   // matrix_rows [n_as][n_ids * n_tokens]
+    size_t chunks; // chunk counters [n_as], one cache line each
+    size_t size;
+};
+
+static struct ggml_numa_mmid_layout ggml_numa_mmid_layout_of(const struct ggml_tensor * node) {
+    const struct ggml_tensor * src0 = node->src[0];
+    const struct ggml_tensor * src1 = node->src[1];
+    const struct ggml_tensor * ids  = node->src[2];
+    const enum ggml_type vec_dot_type = type_traits_cpu[src0->type].vec_dot_type;
+    const size_t n_as = (size_t) src0->ne[2];
+
+    struct ggml_numa_mmid_layout l;
+    size_t off = 0;
+
+    l.src1 = off;
+    if (src1->type != vec_dot_type) {
+        off += ggml_row_size(vec_dot_type, ggml_nelements(src1));
+    }
+    off = GGML_PAD(off, CACHE_LINE_SIZE);
+
+    l.gemm = off;
+    if (ggml_cpu_g128_gemm_node(node)) {
+        off += ggml_nrows(src1) * GGML_Q4_G128_GEMM_PANEL_SIZE(src1->ne[0]);
+    }
+    off = GGML_PAD(off, CACHE_LINE_SIZE);
+
+    l.counts = off;
+    off = GGML_PAD(off + n_as * sizeof(int64_t), CACHE_LINE_SIZE);
+
+    l.rows = off;
+    off = GGML_PAD(off + n_as * ids->ne[0] * ids->ne[1] * sizeof(struct mmid_row_mapping), CACHE_LINE_SIZE);
+
+    l.chunks = off;
+    off += CACHE_LINE_SIZE * n_as;
+
+    l.size = off;
+    return l;
+}
+
+// --numa tensors: true when MUL_MAT_ID keeps its per-node data in node memory and syncs each node alone after the src1
+// conversion. That needs the whole gang (a node barrier counts the node's workers) and every node's scratch reserved by
+// ggml_graph_compute. Every thread gets the same answer.
+static bool ggml_numa_mmid_node_local(const struct ggml_compute_params * params, size_t size) {
+    const struct ggml_threadpool * tp = params->threadpool;
+    if (!ggml_numa_node_local_enabled() || !tp || tp->numa_n_nodes < 2 || params->nth != tp->n_threads ||
+            (uint32_t) tp->numa_n_nodes != ggml_numa_get_node_count()) {
+        return false;
+    }
+    for (int node = 0; node < tp->numa_n_nodes; ++node) {
+        if (!tp->numa_state[node] || tp->numa_state[node]->scratch_size < size) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// The pieces of one expert for the n_workers workers of a node: nchunk0 x nchunk1 pieces of dr0 x dr1 rows over nr0 weight
+// rows and nr1 token rows. Worker i takes piece i first; the others claim the rest from the node's counter.
+static void ggml_mmid_chunking(
+        int64_t nr0, int64_t nr1, int n_workers, int numa_chunks, bool g128_fused, bool disable_chunking,
+        int64_t * nchunk0, int64_t * nchunk1, int64_t * dr0, int64_t * dr1) {
+    int chunk_size = 16;
+    if (nr0 == 1 || nr1 == 1) {
+        chunk_size = 64;
+    }
+
+    int64_t nc0 = (nr0 + chunk_size - 1) / chunk_size;
+    int64_t nc1 = (nr1 + chunk_size - 1) / chunk_size;
+
+    if (numa_chunks > 0 && nr0 > nr1) {
+        // a node's workers claim its rows of the expert in pieces, so a worker that starts late or runs slow does not
+        // hold up the node (static slices: the slowest worker ends ~10% after the median one in MiMo MTP decode). Short
+        // pieces stream worse: MiMo CPU expert time per verify pass with 1/2/4/8 pieces per worker 39.0/37.9/41.4/46.5 ms,
+        // and a static slice plus a tail of 16-row pieces 39.5 ms.
+        nc0 = MIN(nr0, (int64_t) n_workers * numa_chunks);
+        nc1 = 1;
+    } else if (nc0 * nc1 < n_workers * 4 || disable_chunking) {
+        nc0 = nr0 > nr1 ? n_workers : 1;
+        nc1 = nr0 > nr1 ? 1 : n_workers;
+    }
+
+    int64_t d0 = (nr0 + nc0 - 1) / nc0;
+    const int64_t d1 = (nr1 + nc1 - 1) / nc1;
+    if ((numa_chunks > 0 && nr0 > nr1) || g128_fused) {
+        // whole 8-row pieces: the fused SwiGLU below then takes the vector path for every row, as the unfused GLU does
+        d0 = GGML_PAD(d0, 8);
+        nc0 = (nr0 + d0 - 1) / d0;
+    }
+
+    *nchunk0 = nc0;
+    *nchunk1 = nc1;
+    *dr0 = d0;
+    *dr1 = d1;
+}
+
+// One piece of expert cur_a: weight rows [ir0_start, ir0_end) for its token rows [ir1_start, ir1_end). With g128_fused,
+// also the same rows of up (fuse_up) and the SwiGLU of both into fuse_dst.
+static void ggml_mmid_piece(
+        struct ggml_tensor * dst, struct ggml_tensor * fuse_up, struct ggml_tensor * fuse_dst, bool g128_fused,
+        int64_t cur_a, int64_t ir0_start, int64_t ir0_end, int64_t ir1_start, int64_t ir1_end,
+        const struct mmid_row_mapping * matrix_rows, size_t row_size, bool src1_cont, const void * wdata,
+        char * g128_panels, const char * gemm_panels) {
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+    const struct ggml_tensor * ids  = dst->src[2];
+
+    ggml_compute_forward_mul_mat_id_one_chunk(
+        dst, src0, src1, ids, cur_a,
+        ir0_start, ir0_end, ir1_start, ir1_end,
+        (const char *) src0->data + cur_a * src0->nb[2],
+        matrix_rows, row_size, src1_cont, wdata, g128_panels, gemm_panels
+    );
+    if (g128_fused) {
+        // the same rows of up, then SwiGLU over them: one node and one barrier instead of three
+        ggml_compute_forward_mul_mat_id_one_chunk(
+            fuse_up, fuse_up->src[0], src1, ids, cur_a,
+            ir0_start, ir0_end, ir1_start, ir1_end,
+            (const char *) fuse_up->src[0]->data + cur_a * fuse_up->src[0]->nb[2],
+            matrix_rows, row_size, src1_cont, wdata, g128_panels, gemm_panels
+        );
+        for (int64_t ir1 = ir1_start; ir1 < ir1_end; ++ir1) {
+            const struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, ir1);
+            const size_t off = row_mapping.i1*dst->nb[1] + row_mapping.i2*dst->nb[2];
+            ggml_vec_swiglu_f32((int) (ir0_end - ir0_start),
+                (float *) ((char *) fuse_dst->data + row_mapping.i1*fuse_dst->nb[1] + row_mapping.i2*fuse_dst->nb[2]) + ir0_start,
+                (const float *) ((const char *) dst->data + off) + ir0_start,
+                (const float *) ((const char *) fuse_up->data + off) + ir0_start);
+        }
+    }
+}
+
 // `fuse_up` and `fuse_dst` are the up-projection MUL_MAT_ID node and the GLU node of a
 // fused MoE up+gate subgraph, or NULL for a plain MUL_MAT_ID. When set, `dst` supplies the
 // gate weights and every other shape, and the routed rows are written to `fuse_dst`
@@ -2074,10 +2359,31 @@ static void ggml_compute_forward_mul_mat_id_impl(
 
     GGML_ASSERT(params->wsize >= (size_t)((char *) wdata_cur - (char *) params->wdata));
 
+    // src1 converted to vec_dot_type, one copy per node
+    char * src1_conv = (char *) params->wdata + numa_node * src1_scratch_stride;
+
+    // --numa tensors: the node's src1 copy, GEMM panels, row map and counters go to the node's own memory, and the node's
+    // workers wait only for each other after the conversion (ggml_numa_mmid_node_local). With the global barrier and the
+    // shared work buffer, every node waited for the slowest node, and its copies sat in one node's memory.
+    struct ggml_threadpool * tp = params->threadpool;
+    const struct ggml_numa_mmid_layout numa_layout = numa_tensors ? ggml_numa_mmid_layout_of(dst) : (struct ggml_numa_mmid_layout) {0};
+    const bool node_local = numa_tensors && ggml_numa_mmid_node_local(params, numa_layout.size);
+
+    if (node_local) {
+        uint8_t * scratch = tp->numa_state[numa_node]->scratch;
+        src1_conv          = (char *) scratch + numa_layout.src1;
+        matrix_row_counts  = (int64_t *) (scratch + numa_layout.counts);
+        matrix_rows        = (struct mmid_row_mapping *) (scratch + numa_layout.rows);
+        node_current_chunk = (char (*)[CACHE_LINE_SIZE]) (scratch + numa_layout.chunks);
+        if (g128_gemm_node) {
+            gemm_panels = (char *) scratch + numa_layout.gemm;
+        }
+    }
+
     const int64_t prof_t_quant = prof ? ggml_time_us() : 0;
 
     if (src1->type != vec_dot_type) {
-        char * wdata = (char *) params->wdata + numa_node * src1_scratch_stride;
+        char * wdata = src1_conv;
 
         const size_t nbw0 = ggml_type_size(vec_dot_type);
         const size_t nbw1 = ggml_row_size(vec_dot_type, ne10);
@@ -2132,7 +2438,8 @@ static void ggml_compute_forward_mul_mat_id_impl(
 
     const int64_t prof_t_rows = prof ? ggml_time_us() : 0;
 
-    if (ith == 0) {
+    // the row map is shared, or one per node when node-local
+    if (node_local ? params->numa_node_leader : ith == 0) {
         // initialize matrix_row_counts
         memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
 
@@ -2175,6 +2482,9 @@ static void ggml_compute_forward_mul_mat_id_impl(
         atomic_int * current_chunk_ctr = (atomic_int *)(node_current_chunk + cur_a);
         *current_chunk_ctr = work_nth;
     }
+    if (node_local && params->numa_node_leader) {
+        atomic_store_explicit(&tp->numa_state[numa_node]->frontier, -1, memory_order_relaxed);
+    }
 
     if (prof) {
         ggml_moe_prof_add(GGML_MOE_PROF_ROW_MAP, ggml_time_us() - prof_t_rows);
@@ -2182,7 +2492,11 @@ static void ggml_compute_forward_mul_mat_id_impl(
 
     const int64_t prof_t_barrier = prof ? ggml_time_us() : 0;
 
-    ggml_barrier(params->threadpool);
+    if (node_local) {
+        ggml_numa_node_barrier(tp->numa_state[numa_node], work_nth);
+    } else {
+        ggml_barrier(params->threadpool);
+    }
 
     if (prof) {
         ggml_moe_prof_add(GGML_MOE_PROF_BARRIER, ggml_time_us() - prof_t_barrier);
@@ -2221,6 +2535,14 @@ static void ggml_compute_forward_mul_mat_id_impl(
                 nth, ((uint32_t) MIN(iqp_experts, UINT16_MAX) << 16) | (uint32_t) MIN(active_experts, UINT16_MAX));
     }
 
+    const int numa_chunks = numa_tensors ? ggml_cpu_numa_chunks_per_thread() : 0;
+
+    // pieces of another node can be taken only where its owners claim them from the counter: the per-row code below,
+    // not the IQK paths (a static split; they need Q8_K activations), and not the experts that go to the IQ panel GEMM
+    const bool steal_path = !(fuse_up && !g128_fused) &&
+        (g128_fused || params->use_ref || vec_dot_type != GGML_TYPE_Q8_K || !ggml_cpu_iqk_mul_mat_enabled() ||
+         ne13 != 1 || dst->type != GGML_TYPE_F32 || !(src1_cont || src1->type != vec_dot_type));
+
     for (int cur_a = 0; cur_a < n_as && numa_row0_start < numa_row0_end; ++cur_a) {
         const int64_t cne1 = matrix_row_counts[cur_a];
 
@@ -2228,14 +2550,20 @@ static void ggml_compute_forward_mul_mat_id_impl(
             continue;
         }
 
+        if (node_local) {
+            // tell the other nodes' workers that this expert is started (only the first worker here writes the line)
+            atomic_int * frontier = &tp->numa_state[numa_node]->frontier;
+            if (atomic_load_explicit(frontier, memory_order_relaxed) < cur_a) {
+                atomic_store_explicit(frontier, cur_a, memory_order_relaxed);
+            }
+        }
+
         if (prof && work_ith == 0) {
             ggml_moe_prof_add_expert_rows(cne1);
         }
 
         const char * src0_cur = (const char *) src0->data + cur_a * nb02;
-        const void * wdata = (src1->type == vec_dot_type)
-            ? src1->data
-            : (const char *) params->wdata + numa_node * src1_scratch_stride;
+        const void * wdata = (src1->type == vec_dot_type) ? src1->data : src1_conv;
 
         if (iqp && ggml_cpu_iqp_mul_mat_id_min_batch(cne1)) {
             ggml_compute_forward_mul_mat_id_iqp(params, dst, cur_a, cne1, (const int32_t *) &MMID_MATRIX_ROW(cur_a, 0),
@@ -2283,37 +2611,11 @@ static void ggml_compute_forward_mul_mat_id_impl(
             continue;
         }
 
-        int chunk_size = 16;
-        if (nr0 == 1 || nr1 == 1) {
-            chunk_size = 64;
-        }
-
         // disable for NUMA, except for --numa tensors, where the counters and the rows belong to the node
         const bool disable_chunking = ggml_is_numa() && !numa_tensors;
 
-        int64_t nchunk0 = (nr0 + chunk_size - 1) / chunk_size;
-        int64_t nchunk1 = (nr1 + chunk_size - 1) / chunk_size;
-
-        const int numa_chunks = numa_tensors ? ggml_cpu_numa_chunks_per_thread() : 0;
-        if (numa_chunks > 0 && nr0 > nr1) {
-            // a node's workers claim its rows of the expert in pieces, so a worker that starts late or runs slow does not
-            // hold up the node (static slices: the slowest worker ends ~10% after the median one in MiMo MTP decode). Short
-            // pieces stream worse: MiMo CPU expert time per verify pass with 1/2/4/8 pieces per worker 39.0/37.9/41.4/46.5 ms,
-            // and a static slice plus a tail of 16-row pieces 39.5 ms.
-            nchunk0 = MIN(nr0, (int64_t) work_nth * numa_chunks);
-            nchunk1 = 1;
-        } else if (nchunk0 * nchunk1 < work_nth * 4 || disable_chunking) {
-            nchunk0 = nr0 > nr1 ? work_nth : 1;
-            nchunk1 = nr0 > nr1 ? 1 : work_nth;
-        }
-
-        int64_t dr0 = (nr0 + nchunk0 - 1) / nchunk0;
-        const int64_t dr1 = (nr1 + nchunk1 - 1) / nchunk1;
-        if ((numa_chunks > 0 && nr0 > nr1) || g128_fused) {
-            // whole 8-row pieces: the fused SwiGLU below then takes the vector path for every row, as the unfused GLU does
-            dr0 = GGML_PAD(dr0, 8);
-            nchunk0 = (nr0 + dr0 - 1) / dr0;
-        }
+        int64_t nchunk0, nchunk1, dr0, dr1;
+        ggml_mmid_chunking(nr0, nr1, work_nth, numa_chunks, g128_fused, disable_chunking, &nchunk0, &nchunk1, &dr0, &dr1);
 
         int current_chunk = work_ith;
 
@@ -2329,34 +2631,82 @@ static void ggml_compute_forward_mul_mat_id_impl(
             const int64_t ir1_start = dr1 * ith1;
             const int64_t ir1_end = MIN(ir1_start + dr1, nr1);
 
-            ggml_compute_forward_mul_mat_id_one_chunk(
-                dst, src0, src1, ids, cur_a,
-                ir0_start, ir0_end, ir1_start, ir1_end,
-                src0_cur, matrix_rows, row_size, src1_cont, wdata, g128_panels, g128_gemm ? gemm_panels : NULL
-            );
-            if (g128_fused) {
-                // the same rows of up, then SwiGLU over them: one node and one barrier instead of three
-                ggml_compute_forward_mul_mat_id_one_chunk(
-                    fuse_up, fuse_up->src[0], src1, ids, cur_a,
-                    ir0_start, ir0_end, ir1_start, ir1_end,
-                    (const char *) fuse_up->src[0]->data + cur_a * fuse_up->src[0]->nb[2],
-                    matrix_rows, row_size, src1_cont, wdata, g128_panels, g128_gemm ? gemm_panels : NULL
-                );
-                for (int64_t ir1 = ir1_start; ir1 < ir1_end; ++ir1) {
-                    const struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, ir1);
-                    const size_t off = row_mapping.i1*nb1 + row_mapping.i2*nb2;
-                    ggml_vec_swiglu_f32((int) (ir0_end - ir0_start),
-                        (float *) ((char *) fuse_dst->data + row_mapping.i1*fuse_dst->nb[1] + row_mapping.i2*fuse_dst->nb[2]) + ir0_start,
-                        (const float *) ((const char *) dst->data + off) + ir0_start,
-                        (const float *) ((const char *) fuse_up->data + off) + ir0_start);
-                }
-            }
+            ggml_mmid_piece(dst, fuse_up, fuse_dst, g128_fused, cur_a, ir0_start, ir0_end, ir1_start, ir1_end,
+                matrix_rows, row_size, src1_cont, wdata, g128_panels, g128_gemm ? gemm_panels : NULL);
 
             if (work_nth >= nchunk0 * nchunk1) {
                 break;
             }
 
             current_chunk = atomic_fetch_add_explicit(current_chunk_ctr, 1, memory_order_relaxed);
+        }
+    }
+
+    // --numa tensors: this worker has no more pieces of its own node, so it helps the other nodes, nearest node first. It
+    // takes spare pieces (those after the first piece of each owner) of the experts that the owners have not started:
+    // then it works beside the owners, and a slow node (a core shared with a VM, a GPU's DMA, the OS) does not hold up the
+    // op. The expert that the owners work on is left to them, as their next piece starts sooner than a remote one ends.
+    // A piece is claimed from its owner's counter, so it is still computed once and by the same code: only its weight
+    // rows come from the other node's memory, and the result is bitwise the same.
+    if (node_local && steal_path && ggml_numa_steal_enabled()) {
+        // the generation of this op's node barriers: a node that has another one has not yet reset its counters
+        const int gen = atomic_load_explicit(&tp->numa_state[numa_node]->n_barrier_passed, memory_order_relaxed);
+
+        const void * wdata = (src1->type == vec_dot_type) ? src1->data : src1_conv;
+        const size_t row_size = ggml_row_size(vec_dot_type, ne10);
+
+        for (int k = 0; k + 1 < tp->numa_n_nodes; ++k) {
+            const int victim = tp->numa_steal_order[numa_node][k];
+            struct ggml_numa_node_state * vs = tp->numa_state[victim];
+            if (atomic_load_explicit(&vs->n_barrier_passed, memory_order_acquire) != gen) {
+                continue;
+            }
+
+            int64_t v_row0_start, v_row0_end;
+            ggml_numa_tp_row_range_for_node(victim, ne01, GGML_NUMA_TP_PLAIN_ALIGN, &v_row0_start, &v_row0_end);
+            if (v_row0_start >= v_row0_end) {
+                continue;
+            }
+
+            const int v_nth = tp->numa_node_workers[victim];
+            char (*v_chunk)[CACHE_LINE_SIZE] = (char (*)[CACHE_LINE_SIZE]) (vs->scratch + numa_layout.chunks);
+
+            // from the last expert down to the one the owners work on
+            for (int cur_a = n_as - 1; cur_a > atomic_load_explicit(&vs->frontier, memory_order_relaxed); --cur_a) {
+                const int64_t cne1 = matrix_row_counts[cur_a];
+                if (cne1 == 0 || (iqp && ggml_cpu_iqp_mul_mat_id_min_batch(cne1))) {
+                    continue;
+                }
+
+                int64_t nchunk0, nchunk1, dr0, dr1;
+                ggml_mmid_chunking(v_row0_end - v_row0_start, cne1, v_nth, numa_chunks, g128_fused, false,
+                        &nchunk0, &nchunk1, &dr0, &dr1);
+                if (v_nth >= nchunk0 * nchunk1) {
+                    continue; // no spare pieces: one per owner
+                }
+
+                atomic_int * ctr = (atomic_int *) (v_chunk + cur_a);
+                if (atomic_load_explicit(ctr, memory_order_relaxed) >= nchunk0 * nchunk1) {
+                    continue; // other thieves took them
+                }
+
+                int chunk = atomic_fetch_add_explicit(ctr, 1, memory_order_relaxed);
+                while (chunk < nchunk0 * nchunk1) {
+                    const int64_t ith0 = chunk % nchunk0;
+                    const int64_t ith1 = chunk / nchunk0;
+
+                    const int64_t ir0_start = v_row0_start + dr0 * ith0;
+                    const int64_t ir0_end = MIN(ir0_start + dr0, v_row0_end);
+
+                    const int64_t ir1_start = dr1 * ith1;
+                    const int64_t ir1_end = MIN(ir1_start + dr1, cne1);
+
+                    ggml_mmid_piece(dst, fuse_up, fuse_dst, g128_fused, cur_a, ir0_start, ir0_end, ir1_start, ir1_end,
+                        matrix_rows, row_size, src1_cont, wdata, g128_panels, g128_gemm ? gemm_panels : NULL);
+
+                    chunk = atomic_fetch_add_explicit(ctr, 1, memory_order_relaxed);
+                }
+            }
         }
     }
 
@@ -2369,6 +2719,26 @@ static void ggml_compute_forward_mul_mat_id(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
     ggml_compute_forward_mul_mat_id_impl(params, dst, NULL, NULL, 0.0f);
+}
+
+// --numa tensors: make every node's scratch large enough for the largest routed-expert MUL_MAT_ID of the graph. Call only
+// while no worker runs.
+static void ggml_numa_reserve_scratch(struct ggml_threadpool * tp, const struct ggml_cgraph * cgraph) {
+    if (tp->numa_n_nodes < 2 || !ggml_numa_node_local_enabled()) {
+        return;
+    }
+
+    size_t size = 0;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const struct ggml_tensor * node = cgraph->nodes[i];
+        if (node->op == GGML_OP_MUL_MAT_ID && (node->src[0]->flags & GGML_TENSOR_FLAG_NUMA_EXPERT) != 0) {
+            size = MAX(size, ggml_numa_mmid_layout_of(node).size);
+        }
+    }
+
+    for (int node = 0; size > 0 && node < tp->numa_n_nodes; ++node) {
+        ggml_numa_node_scratch_reserve(tp->numa_state[node], (uint32_t) node, size);
+    }
 }
 
 /////////////////////////////////
@@ -3474,6 +3844,33 @@ static void ggml_numa_assign_workers(
         }
         GGML_LOG_CONT("\n");
     }
+
+    // per-node state of MUL_MAT_ID, and the order in which a node takes pieces from the others: nearest first, and at
+    // equal distance node+1, node+2, ... so that the nodes of one socket do not all go to the same node first
+    struct ggml_threadpool * tp = workers[0].threadpool;
+    const uint32_t n_nodes = g_state.numa.n_nodes;
+    tp->numa_n_nodes = (int) n_nodes;
+    for (uint32_t node = 0; node < n_nodes; ++node) {
+        tp->numa_node_workers[node] = (int) node_workers[node];
+        tp->numa_state[node] = ggml_numa_node_state_alloc(node);
+        if (!tp->numa_state[node]) {
+            GGML_ABORT("--numa tensors: failed to allocate the state of NUMA node %u", g_state.numa.nodes[node].id);
+        }
+        int * order = tp->numa_steal_order[node];
+        for (uint32_t step = 1; step < n_nodes; ++step) {
+            const int other = (int) ((node + step) % n_nodes);
+            int k = (int) step - 1;
+            while (k > 0 && g_state.numa.distance[node][order[k - 1]] > g_state.numa.distance[node][other]) {
+                order[k] = order[k - 1];
+                --k;
+            }
+            order[k] = other;
+        }
+    }
+    GGML_LOG_INFO("numa tensors: MUL_MAT_ID node-local scratch and barrier %s, piece stealing %s\n",
+            ggml_numa_node_local_enabled() ? "on" : "off (GGML_NUMA_NODE_LOCAL=0)",
+            !ggml_numa_node_local_enabled() ? "off (needs GGML_NUMA_NODE_LOCAL)" :
+            ggml_numa_steal_enabled() ? "on" : "off (GGML_NUMA_STEAL=0)");
 #else
     UNUSED(tpp);
     UNUSED(workers);
@@ -3505,6 +3902,10 @@ void ggml_threadpool_free(struct ggml_threadpool* threadpool) {
     ggml_mutex_destroy(&threadpool->mutex);
     ggml_cond_destroy(&threadpool->cond);
 #endif // GGML_USE_OPENMP
+
+    for (int node = 0; node < threadpool->numa_n_nodes; ++node) {
+        ggml_numa_node_state_free(threadpool->numa_state[node]);
+    }
 
     const size_t workers_size = sizeof(struct ggml_compute_state) * n_threads;
     ggml_aligned_free(threadpool->workers, workers_size);
@@ -4258,6 +4659,8 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
         threadpool->prio             = tpp->prio;
         threadpool->ec               = GGML_STATUS_SUCCESS;
         threadpool->timeline_call    = -1;
+        threadpool->numa_n_nodes     = 0;
+        memset(threadpool->numa_state, 0, sizeof(threadpool->numa_state));
     }
 
     // Allocate and init workers state
@@ -4348,6 +4751,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         threadpool->abort            = -1;
         threadpool->ec               = GGML_STATUS_SUCCESS;
     }
+    ggml_numa_reserve_scratch(threadpool, cgraph);
     threadpool->timeline_call = ggml_cpu_timeline_begin(cgraph, n_threads);
 
 #ifdef GGML_USE_OPENMP

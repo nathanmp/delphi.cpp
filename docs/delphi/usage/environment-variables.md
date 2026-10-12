@@ -152,3 +152,14 @@ Packed and grouped kernels add the same products in a different order from the o
 - Use `GGML_CUDA_MOE_PACKED_INPLACE=0` (if the memory allows it) or `GGML_CUDA_MOE_GROUPED=old` when you need the original layout on the device.
 
 `GGML_CUDA_MOE_GROUPED` also accepts `packed-f16` and `packed-i8`, which are measurement-only formats 2.1-4.7x the GGUF size.
+
+## CPU routed experts (`--numa tensors`)
+
+| variable | default | effect |
+| --- | --- | --- |
+| `GGML_NUMA_NODE_LOCAL` | `1` | MUL_MAT_ID keeps each NUMA node's copy of the activations, its row map and its piece counters in that node's memory, and the workers of a node wait only for each other after they convert the activations. `0` uses the shared work buffer and waits for all nodes (previous behavior); it also turns off `GGML_NUMA_STEAL`. |
+| `GGML_NUMA_STEAL` | `1` | A worker that has no more pieces of its own node takes spare pieces of the experts that another node has not started, nearest node first. `0` keeps each node on its own rows. |
+| `GGML_CPU_NUMA_CHUNKS` | `2` | Pieces per worker of a node's rows of an expert. `0` gives each worker one static slice. |
+| `GGML_NUMA_TP_SHARES` | equal | Relative share of each node in the column split, for example `1,3`. It also sets where the weight rows are placed at load. |
+
+The first two change only where data is kept and which thread computes a piece, so outputs are bitwise identical with any setting (checked on a MiMo V2.6 Flash layer at 1 to 512 tokens, with equal and 1:3 shares). Stealing applies to experts on the per-row and G128 paths (for example Q4_G128 and MXFP4), not to the IQK paths, which split statically. A stolen piece reads its weight rows from the other node's memory. Speed is not yet measured at NPS1 or NPS4.
