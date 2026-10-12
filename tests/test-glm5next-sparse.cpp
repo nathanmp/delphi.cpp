@@ -249,9 +249,14 @@ static bool run_indexed_test(
 
 int main() {
     llama_backend_init();
+    ggml_backend_load_all();
 
     bool passed = true;
-    ggml_backend_t cpu = ggml_backend_cpu_init();
+    ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    if (cpu == nullptr) {
+        fprintf(stderr, "no CPU backend\n");
+        return 1;
+    }
     passed &= run_test(cpu);
     ggml_backend_free(cpu);
 
