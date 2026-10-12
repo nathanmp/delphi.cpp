@@ -162,6 +162,8 @@ Packed and grouped kernels add the same products in a different order from the o
 | `GGML_CPU_NUMA_CHUNKS` | `2` | Pieces per worker of a node's rows of an expert. `0` gives each worker one static slice. |
 | `GGML_NUMA_TP_SHARES` | equal | Relative share of each node in the column split, for example `1,3`. It also sets where the weight rows are placed at load. |
 | `LLAMA_NUMA_HOST_INTERLEAVE` | `1` | With a GPU (CUDA or ROCm), the CPU compute buffer (activations and expert outputs of the CPU part) is pinned host memory with its pages interleaved over all NUMA nodes. `0` uses the GPU's plain pinned host memory, which is on the GPU's node only. |
+| `LLAMA_MOE_CACHE_REFILL_INTERLEAVE` | `0` | `1`: the pinned staging buffer of expert-cache refreshes is interleaved over all NUMA nodes instead of lying on the GPU's node. For NPS4. |
+| `LLAMA_MOE_CACHE_REFILL_NUMA` | `0` | `1`: each refresh copy thread runs on the node that holds its part of the expert rows (at least 2 threads per node). For NPS4, with the previous switch; together they cut a MiMo refresh from ~210 to ~150 ms per prompt. |
 
 The first two change only where data is kept and which thread computes a piece, so outputs are bitwise identical with any setting (checked on a MiMo V2.6 Flash layer at 1 to 512 tokens, with equal and 1:3 shares). Stealing applies to experts on the per-row and G128 paths (for example Q4_G128 and MXFP4), not to the IQK paths, which split statically. A stolen piece reads its weight rows from the other node's memory. `LLAMA_NUMA_HOST_INTERLEAVE` changes only where the buffer's pages are.
 
