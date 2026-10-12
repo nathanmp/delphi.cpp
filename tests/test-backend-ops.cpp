@@ -13022,14 +13022,23 @@ static bool parse_source(const std::string & spec, input_tensor & out, std::stri
 struct test_custom_op : public test_generic_op {
     const moe_routing::routing route; // ids stay empty unless the op routes experts
     const bool zero_weights;
+    const bool numa_expert;
     const std::string desc;
 
     test_custom_op(ggml_op op, ggml_type type, std::array<int64_t, 4> ne,
                    std::array<int32_t, GGML_MAX_OP_PARAMS / sizeof(int32_t)> op_params,
                    std::vector<input_tensor> sources, moe_routing::routing route, bool zero_weights,
-                   std::string desc)
+                   std::string desc, bool numa_expert = false)
         : test_generic_op(op, type, ne, op_params, std::move(sources)),
-          route(std::move(route)), zero_weights(zero_weights), desc(std::move(desc)) {}
+          route(std::move(route)), zero_weights(zero_weights), numa_expert(numa_expert), desc(std::move(desc)) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = test_generic_op::build_graph(ctx);
+        if (numa_expert && op == GGML_OP_MUL_MAT_ID) {
+            out->src[0]->flags |= GGML_TENSOR_FLAG_NUMA_EXPERT;
+        }
+        return out;
+    }
 
     std::string vars() override {
         return desc;
@@ -13088,6 +13097,60 @@ struct test_custom_op : public test_generic_op {
                                     token * ids->nb[1], ids->ne[0] * sizeof(int32_t));
         }
     }
+};
+
+// Measure gate/up as one graph so backend fusion and its shared activation conversion remain visible.
+struct test_custom_gate_up : public test_case {
+    ggml_type type;
+    std::array<int64_t, 4> ne;
+    int64_t tokens;
+    moe_routing::routing route;
+    bool zero_weights;
+    bool numa_expert;
+    std::string desc;
+
+    test_custom_gate_up(ggml_type type, std::array<int64_t, 4> ne, int64_t tokens,
+                       moe_routing::routing route, bool zero_weights, std::string desc, bool numa_expert)
+        : type(type), ne(ne), tokens(tokens), route(std::move(route)), zero_weights(zero_weights), numa_expert(numa_expert), desc(std::move(desc)) {}
+
+    std::string vars() override { return desc; }
+    std::string op_desc(ggml_tensor *) override { return "MUL_MAT_GATE_UP"; }
+    bool run_whole_graph() override { return true; }
+    uint64_t op_flops(ggml_tensor *) override { return 4 * ne[0] * ne[1] * route.ids.size(); }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t top_k = route.ids.size() / tokens;
+        ggml_tensor * gate = ggml_new_tensor_3d(ctx, type, ne[0], ne[1], ne[2]);
+        ggml_tensor * up   = ggml_new_tensor_3d(ctx, type, ne[0], ne[1], ne[2]);
+        ggml_tensor * cur  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne[0], 1, tokens);
+        ggml_tensor * ids  = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, top_k, tokens);
+        ggml_set_name(gate, "gate_weights");
+        ggml_set_name(up, "up_weights");
+        ggml_set_name(ids, "expert_ids");
+        if (numa_expert) {
+            gate->flags |= GGML_TENSOR_FLAG_NUMA_EXPERT;
+            up->flags   |= GGML_TENSOR_FLAG_NUMA_EXPERT;
+        }
+        ggml_tensor * out = ggml_glu_split(ctx, ggml_mul_mat_id(ctx, gate, cur, ids), ggml_mul_mat_id(ctx, up, cur, ids), GGML_GLU_OP_SWIGLU);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE || t->type == GGML_TYPE_I32) { continue; }
+            if (zero_weights && mode == MODE_PERF &&
+                    (strcmp(t->name, "gate_weights") == 0 || strcmp(t->name, "up_weights") == 0)) {
+                test_custom_op::fill_zero(t);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+        ggml_tensor * ids = ggml_get_tensor(ctx, "expert_ids");
+        ggml_backend_tensor_set(ids, route.ids.data(), 0, route.ids.size() * sizeof(int32_t));
+    }
+
+    double max_nmse_err() override { return 5e-3; }
 };
 
 static std::unique_ptr<test_case> make_custom_test_case(const std::string & spec, test_mode mode, std::string & error) {
@@ -13310,8 +13373,18 @@ static std::unique_ptr<test_case> make_custom_test_case(const std::string & spec
         return nullptr;
     }
 
+    if (num_of("pair", 0) != 0) {
+        if (op != GGML_OP_MUL_MAT_ID || num_of("broadcast", 1) == 0 || type_b != GGML_TYPE_F32) {
+            error = "pair=1 requires MUL_MAT_ID with broadcast=1 and f32 activations";
+            return nullptr;
+        }
+        return std::make_unique<test_custom_gate_up>(type, ne, n_tokens, std::move(route), zero_weights,
+                                                   desc.str() + ",pair=1,numa_expert=" + std::to_string(num_of("numa_expert", 0) != 0),
+                                                   num_of("numa_expert", 0) != 0);
+    }
     return std::unique_ptr<test_case>(new test_custom_op(
-        op, out_type, out_ne, op_params, std::move(sources), std::move(route), zero_weights, desc.str()));
+        op, out_type, out_ne, op_params, std::move(sources), std::move(route), zero_weights,
+        desc.str() + ",numa_expert=" + std::to_string(num_of("numa_expert", 0) != 0), num_of("numa_expert", 0) != 0));
 }
 
 static std::vector<std::unique_ptr<test_case>> make_test_cases_custom(
@@ -13809,6 +13882,8 @@ static void usage(char ** argv) {
     printf("      n=<tokens>       token count for MUL_MAT and MUL_MAT_ID (default 1)\n");
     printf("      top_k=<k>        experts for each token, MUL_MAT_ID only (default 1)\n");
     printf("      broadcast=<0|1>  1 shares one activation row over the experts of a token, as a gate/up\n");
+    printf("      pair=<0|1>     1 measures a matched gate/up plus SwiGLU graph (MUL_MAT_ID, broadcast=1)\n");
+    printf("      numa_expert=<0|1>  mark routed weights for the --numa tensors execution path\n");
     printf("                       projection does; 0 gives each expert its own row, as a down projection\n");
     printf("                       does (default 1)\n");
     printf("      dist=<name>      MUL_MAT_ID expert routing: %s (default uniform)\n", moe_routing::dist_names());
