@@ -720,7 +720,9 @@ void register_weight(ggml_backend_cuda_context & ctx, const ggml_tensor * t) {
     GGML_ASSERT(!capturing(ctx));
     int * flag = nullptr;
     CUDA_CHECK(cudaMalloc(&flag, sizeof(int)));
-    CUDA_CHECK(cudaMemset(flag, 0, sizeof(int)));
+    // on the compute stream, which orders the later flag writes: the legacy stream does not order the non-blocking streams, and a
+    // late clear of a slot's flag after ggml_cuda_moe_int4_stage_prepare set it made the kernels read packed experts as row-major
+    CUDA_CHECK(cudaMemsetAsync(flag, 0, sizeof(int), ctx.stream()));
     states.push_back({ctx.device, int(t->ne[0]), int(t->ne[1]), int(t->ne[2]), static_cast<char *>(t->data), t->nb[2], flag, false});
 }
 
