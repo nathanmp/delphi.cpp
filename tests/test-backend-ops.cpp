@@ -12536,6 +12536,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_G128, GGML_TYPE_F32, 256, 8, true, 2048, bs, 4096));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_G128, GGML_TYPE_F32, 256, 8, false, 4096, bs, 2048));
     }
+    // the expert cache's GPU part for MiMo: ~28 resident experts per layer, about half of the selections hit
+    for (int bs : {1, 3, 16, 64, 300}) {
+        test_cases.emplace_back(new test_mul_mat_id_partial(GGML_TYPE_Q4_G128, 32, 8, true, 2048, bs, 4096));
+        test_cases.emplace_back(new test_mul_mat_id_partial(GGML_TYPE_Q4_G128, 32, 8, false, 4096, bs, 2048));
+    }
 
     // gpt-oss-20b
     for (int bs : {1, 4, 8, 512}) {
