@@ -143,7 +143,7 @@ def merge_imatrices(paths, output):
         return None
     if len(paths) == 1:
         return paths[0]
-    tensors, datasets, chunks, chunk_size = {}, [], 0, None
+    tensors, means, datasets, chunks, chunk_size = {}, {}, [], 0, None
     for path in paths:
         with open(path, "rb") as stream:
             if stream.read(4) != b"GGUF":
@@ -151,6 +151,13 @@ def merge_imatrices(paths, output):
         reader = GGUFReader(path)
         entries = {t.name: t for t in reader.tensors}
         for name, t in entries.items():
+            if name.endswith((".in_sum", ".in_sum1")):
+                # activation sums (".in_sum1" is the older delphi name); summed like the second moments
+                base = name[:name.rindex(".in_sum")]
+                if base + ".in_sum2" not in entries:
+                    raise QuantError(f"imatrix activation sums have no second moments: {name}")
+                means.setdefault(base + ".in_sum", []).append(np.array(t.data, copy=True))
+                continue
             if not name.endswith((".in_sum2", ".counts")):
                 continue
             partner = name[:-8] + ".counts" if name.endswith(".in_sum2") else name[:-7] + ".in_sum2"
@@ -180,6 +187,14 @@ def merge_imatrices(paths, output):
                 chunk_size = size
     if not tensors:
         raise QuantError("imatrices contain no raw sums/counts")
+    for name, values in means.items():
+        # means need the same tokens as the second moments: keep them only when every input has them
+        if len(values) == len(paths):
+            if any(v.shape != values[0].shape for v in values):
+                raise QuantError(f"incompatible imatrix activation sums: {name}")
+            tensors[name] = np.sum(values, axis=0)
+            if not np.isfinite(tensors[name]).all():
+                raise QuantError(f"invalid imatrix activation sums: {name}")
     writer = GGUFWriter(str(output), "imatrix")
     writer.add_array("imatrix.datasets", datasets)
     writer.add_uint32("imatrix.chunk_count", chunks)
