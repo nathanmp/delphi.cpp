@@ -61,6 +61,16 @@ def read_model(path):
     return info
 
 
+def mtp_layers(info):
+    """Multi-token-prediction blocks: the blocks with blk.N.nextn.* tensors and the last nextn_predict_layers blocks."""
+    found = {int(m[1]) for t in info["tensors"] if (m := re.match(r"blk\.([0-9]+)\.nextn\.", t["name"]))}
+    declared = set(range(info["n_layer"] - info["nextn"], info["n_layer"])) if info.get("nextn", 0) > 0 else set()
+    if found != declared:
+        print(f"warning: MTP blocks by tensor names {sorted(found)} and by nextn_predict_layers {sorted(declared)} differ; "
+              "both are treated as MTP blocks", file=sys.stderr)
+    return sorted(found | declared)
+
+
 # Conservative preservation mirrors the ordinary quantizer exclusions. Encoding is independently checked against the plan.
 PRESERVE = ("_norm.weight", "ffn_gate_inp.weight", "position_embd", "token_types", "ssm_conv1d", "shortconv.conv.weight",
             "indexer.k_proj.weight", "indexer.q_proj.weight", "time_mix_", "attn_rel_b.weight", ".patch_embd",
@@ -75,6 +85,7 @@ def classify(info, cfg):
     pools = {category: [qtype(q) for q in cfg[f"{category}_qtypes"]] for category in ("primary", "other")}
     if any(not pool for pool in pools.values()):
         raise QuantError("both qtype pools must be nonempty")
+    info["mtp_layers"] = mtp_layers(info)
     names = {t["name"] for t in info["tensors"]}
     if set(cfg["pins"]) - names:
         raise QuantError(f"pins name missing tensors: {sorted(set(cfg['pins']) - names)}")
@@ -85,8 +96,8 @@ def classify(info, cfg):
         t["category"] = "primary" if primary else "other"
         t["expert"] = bool(re.search(r"\.ffn_(gate|up|down|gate_up)_exps\.weight$", name))
         t["layer"] = int(re.match(r"blk\.([0-9]+)\.", name)[1]) if name.startswith("blk.") else -1
-        # Multi-token-prediction layers follow the main layers; perplexity and the main decode path do not run them.
-        t["mtp"] = info.get("nextn", 0) > 0 and t["layer"] >= info["n_layer"] - info["nextn"]
+        # Perplexity and the main decode path do not run the MTP blocks; their weights stay at the ceiling (see below).
+        t["mtp"] = t["layer"] in info["mtp_layers"]
         preserve = (len(shape) < 2 or not name.endswith("weight") or t["source_bytes"] < cfg["preserve_below_mib"] * (1 << 20)
                     or any(part in name for part in PRESERVE)
                     or (info["architecture"] == "glm5next" and any(part in name for part in GLM_PRESERVE))
@@ -133,6 +144,9 @@ def classify(info, cfg):
                 pass
         if not legal:
             raise QuantError(f"no row-compatible qtype for {t['name']}")
+        if any(m["mtp"] for m in members) and not any(m["preserved"] or m["name"] in cfg["pins"] for m in members):
+            # The KL measurement cannot see the draft quality, so MTP groups take the ceiling: the most bytes of the pool.
+            legal = [max(legal, key=lambda q: (sum(tensor_bytes(m["shape"], q) for m in members), q))]
         for member in members:
             member["pool"] = legal
             assigned.add(member["name"])

@@ -33,8 +33,6 @@ from config import ROOT, QuantError, file_identity, write_json
 from quality import METHOD, METRIC, SCHEMA, damage_digest, damage_records, modelled_groups, sensitivity
 from timing import gpu
 
-UNSWAPPABLE = {"Q4_G128", "NVFP4"}
-
 
 def hotswap_module():
     spec = importlib.util.spec_from_file_location("hotswap", ROOT / "tools/perplexity/hotswap.py")
@@ -81,8 +79,7 @@ def probe_qtypes(groups, records, c):
     if c.get("probe_qtypes"):
         mid, top = (q.upper() for q in c["probe_qtypes"])
     else:
-        # The hotswap loader refuses formats with load-time transforms; they are predicted from their damage only.
-        common = set.intersection(*(set(g["pool"]) for g in groups)) - {g["floor"] for g in groups} - UNSWAPPABLE
+        common = set.intersection(*(set(g["pool"]) for g in groups)) - {g["floor"] for g in groups}
 
         def level(q):
             values = [records.get((n, q)) for g in groups for n in g["members"]]
@@ -99,8 +96,6 @@ def probe_qtypes(groups, records, c):
     for q in (mid, top):
         if any(q not in g["pool"] for g in groups):
             raise QuantError(f"probe qtype {q} is not a candidate of every modelled group")
-        if q in UNSWAPPABLE:
-            raise QuantError(f"probe qtype {q} cannot be loaded by the hotswap session")
     return mid, top
 
 
@@ -429,7 +424,7 @@ def calibrate(data, cfg, output, encode, verify, timeout=7200):
                 observations.append((job["choices"], y, max(se, 1e-6)))
                 probes.append({"label": job["label"], "device": device, "gain": y, "se": se,
                                "kl": float(out[job["label"]].mean()), "choices": job["choices"]})
-    n_layer = info["n_layer"] - info["nextn"] if info.get("n_layer") else 1 + max(t["layer"] for t in info["tensors"])
+    n_layer = 1 + max(t["layer"] for t in info["tensors"] if not t.get("mtp"))
     fit = Fit(groups, records, n_layer, c["bands"])
     params, kinf, u0, chi2 = fit.fit(observations)
     predicted = fit.predict(params, kinf, u0, [o[0] for o in observations])

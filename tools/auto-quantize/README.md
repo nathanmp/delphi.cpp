@@ -50,7 +50,7 @@ gain_g(q) = s_r(x) * (R_g(floor)^gamma_r - R_g(q)^gamma_r),   s_r(x) = exp(a0 + 
 G = sum_g gain_g(q_g),   u = G / G_full,   KL = KL_floor * (1 - kappa(u) G),   kappa(u) = 1 + (kinf - 1)(1 - exp(-u / u0))
 ```
 
-R is the sampled local relative error of `llama-quant-damage`, summed over the group members. Qtypes enter only through R. A qtype that the calibration did not probe needs no extra passes: prepare samples its R and the table predicts its KL. kappa describes the measured super-additive composition of upgrades. MTP layers do not affect the main-model KL; they stay at the floor unless `pins` set them.
+R is the sampled local relative error of `llama-quant-damage`, summed over the group members. Qtypes enter only through R. A qtype that the calibration did not probe needs no extra passes: prepare samples its R and the table predicts its KL. kappa describes the measured super-additive composition of upgrades. MTP blocks are the blocks with `blk.N.nextn.*` tensors and the last `nextn_predict_layers` blocks of the GGUF metadata (a warning reports a difference). The KL measurement does not run them, so they take the ceiling: the qtype of the pool with the most bytes, in the floor and in every plan, unless `pins` set them.
 
 Calibrate after prepare. Calibration requires an imatrix: without activation statistics, R is a weight-space error, and it misranks layers inside a band (OLMoE-1B-7B without an imatrix: chi2/dof 8.6).
 

@@ -287,17 +287,7 @@ class Quality(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
         self.source = self.root / "source.gguf"
-        writer = GGUFWriter(str(self.source), "olmoe")
-        writer.add_uint32("olmoe.expert_count", 8)
-        writer.add_uint32("olmoe.expert_used_count", 2)
-        for layer in range(4):
-            for role in ("gate", "up", "down"):
-                writer.add_tensor(f"blk.{layer}.ffn_{role}_exps.weight", np.zeros((8, 256, 256), dtype=np.float32))
-        writer.add_tensor("output.weight", np.ones((256, 256), dtype=np.float32))
-        writer.write_header_to_file()
-        writer.write_kv_data_to_file()
-        writer.write_tensors_to_file()
-        writer.close()
+        self.write_source(self.source)
         self.config = cfg(primary_qtypes=["Q2_K", "Q4_K", "Q6_K"], other_qtypes=["F32"], imatrix=[],
                           quality={"table": str(self.root / "quality.json")})
         self.model = classify(read_model(str(self.source)), self.config)
@@ -327,21 +317,44 @@ class Quality(unittest.TestCase):
         self.assertEqual(len(groups), 8)
         self.assertEqual({g["role"] for g in groups}, {"gu", "dn"})
 
-    def test_mtp_layers_are_not_modelled_and_recipes_are_witnesses(self):
+    def write_source(self, path, extra=()):
+        writer = GGUFWriter(str(path), "olmoe")
+        writer.add_uint32("olmoe.expert_count", 8)
+        writer.add_uint32("olmoe.expert_used_count", 2)
+        for layer in range(4):
+            for role in ("gate", "up", "down"):
+                writer.add_tensor(f"blk.{layer}.ffn_{role}_exps.weight", np.zeros((8, 256, 256), dtype=np.float32))
+        for name in extra:
+            writer.add_tensor(name, np.zeros((256, 512), dtype=np.float32))
+        writer.add_tensor("output.weight", np.ones((256, 256), dtype=np.float32))
+        writer.write_header_to_file()
+        writer.write_kv_data_to_file()
+        writer.write_tensors_to_file()
+        writer.close()
+
+    def test_mtp_layers_are_found_pinned_at_the_ceiling_and_recipes_are_witnesses(self):
         raw = read_model(str(self.source))
         raw["n_layer"], raw["nextn"] = 4, 1
-        model = classify(raw, self.config)
-        groups = modelled_groups(model, self.floor)
+        self.assertEqual(classify(raw, self.config)["mtp_layers"], [3])
+        source = self.root / "mtp.gguf"
+        self.write_source(source, ["blk.3.nextn.eh_proj.weight"])
+        model = classify(read_model(str(source)), self.config)
+        self.assertEqual(model["mtp_layers"], [3])
+        floor = {g["name"]: "Q2_K" if len(g["pool"]) > 1 else g["pool"][0] for g in model["groups"]}
+        self.assertEqual({floor[f"blk.3.ffn_{r}_exps.weight"] for r in ("gate", "down")}, {"Q6_K"})
+        pinned = classify(read_model(str(source)), dict(self.config, pins={"blk.3.ffn_down_exps.weight": "Q4_K"}))
+        self.assertEqual(next(g["pool"] for g in pinned["groups"] if g["name"] == "blk.3.ffn_down_exps.weight"), ["Q4_K"])
+        groups = modelled_groups(model, floor)
         self.assertEqual(len(groups), 6)
         self.assertTrue(all(g["layer"] < 3 for g in groups))
         recipe = self.root / "recipe.json"
-        planned = dict(self.floor, **{g["name"]: "Q6_K" for g in groups})
+        planned = dict(floor, **{g["name"]: "Q6_K" for g in groups})
         write_json(recipe, {"choices": planned})
-        self.assertEqual(witness_choices(model, self.floor, {"recipe": str(recipe), "overrides": {"blk.0.ffn_down": "Q4_K"}}),
+        self.assertEqual(witness_choices(model, floor, {"recipe": str(recipe), "overrides": {"blk.0.ffn_down": "Q4_K"}}),
                          dict(planned, **{"blk.0.ffn_down_exps.weight": "Q4_K"}))
         write_json(recipe, {"choices": dict(planned, **{"output.weight": "Q4_K"})})
         with self.assertRaises(QuantError):
-            witness_choices(model, self.floor, {"recipe": str(recipe)})
+            witness_choices(model, floor, {"recipe": str(recipe)})
 
     def test_floor_prediction_composition_and_bounds(self):
         loss = LossModel(self.model, self.load(), self.damage)
