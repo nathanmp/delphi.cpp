@@ -21,9 +21,10 @@ static scalar_format format(ggml_type type) {
     return {0, 0, 0, 0};
 }
 
+// K types and the self-contained block types whose feedback limit comes from the decoded block error
 static bool is_k_type(ggml_type type) {
     return type == GGML_TYPE_Q2_K || type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q4_K ||
-           type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K;
+           type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q4_G128 || type == GGML_TYPE_MXFP4;
 }
 
 static uint64_t random_next(uint64_t & state) {

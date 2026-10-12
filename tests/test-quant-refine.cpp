@@ -107,6 +107,8 @@ int main() {
     changed |= check_k_type(GGML_TYPE_Q4_K);
     changed |= check_k_type(GGML_TYPE_Q5_K);
     changed |= check_k_type(GGML_TYPE_Q6_K);
+    changed |= check_k_type(GGML_TYPE_Q4_G128);
+    changed |= check_k_type(GGML_TYPE_MXFP4);
     assert(changed);
     return 0;
 }

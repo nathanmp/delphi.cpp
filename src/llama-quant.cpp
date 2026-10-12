@@ -1450,7 +1450,8 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
                 const bool scalar_refine_type = new_type == GGML_TYPE_Q2_0 || new_type == GGML_TYPE_Q4_0;
                 const bool k_refine_type = new_type == GGML_TYPE_Q2_K || new_type == GGML_TYPE_Q3_K ||
-                    new_type == GGML_TYPE_Q4_K || new_type == GGML_TYPE_Q5_K || new_type == GGML_TYPE_Q6_K;
+                    new_type == GGML_TYPE_Q4_K || new_type == GGML_TYPE_Q5_K || new_type == GGML_TYPE_Q6_K ||
+                    new_type == GGML_TYPE_Q4_G128 || new_type == GGML_TYPE_MXFP4;
                 const bool refine_match = refine_enabled && std::regex_search(tensor->name, refine_re);
                 const bool refine_feedback = refine_match && params->gptq_feedback && (scalar_refine_type || k_refine_type);
                 const int refine_gsq_steps = refine_match && scalar_refine_type ? params->gsq_steps : 0;
