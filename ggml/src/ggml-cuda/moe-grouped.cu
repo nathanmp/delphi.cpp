@@ -204,6 +204,7 @@ static bool moe_grouped_type_supported(ggml_type type) {
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:
         case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_G128:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
@@ -348,6 +349,7 @@ static void moe_grouped_switch_type(ggml_type type, const mmq_grouped_args & arg
         case GGML_TYPE_Q1_0:    mul_mat_q_grouped_case<GGML_TYPE_Q1_0>   (args, stream); break;
         case GGML_TYPE_Q2_0:    mul_mat_q_grouped_case<GGML_TYPE_Q2_0>   (args, stream); break;
         case GGML_TYPE_Q4_0:    mul_mat_q_grouped_case<GGML_TYPE_Q4_0>   (args, stream); break;
+        case GGML_TYPE_Q4_G128: mul_mat_q_grouped_case<GGML_TYPE_Q4_G128>(args, stream); break;
         case GGML_TYPE_Q4_1:    mul_mat_q_grouped_case<GGML_TYPE_Q4_1>   (args, stream); break;
         case GGML_TYPE_Q5_0:    mul_mat_q_grouped_case<GGML_TYPE_Q5_0>   (args, stream); break;
         case GGML_TYPE_Q5_1:    mul_mat_q_grouped_case<GGML_TYPE_Q5_1>   (args, stream); break;

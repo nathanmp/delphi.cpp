@@ -31,7 +31,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 ROOT = Path(__file__).resolve().parents[2]
 TRACE_DUMP_PATH = ROOT / "tools" / "exec-trace" / "exec-trace-dump.py"
-ENV_PREFIXES = ("GGML_", "LLAMA_", "CUDA_", "HIP_", "HSA_", "ROCR_", "OMP_")
+ENV_PREFIXES = ("GGML_", "LLAMA_", "CUDA_", "HIP_", "HSA_", "ROCR_", "OMP_", "LD_LIBRARY_PATH")
 DRM_ROOT = Path("/sys/class/drm")
 GPU_SAMPLE_INTERVAL_S = 2.0
 # a sample counts as busy at or above this utilization; idle samples say nothing about the clocks a workload gets
@@ -74,6 +74,8 @@ class BenchArm:
     trace_event_capacity: int = 16_384
     family_rules: tuple[FamilyRule, ...] = ()
     notes: tuple[str, ...] = ()
+    trace_prefill_min_tokens: int = 0
+    trace_prefill_target_tokens: int = 0
 
 
 @dataclass(frozen=True)
@@ -585,7 +587,7 @@ def _parse_json_output(text: str, description: str) -> Any:
 
 
 def _bench_metrics(payload: Any) -> dict[str, Any]:
-    tests = payload.get("tests", []) if isinstance(payload, dict) else []
+    tests = payload if isinstance(payload, list) else payload.get("tests", []) if isinstance(payload, dict) else []
     results = []
     for test in tests:
         if not isinstance(test, dict):

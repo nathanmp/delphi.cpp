@@ -9,7 +9,7 @@
 //   ggml-ffn --prefill-verify GGUF LAYER FIXTURE_DIR WIDTH                    Q4_G128 GGUF: the output at WIDTH rows (prefill kernels from 64 rows) against the decode
 //                                                                             kernels run on the same rows in chunks of 16, bitwise per row
 //   ggml-ffn --shapes                                                         Q4_G128 MUL_MAT_ID of shapes the executor does not take (random weights): the ordinary
-//                                                                             path on a Q4_0 conversion against a host reference
+//                                                                             Q4_G128 kernels against a host reference
 //
 // The fixture directory holds input.f32 [M, 4096], ids.i32 [M, 8] and router.f32 [M, 8]. Optional: reference-output.f64 (ideal FP64
 // execution of the weights), cmp-orig-output.f32 (the CMP "orig" output on the matched INT4 weights), ggml-output.f32 (the output
@@ -708,8 +708,8 @@ static int lifecycle_main(int argc, char ** argv) {
     }
     hooks.set_mode(1);
 
-    // G. a write into the weight buffer forgets the packed state: with the executor off the row-major bytes are converted; with it on the
-    //    weights are packed again
+    // G. a write into the weight buffer forgets the packed state: with the executor off the ordinary kernels read the row-major bytes;
+    //    with it on the weights are packed again
     for (int i = n_all - 1; i >= 0; --i) { session_destroy(*all[i]); } // s3 owns the context that s4, s7, s8 and s9 use: it goes last
     reload_bank(bk, gguf_a, layer_a);
     check(stats()[ST_SETS] == 0, "G a write into the weight buffer forgets the packed set");
@@ -718,7 +718,7 @@ static int lifecycle_main(int argc, char ** argv) {
         session g;
         session_create(g, dev, bk, 3, a3.dir); session_warm(g);
         const error_stats q = compare_outputs(session_output(g), a3.ref.ggml);
-        check(session_uses(g, "moe_int4_rowmajor_to_q4_0") && q.nmse <= 1e-10, "G row-major weights, executor off: Q4_0 conversion, equals the Q4_0 path " + describe(q));
+        check(!session_uses(g, "moe_int4_packed_to_q4_0") && q.nmse <= 1e-10, "G row-major weights, executor off: the ordinary Q4_G128 kernels, equal the Q4_0 path " + describe(q));
         session_destroy(g);
         hooks.set_mode(1);
         const auto before = stats();
@@ -869,7 +869,7 @@ static int shapes_main() {
             int64_t after[ST_COUNT] = {};
             hooks.stats(after);
             check(rel < 0.03, "  output matches the host product of the dequantized weights: relative L2 " + std::to_string(rel));
-            check(after[ST_SHADOWS] == before[ST_SHADOWS] + 1 && after[ST_PACKS] == before[ST_PACKS] && after[ST_RUNS] == before[ST_RUNS], "  one shadow conversion, no packing, no region");
+            check(after[ST_SHADOWS] == before[ST_SHADOWS] && after[ST_PACKS] == before[ST_PACKS] && after[ST_RUNS] == before[ST_RUNS], "  the ordinary Q4_G128 kernels: no conversion, no packing, no region");
         }
         ggml_backend_buffer_free(buf);
         ggml_free(ctx);

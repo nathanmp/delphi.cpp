@@ -790,6 +790,29 @@ static __device__ __forceinline__ float vec_dot_q4_0_q8_1(
 }
 
 
+#define VDR_Q4_G128_Q8_1_MMVQ VDR_Q4_0_Q8_1_MMVQ
+
+// bq8_1 holds the four Q8_1 blocks of the Q4_G128 block kbx; ints iqs .. iqs + VDR - 1 are in its group iqs / QI4_0
+static __device__ __forceinline__ float vec_dot_q4_g128_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_q4_g128 * bq = (const block_q4_g128 *) vbq + kbx;
+    const block_q8_1 * bq8 = bq8_1 + iqs / QI4_0;
+    const int iqs8 = iqs % QI4_0;
+
+    int v[VDR_Q4_G128_Q8_1_MMVQ];
+    int u[2*VDR_Q4_G128_Q8_1_MMVQ];
+
+#pragma unroll
+    for (int i = 0; i < VDR_Q4_G128_Q8_1_MMVQ; ++i) {
+        v[i]     = get_int_b2(bq->qs, iqs + i);
+        u[2*i+0] = get_int_b4(bq8->qs, iqs8 + i);
+        u[2*i+1] = get_int_b4(bq8->qs, iqs8 + i + QI4_0);
+    }
+
+    return vec_dot_q4_0_q8_1_impl<VDR_Q4_G128_Q8_1_MMVQ>(v, u, ggml_cuda_q4_g128_scale(bq->d), bq8->ds);
+}
+
 static __device__ __forceinline__ float vec_dot_q4_1_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 

@@ -720,7 +720,9 @@ void register_weight(ggml_backend_cuda_context & ctx, const ggml_tensor * t) {
     GGML_ASSERT(!capturing(ctx));
     int * flag = nullptr;
     CUDA_CHECK(cudaMalloc(&flag, sizeof(int)));
-    CUDA_CHECK(cudaMemset(flag, 0, sizeof(int)));
+    // on the compute stream, which orders the later flag writes: the legacy stream does not order the non-blocking streams, and a
+    // late clear of a slot's flag after ggml_cuda_moe_int4_stage_prepare set it made the kernels read packed experts as row-major
+    CUDA_CHECK(cudaMemsetAsync(flag, 0, sizeof(int), ctx.stream()));
     states.push_back({ctx.device, int(t->ne[0]), int(t->ne[1]), int(t->ne[2]), static_cast<char *>(t->data), t->nb[2], flag, false});
 }
 
@@ -973,10 +975,6 @@ bool ggml_cuda_moe_int4_enabled() {
 
 bool ggml_cuda_moe_int4_type_supported(int device) {
     return GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[device].cc);
-}
-
-ggml_type ggml_cuda_moe_int4_dispatch_type(const ggml_tensor * src0) {
-    return src0->type == GGML_TYPE_Q4_G128 ? GGML_TYPE_Q4_0 : src0->type;
 }
 
 void ggml_hip_moe_int4_prepare_graph(ggml_backend_cuda_context & ctx, const ggml_cgraph * graph) {
@@ -1343,7 +1341,9 @@ void ggml_cuda_moe_int4_stage_prepare(ggml_backend_cuda_context & ctx, ggml_tens
     std::lock_guard<std::mutex> lock(state_mutex);
     weight_state * s = find_state(ctx.device, t->data);
     GGML_ASSERT(s && s->stride == size_t(t->nb[2]) && s->experts == t->ne[2]);
-    GGML_ASSERT(s->k == t->ne[0] && s->n == t->ne[1]);
+    // a slot holds tensors of different shapes with the same expert size (gate/up [k, n] and down [n, k]): it describes the newest
+    s->k = int(t->ne[0]);
+    s->n = int(t->ne[1]);
     const cudaStream_t stream = ctx.stream();
     if (staged_packed.erase({ctx.device, t->data}) > 0) {
         if (!s->packed) {

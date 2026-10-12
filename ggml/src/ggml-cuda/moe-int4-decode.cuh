@@ -35,12 +35,12 @@
 //   ROWMAJOR  the layout of the GGUF file;
 //   PACKED    rewritten in place (each expert inside its own bytes) into the layout of the kernels, once, by
 //             ggml_cuda_moe_int4_prepare, before graph capture. The registry of this file knows the packed sets.
-// Only code of moe-int4-decode.cu reads PACKED bytes. Every other consumer goes through ggml_cuda_moe_int4_shadow, which converts
-// the weights of a MUL_MAT_ID node (from either state) into a temporary Q4_0 tensor that the ordinary kernels read. A buffer that is
-// freed or written forgets its packed sets.
+// Only code of moe-int4-decode.cu reads PACKED bytes. Every other consumer of a PACKED set goes through ggml_cuda_moe_int4_shadow,
+// which converts the weights of a MUL_MAT_ID node into a temporary Q4_0 tensor that the ordinary kernels read. The ordinary kernels
+// (MMVQ, MMQ, dequantization) read ROWMAJOR weights directly, as four Q4_0 groups under one scale. A buffer that is freed or
+// written forgets its packed sets.
 //
-// Selected by GGML_CUDA_MOE_INT4_DECODE=1 (default 0: the weights stay ROWMAJOR and every node takes the shadow path, which is
-// correct and slow: use Q4_0 weights of the same values for a baseline). A region that the matcher of ggml-cuda.cu accepts runs as
+// Selected by GGML_CUDA_MOE_INT4_DECODE=1 (default 0: the weights stay ROWMAJOR and every node takes the ordinary kernels). A region that the matcher of ggml-cuda.cu accepts runs as
 // five kernels on the compute stream (decode) or about nine (prefill): input bridge + routing, W13, clipped SwiGLU, W2 with router weights,
 // slot sum + output bridge. A region that does not fit (other shapes, unaligned activations) takes the shadow path per node.
 // Arithmetic (rounding points follow the reference): F32 -> BF16 input; INT4 -> BF16 weights, one BF16 scale multiply, FP32 MMA
@@ -74,8 +74,9 @@ bool ggml_cuda_moe_int4_enabled();
 // Device eligibility for G128 routed weights: NVIDIA (ordinary shadow path) or RDNA4 (direct G128 path).
 bool ggml_cuda_moe_int4_type_supported(int device);
 
-// The type that the ordinary dispatch logic must assume for the weights of a MUL_MAT_ID (Q4_0 for Q4_G128 weights, else the type).
-ggml_type ggml_cuda_moe_int4_dispatch_type(const ggml_tensor * src0);
+// True if the weights at data belong to a PACKED set (NVIDIA; false elsewhere): only the INT4 kernels and ggml_cuda_moe_int4_shadow
+// read them. The ordinary kernels read ROWMAJOR Q4_G128 weights directly.
+bool ggml_cuda_moe_int4_is_packed(int device, const void * data);
 
 // Checks the tensors of ffn and, on the first call for these weights, packs them in place (after the device is idle) and primes the
 // per-device launch tables and the scratch. Returns whether ggml_cuda_moe_int4_run can execute ffn. Must not be called during stream
@@ -89,9 +90,9 @@ bool ggml_cuda_moe_int4_ready(ggml_backend_cuda_context & ctx, const ggml_cuda_m
 // Runs the region. Only after ggml_cuda_moe_int4_ready.
 void ggml_cuda_moe_int4_run(ggml_backend_cuda_context & ctx, const ggml_cuda_moe_int4_ffn & ffn);
 
-// The ordinary path for one MUL_MAT_ID node whose weights are Q4_G128: converts all experts into a Q4_0 tensor in storage (from the
-// state they are in) and fills src0_q (Q4_0 weights) and dst_q (a copy of the node that reads src0_q). The caller runs the ordinary
-// MUL_MAT_ID on dst_q and keeps storage alive until then.
+// The ordinary path for one MUL_MAT_ID node whose weights are a PACKED Q4_G128 set: converts all experts into a Q4_0 tensor in
+// storage and fills src0_q (Q4_0 weights) and dst_q (a copy of the node that reads src0_q). The caller runs the ordinary MUL_MAT_ID
+// on dst_q and keeps storage alive until then.
 void ggml_cuda_moe_int4_shadow(ggml_backend_cuda_context & ctx, const ggml_tensor * dst, ggml_cuda_pool_alloc<char> & storage,
         ggml_tensor & src0_q, ggml_tensor & dst_q);
 

@@ -2331,8 +2331,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int cc) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
-    // delphi: weights of type Q4_G128 run as a Q4_0 conversion (ggml_cuda_moe_int4_shadow)
-    const ggml_type src0_type = ggml_cuda_moe_int4_dispatch_type(src0);
+    const ggml_type src0_type = src0->type;
 
     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         return true;
@@ -2374,15 +2373,18 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         ggml_hip_moe_int4_mul_mat_id(ctx, dst);
         return;
 #else
-        // delphi: INT4 expert weights (moe-int4-decode.cuh) outside a matched region: every expert is converted to Q4_0 in a temporary
-        // tensor, whatever state the weights are in, and the ordinary path runs on it
-        ggml_cuda_pool_alloc<char> storage(ctx.pool());
-        ggml_tensor src0_q, dst_q;
-        ggml_cuda_moe_int4_shadow(ctx, dst, storage, src0_q, dst_q);
-        ggml_exec_trace_dispatch(dst->op, GGML_EXEC_TRACE_DISPATCH_GPU_MOE_INT4, GGML_EXEC_TRACE_DISPATCH_VARIANT_UNPACKED,
-                ggml_cuda_info().devices[ctx.device].cc, (uint32_t) dst->ne[2]);
-        ggml_cuda_mul_mat_id(ctx, &dst_q);
-        return;
+        if (ggml_cuda_moe_int4_is_packed(ctx.device, src0->data)) {
+            // delphi: a PACKED INT4 expert set (moe-int4-decode.cuh) outside its matched region: every expert is converted to Q4_0 in
+            // a temporary tensor and the ordinary path runs on it
+            ggml_cuda_pool_alloc<char> storage(ctx.pool());
+            ggml_tensor src0_q, dst_q;
+            ggml_cuda_moe_int4_shadow(ctx, dst, storage, src0_q, dst_q);
+            ggml_exec_trace_dispatch(dst->op, GGML_EXEC_TRACE_DISPATCH_GPU_MOE_INT4, GGML_EXEC_TRACE_DISPATCH_VARIANT_UNPACKED,
+                    ggml_cuda_info().devices[ctx.device].cc, (uint32_t) dst->ne[2]);
+            ggml_cuda_mul_mat_id(ctx, &dst_q);
+            return;
+        }
+        // ROWMAJOR weights: the ordinary kernels read Q4_G128
 #endif
     }
 
@@ -4372,9 +4374,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             }
         }
         if (node->src[0]->type == GGML_TYPE_Q4_G128) {
-            // The fusions below read the weights in the layout of their type, which Q4_G128 weights are not in (PACKED). This node
-            // runs alone, on the Q4_0 conversion of ggml_cuda_mul_mat_id.
+            // The fusions below read the weights in the layout of their type. HIP runs the node with the direct G128 implementation
+            // (its weights may be packed); on NVIDIA, a PACKED set runs alone, on the Q4_0 conversion of ggml_cuda_mul_mat_id.
+#ifdef GGML_HIP_MOE_INT4_AVAILABLE
             return 0;
+#else
+            if (ggml_cuda_moe_int4_is_packed(cuda_ctx->device, node->src[0]->data)) {
+                return 0;
+            }
+#endif
         }
     }
 
@@ -6550,7 +6558,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 hip_g128 = a->type == GGML_TYPE_Q4_G128;
 #endif
                 if (ggml_mul_mat_id_is_partial(op) && !hip_g128 && (b->type != GGML_TYPE_F32 ||
-                        !ggml_cuda_should_use_mmq(ggml_cuda_moe_int4_dispatch_type(a), ggml_cuda_info().devices[dev_ctx->device].cc, 1, a->ne[2]) ||
+                        !ggml_cuda_should_use_mmq(a->type, ggml_cuda_info().devices[dev_ctx->device].cc, 1, a->ne[2]) ||
                         ggml_cuda_moe_packed_inplace_fmt(a) != GGML_CUDA_MOE_PACKED_NONE)) {
                     return false; // see ggml_cuda_mul_mat_id
                 }
@@ -6605,16 +6613,18 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_IQ5_KS:
                     case GGML_TYPE_BF16:
                         return true;
-#if defined(GGML_CUDA_MOE_INT4_AVAILABLE) || defined(GGML_HIP_MOE_INT4_AVAILABLE)
                     case GGML_TYPE_Q4_G128:
-                        // delphi: INT4 expert weights; MUL_MAT_ID only (moe-int4-decode.cuh: matched region or Q4_0 conversion)
-                        return op->op == GGML_OP_MUL_MAT_ID && ggml_cuda_moe_int4_type_supported(dev_ctx->device)
+                        // delphi: the ordinary kernels read Q4_G128 (four Q4_0 groups under one BF16 scale; the dequantization
+                        // needs contiguous rows). A PACKED INT4 expert set on NVIDIA (moe-int4-decode.cuh) runs as its matched
+                        // region or a Q4_0 conversion; HIP runs MUL_MAT_ID with the direct G128 implementation (moe-int4-hip.cu).
 #ifdef GGML_HIP_MOE_INT4_AVAILABLE
-                            && a->ne[1] % 16 == 0 && !a->view_src && ggml_is_contiguous(a) && op->src[1]->type == GGML_TYPE_F32
-                            && op->src[2]->nb[0] == sizeof(int32_t) && op->src[1]->nb[0] == sizeof(float)
-#endif
-                            ;
-#endif // GGML_CUDA_MOE_INT4_AVAILABLE
+                        if (op->op == GGML_OP_MUL_MAT_ID) {
+                            return ggml_cuda_moe_int4_type_supported(dev_ctx->device)
+                                && a->ne[1] % 16 == 0 && !a->view_src && ggml_is_contiguous(a) && op->src[1]->type == GGML_TYPE_F32
+                                && op->src[2]->nb[0] == sizeof(int32_t) && op->src[1]->nb[0] == sizeof(float);
+                        }
+#endif // GGML_HIP_MOE_INT4_AVAILABLE
+                        return ggml_is_contiguous(a);
                     default:
                         return false;
                 }

@@ -15,6 +15,15 @@ SPEC.loader.exec_module(profile)
 
 
 class TestBottleneckProfile(unittest.TestCase):
+    def test_llama_bench_json_array_retains_prompt_and_decode_samples(self):
+        rows = [{"n_prompt": 128, "n_gen": 0, "samples_ts": [100.0, 110.0]},
+                {"n_prompt": 0, "n_gen": 64, "samples_ts": [20.0, 22.0]}]
+        parsed = profile._bench_metrics(rows)
+        self.assertEqual(len(parsed["tests"]), 2)
+        self.assertEqual(parsed["tests"][0]["test"]["n_prompt"], 128)
+        self.assertEqual(parsed["tests"][1]["throughput_t_s"]["mean"], 21.0)
+        self.assertEqual(parsed, profile._bench_metrics({"tests": rows}))
+
     def test_option_override_replaces_short_and_adds_missing_options(self):
         command = ("llama-bench", "-ub", "1024", "-n", "32")
         self.assertEqual(profile._replace_option(command, "-ub", "2048"), ("llama-bench", "-ub", "2048", "-n", "32"))

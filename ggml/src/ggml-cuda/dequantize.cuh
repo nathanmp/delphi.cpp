@@ -57,6 +57,21 @@ static __device__ __forceinline__ void dequantize_q4_0(const void * vx, const in
     v.y = (v.y - 8.0f) * d;
 }
 
+// ib counts groups of QK4_0 values: a Q4_G128 block holds four, each in the nibble layout of a block_q4_0
+static __device__ __forceinline__ void dequantize_q4_g128(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_q4_g128 * x = (const block_q4_g128 *) vx + ib / (QK4_G128 / QK4_0);
+
+    const float d = ggml_cuda_q4_g128_scale(x->d);
+
+    const int vui = x->qs[(ib % (QK4_G128 / QK4_0)) * (QK4_0 / 2) + iqs];
+
+    v.x = vui & 0xF;
+    v.y = vui >> 4;
+
+    v.x = (v.x - 8.0f) * d;
+    v.y = (v.y - 8.0f) * d;
+}
+
 static __device__ __forceinline__ void dequantize_q4_1(const void * vx, const int64_t ib, const int iqs, float2 & v){
     const block_q4_1 * x = (const block_q4_1 *) vx;
 

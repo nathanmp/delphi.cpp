@@ -293,6 +293,7 @@ void mul_mat_q_grouped_case(const mmq_grouped_args & args, cudaStream_t stream) 
 extern DECL_MMQ_GROUPED_CASE(GGML_TYPE_Q1_0);
 extern DECL_MMQ_GROUPED_CASE(GGML_TYPE_Q2_0);
 extern DECL_MMQ_GROUPED_CASE(GGML_TYPE_Q4_0);
+extern DECL_MMQ_GROUPED_CASE(GGML_TYPE_Q4_G128);
 extern DECL_MMQ_GROUPED_CASE(GGML_TYPE_Q4_1);
 extern DECL_MMQ_GROUPED_CASE(GGML_TYPE_Q5_0);
 extern DECL_MMQ_GROUPED_CASE(GGML_TYPE_Q5_1);

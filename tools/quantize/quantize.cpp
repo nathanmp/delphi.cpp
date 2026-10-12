@@ -534,17 +534,17 @@ int llama_quantize(int argc, char ** argv) {
         }
         for (const auto & [name, entry] : loaded.entries) {
             if (imatrix_data.count(name) == 0) { continue; }
-            if (entry.sums1.size() != entry.sums.size() || entry.counts.empty() || entry.sums1.size() % entry.counts.size() != 0) {
+            if (entry.activations.size() != entry.sums.size() || entry.counts.empty() || entry.activations.size() % entry.counts.size() != 0) {
                 fprintf(stderr, "missing or invalid activation means for %s\n", name.c_str());
                 return 1;
             }
             auto & mean = imatrix_means[name];
-            mean.resize(entry.sums1.size());
+            mean.resize(entry.activations.size());
             const size_t ne0 = mean.size() / entry.counts.size();
             for (size_t expert = 0; expert < entry.counts.size(); ++expert) {
                 const float inv_count = entry.counts[expert] > 0 ? 1.0f / entry.counts[expert] : 0.0f;
                 for (size_t col = 0; col < ne0; ++col) {
-                    mean[expert*ne0 + col] = entry.sums1[expert*ne0 + col] * inv_count;
+                    mean[expert*ne0 + col] = entry.activations[expert*ne0 + col] * inv_count;
                 }
             }
         }

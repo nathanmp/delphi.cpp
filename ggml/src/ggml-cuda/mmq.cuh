@@ -63,6 +63,7 @@ static mmq_q8_1_ds_layout mmq_get_q8_1_ds_layout(const ggml_type type_x) {
         case GGML_TYPE_Q2_0:
             return MMQ_Q8_1_DS_LAYOUT_D4;
         case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_G128:
         case GGML_TYPE_Q4_1:
             return MMQ_Q8_1_DS_LAYOUT_DS4;
         case GGML_TYPE_Q5_0:
@@ -296,8 +297,11 @@ static constexpr __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config_raw(gg
     GGML_UNUSED_VARS(type, J, fallback);
 }
 
-static constexpr __host__ __device__ ggml_type ggml_cuda_mmq_iqk_config_type(const ggml_type type) {
+// The type whose config table entries a type uses.
+static constexpr __host__ __device__ ggml_type ggml_cuda_mmq_config_type(const ggml_type type) {
     switch (type) {
+        case GGML_TYPE_Q4_G128:
+            return GGML_TYPE_Q4_0; // the same tile and iteration, see ggml_cuda_mmq_load_tiles_q4_g128
         case GGML_TYPE_IQ2_K:
         case GGML_TYPE_IQ3_K:
         case GGML_TYPE_IQ4_K:
@@ -325,11 +329,11 @@ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_retype_c
 }
 
 static __host__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(const ggml_type type, const int J, const bool fallback, const int cc) {
-    return ggml_cuda_mmq_retype_config(ggml_cuda_mmq_get_config_raw(ggml_cuda_mmq_iqk_config_type(type), J, fallback, cc), type);
+    return ggml_cuda_mmq_retype_config(ggml_cuda_mmq_get_config_raw(ggml_cuda_mmq_config_type(type), J, fallback, cc), type);
 }
 
 static constexpr __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(ggml_type type, int J, bool fallback) {
-    return ggml_cuda_mmq_retype_config(ggml_cuda_mmq_get_config_raw(ggml_cuda_mmq_iqk_config_type(type), J, fallback), type);
+    return ggml_cuda_mmq_retype_config(ggml_cuda_mmq_get_config_raw(ggml_cuda_mmq_config_type(type), J, fallback), type);
 }
 
 static __host__ int ggml_cuda_mmq_get_type(const ggml_type type, const int J, const bool fallback, const int cc) {
@@ -445,6 +449,7 @@ static constexpr __host__ __device__ tile_x_sizes mmq_get_dp4a_tile_x_sizes(ggml
         case GGML_TYPE_Q1_0:    return MMQ_DP4A_TXS_Q8_0;
         case GGML_TYPE_Q2_0:    return MMQ_DP4A_TXS_Q8_0;
         case GGML_TYPE_Q4_0:    return MMQ_DP4A_TXS_Q4_0;
+        case GGML_TYPE_Q4_G128: return MMQ_DP4A_TXS_Q4_0;
         case GGML_TYPE_Q4_1:    return MMQ_DP4A_TXS_Q4_1;
         case GGML_TYPE_Q5_0:    return MMQ_DP4A_TXS_Q8_0;
         case GGML_TYPE_Q5_1:    return MMQ_DP4A_TXS_Q8_1;
@@ -616,6 +621,12 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
                 return ggml_cuda_mmq_util_funcs(
                     VDR_Q4_0_Q8_1_MMQ,
                     ggml_cuda_mmq_load_tiles_q4_0<type, J, fallback>,
+                    ggml_cuda_mmq_vec_dot_q4_0_q8_1_dp4a<type, J, fallback>,
+                    ggml_cuda_mmq_write_back_dp4a<type, J, fallback>);
+            case GGML_TYPE_Q4_G128:
+                return ggml_cuda_mmq_util_funcs(
+                    VDR_Q4_0_Q8_1_MMQ,
+                    ggml_cuda_mmq_load_tiles_q4_g128<type, J, fallback>,
                     ggml_cuda_mmq_vec_dot_q4_0_q8_1_dp4a<type, J, fallback>,
                     ggml_cuda_mmq_write_back_dp4a<type, J, fallback>);
             case GGML_TYPE_Q4_1:
@@ -834,6 +845,12 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
             return ggml_cuda_mmq_util_funcs(
                 -1,
                 ggml_cuda_mmq_load_tiles_q4_0<type, J, fallback>,
+                ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_DS4>,
+                ggml_cuda_mmq_write_back_mma<type, J, fallback>);
+        case GGML_TYPE_Q4_G128:
+            return ggml_cuda_mmq_util_funcs(
+                -1,
+                ggml_cuda_mmq_load_tiles_q4_g128<type, J, fallback>,
                 ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_DS4>,
                 ggml_cuda_mmq_write_back_mma<type, J, fallback>);
         case GGML_TYPE_Q4_1:
@@ -1769,6 +1786,7 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
 extern DECL_MMQ_CASE(GGML_TYPE_Q1_0);
 extern DECL_MMQ_CASE(GGML_TYPE_Q2_0);
 extern DECL_MMQ_CASE(GGML_TYPE_Q4_0);
+extern DECL_MMQ_CASE(GGML_TYPE_Q4_G128);
 extern DECL_MMQ_CASE(GGML_TYPE_Q4_1);
 extern DECL_MMQ_CASE(GGML_TYPE_Q5_0);
 extern DECL_MMQ_CASE(GGML_TYPE_Q5_1);

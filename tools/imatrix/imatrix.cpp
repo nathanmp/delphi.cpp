@@ -38,7 +38,7 @@ static void print_usage(int, char ** argv) {
 
 struct Stats {
     std::vector<float>   values;
-    std::vector<float>   sums1;
+    std::vector<float>   activations;
     std::vector<int64_t> counts;
 };
 
@@ -59,8 +59,16 @@ struct tensor_statistics {
 
 class IMatrixCollector {
 public:
-    IMatrixCollector() : m_collect_means(std::getenv("LLAMA_IMATRIX_COLLECT_MEANS") != nullptr) {}
-    void set_params(common_params params) { m_params = std::move(params); }
+    IMatrixCollector() = default;
+    void set_params(common_params params) {
+        m_params = std::move(params);
+        const char * means = std::getenv("DELPHI_IMATRIX_MEANS");
+        m_collect_means = (means && std::strcmp(means, "1") == 0) || std::getenv("LLAMA_IMATRIX_COLLECT_MEANS") != nullptr;
+        if (m_collect_means && m_params.imat_dat > 0) {
+            LOG_ERR("activation means require GGUF imatrix output\n");
+            exit(1);
+        }
+    }
     bool collect_imatrix(struct ggml_tensor * t, bool ask, void * user_data);
     void save_imatrix_legacy(int32_t ncall = -1) const;
     void save_imatrix(int32_t n_chunk = -1) const;
@@ -70,11 +78,11 @@ private:
     std::unordered_map<std::string, Stats> m_stats;
     common_params                          m_params;
     std::mutex                             m_mutex;
+    bool                                   m_collect_means = false;
     std::vector<std::string>               m_datasets;
     int32_t                                m_last_chunk = 0;
     std::vector<char>                      m_src1_data;
     std::vector<char>                      m_ids; // the expert ids from ggml_mul_mat_id
-    bool                                   m_collect_means = false;
 };
 
 // remove any prefix and suffixes from the name
@@ -300,10 +308,10 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
         }
         if (e.values.empty()) {
             e.values.resize(src1->ne[0]*n_as, 0);
+            if (m_collect_means) {
+                e.activations.resize(e.values.size(), 0.0f);
+            }
             e.counts.resize(n_as, 0);
-        }
-        if (m_collect_means && e.sums1.empty()) {
-            e.sums1.resize(e.values.size(), 0.0f);
         }
         else if (e.values.size() != (size_t)src1->ne[0]*n_as) {
             LOG_ERR("%s: inconsistent size for %s (%d vs %d)\n", __func__, wname.c_str(), (int)e.values.size(), (int)(src1->ne[0]*n_as));
@@ -329,20 +337,23 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
                 const int64_t i11 = idx % src1->ne[1];
                 const float * x   = (const float *) (data + i11 * src1->nb[1] + row * src1->nb[2]);
                 float *       acc = e.values.data() + ex * ne0;
-                float *       sum1 = m_collect_means ? e.sums1.data() + ex * ne0 : nullptr;
+                float *       act = m_collect_means ? e.activations.data() + ex * ne0 : nullptr;
 
                 e.counts[ex]++;
                 touched[ex] = 1;
                 for (int64_t j = 0; j < ne0; ++j) {
                     acc[j] += x[j] * x[j];
-                    if (sum1) { sum1[j] += x[j]; }
+                    if (act) {
+                        act[j] += x[j];
+                    }
                 }
             }
         }
 
         // check for non-finite values, only checking experts that were routed to and touched
         for (int64_t ex = 0; ex < n_as; ++ex) {
-            if (touched[ex] && !all_finite(e.values.data() + ex * ne0, ne0)) {
+            if (touched[ex] && (!all_finite(e.values.data() + ex * ne0, ne0) ||
+                (m_collect_means && !all_finite(e.activations.data() + ex * ne0, ne0)))) {
                 LOG_ERR("%s: non-finite values detected in %s\n", __func__, wname.c_str());
                 exit(1);
             }
@@ -381,10 +392,10 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
         }
         if (e.values.empty()) {
             e.values.resize(src1->ne[0] * n_mat, 0);
+            if (m_collect_means) {
+                e.activations.resize(e.values.size(), 0.0f);
+            }
             e.counts.resize(1, 0);
-        }
-        if (m_collect_means && e.sums1.empty()) {
-            e.sums1.resize(e.values.size(), 0.0f);
         }
         else if (e.values.size() != (size_t)(src1->ne[0] * n_mat)) {
             LOG_ERR("%s: inconsistent size for %s (%d vs %d)\n", __func__, wname.c_str(), (int)e.values.size(), (int)(src1->ne[0] * n_mat));
@@ -399,20 +410,23 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
                 // handle 3D+ tensors, but flatten 3D+ activations when model tensor is 2D
                 const int64_t mat_id = (i3 % src0->ne[3]) * src0->ne[2] + (i2 % src0->ne[2]);
                 float *       acc    = e.values.data() + mat_id * ne0;
-                float *       sum1   = m_collect_means ? e.sums1.data() + mat_id * ne0 : nullptr;
+                float *       act    = m_collect_means ? e.activations.data() + mat_id * ne0 : nullptr;
 
                 for (int64_t row = 0; row < src1->ne[1]; ++row) {
                     const float * x = (const float *) (data + row * src1->nb[1] + i2 * src1->nb[2] + i3 * src1->nb[3]);
                     for (int64_t j = 0; j < ne0; ++j) {
                         acc[j] += x[j] * x[j];
-                        if (sum1) { sum1[j] += x[j]; }
+                        if (act) {
+                            act[j] += x[j];
+                        }
                     }
                 }
             }
         }
 
         // check for non-finite values
-        if (!all_finite(e.values.data(), e.values.size())) {
+        if (!all_finite(e.values.data(), e.values.size()) ||
+            (m_collect_means && !all_finite(e.activations.data(), e.activations.size()))) {
             LOG_ERR("%s: non-finite values detected in %s\n", __func__, wname.c_str());
             exit(1);
         }
@@ -589,10 +603,10 @@ void IMatrixCollector::save_imatrix(int32_t n_chunk) const {
 
         to_store.push_back(kv.first);
         data_size += GGML_PAD(ggml_tensor_overhead() + sizeof(float) * kv.second.values.size(), GGML_MEM_ALIGN);
-        if (!kv.second.sums1.empty()) {
-            data_size += GGML_PAD(ggml_tensor_overhead() + sizeof(float) * kv.second.sums1.size(), GGML_MEM_ALIGN);
-        }
         data_size += GGML_PAD(ggml_tensor_overhead() + sizeof(float) * kv.second.counts.size(), GGML_MEM_ALIGN);
+        if (!kv.second.activations.empty()) {
+            data_size += GGML_PAD(ggml_tensor_overhead() + sizeof(float) * kv.second.activations.size(), GGML_MEM_ALIGN);
+        }
     }
 
     // deterministic tensor name order
@@ -643,11 +657,11 @@ void IMatrixCollector::save_imatrix(int32_t n_chunk) const {
 
             gguf_add_tensor(ctx_gguf, in_sum2);
             gguf_add_tensor(ctx_gguf, counts);
-            if (!stat.sums1.empty()) {
-                struct ggml_tensor * in_sum1 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nval / nmat, nmat);
-                ggml_format_name(in_sum1, "%s.in_sum1", name.c_str());
-                std::copy(stat.sums1.begin(), stat.sums1.end(), (float *) in_sum1->data);
-                gguf_add_tensor(ctx_gguf, in_sum1);
+            if (!stat.activations.empty()) {
+                struct ggml_tensor * in_sum = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nval / nmat, nmat);
+                ggml_format_name(in_sum, "%s.in_sum", name.c_str());
+                memcpy(in_sum->data, stat.activations.data(), nval * sizeof(float));
+                gguf_add_tensor(ctx_gguf, in_sum);
             }
         }
     }
@@ -667,19 +681,23 @@ bool IMatrixCollector::load_imatrix(const char * file_name) {
         return false;
     }
 
-    const bool has_means = std::any_of(loaded.entries.begin(), loaded.entries.end(), [](const auto & kv) {
-        return !kv.second.sums1.empty();
-    });
-    if (has_means) { m_collect_means = true; }
-    if (m_collect_means && (loaded.is_legacy || std::any_of(loaded.entries.begin(), loaded.entries.end(), [](const auto & kv) {
-            return kv.second.sums1.size() != kv.second.sums.size();
-        }))) {
-        LOG_ERR("%s: cannot combine activation means with an imatrix that has no means\n", __func__);
-        return false;
+    // an input with activation means keeps collecting them
+    if (std::any_of(loaded.entries.begin(), loaded.entries.end(), [](const auto & kv) { return !kv.second.activations.empty(); })) {
+        m_collect_means = true;
     }
 
     const int32_t chunk_size = m_params.n_ctx / m_params.n_parallel;
     const bool is_legacy = loaded.is_legacy;
+
+    // First and second moments must cover the same tokens; old inputs cannot supply missing means.
+    if (m_collect_means) {
+        for (const auto & kv : loaded.entries) {
+            if (is_legacy || kv.second.activations.size() != kv.second.sums.size()) {
+                LOG_ERR("%s: activation means unavailable for %s in %s\n", __func__, kv.first.c_str(), file_name);
+                return false;
+            }
+        }
+    }
 
     for (auto & [name, entry] : loaded.entries) {
         auto & e = m_stats[name];
@@ -721,10 +739,13 @@ bool IMatrixCollector::load_imatrix(const char * file_name) {
             for (int64_t j = 0; j < nval; ++j) {
                 e.values[j] += entry.sums[j];
             }
-            if (!entry.sums1.empty()) {
-                if (e.sums1.empty()) { e.sums1.resize(nval, 0.0f); }
-                if (e.sums1.size() != (size_t) nval) { return false; }
-                for (int64_t j = 0; j < nval; ++j) { e.sums1[j] += entry.sums1[j]; }
+            if (m_collect_means) {
+                if (e.activations.empty()) {
+                    e.activations.resize(nval, 0.0f);
+                }
+                for (int64_t j = 0; j < nval; ++j) {
+                    e.activations[j] += entry.activations[j];
+                }
             }
             for (int64_t j = 0; j < ncounts; ++j) {
                 e.counts[j] += entry.counts[j];
