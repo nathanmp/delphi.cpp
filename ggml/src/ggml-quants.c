@@ -2363,10 +2363,63 @@ size_t quantize_q8_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, 
     return nrow * row_size;
 }
 
+// With an imatrix, choose each block's E8M0 exponent from the amax exponent and its two neighbours by the weighted
+// squared error. Without one, keep the reference (amax) encoding.
+static void quantize_row_mxfp4_impl(const float * GGML_RESTRICT x, block_mxfp4 * GGML_RESTRICT y, int64_t n_per_row, const float * quant_weights) {
+    float sum_x2 = 0;
+    for (int j = 0; j < n_per_row; ++j) sum_x2 += x[j]*x[j];
+    const float sigma2 = sum_x2/n_per_row;
+
+    float weight[QK_MXFP4];
+    const int64_t nb = n_per_row/QK_MXFP4;
+    for (int64_t ib = 0; ib < nb; ++ib) {
+        const float * xb = x + QK_MXFP4*ib;
+        const float * qw = quant_weights + QK_MXFP4*ib;
+        float amax = 0.0f;
+        for (int j = 0; j < QK_MXFP4; ++j) {
+            weight[j] = qw[j] * sqrtf(sigma2 + xb[j]*xb[j]);
+            amax = MAX(amax, fabsf(xb[j]));
+        }
+        if (amax == 0.0f) {
+            quantize_row_mxfp4_ref(xb, y + ib, QK_MXFP4);
+            continue;
+        }
+        const int e0 = (int) floorf(log2f(amax)) - 2 + 127;
+        int best_e = e0;
+        float best_err = INFINITY;
+        for (int e = MAX(e0 - 1, 1); e <= MIN(e0 + 1, 254); ++e) {
+            const float d = GGML_E8M0_TO_FP32_HALF(e);
+            float err = 0.0f;
+            for (int j = 0; j < QK_MXFP4; ++j) {
+                const float diff = xb[j] - kvalues_mxfp4[best_index_mxfp4(xb[j], d)]*d;
+                err += weight[j]*diff*diff;
+            }
+            if (err < best_err || (err == best_err && e == e0)) {
+                best_err = err;
+                best_e = e;
+            }
+        }
+        const float d = GGML_E8M0_TO_FP32_HALF(best_e);
+        y[ib].e = (uint8_t) best_e;
+        for (int j = 0; j < QK_MXFP4/2; ++j) {
+            y[ib].qs[j] = best_index_mxfp4(xb[j], d) | (best_index_mxfp4(xb[QK_MXFP4/2 + j], d) << 4);
+        }
+    }
+}
+
 size_t quantize_mxfp4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
-    GGML_UNUSED(quant_weights);
-    quantize_row_mxfp4_ref(src, dst, (int64_t)nrow*n_per_row);
-    return nrow * ggml_row_size(GGML_TYPE_MXFP4, n_per_row);
+    if (!quant_weights) {
+        quantize_row_mxfp4_ref(src, dst, (int64_t)nrow*n_per_row);
+        return nrow * ggml_row_size(GGML_TYPE_MXFP4, n_per_row);
+    }
+    const size_t row_size = ggml_row_size(GGML_TYPE_MXFP4, n_per_row);
+    char * qrow = (char *)dst;
+    for (int64_t row = 0; row < nrow; ++row) {
+        quantize_row_mxfp4_impl(src, (block_mxfp4 *)qrow, n_per_row, quant_weights);
+        src += n_per_row;
+        qrow += row_size;
+    }
+    return nrow * row_size;
 }
 
 size_t quantize_nvfp4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {

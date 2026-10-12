@@ -10,6 +10,7 @@
 #include <clocale>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <thread>
@@ -37,6 +38,7 @@ static void print_usage(int, char ** argv) {
 
 struct Stats {
     std::vector<float>   values;
+    std::vector<float>   sums1;
     std::vector<int64_t> counts;
 };
 
@@ -57,7 +59,7 @@ struct tensor_statistics {
 
 class IMatrixCollector {
 public:
-    IMatrixCollector() = default;
+    IMatrixCollector() : m_collect_means(std::getenv("LLAMA_IMATRIX_COLLECT_MEANS") != nullptr) {}
     void set_params(common_params params) { m_params = std::move(params); }
     bool collect_imatrix(struct ggml_tensor * t, bool ask, void * user_data);
     void save_imatrix_legacy(int32_t ncall = -1) const;
@@ -72,6 +74,7 @@ private:
     int32_t                                m_last_chunk = 0;
     std::vector<char>                      m_src1_data;
     std::vector<char>                      m_ids; // the expert ids from ggml_mul_mat_id
+    bool                                   m_collect_means = false;
 };
 
 // remove any prefix and suffixes from the name
@@ -299,6 +302,9 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
             e.values.resize(src1->ne[0]*n_as, 0);
             e.counts.resize(n_as, 0);
         }
+        if (m_collect_means && e.sums1.empty()) {
+            e.sums1.resize(e.values.size(), 0.0f);
+        }
         else if (e.values.size() != (size_t)src1->ne[0]*n_as) {
             LOG_ERR("%s: inconsistent size for %s (%d vs %d)\n", __func__, wname.c_str(), (int)e.values.size(), (int)(src1->ne[0]*n_as));
             exit(1); //GGML_ABORT("fatal error");
@@ -323,11 +329,13 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
                 const int64_t i11 = idx % src1->ne[1];
                 const float * x   = (const float *) (data + i11 * src1->nb[1] + row * src1->nb[2]);
                 float *       acc = e.values.data() + ex * ne0;
+                float *       sum1 = m_collect_means ? e.sums1.data() + ex * ne0 : nullptr;
 
                 e.counts[ex]++;
                 touched[ex] = 1;
                 for (int64_t j = 0; j < ne0; ++j) {
                     acc[j] += x[j] * x[j];
+                    if (sum1) { sum1[j] += x[j]; }
                 }
             }
         }
@@ -375,6 +383,9 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
             e.values.resize(src1->ne[0] * n_mat, 0);
             e.counts.resize(1, 0);
         }
+        if (m_collect_means && e.sums1.empty()) {
+            e.sums1.resize(e.values.size(), 0.0f);
+        }
         else if (e.values.size() != (size_t)(src1->ne[0] * n_mat)) {
             LOG_ERR("%s: inconsistent size for %s (%d vs %d)\n", __func__, wname.c_str(), (int)e.values.size(), (int)(src1->ne[0] * n_mat));
             exit(1); //GGML_ABORT("fatal error");
@@ -388,11 +399,13 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
                 // handle 3D+ tensors, but flatten 3D+ activations when model tensor is 2D
                 const int64_t mat_id = (i3 % src0->ne[3]) * src0->ne[2] + (i2 % src0->ne[2]);
                 float *       acc    = e.values.data() + mat_id * ne0;
+                float *       sum1   = m_collect_means ? e.sums1.data() + mat_id * ne0 : nullptr;
 
                 for (int64_t row = 0; row < src1->ne[1]; ++row) {
                     const float * x = (const float *) (data + row * src1->nb[1] + i2 * src1->nb[2] + i3 * src1->nb[3]);
                     for (int64_t j = 0; j < ne0; ++j) {
                         acc[j] += x[j] * x[j];
+                        if (sum1) { sum1[j] += x[j]; }
                     }
                 }
             }
@@ -576,6 +589,9 @@ void IMatrixCollector::save_imatrix(int32_t n_chunk) const {
 
         to_store.push_back(kv.first);
         data_size += GGML_PAD(ggml_tensor_overhead() + sizeof(float) * kv.second.values.size(), GGML_MEM_ALIGN);
+        if (!kv.second.sums1.empty()) {
+            data_size += GGML_PAD(ggml_tensor_overhead() + sizeof(float) * kv.second.sums1.size(), GGML_MEM_ALIGN);
+        }
         data_size += GGML_PAD(ggml_tensor_overhead() + sizeof(float) * kv.second.counts.size(), GGML_MEM_ALIGN);
     }
 
@@ -627,6 +643,12 @@ void IMatrixCollector::save_imatrix(int32_t n_chunk) const {
 
             gguf_add_tensor(ctx_gguf, in_sum2);
             gguf_add_tensor(ctx_gguf, counts);
+            if (!stat.sums1.empty()) {
+                struct ggml_tensor * in_sum1 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nval / nmat, nmat);
+                ggml_format_name(in_sum1, "%s.in_sum1", name.c_str());
+                std::copy(stat.sums1.begin(), stat.sums1.end(), (float *) in_sum1->data);
+                gguf_add_tensor(ctx_gguf, in_sum1);
+            }
         }
     }
 
@@ -642,6 +664,17 @@ void IMatrixCollector::save_imatrix(int32_t n_chunk) const {
 bool IMatrixCollector::load_imatrix(const char * file_name) {
     common_imatrix loaded;
     if (!common_imatrix_load(file_name, loaded)) {
+        return false;
+    }
+
+    const bool has_means = std::any_of(loaded.entries.begin(), loaded.entries.end(), [](const auto & kv) {
+        return !kv.second.sums1.empty();
+    });
+    if (has_means) { m_collect_means = true; }
+    if (m_collect_means && (loaded.is_legacy || std::any_of(loaded.entries.begin(), loaded.entries.end(), [](const auto & kv) {
+            return kv.second.sums1.size() != kv.second.sums.size();
+        }))) {
+        LOG_ERR("%s: cannot combine activation means with an imatrix that has no means\n", __func__);
         return false;
     }
 
@@ -687,6 +720,11 @@ bool IMatrixCollector::load_imatrix(const char * file_name) {
 
             for (int64_t j = 0; j < nval; ++j) {
                 e.values[j] += entry.sums[j];
+            }
+            if (!entry.sums1.empty()) {
+                if (e.sums1.empty()) { e.sums1.resize(nval, 0.0f); }
+                if (e.sums1.size() != (size_t) nval) { return false; }
+                for (int64_t j = 0; j < nval; ++j) { e.sums1[j] += entry.sums1[j]; }
             }
             for (int64_t j = 0; j < ncounts; ++j) {
                 e.counts[j] += entry.counts[j];

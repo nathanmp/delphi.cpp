@@ -2,6 +2,7 @@
 #include "llama-model.h"
 #include "llama-model-loader.h"
 #include "llama-ext.h"
+#include "llama-quant-refine.h"
 #include "llama.h"
 
 #include <algorithm>
@@ -883,11 +884,25 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, const llama_mod
 
 // quantize rows [first_row, first_row + nrows), indexed globally across all expert matrices
 // note: chunks never cross an expert boundary since each expert has its own imatrix slice
-static size_t llama_tensor_quantize_impl(enum ggml_type new_type, const float * f32_data, void * new_data, const int64_t chunk_size, int64_t first_row, int64_t nrows, int64_t nrows_per_expert, int64_t n_per_row, const float * imatrix, std::vector<std::thread> & workers, const int nthread) {
+static size_t llama_tensor_quantize_impl(enum ggml_type new_type, const float * f32_data, void * new_data, const int64_t chunk_size, int64_t first_row, int64_t nrows, int64_t nrows_per_expert, int64_t n_per_row, const float * imatrix, const float * means, bool feedback, int gsq_steps, std::vector<std::thread> & workers, const int nthread) {
     const size_t row_size = ggml_row_size(new_type, n_per_row);
 
     auto imatrix_for_row = [=](int64_t row_global) {
         return imatrix ? imatrix + (row_global / nrows_per_expert) * n_per_row : nullptr;
+    };
+    auto refine_rows = [=](int64_t row, int64_t count) {
+        if (!feedback && gsq_steps == 0) { return true; }
+        for (int64_t r = row; r < row + count; ++r) {
+            const int64_t global = first_row + r;
+            const float * moment = imatrix_for_row(global);
+            const float * mean = means + (global / nrows_per_expert) * n_per_row;
+            void * output = (char *) new_data + r * row_size;
+            if (!llama_quant_refine_row(new_type, f32_data + r*n_per_row, output, n_per_row, moment, mean,
+                                       feedback, gsq_steps, (uint64_t) global + 0x31415926ULL)) {
+                return false;
+            }
+        }
+        return true;
     };
 
     if (nthread < 2) {
@@ -898,6 +913,7 @@ static size_t llama_tensor_quantize_impl(enum ggml_type new_type, const float * 
             const int64_t this_nrow  = std::min(nrows - row, nrows_per_expert - row_global % nrows_per_expert);
             void * this_data = (char *) new_data + row * row_size;
             size_t this_size = ggml_quantize_chunk(new_type, f32_data + row * n_per_row, this_data, 0, this_nrow, n_per_row, imatrix_for_row(row_global));
+            if (!refine_rows(row, this_nrow)) { throw std::runtime_error("unsupported refinement row"); }
             if (!ggml_validate_row_data(new_type, this_data, this_size)) {
                 throw std::runtime_error("quantized data validation failed");
             }
@@ -912,7 +928,7 @@ static size_t llama_tensor_quantize_impl(enum ggml_type new_type, const float * 
     size_t new_size = 0;
     bool valid = true;
     auto compute = [&mutex, &counter, &new_size, &valid, new_type, f32_data, new_data, chunk_size,
-            first_row, nrows, nrows_per_expert, n_per_row, row_size, imatrix_for_row]() {
+            first_row, nrows, nrows_per_expert, n_per_row, row_size, imatrix_for_row, refine_rows]() {
         const int64_t nrows_per_chunk = chunk_size / n_per_row;
         size_t local_size = 0;
         while (true) {
@@ -932,6 +948,11 @@ static size_t llama_tensor_quantize_impl(enum ggml_type new_type, const float * 
 
             void * this_data = (char *) new_data + row * row_size;
             size_t this_size = ggml_quantize_chunk(new_type, f32_data + row * n_per_row, this_data, 0, this_nrow, n_per_row, imatrix_for_row(row_global));
+            if (!refine_rows(row, this_nrow)) {
+                std::unique_lock<std::mutex> lock(mutex);
+                valid = false;
+                break;
+            }
             local_size += this_size;
 
             // validate the quantized data
@@ -1103,6 +1124,15 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         ftype = ml.ftype;
     }
     std::unordered_map<std::string, std::vector<float>> i_data;
+    std::unordered_map<std::string, std::vector<float>> mean_data;
+    if (params->imatrix_means) {
+        for (const llama_model_imatrix_data * p = params->imatrix_means; p->name != nullptr; p++) {
+            mean_data.emplace(p->name, std::vector<float>(p->data, p->data + p->size));
+        }
+    }
+    const bool refine_enabled = params->gptq_feedback || params->gsq_steps > 0;
+    const std::regex refine_re(params->refine_pattern ? params->refine_pattern : ".*");
+    bool warned_gsq_k = false;
     const std::unordered_map<std::string, std::vector<float>> * imatrix_data = nullptr;
     if (params->imatrix) {
         for (const llama_model_imatrix_data * p = params->imatrix; p->name != nullptr; p++) {
@@ -1387,6 +1417,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                 }
             } else {
                 const float * imatrix = nullptr;
+                const float * means = nullptr;
                 if (imatrix_data) {
                     auto it = imatrix_data->find(tm.remapped_imatrix_name);
                     if (it == imatrix_data->end()) {
@@ -1415,6 +1446,34 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                     LLAMA_LOG_ERROR("The result will be garbage, so bailing out\n");
                     LLAMA_LOG_ERROR("============================================================\n\n");
                     throw std::runtime_error(format("Missing importance matrix for tensor %s in a very low-bit quantization", tensor->name));
+                }
+
+                const bool scalar_refine_type = new_type == GGML_TYPE_Q2_0 || new_type == GGML_TYPE_Q4_0;
+                const bool k_refine_type = new_type == GGML_TYPE_Q2_K || new_type == GGML_TYPE_Q3_K ||
+                    new_type == GGML_TYPE_Q4_K || new_type == GGML_TYPE_Q5_K || new_type == GGML_TYPE_Q6_K ||
+                    new_type == GGML_TYPE_Q4_G128 || new_type == GGML_TYPE_MXFP4;
+                const bool refine_match = refine_enabled && std::regex_search(tensor->name, refine_re);
+                const bool refine_feedback = refine_match && params->gptq_feedback && (scalar_refine_type || k_refine_type);
+                const int refine_gsq_steps = refine_match && scalar_refine_type ? params->gsq_steps : 0;
+                const bool refine_tensor = refine_feedback || refine_gsq_steps > 0;
+                if (refine_match && k_refine_type && params->gsq_steps > 0 && !warned_gsq_k) {
+                    LLAMA_LOG_WARN("%s: local GSQ supports only Q2_0/Q4_0; skipping it for K types\n", __func__);
+                    warned_gsq_k = true;
+                }
+                if (refine_tensor) {
+                    const auto mean_it = mean_data.find(tm.remapped_imatrix_name);
+                    if (!imatrix || mean_it == mean_data.end() || mean_it->second.size() != (size_t) (tensor->ne[0]*tensor->ne[2])) {
+                        throw std::runtime_error(format("refinement requires matching activation means for %s", tensor->name));
+                    }
+                    means = mean_it->second.data();
+                    for (size_t col = 0; col < mean_it->second.size(); ++col) {
+                        if (!std::isfinite(means[col]) || !std::isfinite(imatrix[col]) || imatrix[col] < 0.0f) {
+                            throw std::runtime_error(format("invalid activation moments for %s", tensor->name));
+                        }
+                    }
+                    LLAMA_LOG_INFO("%s: refining %s with %s%s\n", __func__, tensor->name,
+                                   refine_feedback ? "block feedback" : "",
+                                   refine_gsq_steps > 0 ? " local GSQ" : "");
                 }
 
                 if (ggml_is_quantized(tensor->type) && !params->allow_requantize) {
@@ -1464,7 +1523,8 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                     const int64_t nchunk = (nelements_cur + chunk_size - 1)/chunk_size;
                     const int64_t nthread_use = nthread > 1 ? std::max((int64_t)1, std::min((int64_t)nthread, nchunk)) : 1;
 
-                    const size_t size_cur = llama_tensor_quantize_impl(new_type, f32_data, work.data(), chunk_size, ir, nrows_cur, nrows_per_expert, n_per_row, imatrix, workers, nthread_use);
+                    const size_t size_cur = llama_tensor_quantize_impl(new_type, f32_data, work.data(), chunk_size, ir, nrows_cur, nrows_per_expert, n_per_row, imatrix, means,
+                                                                        refine_feedback, refine_gsq_steps, workers, nthread_use);
 
                     fout.write((const char *) work.data(), size_cur);
                     new_size += size_cur;
@@ -1526,7 +1586,11 @@ llama_model_quantize_params llama_model_quantize_default_params() {
         /*.kv_overrides                =*/ nullptr,
         /*.tensor_type                 =*/ nullptr,
         /*.prune_layers                =*/ nullptr,
-        /*.max_buf_size                =*/ LLAMA_QUANT_MAX_BUF_SIZE
+        /*.max_buf_size                =*/ LLAMA_QUANT_MAX_BUF_SIZE,
+        /*.imatrix_means               =*/ nullptr,
+        /*.gptq_feedback              =*/ false,
+        /*.gsq_steps                  =*/ 0,
+        /*.refine_pattern             =*/ nullptr,
     };
 
     return result;

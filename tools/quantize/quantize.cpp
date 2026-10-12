@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <vector>
 #include <string>
 #include <unordered_map>
@@ -132,6 +133,7 @@ static void usage(const char * executable) {
     printf("usage: %s [--help] [--allow-requantize] [--leave-output-tensor] [--pure] [--imatrix] [--include-weights]\n", executable);
     printf("       [--exclude-weights] [--output-tensor-type] [--token-embedding-type] [--tensor-type] [--tensor-type-file]\n");
     printf("       [--prune-layers] [--keep-split] [--override-kv] [--dry-run] [--max-buffer-size]\n");
+    printf("       [--gptq-feedback] [--gsq-steps N] [--refine-tensor REGEX]\n");
     printf("       model-f32.gguf [model-quant.gguf] type [nthreads]\n\n");
     printf("  --allow-requantize\n");
     printf("                                      allow requantizing tensors that have already been quantized\n");
@@ -144,6 +146,9 @@ static void usage(const char * executable) {
     printf("                                      disable k-quant mixtures and quantize all tensors to the same type\n");
     printf("  --imatrix file_name\n");
     printf("                                      use data in file_name as importance matrix for quant optimizations\n");
+    printf("  --gptq-feedback                    use activation-mean error feedback on Q2_0, Q4_0, Q2_K-Q6_K, Q4_G128 and MXFP4\n");
+    printf("  --gsq-steps N                      run N bounded Gumbel-softmax steps on Q2_0/Q4_0 (experimental)\n");
+    printf("  --refine-tensor REGEX              apply feedback/refinement only to matching tensor names\n");
     printf("  --include-weights tensor_name\n");
     printf("                                      use importance matrix for this/these tensor(s)\n");
     printf("  --exclude-weights tensor_name\n");
@@ -411,6 +416,7 @@ int llama_quantize(int argc, char ** argv) {
 
     int arg_idx = 1;
     std::string imatrix_file;
+    std::string refine_pattern;
     std::vector<std::string> included_weights, excluded_weights;
     std::vector<llama_model_kv_override> kv_overrides;
     std::vector<tensor_type_option> tensor_type_opts;
@@ -465,6 +471,18 @@ int llama_quantize(int argc, char ** argv) {
             } else {
                 usage(argv[0]);
             }
+        } else if (strcmp(argv[arg_idx], "--gptq-feedback") == 0) {
+            params.gptq_feedback = true;
+        } else if (strcmp(argv[arg_idx], "--gsq-steps") == 0) {
+            if (arg_idx == argc-1) { usage(argv[0]); }
+            char * end = nullptr;
+            const long steps = std::strtol(argv[++arg_idx], &end, 10);
+            if (!end || *end || steps < 0 || steps > 64) { usage(argv[0]); }
+            params.gsq_steps = (int32_t) steps;
+        } else if (strcmp(argv[arg_idx], "--refine-tensor") == 0) {
+            if (arg_idx == argc-1) { usage(argv[0]); }
+            refine_pattern = argv[++arg_idx];
+            params.refine_pattern = refine_pattern.c_str();
         } else if (strcmp(argv[arg_idx], "--include-weights") == 0) {
             if (arg_idx < argc-1) {
                 included_weights.emplace_back(argv[++arg_idx]);
@@ -505,6 +523,38 @@ int llama_quantize(int argc, char ** argv) {
     std::vector<std::string> imatrix_datasets;
     std::unordered_map<std::string, std::vector<float>> imatrix_data;
     int m_last_call = prepare_imatrix(imatrix_file, imatrix_datasets, included_weights, excluded_weights, imatrix_data);
+
+    std::unordered_map<std::string, std::vector<float>> imatrix_means;
+    std::vector<llama_model_imatrix_data> mean_data;
+    if (params.gptq_feedback || params.gsq_steps > 0) {
+        common_imatrix loaded;
+        if (imatrix_file.empty() || !common_imatrix_load(imatrix_file, loaded) || loaded.is_legacy) {
+            fprintf(stderr, "feedback/refinement requires a GGUF imatrix with activation means\n");
+            return 1;
+        }
+        for (const auto & [name, entry] : loaded.entries) {
+            if (imatrix_data.count(name) == 0) { continue; }
+            if (entry.sums1.size() != entry.sums.size() || entry.counts.empty() || entry.sums1.size() % entry.counts.size() != 0) {
+                fprintf(stderr, "missing or invalid activation means for %s\n", name.c_str());
+                return 1;
+            }
+            auto & mean = imatrix_means[name];
+            mean.resize(entry.sums1.size());
+            const size_t ne0 = mean.size() / entry.counts.size();
+            for (size_t expert = 0; expert < entry.counts.size(); ++expert) {
+                const float inv_count = entry.counts[expert] > 0 ? 1.0f / entry.counts[expert] : 0.0f;
+                for (size_t col = 0; col < ne0; ++col) {
+                    mean[expert*ne0 + col] = entry.sums1[expert*ne0 + col] * inv_count;
+                }
+            }
+        }
+        mean_data.reserve(imatrix_means.size() + 1);
+        for (const auto & [name, values] : imatrix_means) {
+            mean_data.push_back({name.c_str(), values.data(), values.size()});
+        }
+        mean_data.push_back({nullptr, nullptr, 0});
+        params.imatrix_means = mean_data.data();
+    }
 
     std::vector<llama_model_imatrix_data> i_data;
     std::vector<llama_model_tensor_override> t_override;
