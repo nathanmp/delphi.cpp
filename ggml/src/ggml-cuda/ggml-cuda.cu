@@ -30,6 +30,7 @@
 #include "ggml-cuda/fattn.cuh"
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
+#include "ggml-cuda/host-numa.cuh"
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
@@ -1679,8 +1680,15 @@ static const char * ggml_backend_cuda_host_buffer_type_name(ggml_backend_buffer_
     GGML_UNUSED(buft);
 }
 
+static const char * ggml_backend_cuda_host_numa_buffer_type_name(ggml_backend_buffer_type_t buft) {
+    return GGML_CUDA_NAME "_Host_NUMA";
+
+    GGML_UNUSED(buft);
+}
+
 static bool ggml_backend_buft_is_cuda_host(ggml_backend_buffer_type_t buft) {
-    return buft->iface.get_name == ggml_backend_cuda_host_buffer_type_name;
+    return buft->iface.get_name == ggml_backend_cuda_host_buffer_type_name ||
+           buft->iface.get_name == ggml_backend_cuda_host_numa_buffer_type_name;
 }
 
 static void ggml_backend_cuda_host_buffer_free_buffer(ggml_backend_buffer_t buffer) {
@@ -1735,6 +1743,44 @@ ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
     };
 
     return &ggml_backend_cuda_buffer_type_host;
+}
+
+// Pinned host memory with its pages interleaved over the NUMA nodes (host-numa.cu), for a buffer that CPU threads of
+// all nodes use. Without a second node, or if this allocation fails, the buffer is ordinary pinned host memory.
+
+static void ggml_backend_cuda_host_numa_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    ggml_cuda_host_numa_free(buffer->context, buffer->size);
+}
+
+static ggml_backend_buffer_t ggml_backend_cuda_host_numa_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    void * ptr = ggml_cuda_host_numa_alloc(size);
+
+    if (ptr == nullptr) {
+        return ggml_backend_cuda_host_buffer_type_alloc_buffer(ggml_backend_cuda_host_buffer_type(), size);
+    }
+
+    ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
+    buffer->buft = buft;
+    buffer->iface.free_buffer = ggml_backend_cuda_host_numa_buffer_free_buffer;
+
+    return buffer;
+}
+
+static ggml_backend_buffer_type_t ggml_backend_cuda_host_numa_buffer_type() {
+    static struct ggml_backend_buffer_type ggml_backend_cuda_buffer_type_host_numa = {
+        /* .iface    = */ {
+            /* .get_name         = */ ggml_backend_cuda_host_numa_buffer_type_name,
+            /* .alloc_buffer     = */ ggml_backend_cuda_host_numa_buffer_type_alloc_buffer,
+            /* .get_alignment    = */ ggml_backend_cpu_buffer_type()->iface.get_alignment,
+            /* .get_max_size     = */ NULL, // defaults to SIZE_MAX
+            /* .get_alloc_size   = */ ggml_backend_cpu_buffer_type()->iface.get_alloc_size,
+            /* .is_host          = */ ggml_backend_cpu_buffer_type()->iface.is_host,
+        },
+        /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), 0),
+        /* .context  = */ nullptr,
+    };
+
+    return &ggml_backend_cuda_buffer_type_host_numa;
 }
 
 //static bool ggml_backend_buffer_is_cuda_host(ggml_backend_buffer_t buffer) {
@@ -7279,6 +7325,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_cuda_trim") == 0) {
         return (void *) ggml_backend_cuda_trim;
+    }
+    if (strcmp(name, "ggml_backend_host_numa_buffer_type") == 0) {
+        return (void *) ggml_backend_cuda_host_numa_buffer_type;
     }
     if (strcmp(name, "ggml_backend_copy_on") == 0) {
         return (void *) ggml_backend_cuda_copy_on;

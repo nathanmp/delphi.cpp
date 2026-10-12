@@ -30,6 +30,17 @@
 // llama_context
 //
 
+// true if the CPU backend runs --numa tensors (as in llama_model_loader)
+static bool cpu_numa_tensor_mode() {
+    auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (!cpu_dev) {
+        return false;
+    }
+    auto * is_tensor_mode = (bool (*)(void))
+        ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(cpu_dev), "ggml_backend_cpu_is_numa_tensor_mode");
+    return is_tensor_mode && is_tensor_mode();
+}
+
 static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     switch (ctx_type) {
         case LLAMA_CONTEXT_TYPE_DEFAULT: return LLM_GRAPH_TYPE_DEFAULT;
@@ -524,6 +535,17 @@ llama_context::llama_context(
                 // use the host buffer of the first device CPU for faster transfer of the intermediate state
                 const auto & dev = model.devices[0];
                 auto * host_buft = ggml_backend_dev_host_buffer_type(dev.dev);
+                // Under --numa tensors the CPU threads of all nodes read and write this buffer. Pinned host memory is
+                // on the node of the GPU, and the memory channels of that node then carry all of that traffic. Thus
+                // spread its pages over the nodes, if the device can (LLAMA_NUMA_HOST_INTERLEAVE=0 disables this).
+                const char * interleave = getenv("LLAMA_NUMA_HOST_INTERLEAVE");
+                if (host_buft && (!interleave || atoi(interleave) != 0) && cpu_numa_tensor_mode()) {
+                    auto * numa_buft_fn = (ggml_backend_buffer_type_t (*)(void))
+                        ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev.dev), "ggml_backend_host_numa_buffer_type");
+                    if (numa_buft_fn) {
+                        host_buft = numa_buft_fn();
+                    }
+                }
                 if (host_buft) {
                     buft = host_buft;
                 }

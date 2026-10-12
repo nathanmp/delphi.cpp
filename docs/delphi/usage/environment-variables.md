@@ -161,5 +161,10 @@ Packed and grouped kernels add the same products in a different order from the o
 | `GGML_NUMA_STEAL` | `1` | A worker that has no more pieces of its own node takes spare pieces of the experts that another node has not started, nearest node first. `0` keeps each node on its own rows. |
 | `GGML_CPU_NUMA_CHUNKS` | `2` | Pieces per worker of a node's rows of an expert. `0` gives each worker one static slice. |
 | `GGML_NUMA_TP_SHARES` | equal | Relative share of each node in the column split, for example `1,3`. It also sets where the weight rows are placed at load. |
+| `LLAMA_NUMA_HOST_INTERLEAVE` | `1` | With a GPU (CUDA or ROCm), the CPU compute buffer (activations and expert outputs of the CPU part) is pinned host memory with its pages interleaved over all NUMA nodes. `0` uses the GPU's plain pinned host memory, which is on the GPU's node only. |
 
-The first two change only where data is kept and which thread computes a piece, so outputs are bitwise identical with any setting (checked on a MiMo V2.6 Flash layer at 1 to 512 tokens, with equal and 1:3 shares). Stealing applies to experts on the per-row and G128 paths (for example Q4_G128 and MXFP4), not to the IQK paths, which split statically. A stolen piece reads its weight rows from the other node's memory. Speed is not yet measured at NPS1 or NPS4.
+The first two change only where data is kept and which thread computes a piece, so outputs are bitwise identical with any setting (checked on a MiMo V2.6 Flash layer at 1 to 512 tokens, with equal and 1:3 shares). Stealing applies to experts on the per-row and G128 paths (for example Q4_G128 and MXFP4), not to the IQK paths, which split statically. A stolen piece reads its weight rows from the other node's memory. `LLAMA_NUMA_HOST_INTERLEAVE` changes only where the buffer's pages are.
+
+Measured on MiMo V2.6 Flash (2x EPYC 7532, production deployment, -t 48, MTP decode and 128/300-token CPU prompts):
+node-local state gave prompts -5% at NPS1 and decode +2.7% at NPS4; stealing was neutral (no node was slowed by other
+load); the interleaved compute buffer gave decode +8.6% and prompts -13% / -25% at NPS4.
