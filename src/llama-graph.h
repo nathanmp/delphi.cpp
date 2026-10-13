@@ -827,6 +827,9 @@ struct llm_graph_params {
     // delphi: generation of the VRAM sharing state (expert cache tiers, staging devices); a graph of another generation is rebuilt
     uint64_t share_gen = 0;
 
+    // delphi: generation of the context's sampler objects; a graph built with other sampler objects is rebuilt
+    uint64_t samplers_gen = 0;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -898,6 +901,11 @@ struct llm_graph_params {
         }
 
         if (share_gen != other.share_gen) {
+            return false;
+        }
+
+        // a new sampler object can have the address of a freed one
+        if (samplers_gen != other.samplers_gen) {
             return false;
         }
 

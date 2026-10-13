@@ -396,6 +396,15 @@ private:
 
     bool sched_need_reserve = true;
 
+    // delphi: the sampler chains (per sequence, by sampler names) of the last reservation. A new sampler object with the same
+    // chain does not need a new reservation; set_sampler() only increments samplers_gen, which stops the reuse of a graph
+    // built with the old sampler object. LLAMA_SAMPLER_RESERVE_ALWAYS=1: reserve on every sampler change (upstream behavior).
+    std::string sampler_sig_reserved;
+    uint64_t    samplers_gen = 0;
+
+    std::string sampler_sig() const;
+    void sampler_changed();
+
     ggml_backend_t backend_cpu = nullptr;
     ggml_backend_t backend_moe_split = nullptr; // LLAMA_MOE_SPLIT device
     // LLAMA_ATTN_SPLIT: the split device's head slices of wq_b, wo_a and the sinks, copied into its memory
