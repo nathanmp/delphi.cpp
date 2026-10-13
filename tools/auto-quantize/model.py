@@ -6,7 +6,7 @@ import re
 import sys
 from pathlib import Path
 
-from config import ROOT, QuantError, digest, file_identity
+from config import ROOT, QuantError, digest, file_identity, normalized
 
 sys.path.insert(0, str(ROOT / "gguf-py"))
 import numpy as np
@@ -155,16 +155,65 @@ def classify(info, cfg):
     return info
 
 
-def merge_imatrices(paths, output):
+def imatrix_tokens(path):
+    """Tokens that a raw imatrix saw: its largest count, which is how llama-imatrix defines the chunk count."""
+    counts = [float(np.max(t.data)) for t in GGUFReader(path).tensors if t.name.endswith(".counts") and t.data.size]
+    if not counts or max(counts) <= 0:
+        raise QuantError(f"imatrix has no token counts: {path}")
+    return max(counts)
+
+
+def whole_counts(tensors):
+    """F32 tensors with whole counts. The quantizer rounds counts on load, so round here and scale the sums to keep every mean."""
+    for name in [n for n in tensors if n.endswith(".counts")]:
+        base, counts = name[:-7], tensors[name].reshape(-1)
+        rounded = np.where(counts > 0, np.maximum(np.rint(counts), 1), 0)
+        ratio = np.divide(rounded, counts, out=np.ones_like(counts), where=counts > 0)
+        for suffix in (".in_sum2", ".in_sum"):
+            sums = tensors.get(base + suffix)
+            if sums is not None:
+                if sums.size % counts.size:
+                    raise QuantError(f"imatrix sums and counts disagree: {base}")
+                tensors[base + suffix] = (sums.reshape(counts.size, -1) * ratio[:, None]).reshape(sums.shape)
+        tensors[name] = rounded.reshape(tensors[name].shape)
+    result = {name: value.astype(np.float32) for name, value in tensors.items()}
+    if not all(np.isfinite(value).all() for value in result.values()):
+        raise QuantError("weighted imatrix sums exceed the F32 range")
+    return result
+
+
+def merge_imatrices(paths, output, weights=None):
+    """Merge raw GGUF imatrices. Without weights the sums and counts are added, so a file weighs in proportion to its tokens.
+
+    With weights (relative, one per file) file k is scaled by w_k * T / T_k before the addition, where T_k is the token count
+    of the file and T the sum over all files. The merged mean of every tensor and expert is then the mean of the mixture
+    in which file k supplies the fraction w_k of the tokens, and the counts are those of T tokens."""
     if not paths:
         return None
     if len(paths) == 1:
         return paths[0]
-    tensors, means, datasets, chunks, chunk_size = {}, {}, [], 0, None
     for path in paths:
         with open(path, "rb") as stream:
             if stream.read(4) != b"GGUF":
                 raise QuantError("multiple imatrices require raw GGUF sums/counts; legacy merging is not supported")
+    scales = None
+    if weights is not None:
+        if len(weights) != len(paths) or any(w <= 0 for w in weights):
+            raise QuantError("imatrix weights must be positive, one per file")
+        weights = normalized(weights)
+        tokens = [imatrix_tokens(path) for path in paths]
+        scales = [w * sum(tokens) / t for w, t in zip(weights, tokens)]
+        print("Weighted imatrix merge: " + ", ".join(f"{Path(p).name} weight {100 * w:.1f} % (own tokens {100 * t / sum(tokens):.1f} %)"
+                                                      for p, w, t in zip(paths, weights, tokens)), flush=True)
+
+    def scaled(value, index):
+        if scales is None:
+            return value
+        if value.dtype != np.float32:
+            raise QuantError("weighted merging needs F32 sums and counts")
+        return value.astype(np.float64) * scales[index]
+    tensors, means, datasets, chunks, chunk_size = {}, {}, [], 0, None
+    for index, path in enumerate(paths):
         reader = GGUFReader(path)
         entries = {t.name: t for t in reader.tensors}
         for name, t in entries.items():
@@ -173,14 +222,14 @@ def merge_imatrices(paths, output):
                 base = name[:name.rindex(".in_sum")]
                 if base + ".in_sum2" not in entries:
                     raise QuantError(f"imatrix activation sums have no second moments: {name}")
-                means.setdefault(base + ".in_sum", []).append(np.array(t.data, copy=True))
+                means.setdefault(base + ".in_sum", []).append(scaled(np.array(t.data, copy=True), index))
                 continue
             if not name.endswith((".in_sum2", ".counts")):
                 continue
             partner = name[:-8] + ".counts" if name.endswith(".in_sum2") else name[:-7] + ".in_sum2"
             if partner not in entries:
                 raise QuantError(f"imatrix entry has no raw counterpart: {name}")
-            value = np.array(t.data, copy=True)
+            value = scaled(np.array(t.data, copy=True), index)
             if name in tensors:
                 if tensors[name].shape != value.shape or tensors[name].dtype != value.dtype:
                     raise QuantError(f"incompatible imatrix shape/type: {name}")
@@ -212,6 +261,8 @@ def merge_imatrices(paths, output):
             tensors[name] = np.sum(values, axis=0)
             if not np.isfinite(tensors[name]).all():
                 raise QuantError(f"invalid imatrix activation sums: {name}")
+    if scales is not None:
+        tensors = whole_counts(tensors)
     writer = GGUFWriter(str(output), "imatrix")
     writer.add_array("imatrix.datasets", datasets)
     writer.add_uint32("imatrix.chunk_count", chunks)

@@ -29,7 +29,7 @@ from pathlib import Path
 
 import numpy as np
 
-from config import ROOT, QuantError, file_identity, write_json
+from config import ROOT, QuantError, file_identity, imatrix_identities, write_json
 from quality import METHOD, METRIC, SCHEMA, damage_digest, damage_records, modelled_groups, sensitivity
 from timing import gpu
 
@@ -433,7 +433,7 @@ def calibrate(data, cfg, output, encode, verify, timeout=7200):
     teacher_identity = file_identity(teacher, content=True)
     table = {"schema": SCHEMA, "method": METHOD, "metric": METRIC,
              "source_files": [file_identity(f["path"], content=True) for f in info["files"]],
-             "imatrices": [file_identity(p, content=True) for p in cfg["imatrix"]],
+             "imatrices": imatrix_identities(cfg),
              "damage": damage_digest(data["damage"]),
              "floor": {"choices": floor_choices, "kl": floors[devices[0]], "kl_by_device": floors,
                        **file_identity(data["baseline"]["path"])},

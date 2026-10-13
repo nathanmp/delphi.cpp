@@ -11,7 +11,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from config import AXES, SCHEMA, QuantError, digest, file_identity, load_config, write_json
+from config import AXES, SCHEMA, QuantError, digest, file_identity, imatrix_identities, imatrix_inputs, load_config, write_json
 from model import classify, merge_imatrices, read_model
 from calibrate import calibrate, per_chunk, perplexity_command, run_direct
 from quality import LossModel, load_quality, quality_metadata
@@ -20,7 +20,7 @@ from timing import MODEL_REVISION, Predictor, fit_slopes, gpu, machine_settings,
 
 
 def inputs(cfg, info):
-    result = {"model": info["identity"], "imatrix": [file_identity(path, content=True) for path in cfg["imatrix"]],
+    result = {"model": info["identity"], "imatrix": imatrix_identities(cfg),
             "sampling": cfg["sampling"], "groups": info["groups"],
             "binaries": {name: file_identity(Path(cfg["bindir"]) / name) for name in
                          ("llama-quant-damage", "llama-quantize", "test-backend-ops", "llama-bench")},
@@ -39,7 +39,7 @@ def configured_model(cfg):
 
 def get_damage(info, cfg, directory, imatrix):
     cache_key = digest({"model": info["identity"], "sampling": cfg["sampling"], "groups": info["groups"],
-                        "imatrices": [file_identity(p, content=True) for p in cfg["imatrix"]],
+                        "imatrices": imatrix_identities(cfg),
                         "binary": file_identity(Path(cfg["bindir"]) / "llama-quant-damage"),
                         "libraries": [file_identity(p) for p in sorted(Path(cfg["bindir"]).glob("lib*.so*")) if not p.is_symlink()],
                         "threads": cfg["runtime"]["threads"]})
@@ -150,7 +150,7 @@ def prepare(cfg, directory, timeout):
         old = load_prepared(snapshot, cfg)
         print(f"Reusing {snapshot}; timing reflects the recorded machine state", flush=True)
         return old
-    imatrix = merge_imatrices(cfg["imatrix"], directory / "merged-imatrix.gguf")
+    imatrix = merge_imatrices(cfg["imatrix"], directory / "merged-imatrix.gguf", cfg.get("imatrix_weights"))
     damage = get_damage(info, cfg, directory, imatrix)
     print("Measuring bounded operation signatures", flush=True)
     operations = measure_ops(info, cfg, directory / "calibration", timeout)
@@ -396,12 +396,24 @@ def main():
             p.add_argument("--measurement-seconds", type=float, default=600)
         if name == "validate":
             p.add_argument("--mixes", type=Path, required=True)
+    p = sub.add_parser("merge-imatrix", help="merge raw GGUF imatrices; PATH:WEIGHT entries weigh files by influence instead of tokens")
+    p.add_argument("--imatrix", nargs="+", required=True, metavar="PATH[:WEIGHT]")
+    p.add_argument("--output", type=Path, required=True)
     p = sub.add_parser("encode")
     p.add_argument("--frontier", type=Path, required=True)
     p.add_argument("--recipe", default="recipe-000")
     p.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     try:
+        if args.command == "merge-imatrix":
+            paths, weights = imatrix_inputs(",".join(args.imatrix), lambda p: str(Path(p).expanduser().resolve()))
+            if len(paths) < 2:
+                raise QuantError("merge-imatrix needs at least two imatrices")
+            if args.output.exists():
+                raise QuantError(f"output already exists: {args.output}")
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            print(f"Saved {merge_imatrices(paths, args.output.resolve(), weights)}")
+            return
         if args.command == "encode":
             frontier = json.loads(args.frontier.read_text())
             if frontier.get("schema") != SCHEMA:

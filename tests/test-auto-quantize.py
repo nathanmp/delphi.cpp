@@ -10,7 +10,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools/auto-quantize"))
-from config import QuantError, capacity, devices, file_identity, load_config, write_json
+from config import QuantError, capacity, devices, file_identity, imatrix_identities, imatrix_inputs, load_config, normalized, write_json
 from model import classify, merge_imatrices, read_model, tensor_bytes
 from search import dominates, make_options, memory, pareto, search
 from quality import LossModel, damage_digest, load_quality, modelled_groups, role_of
@@ -196,6 +196,99 @@ class Files(unittest.TestCase):
             merge_imatrices([str(a), str(b)], output)
             result = GGUFReader(str(output))
             self.assertTrue(all(np.all(t.data == 7) for t in result.tensors))
+
+    def write_tokens(self, path, counts, means, activations=None, dense=None, only=None):
+        """Raw imatrix with a 2-expert tensor (counts per expert, mean x^2 per expert), a dense tensor and optional extras."""
+        writer = GGUFWriter(str(path), "imatrix")
+        writer.add_array("imatrix.datasets", [Path(path).stem])
+        writer.add_uint32("imatrix.chunk_count", int(max(counts)) // 8)
+        writer.add_uint32("imatrix.chunk_size", 8)
+
+        def add(name, n, mean, act=None):
+            n, mean = np.asarray(n, dtype=np.float32), np.asarray(mean, dtype=np.float32)
+            writer.add_tensor(name + ".in_sum2", (n * mean)[:, None] * np.ones((1, 4), dtype=np.float32))
+            writer.add_tensor(name + ".counts", n.reshape(-1, 1))
+            if act is not None:
+                writer.add_tensor(name + ".in_sum", (n * act)[:, None] * np.ones((1, 4), dtype=np.float32))
+        add("blk.0.ffn_up_exps.weight", counts, means)
+        add("blk.0.attn_q.weight", [dense[0]], [dense[1]], None if activations is None else np.float32(activations))
+        if only:
+            add("blk.1.attn_q.weight", [only[0]], [only[1]])
+        writer.write_header_to_file()
+        writer.write_kv_data_to_file()
+        writer.write_tensors_to_file()
+        writer.close()
+
+    def merged(self, path):
+        return {t.name: np.array(t.data, copy=True) for t in GGUFReader(str(path)).tensors}
+
+    def test_weighted_merge_is_the_token_mixture(self):
+        with tempfile.TemporaryDirectory() as d:
+            a, b, output = [Path(d) / name for name in ("a.gguf", "b.gguf", "merged.gguf")]
+            self.write_tokens(a, [100, 50], [2, 4], 0.5, (100, 1), only=(100, 7))
+            self.write_tokens(b, [10, 10], [6, 8], 1.0, (10, 5))
+            merge_imatrices([str(a), str(b)], output, [3, 1])
+            result = self.merged(output)
+            counts = result["blk.0.ffn_up_exps.weight.counts"].reshape(-1)
+            sums = result["blk.0.ffn_up_exps.weight.in_sum2"]
+            # expert 0: both files route all tokens to it; expert 1: file A routes half of its tokens
+            np.testing.assert_allclose(counts, [110, 69])
+            np.testing.assert_allclose(sums / counts[:, None], [[3.0] * 4, [5.6] * 4], rtol=1e-5)
+            dense = result["blk.0.attn_q.weight.counts"].reshape(-1)
+            np.testing.assert_allclose(dense, [110])
+            np.testing.assert_allclose(result["blk.0.attn_q.weight.in_sum2"] / dense[:, None], [[2.0] * 4], rtol=1e-5)
+            np.testing.assert_allclose(result["blk.0.attn_q.weight.in_sum"] / dense[:, None], [[0.625] * 4], rtol=1e-5)
+            # a tensor of one file keeps its mean; the other file does not dilute it
+            only = result["blk.1.attn_q.weight.counts"].reshape(-1)
+            np.testing.assert_allclose(result["blk.1.attn_q.weight.in_sum2"] / only[:, None], [[7.0] * 4], rtol=1e-5)
+            self.assertTrue(all(v.dtype == np.float32 for v in result.values()))
+            self.assertTrue(np.all(counts == np.rint(counts)))
+
+    def test_token_proportional_weights_reproduce_the_plain_merge(self):
+        with tempfile.TemporaryDirectory() as d:
+            a, b, plain, weighted = [Path(d) / name for name in ("a.gguf", "b.gguf", "plain.gguf", "weighted.gguf")]
+            self.write_tokens(a, [100, 50], [2, 4], None, (100, 1))
+            self.write_tokens(b, [10, 10], [6, 8], None, (10, 5))
+            merge_imatrices([str(a), str(b)], plain)
+            merge_imatrices([str(a), str(b)], weighted, [100, 10])
+            left, right = self.merged(plain), self.merged(weighted)
+            self.assertEqual(set(left), set(right))
+            np.testing.assert_allclose(left["blk.0.ffn_up_exps.weight.counts"], right["blk.0.ffn_up_exps.weight.counts"])
+            np.testing.assert_allclose(left["blk.0.ffn_up_exps.weight.in_sum2"], right["blk.0.ffn_up_exps.weight.in_sum2"], rtol=1e-5)
+
+    def test_weighted_entries(self):
+        absolute = lambda p: "/x/" + p
+        paths, weights = imatrix_inputs("code.gguf:50, math.gguf:30,roleplay.gguf:25", absolute)
+        self.assertEqual(paths, ["/x/code.gguf", "/x/math.gguf", "/x/roleplay.gguf"])
+        self.assertAlmostEqual(weights[0], 50 / 105)
+        self.assertAlmostEqual(sum(weights), 1)
+        self.assertEqual(weights, imatrix_inputs(["code.gguf:5", "math.gguf:3", "roleplay.gguf:2.5"], absolute)[1])
+        self.assertEqual(imatrix_inputs(["a.gguf", "b.gguf"], absolute), (["/x/a.gguf", "/x/b.gguf"], None))
+        self.assertEqual(imatrix_inputs([], absolute), ([], None))
+        paths, weights = imatrix_inputs(["C:/m/a.gguf:2", "b.gguf", {"path": "c.gguf", "weight": 1}], absolute)
+        self.assertEqual((paths[0], weights), ("/x/C:/m/a.gguf", normalized([2, 1, 1])))
+        for bad in ("a.gguf:0,b.gguf:1", "a.gguf:-2,b.gguf:1", "a.gguf:1,a.gguf:2", [{"path": "a.gguf", "weight": True}],
+                    [{"path": "a.gguf", "color": 1}], [3], "a.gguf:1e999,b.gguf"):
+            with self.assertRaises(QuantError):
+                imatrix_inputs(bad, absolute)
+
+    def test_weights_enter_the_fingerprint_and_the_config(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d).resolve()
+            for name in ("a.gguf", "b.gguf"):
+                (root / name).write_bytes(name.encode())
+            base = {"schema": "delphi.auto-quantize/1", "model": "/tmp/a.gguf", "devices": "ROCm1:16000,RAM:16000",
+                    "primary_qtypes": ["Q2_K"], "other_qtypes": ["Q6_K"]}
+            parsed = {}
+            for label, entries in (("plain", ["a.gguf", "b.gguf"]), ("weighted", "a.gguf:3,b.gguf:1"), ("other", "a.gguf:1,b.gguf:1")):
+                write_json(root / "c.json", {**base, "imatrix": entries})
+                parsed[label] = load_config(root / "c.json")
+            self.assertIsNone(parsed["plain"]["imatrix_weights"])
+            self.assertEqual(parsed["weighted"]["imatrix_weights"], [.75, .25])
+            self.assertEqual(parsed["plain"]["imatrix"], [str(root / "a.gguf"), str(root / "b.gguf")])
+            self.assertEqual(imatrix_identities(parsed["plain"])[0], file_identity(root / "a.gguf", content=True))
+            self.assertEqual(imatrix_identities(parsed["weighted"])[0]["weight"], .75)
+            self.assertEqual(len({digest(imatrix_identities(c)) for c in parsed.values()}), 3)
 
     def test_output_verification_detects_changed_preserved_data(self):
         with tempfile.TemporaryDirectory() as d:

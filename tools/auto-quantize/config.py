@@ -49,6 +49,55 @@ def devices(value):
     return result
 
 
+NUMBER = r"[+-]?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?"
+
+
+def weighted_entries(value, name, extra=()):
+    """Entries of PATH, PATH:WEIGHT or {"path", "weight", *extra}, given as a list, one entry or a comma-separated string."""
+    items = [item for item in value.split(",") if item.strip()] if isinstance(value, str) else value
+    if not isinstance(items, list) or any(not isinstance(item, (str, dict)) for item in items):
+        raise QuantError(f"{name} must be a list of PATH, PATH:WEIGHT or objects with path and weight")
+    result = []
+    for item in items:
+        if isinstance(item, dict):
+            if set(item) - {"path", "weight", *extra}:
+                raise QuantError(f"{name} entries accept only {sorted({'path', 'weight', *extra})}")
+            path, weight = item.get("path"), item.get("weight")
+        else:
+            head, colon, tail = item.strip().rpartition(":")
+            numeric = bool(colon and head and re.fullmatch(NUMBER, tail.strip()))
+            path, weight = (head, float(tail)) if numeric else (item.strip(), None)
+        if not isinstance(path, str) or not path:
+            raise QuantError(f"{name} entry needs a path")
+        if weight is not None:
+            number(weight, f"{name} weight of {path}", positive=True)
+        result.append({"path": path, "weight": weight, **{key: item[key] for key in extra if isinstance(item, dict) and key in item}})
+    return result
+
+
+def normalized(weights):
+    """Relative weights scaled to sum 1, rounded so that equivalent spellings give equal values."""
+    total = sum(weights)
+    return [float(f"{weight / total:.12g}") for weight in weights]
+
+
+def imatrix_inputs(value, absolute):
+    """(paths, weights) of the imatrix entries. Weights are normalized (plain paths count 1) and None when no entry has one."""
+    entries = weighted_entries(value, "imatrix") if value else []
+    paths = [absolute(entry["path"]) for entry in entries]
+    if all(entry["weight"] is None for entry in entries):
+        return paths, None
+    if len(set(paths)) != len(paths):
+        raise QuantError("weighted imatrix entries must be distinct files")
+    return paths, normalized([1.0 if entry["weight"] is None else entry["weight"] for entry in entries])
+
+
+def imatrix_identities(cfg):
+    """Content identities of the imatrix inputs; weighted inputs add their normalized weight."""
+    weights = cfg.get("imatrix_weights")
+    return [{**file_identity(path, content=True), **({"weight": weights[i]} if weights else {})} for i, path in enumerate(cfg["imatrix"])]
+
+
 def digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
 
@@ -91,7 +140,7 @@ def load_config(path):
         return str((path.parent / p).resolve() if not p.is_absolute() else p.resolve())
     cfg["model"] = absolute(cfg["model"])
     cfg["bindir"] = absolute(cfg.get("bindir", str(ROOT / "build-auto-quantizer/bin")))
-    cfg["imatrix"] = [absolute(p) for p in cfg.get("imatrix", [])]
+    cfg["imatrix"], cfg["imatrix_weights"] = imatrix_inputs(cfg.get("imatrix", []), absolute)
     if "quality" in cfg:
         if not isinstance(cfg["quality"], dict) or set(cfg["quality"]) != {"table"}:
             raise QuantError("quality must contain only a calibrated table path")
