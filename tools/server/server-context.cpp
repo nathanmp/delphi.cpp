@@ -1412,8 +1412,10 @@ private:
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
         if (params_base.n_ctx_checkpoints > 0) {
-            SRV_TRC("context checkpoints enabled, max = %d, min spacing = %d\n",
-                    params_base.n_ctx_checkpoints, params_base.checkpoint_min_step);
+            SRV_TRC("context checkpoints enabled, max = %d, min spacing = %d, eviction = %s, pin first = %s\n",
+                    params_base.n_ctx_checkpoints, params_base.checkpoint_min_step,
+                    params_base.ckpt_evict == COMMON_CKPT_EVICT_FIFO ? "fifo" : "variance",
+                    params_base.ckpt_pin_first ? "yes" : "no");
         } else {
             SRV_TRC("%s", "context checkpoints disabled\n");
         }
@@ -2413,7 +2415,7 @@ private:
 
         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
             // make room for the new checkpoint, if needed
-            const auto victim = server_ckpt_pick_victim(slot.prompt.checkpoints, n_tokens_new, params_base.ckpt_evict);
+            const auto victim = server_ckpt_pick_victim(slot.prompt.checkpoints, n_tokens_new, params_base.ckpt_evict, params_base.ckpt_pin_first);
 
             if (victim->id_task == id_task) {
                 ckpt_async_sync();
@@ -2425,7 +2427,10 @@ private:
             slot.prompt.checkpoints.erase(victim);
         }
 
-        auto & cur = slot.prompt.checkpoints.emplace_back();
+        // keep the list ordered by n_tokens: the new checkpoint goes in place of the one it superseded
+        auto & cur = *slot.prompt.checkpoints.emplace(
+                std::find_if(slot.prompt.checkpoints.begin(), slot.prompt.checkpoints.end(),
+                    [&](const common_prompt_checkpoint & c) { return c.n_tokens > n_tokens_new; }));
 
         cur.id_task = id_task;
 

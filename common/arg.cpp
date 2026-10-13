@@ -1726,6 +1726,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CTX_CHECKPOINTS_EVICTION").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--ctx-checkpoints-pin-first"},
+        {"--no-ctx-checkpoints-pin-first"},
+        string_format("a full slot never drops its oldest context checkpoint, usually the end of the system prompt (default: %s)", params.ckpt_pin_first ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.ckpt_pin_first = value;
+        }
+    ).set_env("LLAMA_ARG_CTX_CHECKPOINTS_PIN_FIRST").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-cram", "--cache-ram"}, "N",
         string_format("set the maximum cache size in MiB (default: %d, -1 - no limit, 0 - disable)"
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)", params.cache_ram_mib),
