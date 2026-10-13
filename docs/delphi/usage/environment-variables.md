@@ -14,6 +14,14 @@ With mmap (the default load mode), each tensor in a plain device buffer is copie
 
 The gain depends on how evenly the weights are spread and how slow the device links are. With a model split by layers over three GPUs on narrow PCIe links, loading from the page cache took half the time (249 s to 127 s). Models on one device, or with split buffers, load in the same time as before. Outputs are identical.
 
+## Backend sampling (`-bs`)
+
+| variable | default | set to | effect of the non-default value |
+| --- | --- | --- | --- |
+| `LLAMA_SAMPLER_RESERVE_ALWAYS` | off | `1` | Reserve the compute buffers again at each sampler change (upstream behavior) |
+
+The server sets a new sampler object for each request and removes it at the end. A reservation recreates the scheduler and all its compute buffers, and with staging the staging slots: 0.6 s per request on GLM-5.3 and Qwen 3.8, 1.7 s on DeepSeek V4.1 (measured from the execution trace of the first prompt batch). By default, the context reserves again only when the sampler chains of the sequences (the sampler names in each chain) are not the same as at the last reservation. A new sampler object always causes a new graph, not the reuse of a graph that was built with the old object. A sampler parameter that changes a tensor size (for example a larger top-k) can make the compute buffer grow on the next batch.
+
 ## Multi-device scheduler
 
 These switches control how `ggml_backend_sched` copies and synchronizes split inputs between backends. They matter for models split by layers over several devices (`-sm layer`, pipeline parallelism). They change only copies and waits, never the computation, so outputs are identical with any setting.

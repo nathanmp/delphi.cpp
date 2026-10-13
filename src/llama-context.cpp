@@ -791,11 +791,12 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
 }
 
 void llama_context::sched_reserve() {
-    if (!sched_need_reserve) {
+    if (!sched_need_reserve && sampler_sig() == sampler_sig_reserved) {
         return;
     }
 
     sched_need_reserve = false;
+    sampler_sig_reserved = sampler_sig();
 
     LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
 
@@ -1875,9 +1876,7 @@ bool llama_context::mtp_device_draft_begin(uint32_t n_steps) {
         }
     }
 
-    if (sched_need_reserve) {
-        sched_reserve();
-    }
+    sched_reserve(); // returns at once when nothing changed
 
     if ((size_t) n_steps > std::numeric_limits<size_t>::max()/cparams.n_seq_max) {
         return false;
@@ -2009,6 +2008,36 @@ void llama_context::set_warmup(bool value) {
     //sched_need_reserve = true;
 }
 
+std::string llama_context::sampler_sig() const {
+    std::string sig;
+    for (const auto & [seq_id, smpl] : sampling.samplers) {
+        sig += std::to_string(seq_id);
+        sig += ':';
+        const int n = llama_sampler_chain_n(smpl);
+        for (int i = 0; i < n; ++i) {
+            sig += llama_sampler_name(llama_sampler_chain_get(smpl, i));
+            sig += ',';
+        }
+        sig += ';';
+    }
+    return sig;
+}
+
+void llama_context::sampler_changed() {
+    static const bool always = [] {
+        const char * e = getenv("LLAMA_SAMPLER_RESERVE_ALWAYS");
+        return e && atoi(e) != 0;
+    }();
+
+    samplers_gen++;
+
+    // without the switch, sched_reserve() compares the chains with those of the last reservation (the server sets a new
+    // sampler object for each request and removes it at the end; a full reservation recreates the scheduler and its buffers)
+    if (always) {
+        sched_need_reserve = true;
+    }
+}
+
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     if (!sampler && sampling.samplers.count(seq_id) == 0) {
         return true;
@@ -2023,7 +2052,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
             warned = true;
         }
         if (sampling.samplers.count(seq_id) > 0) {
-            sched_need_reserve = true;
+            sampler_changed();
         }
         sampling.samplers.erase(seq_id);
         return false;
@@ -2042,7 +2071,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
         sampling.samplers[seq_id] = sampler;
 
-        sched_need_reserve = true;
+        sampler_changed();
 
         return true;
     }
@@ -2051,7 +2080,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
         LLAMA_LOG_WARN("%s: sampler '%s' for seq_id = %d, cannot be offloaded to the backend\n", __func__, llama_sampler_name(sampler), seq_id);
 
         if (sampling.samplers.count(seq_id) > 0) {
-            sched_need_reserve = true;
+            sampler_changed();
         }
 
         sampling.samplers.erase(seq_id);
@@ -2061,7 +2090,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
     sampling.samplers.erase(seq_id);
 
-    sched_need_reserve = true;
+    sampler_changed();
 
     return true;
 }
@@ -3753,6 +3782,7 @@ llm_graph_params llama_context::graph_params(
         /*.res         =*/ res,
     };
     params.share_gen = share_gen;
+    params.samplers_gen = samplers_gen;
     return params;
 }
 
