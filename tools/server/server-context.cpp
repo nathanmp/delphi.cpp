@@ -2,6 +2,7 @@
 #include "server-vram.h"
 #include "server-chat.h"
 #include "server-ckpt.h"
+#include "server-ckpt-spill.h"
 #include "server-turn.h"
 #include "server-common.h"
 #include "server-http.h"
@@ -317,6 +318,9 @@ struct server_slot {
 
     server_prompt prompt;
 
+    // delphi: where the checkpoints of this slot go when they are dropped (--ctx-checkpoints-spill-dir)
+    server_ckpt_spill * ckpt_spill = nullptr;
+
     bool prompt_save(server_prompt_cache & prompt_cache) const {
         if (prompt.tokens.size() == 0) {
             return false;
@@ -351,6 +355,9 @@ struct server_slot {
         bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
+        } else if (ckpt_spill) {
+            // the prompt of the slot is another one now
+            ckpt_spill->drop_slot(id);
         }
 
         return res;
@@ -362,6 +369,10 @@ struct server_slot {
         mem.seq_rm(id, -1, -1);
 
         prompt.clear();
+
+        if (ckpt_spill) {
+            ckpt_spill->drop_slot(id);
+        }
     }
 
     std::vector<common_adapter_lora_info> lora;
@@ -949,6 +960,8 @@ private:
     // if swa_full is enabled, this is set to 0 to simulate a non-SWA model
     int32_t n_swa;
 
+    server_ckpt_spill ckpt_spill; // delphi: context checkpoints on disk, declared before the slots that point to it
+
     // slots / clients
     std::vector<server_slot> slots;
 
@@ -983,16 +996,23 @@ private:
 
     int64_t t_last_load_progress_ms = 0;
 
-    // checkpoints at the ends of chat messages are made only where the slots make checkpoints at all
-    int32_t ckpt_turn_step() const {
-        return params_base.use_jinja && params_base.n_ctx_checkpoints > 0 && (
+    // do the slots make context checkpoints at all
+    bool ckpt_used() const {
+        return params_base.n_ctx_checkpoints > 0 && (
                 ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
                 ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
-                n_swa > 0) ? params_base.ckpt_turn_step : 0;
+                n_swa > 0);
+    }
+
+    // checkpoints at the ends of chat messages are made only where the slots make checkpoints at all
+    int32_t ckpt_turn_step() const {
+        return params_base.use_jinja && ckpt_used() ? params_base.ckpt_turn_step : 0;
     }
 
     void destroy() {
         vram.free();
+
+        ckpt_spill.shutdown();
 
         spec.reset();
         spec_init.reset();
@@ -1428,6 +1448,19 @@ private:
                     ckpt_turn_step());
         } else {
             SRV_TRC("%s", "context checkpoints disabled\n");
+        }
+
+        // delphi: the checkpoints that a full slot drops can go to disk
+        if (!params_base.ckpt_spill_dir.empty()) {
+            if (ckpt_used()) {
+                ckpt_spill.init(params_base.ckpt_spill_dir, (uint64_t) params_base.ckpt_spill_max_mib << 20,
+                        server_ckpt_model_key(params_base, model_tgt, model_dft, llama_n_ctx_seq(ctx_tgt)));
+            } else {
+                SRV_WRN("%s", "--ctx-checkpoints-spill-dir has no effect: the slots make no context checkpoints\n");
+            }
+        }
+        for (auto & slot : slots) {
+            slot.ckpt_spill = &ckpt_spill;
         }
 
         if (!params_base.model_alias.empty()) {
@@ -2386,6 +2419,83 @@ private:
         return true;
     }
 
+    // A full slot drops this checkpoint. With --ctx-checkpoints-spill-dir the data goes to the writer thread first, which takes it
+    // out of the checkpoint. The caller has synced the async copy of the checkpoint.
+    void ckpt_spill_put(server_slot & slot, common_prompt_checkpoint & ckpt) {
+        if (!ckpt_spill.enabled() || ckpt.empty()) {
+            return;
+        }
+
+        const auto & tokens = slot.prompt.tokens.get_tokens();
+        if (ckpt.n_tokens <= 0 || ckpt.n_tokens > (int64_t) tokens.size()) {
+            return;
+        }
+
+        // a media chunk is only a placeholder in the tokens, so the hash would not tell two prompts apart
+        const auto end = tokens.begin() + ckpt.n_tokens;
+        if (std::find(tokens.begin(), end, LLAMA_TOKEN_NULL) != end) {
+            return;
+        }
+
+        const int64_t n_tokens = ckpt.n_tokens;
+        if (ckpt_spill.put(slot.id, server_ckpt_prefix_hash(tokens, n_tokens), std::move(ckpt))) {
+            SLT_TRC(slot, "queued context checkpoint for the disk (n_tokens = %" PRId64 ")\n", n_tokens);
+        } else {
+            SLT_TRC(slot, "context checkpoint not written to the disk (n_tokens = %" PRId64 "): queue or disk space full\n", n_tokens);
+        }
+    }
+
+    // Looks for a checkpoint on disk that reaches further than the best one in memory (n_ram is its n_tokens, 0 if there is none)
+    // and reads it into out. A file is usable under the rule of the search in memory, and if the prompt of the slot still starts with
+    // the tokens that it was made for.
+    bool ckpt_spill_load(server_slot & slot, llama_pos pos_next, llama_pos pos_min_thold, int64_t n_ram, common_prompt_checkpoint & out) {
+        if (!ckpt_spill.enabled()) {
+            return false;
+        }
+
+        auto entries = ckpt_spill.list(slot.id);
+        std::sort(entries.begin(), entries.end(), [](const server_ckpt_spill_entry & a, const server_ckpt_spill_entry & b) {
+            return a.n_tokens > b.n_tokens;
+        });
+
+        const auto & tokens = slot.prompt.tokens.get_tokens();
+
+        for (const auto & e : entries) {
+            // the prompt of the slot may be another one than when the file was written
+            if (e.n_tokens > (int64_t) tokens.size() || server_ckpt_prefix_hash(tokens, e.n_tokens) != e.prefix_hash) {
+                ckpt_spill.erase(e);
+                continue;
+            }
+
+            if (e.n_tokens <= n_ram) {
+                break; // this one and the rest are not further than the one in memory
+            }
+
+            if (e.pos_max > pos_next || !(e.pos_min < pos_min_thold || e.pos_min == 0)) {
+                continue;
+            }
+
+            // The read blocks the slot loop. It has to take well under the time to process the tokens that it saves.
+            const double ms_read = ckpt_spill.read_ms(e.bytes);
+            const double ms_tok  = metrics.prompt.count > 0 ? 1e-3 * (double) metrics.prompt.time / (double) metrics.prompt.count : 0.0;
+            const double ms_save = (double) (e.n_tokens - n_ram) * ms_tok;
+            if (ms_tok <= 0.0 || ms_read > 0.5 * ms_save) {
+                SLT_TRC(slot, "not reading the context checkpoint from disk (n_tokens = %" PRId64 "): read about %.0f ms, saves about %.0f ms\n",
+                        e.n_tokens, ms_read, ms_save);
+                break; // the next one saves less, for a read of the same size
+            }
+
+            double ms = 0.0;
+            if (ckpt_spill.load(e, out, ms)) {
+                SLT_TRC(slot, "read context checkpoint from disk (n_tokens = %" PRId64 ", size = %.3f MiB, took %.0f ms, planned %.0f ms)\n",
+                        e.n_tokens, (float) e.bytes / 1024 / 1024, ms, ms_read);
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
@@ -2434,6 +2544,8 @@ private:
 
             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                     victim->pos_min, victim->pos_max, victim->n_tokens, (float) victim->size() / 1024 / 1024);
+
+            ckpt_spill_put(slot, *victim);
 
             slot.prompt.checkpoints.erase(victim);
         }
@@ -3513,16 +3625,25 @@ private:
 
                                     bool do_reset = it == slot.prompt.checkpoints.rend();
 
+                                    // delphi: a checkpoint on disk may reach further than the one in memory
+                                    common_prompt_checkpoint spilled;
+                                    const common_prompt_checkpoint * ckpt = do_reset ? nullptr : &*it;
+                                    if (ckpt_spill_load(slot, pos_next, pos_min_thold, do_reset ? 0 : it->n_tokens, spilled)) {
+                                        ckpt     = &spilled;
+                                        do_reset = false;
+                                    }
+
                                     if (!do_reset) {
                                         // restore the context checkpoint
-                                        it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                                        it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                        ckpt->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                        ckpt->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                                         // restore the draft's speculative state
-                                        common_speculative_set_state(spec.get(), slot.id, it->data_spec);
+                                        common_speculative_set_state(spec.get(), slot.id, ckpt->data_spec);
 
-                                        pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
-                                        n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
-                                        SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
+                                        // the positions come from the checkpoint itself, for one from disk the header that was checked
+                                        pos_next = std::min(pos_next, std::max(ckpt->pos_min + 1, ckpt->pos_max));
+                                        n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) ckpt->n_tokens);
+                                        SLT_TRC(slot, "restored context checkpoint%s (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", ckpt == &spilled ? " from disk" : "", ckpt->pos_min, ckpt->pos_max, ckpt->n_tokens, n_past, (float) ckpt->size() / 1024 / 1024);
                                     }
 
                                     if (do_reset) {
@@ -3545,6 +3666,9 @@ private:
                                         ++it;
                                     }
                                 }
+
+                                // the files on disk go too: the cells that they need are overwritten from here
+                                ckpt_spill.erase_beyond(slot.id, pos_next);
                             }
                         }
 

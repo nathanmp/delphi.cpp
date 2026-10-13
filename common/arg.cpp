@@ -1745,6 +1745,25 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CTX_CHECKPOINTS_TURN_STEP").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--ctx-checkpoints-spill-dir"}, "DIR",
+        "write the context checkpoints that a full slot drops to files in DIR, and read them back when a prompt needs one "
+        "(default: off). The files live as long as the server runs. Reads are skipped when they would be slower than "
+        "processing the tokens again",
+        [](common_params & params, const std::string & value) {
+            params.ckpt_spill_dir = value;
+        }
+    ).set_env("LLAMA_ARG_CTX_CHECKPOINTS_SPILL_DIR").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--ctx-checkpoints-spill-max-mib"}, "N",
+        string_format("the most disk space in MiB that the spilled context checkpoints use (default: %d)", params.ckpt_spill_max_mib),
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("ctx-checkpoints-spill-max-mib must be positive");
+            }
+            params.ckpt_spill_max_mib = value;
+        }
+    ).set_env("LLAMA_ARG_CTX_CHECKPOINTS_SPILL_MAX_MIB").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-cram", "--cache-ram"}, "N",
         string_format("set the maximum cache size in MiB (default: %d, -1 - no limit, 0 - disable)"
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)", params.cache_ram_mib),

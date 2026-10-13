@@ -660,6 +660,8 @@ struct common_params {
     common_ckpt_evict ckpt_evict = COMMON_CKPT_EVICT_VARIANCE; // which context checkpoint a full slot drops
     bool    ckpt_pin_first = true;        // a full slot never drops its oldest context checkpoint
     int32_t ckpt_turn_step = 4096;        // chat requests: min spacing in tokens between the checkpoints at message ends, 0 = off
+    std::string ckpt_spill_dir;           // directory for the context checkpoints that a full slot drops, empty = off
+    int32_t ckpt_spill_max_mib = 8192;    // the most disk space that those use
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
 
     std::string hostname      = "127.0.0.1";

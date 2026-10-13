@@ -2,7 +2,7 @@
 
 A model with sliding-window attention (SWA), recurrent layers, or a hybrid of both cannot drop the tail of its memory the way a plain KV cache can. When a new prompt shares a prefix with the slot's cached prompt but then differs, the server needs a saved copy of that state at (or before) the point where the prompts differ. These copies are the context checkpoints. Each slot keeps up to `--ctx-checkpoints N` of them (default 32), and the server restores the newest one that is usable for the new prompt. Without a usable checkpoint, the server processes the whole prompt again.
 
-This page describes the delphi.cpp options that decide which checkpoints a slot takes and keeps. The upstream options `--ctx-checkpoints` and `--checkpoint-min-step` are unchanged.
+This page describes the delphi.cpp options that decide which checkpoints a slot takes, keeps, and writes to disk when it drops them. The upstream options `--ctx-checkpoints` and `--checkpoint-min-step` are unchanged.
 
 ## Eviction
 
@@ -57,6 +57,44 @@ Limit and eviction: these are ordinary checkpoints. They count against `--ctx-ch
 
 Why this default: N is half of upstream's spacing, so any message end of a long chat is at most a few thousand tokens of reprocessing away from a checkpoint. A smaller N takes more checkpoints, and each one is a copy of the SWA window or recurrent state on the host. A larger N leaves long turns without one. It is on by default because the cost is bounded: per request at most five template renders and tokenizations of a prefix (in the HTTP thread, together a few times the cost of tokenizing the prompt), at most five extra batch splits, and no work at all for a short prompt or a model without checkpoints. Use `--ctx-checkpoints-turn-step 0` to remove all of it.
 
+## Spill to disk
+
+| option | default | effect |
+| --- | --- | --- |
+| `--ctx-checkpoints-spill-dir DIR` | off | A full slot writes the checkpoint it drops to a file in DIR, and reads it back when a later prompt of the slot needs it. |
+| `--ctx-checkpoints-spill-max-mib N` | `8192` | The most disk space the files use. |
+
+There is no default directory, and nothing is written unless DIR is set: the server does not pick a place on a disk that may be slow, small or shared. The option does nothing for a model that makes no checkpoints.
+
+What is written: only a checkpoint that `--ctx-checkpoints-eviction` drops to make room. A checkpoint that upstream's spacing rule drops, or one that a new checkpoint at the same position replaces, is not written. A checkpoint of a prompt with images or audio is not written either, as the tokens of those are placeholders and cannot tell two prompts apart.
+
+When it is read: when a new prompt shares a prefix with the cached prompt of the slot, the server looks for the newest usable checkpoint (the rule that it always used, see the start of this page). With a spill directory it also looks at the files of that slot. If a file reaches further into the prompt than the best checkpoint in memory, and reading it is worth it, the server reads the file and restores from it, and the prompt starts there. If not, nothing changes.
+
+A file is valid only for the prompt it was made for, and only while the slot holds that prompt. A checkpoint holds only the part of the memory that cannot be rolled back (the SWA window, the recurrent state). It restores a slot only together with the KV cells of the prompt before it, and those are in memory, in the slot. So a file cannot outlive the slot's prompt or the process:
+
+- The key of a file is the model and the context setup (model path, size and time, parameters, context size per sequence, KV types, SWA setting), the slot, the position (`n_tokens`) and a 64-bit hash of the tokens before the position. The header repeats the key and the positions. The reader checks the header, the sizes and a checksum of the data, and removes a file that fails.
+- Before it reads, the server hashes the first `n_tokens` tokens of the slot's cached prompt and compares. A file for another prompt is removed and never used.
+- Files of a slot go when the slot's prompt is cleared or replaced by a prompt from the host cache, and files that lie beyond the point where a new prompt differs go at the start of that request (the same rule that erases the checkpoints in memory).
+- The server removes all its files when it stops. At start it removes the files of servers that died (Linux and macOS: the name has the pid, and a pid that no longer exists counts as dead). Give each group of servers its own directory when they run in different pid namespaces (containers), or one server may remove the files of another.
+- The file name is `dckpt-<pid>-<model key>-s<slot>-<n_tokens>-<token hash>.bin`, written as `.tmp` and renamed when complete. The format is versioned (version 1: an 80 byte header, then the data of the target context, of the draft context and of the speculative state, in the byte order of the machine). A file of another version is not read.
+
+After a restore from a file, the positions come from the header, which the reader has checked against the key: `pos_next` becomes the smaller of the prompt match and `max(pos_min + 1, pos_max)`, `n_past` becomes the number of prompt tokens up to there, and the checkpoints in memory and the files with a larger `pos_max` are dropped. That is the same recomputation that a restore from memory does.
+
+Disk use is bounded. The total of the files, and of the writes in the queue, stays under `--ctx-checkpoints-spill-max-mib`; when a new file does not fit, the files that were used the longest ago are removed first, and a checkpoint that is larger than the bound alone is not written.
+
+The server does not assume a fast disk:
+
+- The files are written by a thread of its own, from a queue of two checkpoints (one being written, one waiting). Each of those holds a copy of the data in memory. When the queue is full, the checkpoint is dropped as it was before, and the slot loop never waits for the disk.
+- A read blocks the slot loop, so the server reads a file only when the estimated time is at most half of the estimated time to process the tokens that the file saves. The estimate for the read is 5 ms plus the size over the measured speed of earlier reads (before any read, writes, and before any write, 100 MB/s). The estimate for processing is the average time per prompt token so far in this server. On a slow disk the server tries once, and when the file is not worth it, the prompt is processed as without the option.
+
+Why spill: a checkpoint that a full slot drops is gone, and a later request that would have restored from it processes those tokens again. A rewind needs a checkpoint before the change, and in a long session the ones that eviction drops can be those. The file turns the reprocessing into a read, when the disk reads faster than the model processes the prompt. The costs are disk space (bounded, see above), and a copy of the data in host memory while it waits for the write. Raising `--ctx-checkpoints` keeps the checkpoints in host memory instead, at the cost of RAM per slot.
+
+Prior art: ik_llama.cpp PR 2446 (`--ctx-checkpoints-spill-dir`). It is in-process too (it wipes its files at start), and it also checks the file against the positions of the entry. The differences: there, a limit on checkpoints with data in memory (`--ctx-checkpoints-live-n`) moves them to disk while the list keeps an entry for each, and the checkpoints that a changed prompt invalidates are spilled as well. Here the list is as it was, and only the checkpoint that eviction drops is written, because an invalidated checkpoint cannot be restored (the KV cells it needs are overwritten by the new prompt). The key is wider (model, slot, position, token hash), the format has a version and a checksum, the write has a queue bound, the read has the speed guard, the disk use has a bound, and stale files are removed by pid instead of by name prefix.
+
+The files are not part of the host prompt cache (`--cache-ram`): see below.
+
 ## Interaction with the host prompt cache (`--cache-ram`)
 
 The prompt cache stores whole prompts of slots that other requests displaced: the prompt tokens, the full state of the sequence, and a copy of the slot's list of checkpoints. The copies count against `--cache-ram`, so a larger `--ctx-checkpoints` means that fewer prompts fit in the cache. A prompt that returns from the cache brings back its list with it, including the pinned checkpoint. The cache picks the stored prompt by the length of the shared token prefix only; it does not check that a checkpoint exists at or before that prefix. For SWA and recurrent models, a cached prompt without such a checkpoint is processed again from the start, so the choice of the checkpoints matters for how much of a cache hit is really used.
+
+The files of the spill directory are not part of this cache. A slot that clears its prompt, or loads a prompt from the cache, drops its files, as the prompt in the slot is another one then. A file for a prompt that the slot no longer holds also fails the token hash check, and is removed when a request looks at it. A checkpoint that is only in the cache entry stays in memory with the entry, and the cache's own eviction drops it without a write. So the cache keeps whole prompts with their checkpoints in memory, and the spill directory keeps the dropped checkpoints of the prompt that is in the slot now.
