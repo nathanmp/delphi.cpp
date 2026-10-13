@@ -11,7 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools/auto-quantize"))
 from config import QuantError, capacity, devices, file_identity, imatrix_identities, imatrix_inputs, load_config, normalized, write_json
-from corpus import calibration_text, compose_text, shares
+from corpus import calibration_text, collect_imatrices, compose_text, imatrix_command, shares
 from model import classify, merge_imatrices, read_model, tensor_bytes
 from search import dominates, make_options, memory, pareto, search
 from quality import LossModel, damage_digest, load_quality, modelled_groups, role_of
@@ -386,6 +386,80 @@ class Corpora(unittest.TestCase):
             write_json(path, {**base, "calibration": bad})
             with self.assertRaises(QuantError):
                 load_config(path)
+
+
+class Collect(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name).resolve()
+        (self.root / "bin").mkdir()
+        script = self.root / "bin/llama-imatrix"
+        script.write_text('#!/bin/sh\necho "$@" >> "$FAKE_LOG"\necho "means=$DELPHI_IMATRIX_MEANS" >> "$FAKE_LOG"\n'
+                          'while [ $# -gt 0 ]; do [ "$1" = "-o" ] && out="$2"; shift; done\ncp "$FAKE_IMATRIX" "$out"\n')
+        script.chmod(0o755)
+        writer = GGUFWriter(str(self.root / "model.gguf"), "olmoe")
+        writer.add_tensor("blk.0.attn_norm.weight", np.ones(256, dtype=np.float32))
+        writer.write_header_to_file()
+        writer.write_kv_data_to_file()
+        writer.write_tensors_to_file()
+        writer.close()
+        writer = GGUFWriter(str(self.root / "fake.gguf"), "imatrix")
+        writer.add_array("imatrix.datasets", ["fake"])
+        writer.add_uint32("imatrix.chunk_count", 1)
+        writer.add_uint32("imatrix.chunk_size", 8)
+        for suffix, value in ((".in_sum2", np.ones((1, 4))), (".counts", np.ones((1, 1))), (".in_sum", np.ones((1, 4)))):
+            writer.add_tensor("blk.0.attn_q.weight" + suffix, value.astype(np.float32))
+        writer.write_header_to_file()
+        writer.write_kv_data_to_file()
+        writer.write_tensors_to_file()
+        writer.close()
+        for name in ("code", "math", "rp"):
+            (self.root / f"{name}.txt").write_text(f"{name}\n" * 50)
+        self.log = self.root / "log.txt"
+        self.base = {"schema": "delphi.auto-quantize/1", "model": str(self.root / "model.gguf"), "devices": "ROCm1:16000,RAM:16000",
+                     "bindir": str(self.root / "bin"), "primary_qtypes": ["Q2_K"], "other_qtypes": ["Q6_K"],
+                     "runtime": {"env": {"FAKE_LOG": str(self.log), "FAKE_IMATRIX": str(self.root / "fake.gguf")}}}
+
+    def config(self, **collect):
+        write_json(self.root / "config.json", {**self.base, "imatrix_collect": collect})
+        return load_config(self.root / "config.json")
+
+    def test_one_run_per_corpus_then_reuse(self):
+        cfg = self.config(text="code.txt:50,math.txt:30,rp.txt:25", context=64, chunks=4, threads=3, extra_args=["-b", "256"])
+        output = self.root / "collected"
+        entries = collect_imatrices(cfg, output)
+        log = self.log.read_text().splitlines()
+        self.assertEqual(len(log), 6)
+        for part in (f"-m {self.root / 'model.gguf'}", f"-f {self.root / 'code.txt'}", "-c 64", "-t 3", "--device ROCm1",
+                     "-ngl 999", "-cmoe", "--chunks 4", "--no-ppl", "-b 256"):
+            self.assertIn(part, log[0])
+        self.assertEqual(log[1], "means=1")
+        self.assertEqual([Path(e.rpartition(":")[0]).name for e in entries],
+                         ["00-code.imatrix.gguf", "01-math.imatrix.gguf", "02-rp.imatrix.gguf"])
+        paths, weights = imatrix_inputs(entries, lambda p: p)
+        for weight, expected in zip(weights, normalized((50, 30, 25))):
+            self.assertAlmostEqual(weight, expected, places=8)
+        self.assertTrue(all(Path(path).exists() for path in paths))
+        self.assertEqual(collect_imatrices(cfg, output), entries)
+        self.assertEqual(len(self.log.read_text().splitlines()), 6)
+        (self.root / "code.txt").write_text("changed\n")
+        with self.assertRaises(QuantError):
+            collect_imatrices(cfg, output)
+
+    def test_command_and_configuration(self):
+        c = {"context": 512, "chunks": 0, "threads": 4, "extra_args": []}
+        command = imatrix_command({"bindir": "/b", "model": "/m.gguf", "devices": {"ROCm1": 1}}, c, "/t.txt", "/o.gguf")
+        self.assertEqual(command[0], "/b/llama-imatrix")
+        self.assertNotIn("-cmoe", command)
+        self.assertNotIn("--chunks", command)
+        self.assertEqual(self.config(text="a.txt")["imatrix_collect"]["means"], True)
+        with self.assertRaises(QuantError):
+            collect_imatrices(load_config(self.root / "config.json") | {"imatrix_collect": None}, self.root / "none")
+        for bad in ({}, {"text": "a.txt", "extra_args": ["--device", "CUDA0"]}, {"text": "a.txt", "chunks": -1},
+                    {"text": "a.txt", "means": 1}, {"text": "a.txt", "context": 0}, {"text": "a.txt", "color": 1}):
+            with self.assertRaises(QuantError):
+                self.config(**bad)
 
 
 class Timing(unittest.TestCase):

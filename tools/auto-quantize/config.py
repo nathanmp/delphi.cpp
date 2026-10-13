@@ -146,7 +146,7 @@ def load_config(path):
     allowed = {"schema", "model", "devices", "reserve", "imatrix", "primary_qtypes", "other_qtypes", "importance",
                "preserve_below_mib", "tie_gate_up", "primary_regex", "pins", "preserve_regex", "allow_requantize",
                "bindir", "runtime", "sampling", "search", "bounds", "cache_mib", "multi_gpu_speedup_percent", "timing", "quality",
-               "calibration"}
+               "calibration", "imatrix_collect"}
     unknown = set(cfg) - allowed
     if unknown:
         raise QuantError(f"unknown configuration keys: {sorted(unknown)}")
@@ -233,6 +233,8 @@ def load_config(path):
     if not isinstance(cfg["search"]["display"], int) or cfg["search"]["display"] <= 0:
         raise QuantError("search.display must be a positive integer")
     cfg["calibration"] = calibration(cfg.get("calibration", {}), absolute, cfg)
+    if "imatrix_collect" in cfg:
+        cfg["imatrix_collect"] = imatrix_collect(cfg["imatrix_collect"], absolute, cfg)
     cfg.setdefault("bounds", {})
     for name, value in cfg["bounds"].items():
         if name not in {"max_damage", "max_loss", "min_decode_t_s", "min_short_t_s", "min_long_t_s"}:
@@ -282,4 +284,30 @@ def calibration(c, absolute, cfg):
         if not isinstance(result["devices"], list) or not result["devices"] or any(
                 not isinstance(d, str) or not re.fullmatch(r"(?:CUDA|ROCm)[0-9]+", d) for d in result["devices"]):
             raise QuantError("calibration.devices must list GPU names")
+    return result
+
+
+def imatrix_collect(c, absolute, cfg):
+    """Settings of the collect-imatrix command: the corpora, one llama-imatrix run each, and the run options."""
+    if not isinstance(c, dict):
+        raise QuantError("imatrix_collect must be an object")
+    defaults = {"text": None, "context": 512, "chunks": 0, "means": True, "threads": None, "extra_args": []}
+    if set(c) - set(defaults):
+        raise QuantError(f"unknown imatrix_collect keys: {sorted(set(c) - set(defaults))}")
+    result = {name: c.get(name, default) for name, default in defaults.items()}
+    if result["text"] is None:
+        raise QuantError("imatrix_collect.text must list the corpora, as PATH or PATH:WEIGHT")
+    result["text"] = corpora(result["text"], absolute, "imatrix_collect.text")
+    result["threads"] = result["threads"] or cfg["runtime"]["threads"]
+    for name in ("context", "chunks", "threads"):
+        value = result[name]
+        if not isinstance(value, int) or isinstance(value, bool) or value < (0 if name == "chunks" else 1):
+            raise QuantError(f"imatrix_collect.{name} must be a valid integer")
+    if not isinstance(result["means"], bool):
+        raise QuantError("imatrix_collect.means must be boolean")
+    protected = {"-m", "--model", "-f", "--file", "-o", "--output", "--output-file", "--output-format", "--in-file", "--device",
+                 "--numa", "-ngl", "--gpu-layers", "-cmoe", "--cpu-moe", "-ncmoe", "--n-cpu-moe", "-c", "--ctx-size", "-t",
+                 "--threads", "--chunks", "--no-ppl", "--ppl"}
+    if not isinstance(result["extra_args"], list) or any(str(arg).split("=", 1)[0] in protected for arg in result["extra_args"]):
+        raise QuantError("imatrix_collect.extra_args must be a list that does not override managed placement or input options")
     return result

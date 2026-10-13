@@ -1,4 +1,4 @@
-"""Weighted calibration corpora: one deterministic KL text composed from several corpora.
+"""Weighted calibration corpora: one deterministic KL text composed from several corpora, and per-corpus imatrix collection.
 
 The tool has no tokenizer. A piece is a span of about `context` tokens, sized in bytes with bytes_per_token, so the share of
 tokens follows the weights only as well as that ratio holds for each corpus. Pieces of one corpus are chosen by a seeded hash,
@@ -11,9 +11,12 @@ import hashlib
 import heapq
 import json
 import math
+import re
 from pathlib import Path
 
 from config import QuantError, digest, file_identity, write_json
+from model import read_model
+from timing import gpu, run
 
 MARGIN = 1.2
 FORMAT = 1
@@ -107,3 +110,65 @@ def calibration_text(c, directory):
     if isinstance(c["text"], str):
         return c["text"], None
     return compose_text(c["text"], c["context"], c["chunks"], c["text_seed"], c["bytes_per_token"], directory)
+
+
+def imatrix_command(cfg, c, text, output):
+    """llama-imatrix on one corpus, with the placement of the calibration runs (first GPU, experts in RAM when RAM is a device)."""
+    command = [str(Path(cfg["bindir"]) / "llama-imatrix"), "-m", cfg["model"], "-f", str(text), "-o", str(output),
+               "--output-format", "gguf", "-c", str(c["context"]), "-t", str(c["threads"]), "--numa", "tensors",
+               "--device", gpu(cfg), "-ngl", "999", "--no-ppl"]
+    if "RAM" in cfg["devices"]:
+        command.append("-cmoe")
+    if c["chunks"]:
+        command += ["--chunks", str(c["chunks"])]
+    return command + [str(arg) for arg in c["extra_args"]]
+
+
+def check_raw_imatrix(path, means):
+    from gguf import GGUFReader
+    names = {t.name for t in GGUFReader(str(path)).tensors}
+    if not any(name.endswith(".in_sum2") for name in names):
+        raise QuantError(f"llama-imatrix wrote no raw sums: {path}")
+    if means and not any(name.endswith((".in_sum", ".in_sum1")) for name in names):
+        raise QuantError(f"llama-imatrix wrote no activation means; this build may lack DELPHI_IMATRIX_MEANS: {path}")
+
+
+def collect_imatrices(cfg, directory, timeout=86400):
+    """Run llama-imatrix once per corpus of imatrix_collect.text and return the "imatrix" entries that merge the results.
+
+    An output is reused when the corpus, model, binary and command are unchanged. The weights do not affect a run:
+    the merge applies them, so changing a weight needs no new run."""
+    c = cfg.get("imatrix_collect")
+    if not c:
+        raise QuantError("collect-imatrix needs the imatrix_collect configuration")
+    directory = Path(directory).resolve()
+    directory.mkdir(parents=True, exist_ok=True)
+    environment = dict(cfg["runtime"]["env"])
+    if c["means"]:
+        environment["DELPHI_IMATRIX_MEANS"] = "1"
+    record = directory / "imatrix-collect.json"
+    outputs = json.loads(record.read_text())["outputs"] if record.exists() else {}
+    model, binary = read_model(cfg["model"])["identity"], file_identity(Path(cfg["bindir"]) / "llama-imatrix")
+    entries = []
+    for index, corpus in enumerate(c["text"]):
+        name = f"{index:02d}-{re.sub(r'[^A-Za-z0-9_.-]+', '_', Path(corpus['path']).stem)}"
+        final, partial = directory / f"{name}.imatrix.gguf", directory / f"{name}.imatrix.partial.gguf"
+        text = file_identity(corpus["path"], content=True)
+        command = imatrix_command(cfg, c, corpus["path"], partial)
+        key = digest({"command": command, "env": environment, "text": text["sha256"], "model": model, "binary": binary})
+        if final.exists():
+            if outputs.get(name, {}).get("key") != key:
+                raise QuantError(f"{final} has no record of these inputs; remove it or use another directory")
+            print(f"Reusing {final.name}", flush=True)
+        else:
+            if partial.exists():
+                raise QuantError(f"partial output exists; inspect it before retrying: {partial}")
+            print(f"Collecting the imatrix of {corpus['path']}", flush=True)
+            run(command, directory / f"{name}.log", environment, timeout)
+            check_raw_imatrix(partial, c["means"])
+            partial.replace(final)
+        outputs[name] = {"key": key, "corpus": text, "command": command, "env": environment, "output": file_identity(final)}
+        entries.append(f"{final}:{100 * corpus['weight']:.10g}")
+        write_json(record, {"outputs": outputs, "imatrix": entries})
+    print('Merge them with the corpus weights through the configuration: "imatrix": ' + json.dumps(entries), flush=True)
+    return entries

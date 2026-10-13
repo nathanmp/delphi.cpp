@@ -14,6 +14,7 @@ from pathlib import Path
 from config import AXES, SCHEMA, QuantError, digest, file_identity, imatrix_identities, imatrix_inputs, load_config, write_json
 from model import classify, merge_imatrices, read_model
 from calibrate import calibrate, per_chunk, perplexity_command, run_direct
+from corpus import collect_imatrices
 from quality import LossModel, load_quality, quality_metadata
 from search import make_options, memory, search
 from timing import MODEL_REVISION, Predictor, fit_slopes, gpu, machine_settings, measure_ops, profile_model, profile_times, run
@@ -396,6 +397,9 @@ def main():
             p.add_argument("--measurement-seconds", type=float, default=600)
         if name == "validate":
             p.add_argument("--mixes", type=Path, required=True)
+    p = sub.add_parser("collect-imatrix", help="run llama-imatrix once per imatrix_collect.text corpus (slow; prepare never does this)")
+    p.add_argument("--config", type=Path, required=True)
+    p.add_argument("--output", type=Path, required=True)
     p = sub.add_parser("merge-imatrix", help="merge raw GGUF imatrices; PATH:WEIGHT entries weigh files by influence instead of tokens")
     p.add_argument("--imatrix", nargs="+", required=True, metavar="PATH[:WEIGHT]")
     p.add_argument("--output", type=Path, required=True)
@@ -438,6 +442,8 @@ def main():
                                                  for c in ("primary", "other")}, "groups": info["groups"]}, indent=2))
         elif args.command == "prepare":
             prepare(cfg, args.output, args.measurement_seconds)
+        elif args.command == "collect-imatrix":
+            collect_imatrices(cfg, args.output)
         else:
             data = load_prepared(args.prepared, cfg)
             if args.command == "calibrate":
