@@ -9,6 +9,7 @@
 #include "sampling.h"
 #include "speculative.h"
 #include "unicode.h"
+#include "../src/llama-ext.h" // llama_expert_cache_auto
 
 #include <algorithm>
 #include <cinttypes>
@@ -1544,6 +1545,13 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
 
         // reset samplers to reset RNG state after warmup to the seeded state
         res->reset_samplers();
+    }
+
+    // expert cache in auto mode: the free GPU memory goes to it now, unless a draft or MTP context comes later (the server then
+    // calls it itself)
+    if (params.speculative.types.empty() ||
+            (params.speculative.types.size() == 1 && params.speculative.types[0] == COMMON_SPECULATIVE_TYPE_NONE)) {
+        llama_expert_cache_auto(lctx);
     }
 
     return res;

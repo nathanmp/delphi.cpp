@@ -613,7 +613,14 @@ llama_context::llama_context(
         }
 
         if (params.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && params.ctx_other == nullptr) {
-            expert_cache = llama_expert_cache::create(model, backends);
+            try {
+                expert_cache = llama_expert_cache::create(model, backends);
+            } catch (const std::exception & e) {
+                if (!llama_expert_cache::auto_requested()) {
+                    throw;
+                }
+                LLAMA_LOG_INFO("%s: expert cache off: %s\n", __func__, e.what());
+            }
         }
         sched_reserve();
 
@@ -3421,6 +3428,42 @@ void llama_context::sched_set_workers_all() {
     }
 }
 
+void llama_context::expert_cache_auto() {
+    // At the first decode every context of the process (draft, MTP) holds its memory, so what is free can go to the cache.
+    // The margin is for buffers that grow later (graph reallocations, other processes).
+    if (!expert_cache || !expert_cache->auto_size) {
+        return;
+    }
+    expert_cache->auto_size = false;
+    static const size_t margin = [] {
+        const char * e = getenv("LLAMA_MOE_CACHE_AUTO_MARGIN_MIB");
+        return size_t(e ? std::max(0LL, atoll(e)) : 1536LL) << 20;
+    }();
+    synchronize();
+    // staging slots of their own go back, so that the rings borrow from the tiers instead
+    ggml_backend_sched_stage_release(sched.get());
+    for (auto & slot : graph_slots) {
+        if (slot.sched) {
+            ggml_backend_sched_stage_release(slot.sched.get());
+        }
+    }
+    for (const auto & d : model.devices) {
+        if (ggml_backend_dev_type(d.dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+            continue;
+        }
+        size_t free = 0, total = 0;
+        ggml_backend_dev_memory(d.dev, &free, &total);
+        if (free <= margin) {
+            LLAMA_LOG_INFO("%s: expert cache auto: %s has %.0f MiB free, no tier\n", __func__, ggml_backend_dev_name(d.dev),
+                    free / 1048576.0);
+            continue;
+        }
+        const int id = share_add_tier(d.dev, free - margin);
+        LLAMA_LOG_INFO("%s: expert cache auto: %s %.0f MiB free, tier %d of up to %.0f MiB\n", __func__,
+                ggml_backend_dev_name(d.dev), free / 1048576.0, id, (free - margin) / 1048576.0);
+    }
+}
+
 void llama_context::sched_set_stage_lender() {
     sched_set_workers(sched.get());
     if (expert_cache) {
@@ -4911,6 +4954,10 @@ static ggml_backend_dev_t llama_share_find_dev(const char * name) {
         }
     }
     return nullptr;
+}
+
+void llama_expert_cache_auto(llama_context * ctx) {
+    ctx->expert_cache_auto();
 }
 
 int32_t llama_share_add_tier(llama_context * ctx, const char * dev, size_t bytes) {

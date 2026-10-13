@@ -179,3 +179,34 @@ The first two change only where data is kept and which thread computes a piece, 
 Measured on MiMo V2.6 Flash (2x EPYC 7532, production deployment, -t 48, MTP decode and 128/300-token CPU prompts):
 node-local state gave prompts -5% at NPS1 and decode +2.7% at NPS4; stealing was neutral (no node was slowed by other
 load); the interleaved compute buffer gave decode +8.6% and prompts -13% / -25% at NPS4.
+
+## GPU expert cache (routed experts in host memory)
+
+When the routed experts stay in host memory (`-cmoe`, `-ncmoe` with all layers, `-ot exps=CPU`) and the other layers are on
+one GPU, the most-used experts are copied to GPU memory and run there; the others run on the CPU. Which experts are hot comes
+from the routing of the last `LLAMA_MOE_CACHE_WINDOW` rows. The cache refreshes after each prompt and every
+`LLAMA_MOE_CACHE_EVERY` small batches while decoding. Batches of 16 rows or fewer use it; with `LLAMA_MOE_CACHE_PROMPT_ROWS`,
+CPU prompt batches up to that size use it too.
+
+Requirements: SiLU (or the clipped SiLU of DeepSeek V4) routed FFN with separate gate, up and down experts, no expert biases or
+scales, one geometry per projection, all non-expert layers on one GPU. Other models get no cache in auto mode, and an error
+with an explicit size.
+
+The weight-streaming ring (above) takes its slots from the cache tier on the same GPU while a long prompt runs, and the cache
+takes them back at the next refresh. So the cache and the staging slots do not need separate memory.
+
+| variable | default | effect |
+| --- | --- | --- |
+| `LLAMA_MOE_CACHE_MIB` | `auto` | `auto` (or unset): when the model allows it, one tier per GPU of `--device`, of the GPU's free memory less `LLAMA_MOE_CACHE_AUTO_MARGIN_MIB`. The tiers are allocated when the server has loaded every model (draft and MTP included); other programs allocate them after the warmup. A number: one tier of that many MiB on the GPU of the layers. `0`: no cache. |
+| `LLAMA_MOE_CACHE_AUTO_MARGIN_MIB` | `1536` | memory left free on each GPU in auto mode, for buffers that grow later |
+| `LLAMA_MOE_CACHE_TIERS` | none | more tiers, `<device>:<MiB>[,...]`, for example `ROCm0:16384` |
+| `LLAMA_MOE_CACHE_PROFILE` | none | expert frequencies (`tools/moe-static-cache/profile.py`), used until the window has rows |
+| `LLAMA_MOE_CACHE_WINDOW` | `256` | rows of routing that choose the hot experts; `0` keeps every row, negative never refreshes |
+| `LLAMA_MOE_CACHE_EVERY` | `8` | small batches between decode-time refreshes (at most `LLAMA_MOE_CACHE_ASYNC_EXPERTS`, default 32, experts each); `0` refreshes only after prompts |
+| `LLAMA_MOE_CACHE_PROMPT_ROWS` | `0` | prompt batches up to this many rows also run their hot experts on the GPU |
+| `LLAMA_MOE_CACHE_SHARED` | `0` | `1`: no tier of its own; tiers are leased at run time by the VRAM-sharing daemon. Turns auto mode off. |
+
+DeepSeek V4.1 Flash (Q2_K experts, DSpark, `-ts 1,0` on ROCm1 with ROCm0 for staging, 256-token decode after short
+prompts): auto mode put 7.1 GiB on ROCm1 and 29.6 GiB on ROCm0. Decode was 36.3 t/s against 34.3 without the cache, with 90%
+of the expert selections on the GPU. KL divergence against the CPU path was 0.015 (8 x 512 tokens, 16-token batches), the
+order of a change of summation order.

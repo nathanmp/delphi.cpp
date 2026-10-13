@@ -114,17 +114,25 @@ bool llama_expert_cache::make_tier(tier & t, ggml_backend_t backend, size_t byte
     return true;
 }
 
+bool llama_expert_cache::auto_requested() {
+    const char * budget_env = getenv("LLAMA_MOE_CACHE_MIB");
+    const char * shared_env = getenv("LLAMA_MOE_CACHE_SHARED");
+    return (!budget_env || !strcmp(budget_env, "auto")) && !(shared_env && atoi(shared_env) != 0);
+}
+
 std::unique_ptr<llama_expert_cache> llama_expert_cache::create(
         const llama_model & model, const std::vector<ggml_backend_ptr> & backends) {
     // LLAMA_MOE_CACHE_SHARED=1: a cache without a static tier, for tiers leased at run time (VRAM sharing)
     const char * budget_env = getenv("LLAMA_MOE_CACHE_MIB");
     const char * shared_env = getenv("LLAMA_MOE_CACHE_SHARED");
-    const long long budget_mib = budget_env ? atoll(budget_env) : 0;
+    const bool auto_size = auto_requested();
+    const long long budget_mib = budget_env && !auto_size ? atoll(budget_env) : 0;
     const bool shared = shared_env && atoi(shared_env) != 0;
-    if (budget_mib <= 0 && !shared) { return nullptr; }
+    if (budget_mib <= 0 && !shared && !auto_size) { return nullptr; }
     if (model.hparams.no_alloc) { return nullptr; }
     auto result = std::unique_ptr<llama_expert_cache>(new llama_expert_cache);
     result->model = &model;
+    result->auto_size = auto_size;
     if (const char * env = getenv("LLAMA_MOE_CACHE_WINDOW")) { result->window = atoll(env); }
     if (const char * env = getenv("LLAMA_MOE_CACHE_PREFILL")) { result->record_prompts = atoi(env) != 0; }
     if (const char * env = getenv("LLAMA_MOE_CACHE_PROMPT_ROWS")) { result->prompt_rows = std::max(0LL, atoll(env)); }
@@ -238,8 +246,9 @@ std::unique_ptr<llama_expert_cache> llama_expert_cache::create(
                 ggml_type_name(c.group_types[g][2]), (long long) c.group_layers[g]);
     }
     if (budget_mib <= 0) {
-        LLAMA_LOG_WARN("%s: no static tier (LLAMA_MOE_CACHE_SHARED); %s; window %lld rows, prompts %s, hysteresis %.2f, decode-time refresh every %lld small batches (up to %lld experts)\n", __func__,
-                desc.c_str(), (long long) c.window, c.record_prompts ? "on" : "off", c.hysteresis, (long long) c.every, (long long) c.max_async);
+        LLAMA_LOG_WARN("%s: no static tier (%s); %s; window %lld rows, prompts %s, hysteresis %.2f, decode-time refresh every %lld small batches (up to %lld experts)\n", __func__,
+                auto_size ? "auto: tiers at the first decode" : "LLAMA_MOE_CACHE_SHARED", desc.c_str(), (long long) c.window,
+                c.record_prompts ? "on" : "off", c.hysteresis, (long long) c.every, (long long) c.max_async);
         return result;
     }
 

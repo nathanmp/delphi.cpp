@@ -24,6 +24,11 @@ LLAMA_API void llama_context_sched_reserve(struct llama_context * ctx);
 // (e.g. "ROCm1").
 //
 
+// Expert cache in auto mode (LLAMA_MOE_CACHE_MIB unset or "auto"): add one tier per GPU of the model, of its free memory less
+// LLAMA_MOE_CACHE_AUTO_MARGIN_MIB (default 1536). Call once every context of the process (draft, MTP) holds its memory; a
+// no-op after the first call or without an auto cache.
+LLAMA_API void llama_expert_cache_auto(struct llama_context * ctx);
+
 // Add an expert cache tier of up to `bytes` on device `dev`, filled at the next small batch. Returns its id, or -1.
 LLAMA_API int32_t llama_share_add_tier(struct llama_context * ctx, const char * dev, size_t bytes);
 // Drop expert cache tier `id`; returns the device bytes freed.

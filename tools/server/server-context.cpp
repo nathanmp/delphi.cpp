@@ -18,6 +18,7 @@
 #include "speculative.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
+#include "../../src/llama-ext.h" // llama_expert_cache_auto
 
 #include <algorithm>
 #include <cstddef>
@@ -1435,7 +1436,12 @@ private:
         params = params_base;
 
         if (!is_resume) {
-            return init();
+            const bool ok = init();
+            if (ok) {
+                // after the draft or MTP context and the slots hold their memory
+                llama_expert_cache_auto(ctx_tgt);
+            }
+            return ok;
         }
 
         if (callback_state) {

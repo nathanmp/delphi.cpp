@@ -43,6 +43,11 @@ struct llama_expert_cache {
     };
 
     static std::unique_ptr<llama_expert_cache> create(const llama_model & model, const std::vector<ggml_backend_ptr> & backends);
+    // LLAMA_MOE_CACHE_MIB unset or "auto" (and no LLAMA_MOE_CACHE_SHARED): the cache is on when the model allows it, and its
+    // tiers are sized from the free memory of the GPUs at the first decode (llama_context::expert_cache_auto). An unsupported
+    // model then gets no cache instead of an error.
+    static bool auto_requested();
+    bool auto_size = false; // tiers not added yet
     ~llama_expert_cache();
 
     const entry * layer(int il) const;
