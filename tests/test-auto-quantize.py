@@ -10,7 +10,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools/auto-quantize"))
-from config import QuantError, capacity, devices, file_identity, load_config, write_json
+from config import QuantError, capacity, devices, file_identity, imatrix_identities, imatrix_inputs, load_config, normalized, write_json
+from corpus import calibration_text, collect_imatrices, compose_text, imatrix_command, shares
 from model import classify, merge_imatrices, read_model, tensor_bytes
 from search import dominates, make_options, memory, pareto, search
 from quality import LossModel, damage_digest, load_quality, modelled_groups, role_of
@@ -197,6 +198,99 @@ class Files(unittest.TestCase):
             result = GGUFReader(str(output))
             self.assertTrue(all(np.all(t.data == 7) for t in result.tensors))
 
+    def write_tokens(self, path, counts, means, activations=None, dense=None, only=None):
+        """Raw imatrix with a 2-expert tensor (counts per expert, mean x^2 per expert), a dense tensor and optional extras."""
+        writer = GGUFWriter(str(path), "imatrix")
+        writer.add_array("imatrix.datasets", [Path(path).stem])
+        writer.add_uint32("imatrix.chunk_count", int(max(counts)) // 8)
+        writer.add_uint32("imatrix.chunk_size", 8)
+
+        def add(name, n, mean, act=None):
+            n, mean = np.asarray(n, dtype=np.float32), np.asarray(mean, dtype=np.float32)
+            writer.add_tensor(name + ".in_sum2", (n * mean)[:, None] * np.ones((1, 4), dtype=np.float32))
+            writer.add_tensor(name + ".counts", n.reshape(-1, 1))
+            if act is not None:
+                writer.add_tensor(name + ".in_sum", (n * act)[:, None] * np.ones((1, 4), dtype=np.float32))
+        add("blk.0.ffn_up_exps.weight", counts, means)
+        add("blk.0.attn_q.weight", [dense[0]], [dense[1]], None if activations is None else np.float32(activations))
+        if only:
+            add("blk.1.attn_q.weight", [only[0]], [only[1]])
+        writer.write_header_to_file()
+        writer.write_kv_data_to_file()
+        writer.write_tensors_to_file()
+        writer.close()
+
+    def merged(self, path):
+        return {t.name: np.array(t.data, copy=True) for t in GGUFReader(str(path)).tensors}
+
+    def test_weighted_merge_is_the_token_mixture(self):
+        with tempfile.TemporaryDirectory() as d:
+            a, b, output = [Path(d) / name for name in ("a.gguf", "b.gguf", "merged.gguf")]
+            self.write_tokens(a, [100, 50], [2, 4], 0.5, (100, 1), only=(100, 7))
+            self.write_tokens(b, [10, 10], [6, 8], 1.0, (10, 5))
+            merge_imatrices([str(a), str(b)], output, [3, 1])
+            result = self.merged(output)
+            counts = result["blk.0.ffn_up_exps.weight.counts"].reshape(-1)
+            sums = result["blk.0.ffn_up_exps.weight.in_sum2"]
+            # expert 0: both files route all tokens to it; expert 1: file A routes half of its tokens
+            np.testing.assert_allclose(counts, [110, 69])
+            np.testing.assert_allclose(sums / counts[:, None], [[3.0] * 4, [5.6] * 4], rtol=1e-5)
+            dense = result["blk.0.attn_q.weight.counts"].reshape(-1)
+            np.testing.assert_allclose(dense, [110])
+            np.testing.assert_allclose(result["blk.0.attn_q.weight.in_sum2"] / dense[:, None], [[2.0] * 4], rtol=1e-5)
+            np.testing.assert_allclose(result["blk.0.attn_q.weight.in_sum"] / dense[:, None], [[0.625] * 4], rtol=1e-5)
+            # a tensor of one file keeps its mean; the other file does not dilute it
+            only = result["blk.1.attn_q.weight.counts"].reshape(-1)
+            np.testing.assert_allclose(result["blk.1.attn_q.weight.in_sum2"] / only[:, None], [[7.0] * 4], rtol=1e-5)
+            self.assertTrue(all(v.dtype == np.float32 for v in result.values()))
+            self.assertTrue(np.all(counts == np.rint(counts)))
+
+    def test_token_proportional_weights_reproduce_the_plain_merge(self):
+        with tempfile.TemporaryDirectory() as d:
+            a, b, plain, weighted = [Path(d) / name for name in ("a.gguf", "b.gguf", "plain.gguf", "weighted.gguf")]
+            self.write_tokens(a, [100, 50], [2, 4], None, (100, 1))
+            self.write_tokens(b, [10, 10], [6, 8], None, (10, 5))
+            merge_imatrices([str(a), str(b)], plain)
+            merge_imatrices([str(a), str(b)], weighted, [100, 10])
+            left, right = self.merged(plain), self.merged(weighted)
+            self.assertEqual(set(left), set(right))
+            np.testing.assert_allclose(left["blk.0.ffn_up_exps.weight.counts"], right["blk.0.ffn_up_exps.weight.counts"])
+            np.testing.assert_allclose(left["blk.0.ffn_up_exps.weight.in_sum2"], right["blk.0.ffn_up_exps.weight.in_sum2"], rtol=1e-5)
+
+    def test_weighted_entries(self):
+        absolute = lambda p: "/x/" + p
+        paths, weights = imatrix_inputs("code.gguf:50, math.gguf:30,roleplay.gguf:25", absolute)
+        self.assertEqual(paths, ["/x/code.gguf", "/x/math.gguf", "/x/roleplay.gguf"])
+        self.assertAlmostEqual(weights[0], 50 / 105)
+        self.assertAlmostEqual(sum(weights), 1)
+        self.assertEqual(weights, imatrix_inputs(["code.gguf:5", "math.gguf:3", "roleplay.gguf:2.5"], absolute)[1])
+        self.assertEqual(imatrix_inputs(["a.gguf", "b.gguf"], absolute), (["/x/a.gguf", "/x/b.gguf"], None))
+        self.assertEqual(imatrix_inputs([], absolute), ([], None))
+        paths, weights = imatrix_inputs(["C:/m/a.gguf:2", "b.gguf", {"path": "c.gguf", "weight": 1}], absolute)
+        self.assertEqual((paths[0], weights), ("/x/C:/m/a.gguf", normalized([2, 1, 1])))
+        for bad in ("a.gguf:0,b.gguf:1", "a.gguf:-2,b.gguf:1", "a.gguf:1,a.gguf:2", [{"path": "a.gguf", "weight": True}],
+                    [{"path": "a.gguf", "color": 1}], [3], "a.gguf:1e999,b.gguf"):
+            with self.assertRaises(QuantError):
+                imatrix_inputs(bad, absolute)
+
+    def test_weights_enter_the_fingerprint_and_the_config(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d).resolve()
+            for name in ("a.gguf", "b.gguf"):
+                (root / name).write_bytes(name.encode())
+            base = {"schema": "delphi.auto-quantize/1", "model": "/tmp/a.gguf", "devices": "ROCm1:16000,RAM:16000",
+                    "primary_qtypes": ["Q2_K"], "other_qtypes": ["Q6_K"]}
+            parsed = {}
+            for label, entries in (("plain", ["a.gguf", "b.gguf"]), ("weighted", "a.gguf:3,b.gguf:1"), ("other", "a.gguf:1,b.gguf:1")):
+                write_json(root / "c.json", {**base, "imatrix": entries})
+                parsed[label] = load_config(root / "c.json")
+            self.assertIsNone(parsed["plain"]["imatrix_weights"])
+            self.assertEqual(parsed["weighted"]["imatrix_weights"], [.75, .25])
+            self.assertEqual(parsed["plain"]["imatrix"], [str(root / "a.gguf"), str(root / "b.gguf")])
+            self.assertEqual(imatrix_identities(parsed["plain"])[0], file_identity(root / "a.gguf", content=True))
+            self.assertEqual(imatrix_identities(parsed["weighted"])[0]["weight"], .75)
+            self.assertEqual(len({digest(imatrix_identities(c)) for c in parsed.values()}), 3)
+
     def test_output_verification_detects_changed_preserved_data(self):
         with tempfile.TemporaryDirectory() as d:
             paths = [Path(d) / name for name in ("source.gguf", "good.gguf", "bad.gguf")]
@@ -212,6 +306,160 @@ class Files(unittest.TestCase):
             verify_output(model, types, paths[1])
             with self.assertRaises(QuantError):
                 verify_output(model, types, paths[2])
+
+
+class Corpora(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name).resolve()
+        self.paths = {}
+        for name in ("code", "math", "rp"):
+            self.paths[name] = self.root / f"{name}.txt"
+            self.paths[name].write_text("".join(f"{name} line {i:04d}\n" for i in range(400)))
+
+    def corpora(self, weights=(50, 30, 25)):
+        return [{"path": str(self.paths[n]), "weight": w} for n, w in zip(self.paths, normalized(weights))]
+
+    def compose(self, name="out", seed=1, chunks=21, weights=(50, 30, 25)):
+        # 16 tokens of 4 bytes: pieces of 64 bytes, about four lines
+        return compose_text(self.corpora(weights), 16, chunks, seed, 4.0, self.root / name)
+
+    def test_pieces_follow_the_weights_and_the_text_is_deterministic(self):
+        path, record = self.compose()
+        self.assertEqual([s["pieces"] for s in record["corpora"]], [12, 8, 6])
+        self.assertEqual(shares([.5, .3, .2], 10), [5, 3, 2])
+        body = Path(path).read_bytes()
+        self.assertEqual(record["text"]["bytes"], len(body))
+        self.assertTrue(body.endswith(b"\n"))
+        again, same = self.compose("again")
+        self.assertEqual(Path(again).read_bytes(), body)
+        self.assertEqual(same["key"], record["key"])
+        self.assertNotEqual(Path(self.compose("other", seed=2)[0]).read_bytes(), body)
+        # the order interleaves the corpora, so a prefix keeps the proportions
+        names = [line.split()[0] for line in body.decode().splitlines()]
+        runs = [key for key, _ in itertools.groupby(names)]
+        self.assertEqual(runs[:3], ["code", "math", "rp"])
+        half = names[:len(names) // 2]
+        for name, weight in zip(self.paths, normalized((50, 30, 25))):
+            self.assertAlmostEqual(half.count(name) / len(half), weight, delta=.2)
+
+    def test_reuse_and_digest_names(self):
+        path, record = self.compose()
+        stamp = Path(path).stat().st_mtime_ns
+        self.assertEqual(self.compose()[0], path)
+        self.assertEqual(Path(path).stat().st_mtime_ns, stamp)
+        self.assertNotEqual(self.compose(weights=(50, 30, 30))[0], path)
+        self.assertNotEqual(self.compose(chunks=30)[0], path)
+        self.assertEqual(calibration_text({"text": "plain.txt"}, self.root), ("plain.txt", None))
+        c = {"text": self.corpora(), "context": 16, "chunks": 21, "text_seed": 1, "bytes_per_token": 4.0}
+        self.assertEqual(calibration_text(c, self.root / "out")[0], path)
+
+    def test_small_corpus_and_empty_share_fail(self):
+        self.paths["rp"].write_text("rp line 0000\nrp line 0001\n")
+        with self.assertRaisesRegex(QuantError, "too small for its share"):
+            self.compose()
+        self.paths["rp"].write_text("".join(f"rp line {i:04d}\n" for i in range(400)))
+        with self.assertRaisesRegex(QuantError, "receives no piece"):
+            self.compose(chunks=1, weights=(1000, 1000, 1))
+
+    def test_configuration(self):
+        base = {"schema": "delphi.auto-quantize/1", "model": "/tmp/a.gguf", "devices": "ROCm1:16000,RAM:16000",
+                "primary_qtypes": ["Q2_K"], "other_qtypes": ["Q6_K"]}
+        path = self.root / "config.json"
+        for text, expected in (("one.txt", str(self.root / "one.txt")),
+                               ("one.txt:7", str(self.root / "one.txt")),
+                               ("code.txt:50,math.txt:30,rp.txt:25", None),
+                               (["code.txt:5", {"path": "math.txt", "weight": 3, "bytes_per_token": 3.2}, "rp.txt"], None)):
+            write_json(path, {**base, "calibration": {"text": text, "text_seed": 5}})
+            parsed = load_config(path)["calibration"]
+            self.assertEqual(parsed["text_seed"], 5)
+            if expected:
+                self.assertEqual(parsed["text"], expected)
+            else:
+                self.assertEqual([e["path"] for e in parsed["text"]], [str(self.root / f"{n}.txt") for n in ("code", "math", "rp")])
+                self.assertAlmostEqual(sum(e["weight"] for e in parsed["text"]), 1)
+        self.assertEqual(parsed["text"][1]["bytes_per_token"], 3.2)
+        self.assertAlmostEqual(parsed["text"][0]["weight"], 5 / 9)
+        for bad in ({"text": "a.txt:1,a.txt:2"}, {"text": "a.txt:0,b.txt"}, {"text": []}, {"text_seed": -1},
+                    {"bytes_per_token": 0}, {"text": [{"path": "a.txt", "color": 1}, "b.txt"]}):
+            write_json(path, {**base, "calibration": bad})
+            with self.assertRaises(QuantError):
+                load_config(path)
+
+
+class Collect(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name).resolve()
+        (self.root / "bin").mkdir()
+        script = self.root / "bin/llama-imatrix"
+        script.write_text('#!/bin/sh\necho "$@" >> "$FAKE_LOG"\necho "means=$DELPHI_IMATRIX_MEANS" >> "$FAKE_LOG"\n'
+                          'while [ $# -gt 0 ]; do [ "$1" = "-o" ] && out="$2"; shift; done\ncp "$FAKE_IMATRIX" "$out"\n')
+        script.chmod(0o755)
+        writer = GGUFWriter(str(self.root / "model.gguf"), "olmoe")
+        writer.add_tensor("blk.0.attn_norm.weight", np.ones(256, dtype=np.float32))
+        writer.write_header_to_file()
+        writer.write_kv_data_to_file()
+        writer.write_tensors_to_file()
+        writer.close()
+        writer = GGUFWriter(str(self.root / "fake.gguf"), "imatrix")
+        writer.add_array("imatrix.datasets", ["fake"])
+        writer.add_uint32("imatrix.chunk_count", 1)
+        writer.add_uint32("imatrix.chunk_size", 8)
+        for suffix, value in ((".in_sum2", np.ones((1, 4))), (".counts", np.ones((1, 1))), (".in_sum", np.ones((1, 4)))):
+            writer.add_tensor("blk.0.attn_q.weight" + suffix, value.astype(np.float32))
+        writer.write_header_to_file()
+        writer.write_kv_data_to_file()
+        writer.write_tensors_to_file()
+        writer.close()
+        for name in ("code", "math", "rp"):
+            (self.root / f"{name}.txt").write_text(f"{name}\n" * 50)
+        self.log = self.root / "log.txt"
+        self.base = {"schema": "delphi.auto-quantize/1", "model": str(self.root / "model.gguf"), "devices": "ROCm1:16000,RAM:16000",
+                     "bindir": str(self.root / "bin"), "primary_qtypes": ["Q2_K"], "other_qtypes": ["Q6_K"],
+                     "runtime": {"env": {"FAKE_LOG": str(self.log), "FAKE_IMATRIX": str(self.root / "fake.gguf")}}}
+
+    def config(self, **collect):
+        write_json(self.root / "config.json", {**self.base, "imatrix_collect": collect})
+        return load_config(self.root / "config.json")
+
+    def test_one_run_per_corpus_then_reuse(self):
+        cfg = self.config(text="code.txt:50,math.txt:30,rp.txt:25", context=64, chunks=4, threads=3, extra_args=["-b", "256"])
+        output = self.root / "collected"
+        entries = collect_imatrices(cfg, output)
+        log = self.log.read_text().splitlines()
+        self.assertEqual(len(log), 6)
+        for part in (f"-m {self.root / 'model.gguf'}", f"-f {self.root / 'code.txt'}", "-c 64", "-t 3", "--device ROCm1",
+                     "-ngl 999", "-cmoe", "--chunks 4", "--no-ppl", "-b 256"):
+            self.assertIn(part, log[0])
+        self.assertEqual(log[1], "means=1")
+        self.assertEqual([Path(e.rpartition(":")[0]).name for e in entries],
+                         ["00-code.imatrix.gguf", "01-math.imatrix.gguf", "02-rp.imatrix.gguf"])
+        paths, weights = imatrix_inputs(entries, lambda p: p)
+        for weight, expected in zip(weights, normalized((50, 30, 25))):
+            self.assertAlmostEqual(weight, expected, places=8)
+        self.assertTrue(all(Path(path).exists() for path in paths))
+        self.assertEqual(collect_imatrices(cfg, output), entries)
+        self.assertEqual(len(self.log.read_text().splitlines()), 6)
+        (self.root / "code.txt").write_text("changed\n")
+        with self.assertRaises(QuantError):
+            collect_imatrices(cfg, output)
+
+    def test_command_and_configuration(self):
+        c = {"context": 512, "chunks": 0, "threads": 4, "extra_args": []}
+        command = imatrix_command({"bindir": "/b", "model": "/m.gguf", "devices": {"ROCm1": 1}}, c, "/t.txt", "/o.gguf")
+        self.assertEqual(command[0], "/b/llama-imatrix")
+        self.assertNotIn("-cmoe", command)
+        self.assertNotIn("--chunks", command)
+        self.assertEqual(self.config(text="a.txt")["imatrix_collect"]["means"], True)
+        with self.assertRaises(QuantError):
+            collect_imatrices(load_config(self.root / "config.json") | {"imatrix_collect": None}, self.root / "none")
+        for bad in ({}, {"text": "a.txt", "extra_args": ["--device", "CUDA0"]}, {"text": "a.txt", "chunks": -1},
+                    {"text": "a.txt", "means": 1}, {"text": "a.txt", "context": 0}, {"text": "a.txt", "color": 1}):
+            with self.assertRaises(QuantError):
+                self.config(**bad)
 
 
 class Timing(unittest.TestCase):

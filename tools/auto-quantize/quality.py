@@ -162,13 +162,15 @@ class LossModel:
         return {"loss": self.kl_floor * (1 - self.kappa(u) * g), "gain": g, "u": u}
 
 
-def check_files(expected, paths, label):
+def check_files(expected, paths, label, weights=None):
     if len(expected) != len(paths):
         raise QuantError(f"quality table {label} count differs")
-    for record, path in zip(expected, paths):
+    for i, (record, path) in enumerate(zip(expected, paths)):
         actual = file_identity(path, content=True)
         if record.get("bytes") != actual["bytes"] or record.get("sha256") != actual["sha256"]:
             raise QuantError(f"quality table {label} content changed: {path}")
+        if record.get("weight") != (weights[i] if weights else None):
+            raise QuantError(f"quality table {label} weight changed: {path}")
 
 
 def load_quality(info, cfg, prepared):
@@ -180,7 +182,7 @@ def load_quality(info, cfg, prepared):
     if table.get("schema") != SCHEMA or table.get("method") != METHOD or table.get("metric") != METRIC:
         raise QuantError(f"quality table must use {SCHEMA}, {METHOD} and metric {METRIC}; recalibrate older tables")
     check_files(table["source_files"], [f["path"] for f in info["files"]], "source")
-    check_files(table["imatrices"], cfg["imatrix"], "imatrix")
+    check_files(table["imatrices"], cfg["imatrix"], "imatrix", cfg.get("imatrix_weights"))
     if table["damage"] != damage_digest(prepared["damage"]):
         raise QuantError("quality table was fitted to different sampled damage; calibrate with this prepared directory")
     if table["floor"]["choices"] != prepared["baseline"]["choices"]:

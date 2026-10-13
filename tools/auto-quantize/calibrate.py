@@ -29,7 +29,8 @@ from pathlib import Path
 
 import numpy as np
 
-from config import ROOT, QuantError, file_identity, write_json
+from config import ROOT, QuantError, file_identity, imatrix_identities, write_json
+from corpus import calibration_text
 from quality import METHOD, METRIC, SCHEMA, damage_digest, damage_records, modelled_groups, sensitivity
 from timing import gpu
 
@@ -341,22 +342,30 @@ def teacher_logits(cfg, c, output, timeout):
     if c.get("teacher"):
         return Path(c["teacher"])
     teacher = output / "teacher.kld"
+    text = file_identity(c["text"], content=True)
     if teacher.exists():
+        record = output / "teacher.json"
+        recorded = json.loads(record.read_text()).get("text", {}).get("sha256") if record.exists() else None
+        if recorded not in (None, text["sha256"]):
+            raise QuantError(f"teacher logits in {output} come from a different calibration text; use a new output directory")
         return teacher
     partial = output / "teacher.partial.kld"
     command = perplexity_command(cfg, c, cfg["model"], gpu(cfg), partial, base=True)
     print("Computing teacher logits from the source model", flush=True)
     run_direct(command, output / "teacher.tokens.f32", output / "teacher.log", cfg["runtime"]["env"], timeout)
     partial.replace(teacher)
-    write_json(output / "teacher.json", {"command": command})
+    write_json(output / "teacher.json", {"command": command, "text": text})
     return teacher
 
 
-def calibrate(data, cfg, output, encode, verify, timeout=7200):
-    """Measure the probes and write the quality table; encode/verify are the advisor's model writer and checker."""
-    c = cfg["calibration"]
+def calibrate(data, cfg, output, encode, verify, timeout=7200, text_dir=None):
+    """Measure the probes and write the quality table; encode/verify are the advisor's model writer and checker.
+
+    Weighted calibration corpora are composed into one text in text_dir (the prepared directory) first."""
     output = Path(output).resolve()
     output.mkdir(parents=True, exist_ok=True)
+    text, corpora = calibration_text(cfg["calibration"], text_dir or output)
+    c = dict(cfg["calibration"], text=text)
     info = data["model"]
     floor_choices = data["baseline"]["choices"]
     groups = modelled_groups(info, floor_choices)
@@ -433,12 +442,12 @@ def calibrate(data, cfg, output, encode, verify, timeout=7200):
     teacher_identity = file_identity(teacher, content=True)
     table = {"schema": SCHEMA, "method": METHOD, "metric": METRIC,
              "source_files": [file_identity(f["path"], content=True) for f in info["files"]],
-             "imatrices": [file_identity(p, content=True) for p in cfg["imatrix"]],
+             "imatrices": imatrix_identities(cfg),
              "damage": damage_digest(data["damage"]),
              "floor": {"choices": floor_choices, "kl": floors[devices[0]], "kl_by_device": floors,
                        **file_identity(data["baseline"]["path"])},
-             "teacher": {**teacher_identity, "text": file_identity(c["text"], content=True), "chunks": c["chunks"],
-                         "context": c["context"]},
+             "teacher": {**teacher_identity, "text": {**file_identity(c["text"], content=True), **({"corpora": corpora} if corpora else {})},
+                         "chunks": c["chunks"], "context": c["context"]},
              "execution": {"devices": devices, "ram_routed": "RAM" in cfg["devices"] and devices == [gpu(cfg)],
                            "numa": "tensors", "command": perplexity_command(cfg, c, "FLOOR", devices[0], "TEACHER"),
                            "env": env},

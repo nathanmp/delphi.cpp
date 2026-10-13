@@ -49,6 +49,70 @@ def devices(value):
     return result
 
 
+NUMBER = r"[+-]?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?"
+
+
+def weighted_entries(value, name, extra=()):
+    """Entries of PATH, PATH:WEIGHT or {"path", "weight", *extra}, given as a list, one entry or a comma-separated string."""
+    items = [item for item in value.split(",") if item.strip()] if isinstance(value, str) else value
+    if not isinstance(items, list) or any(not isinstance(item, (str, dict)) for item in items):
+        raise QuantError(f"{name} must be a list of PATH, PATH:WEIGHT or objects with path and weight")
+    result = []
+    for item in items:
+        if isinstance(item, dict):
+            if set(item) - {"path", "weight", *extra}:
+                raise QuantError(f"{name} entries accept only {sorted({'path', 'weight', *extra})}")
+            path, weight = item.get("path"), item.get("weight")
+        else:
+            head, colon, tail = item.strip().rpartition(":")
+            numeric = bool(colon and head and re.fullmatch(NUMBER, tail.strip()))
+            path, weight = (head, float(tail)) if numeric else (item.strip(), None)
+        if not isinstance(path, str) or not path:
+            raise QuantError(f"{name} entry needs a path")
+        if weight is not None:
+            number(weight, f"{name} weight of {path}", positive=True)
+        result.append({"path": path, "weight": weight, **{key: item[key] for key in extra if isinstance(item, dict) and key in item}})
+    return result
+
+
+def normalized(weights):
+    """Relative weights scaled to sum 1, rounded so that equivalent spellings give equal values."""
+    total = sum(weights)
+    return [float(f"{weight / total:.12g}") for weight in weights]
+
+
+def corpora(value, absolute, name):
+    """[{"path", "weight", optional "bytes_per_token"}] with normalized weights; a plain path counts 1."""
+    entries = weighted_entries(value, name, extra=("bytes_per_token",))
+    if not entries:
+        raise QuantError(f"{name} must name at least one corpus")
+    for entry in entries:
+        entry["path"] = absolute(entry["path"])
+        if "bytes_per_token" in entry:
+            number(entry["bytes_per_token"], f"{name} bytes_per_token of {entry['path']}", positive=True)
+    if len({entry["path"] for entry in entries}) != len(entries):
+        raise QuantError(f"{name} corpora must be distinct files")
+    weights = normalized([1.0 if entry["weight"] is None else entry["weight"] for entry in entries])
+    return [{**entry, "weight": weight} for entry, weight in zip(entries, weights)]
+
+
+def imatrix_inputs(value, absolute):
+    """(paths, weights) of the imatrix entries. Weights are normalized (plain paths count 1) and None when no entry has one."""
+    entries = weighted_entries(value, "imatrix") if value else []
+    paths = [absolute(entry["path"]) for entry in entries]
+    if all(entry["weight"] is None for entry in entries):
+        return paths, None
+    if len(set(paths)) != len(paths):
+        raise QuantError("weighted imatrix entries must be distinct files")
+    return paths, normalized([1.0 if entry["weight"] is None else entry["weight"] for entry in entries])
+
+
+def imatrix_identities(cfg):
+    """Content identities of the imatrix inputs; weighted inputs add their normalized weight."""
+    weights = cfg.get("imatrix_weights")
+    return [{**file_identity(path, content=True), **({"weight": weights[i]} if weights else {})} for i, path in enumerate(cfg["imatrix"])]
+
+
 def digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
 
@@ -82,7 +146,7 @@ def load_config(path):
     allowed = {"schema", "model", "devices", "reserve", "imatrix", "primary_qtypes", "other_qtypes", "importance",
                "preserve_below_mib", "tie_gate_up", "primary_regex", "pins", "preserve_regex", "allow_requantize",
                "bindir", "runtime", "sampling", "search", "bounds", "cache_mib", "multi_gpu_speedup_percent", "timing", "quality",
-               "calibration"}
+               "calibration", "imatrix_collect"}
     unknown = set(cfg) - allowed
     if unknown:
         raise QuantError(f"unknown configuration keys: {sorted(unknown)}")
@@ -91,7 +155,7 @@ def load_config(path):
         return str((path.parent / p).resolve() if not p.is_absolute() else p.resolve())
     cfg["model"] = absolute(cfg["model"])
     cfg["bindir"] = absolute(cfg.get("bindir", str(ROOT / "build-auto-quantizer/bin")))
-    cfg["imatrix"] = [absolute(p) for p in cfg.get("imatrix", [])]
+    cfg["imatrix"], cfg["imatrix_weights"] = imatrix_inputs(cfg.get("imatrix", []), absolute)
     if "quality" in cfg:
         if not isinstance(cfg["quality"], dict) or set(cfg["quality"]) != {"table"}:
             raise QuantError("quality must contain only a calibrated table path")
@@ -169,6 +233,8 @@ def load_config(path):
     if not isinstance(cfg["search"]["display"], int) or cfg["search"]["display"] <= 0:
         raise QuantError("search.display must be a positive integer")
     cfg["calibration"] = calibration(cfg.get("calibration", {}), absolute, cfg)
+    if "imatrix_collect" in cfg:
+        cfg["imatrix_collect"] = imatrix_collect(cfg["imatrix_collect"], absolute, cfg)
     cfg.setdefault("bounds", {})
     for name, value in cfg["bounds"].items():
         if name not in {"max_damage", "max_loss", "min_decode_t_s", "min_short_t_s", "min_long_t_s"}:
@@ -188,20 +254,24 @@ def load_config(path):
 
 
 def calibration(c, absolute, cfg):
-    """Calibration inputs: text, teacher, probe design and the devices of the probe sessions."""
+    """Calibration inputs: text (a path or weighted corpora), teacher, probe design and the devices of the probe sessions."""
     if not isinstance(c, dict):
         raise QuantError("calibration must be an object")
     defaults = {"text": None, "teacher": None, "chunks": 64, "context": 512, "batch": 0, "threads": None,
-                "probe_qtypes": None, "bands": 10, "recipes": 8, "seed": 1, "devices": None}
+                "probe_qtypes": None, "bands": 10, "recipes": 8, "seed": 1, "devices": None, "text_seed": 1,
+                "bytes_per_token": 4.0}
     if set(c) - set(defaults):
         raise QuantError(f"unknown calibration keys: {sorted(set(c) - set(defaults))}")
     result = {name: c.get(name, default) for name, default in defaults.items()}
-    for name in ("text", "teacher"):
-        if result[name] is not None:
-            result[name] = absolute(result[name])
-    for name in ("chunks", "context", "bands", "recipes", "seed", "batch"):
+    if result["teacher"] is not None:
+        result["teacher"] = absolute(result["teacher"])
+    number(result["bytes_per_token"], "calibration.bytes_per_token", positive=True)
+    if result["text"] is not None:
+        entries = corpora(result["text"], absolute, "calibration.text")
+        result["text"] = entries[0]["path"] if len(entries) == 1 else entries
+    for name in ("chunks", "context", "bands", "recipes", "seed", "text_seed", "batch"):
         value = result[name]
-        if not isinstance(value, int) or isinstance(value, bool) or value < (0 if name in ("seed", "batch") else 1):
+        if not isinstance(value, int) or isinstance(value, bool) or value < (0 if name in ("seed", "text_seed", "batch") else 1):
             raise QuantError(f"calibration.{name} must be a valid integer")
     if result["recipes"] < 2:
         raise QuantError("calibration.recipes counts the two uniform recipes and must be at least 2")
@@ -214,4 +284,30 @@ def calibration(c, absolute, cfg):
         if not isinstance(result["devices"], list) or not result["devices"] or any(
                 not isinstance(d, str) or not re.fullmatch(r"(?:CUDA|ROCm)[0-9]+", d) for d in result["devices"]):
             raise QuantError("calibration.devices must list GPU names")
+    return result
+
+
+def imatrix_collect(c, absolute, cfg):
+    """Settings of the collect-imatrix command: the corpora, one llama-imatrix run each, and the run options."""
+    if not isinstance(c, dict):
+        raise QuantError("imatrix_collect must be an object")
+    defaults = {"text": None, "context": 512, "chunks": 0, "means": True, "threads": None, "extra_args": []}
+    if set(c) - set(defaults):
+        raise QuantError(f"unknown imatrix_collect keys: {sorted(set(c) - set(defaults))}")
+    result = {name: c.get(name, default) for name, default in defaults.items()}
+    if result["text"] is None:
+        raise QuantError("imatrix_collect.text must list the corpora, as PATH or PATH:WEIGHT")
+    result["text"] = corpora(result["text"], absolute, "imatrix_collect.text")
+    result["threads"] = result["threads"] or cfg["runtime"]["threads"]
+    for name in ("context", "chunks", "threads"):
+        value = result[name]
+        if not isinstance(value, int) or isinstance(value, bool) or value < (0 if name == "chunks" else 1):
+            raise QuantError(f"imatrix_collect.{name} must be a valid integer")
+    if not isinstance(result["means"], bool):
+        raise QuantError("imatrix_collect.means must be boolean")
+    protected = {"-m", "--model", "-f", "--file", "-o", "--output", "--output-file", "--output-format", "--in-file", "--device",
+                 "--numa", "-ngl", "--gpu-layers", "-cmoe", "--cpu-moe", "-ncmoe", "--n-cpu-moe", "-c", "--ctx-size", "-t",
+                 "--threads", "--chunks", "--no-ppl", "--ppl"}
+    if not isinstance(result["extra_args"], list) or any(str(arg).split("=", 1)[0] in protected for arg in result["extra_args"]):
+        raise QuantError("imatrix_collect.extra_args must be a list that does not override managed placement or input options")
     return result

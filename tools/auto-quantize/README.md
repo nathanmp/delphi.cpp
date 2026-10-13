@@ -33,7 +33,7 @@ Paths are relative to the configuration file. Capacities in a string use decimal
 
 For MoE, primary tensors are routed experts; for dense models they are ordinary FFN matrices. `primary_regex` can override this classification. Qtype pools accept actual GGML types, not presets such as Q4_K_M. `pins` maps exact tensor names to qtypes; `preserve_regex` adds preservation patterns. A preserved or pinned gate/up partner constrains the whole tied group. The tool verifies the final encoder output against the plan.
 
-Multiple GGUF imatrices merge raw sums/counts. A single legacy matrix is accepted; merging legacy matrices is not implemented. A quantized source requires `allow_requantize: true`, and its pre-existing error is excluded from the source-relative objective.
+Multiple GGUF imatrices merge raw sums/counts: a file weighs in proportion to its tokens, or by an explicit weight (see Weighted calibration). A single legacy matrix is accepted; merging legacy matrices is not implemented. A quantized source requires `allow_requantize: true`, and its pre-existing error is excluded from the source-relative objective.
 
 `sampling` accepts `samples`, `max_samples`, `seed` and `row_stats`. The default estimator reads each selected tensor once for row statistics. Set `row_stats: false` to sample without that pass, with the estimator's documented accuracy limitations.
 
@@ -52,7 +52,7 @@ G = sum_g gain_g(q_g),   u = G / G_full,   KL = KL_floor * (1 - kappa(u) G),   k
 
 R is the sampled local relative error of `llama-quant-damage`, summed over the group members. Qtypes enter only through R. A qtype that the calibration did not probe needs no extra passes: prepare samples its R and the table predicts its KL. kappa describes the measured super-additive composition of upgrades. MTP blocks are the blocks with `blk.N.nextn.*` tensors and the last `nextn_predict_layers` blocks of the GGUF metadata (a warning reports a difference). The KL measurement does not run them, so they take the ceiling: the qtype of the pool with the most bytes, in the floor and in every plan, unless `pins` set them.
 
-Calibrate after prepare. Calibration requires an imatrix: without activation statistics, R is a weight-space error, and it misranks layers inside a band (OLMoE-1B-7B without an imatrix: chi2/dof 8.6).
+Calibrate after prepare. Calibration requires an imatrix: without activation statistics, R is a weight-space error, and it misranks layers inside a band (OLMoE-1B-7B without an imatrix: chi2/dof 8.6). `calibration.text` can also name several corpora with weights (see Weighted calibration).
 
 ```json
 "calibration": {"text": "/data/calibration.txt", "chunks": 64, "context": 512}
@@ -75,10 +75,76 @@ Set `"quality": {"table": "/tmp/autoq-quality/quality.json"}` for plan and valid
 
 Results on Qwen3.6-35B-A3B (floor Q2_K experts, Q8_0 rest), deployment ROCm2 + RAM with CPU experts: calibration took 24.5 minutes (48 passes of 16K scored tokens). On separate text, predicted KL was within 0.98-1.06 of measured KL for five of six witnesses, including qtypes that were not probed (1.14 for one witness). The plan picks had 3.4 % +- 1.5 and 13.1 % +- 2.6 lower measured KL than picks by the summed local error at +2.2 and +4.2 GB of expert budget over the floor. At +9.2 GB both picks were equal within the noise (+3.0 % +- 5.3); both were 18-20 % better than uniform Q4_K. OLMoE-1B-7B with an imatrix fitted all 21 probes within one standard error.
 
+## Weighted calibration
+
+Calibration data can come from several domains with explicit weights. A weight is relative and independent of the size of the source: `code:50,math:30,roleplay:25` gives code 50/105, math 30/105 and roleplay 25/105 of the influence. Weights are normalized to sum 1. A weight is a positive number. An entry is `PATH`, `PATH:WEIGHT` or `{"path": PATH, "weight": WEIGHT}`, in a JSON list or in one comma-separated string. A plain path in a weighted list counts 1. A path that ends in `:` and digits, or contains a comma inside a string, needs the object form. Weighted files must be distinct.
+
+| key | value |
+| --- | --- |
+| `imatrix` | entries of raw GGUF imatrices; weights change the merge |
+| `calibration.text` | one path, or entries of text corpora; objects also accept `bytes_per_token` |
+| `calibration.text_seed` | integer, default 1: selects the pieces of weighted corpora |
+| `calibration.bytes_per_token` | positive number, default 4.0: sizes a piece in bytes |
+| `imatrix_collect` | `text` (entries, required), `context` (512), `chunks` (0 = whole corpus), `means` (true), `threads` (`runtime.threads`), `extra_args` |
+
+### Imatrices
+
+```json
+"imatrix": ["/data/code.imatrix.gguf:50", "/data/math.imatrix.gguf:30", "/data/roleplay.imatrix.gguf:25"]
+```
+
+```sh
+python tools/auto-quantize/auto_quantize.py merge-imatrix --imatrix code.imatrix.gguf:50 math.imatrix.gguf:30 roleplay.imatrix.gguf:25 --output mixed.imatrix.gguf
+```
+
+`prepare` runs the same merge; `merge-imatrix` writes it alone, for example for `llama-quantize --imatrix`. Without any weight the sums and counts are added, as before: each file weighs in proportion to its tokens. To give every file equal influence, write `:1` on each entry. With weights, file k (weight `w_k`, normalized) is scaled by one factor before the addition:
+
+```text
+T_k = largest count of file k (the tokens it saw)      T = sum_k T_k      c_k = w_k * T / T_k
+sums_e = sum_k c_k * sums_k,e      counts_e = sum_k c_k * counts_k,e      (activation sums likewise)
+mean_e = sums_e / counts_e = sum_k w_k (n_k,e / T_k) m_k,e / sum_k w_k (n_k,e / T_k),   m_k,e = sums_k,e / counts_k,e
+```
+
+The merged mean of every tensor (and every expert of a routed tensor) is the mean of a token mixture in which file k supplies the fraction `w_k` of the tokens; an expert that a domain uses rarely gets little of that domain's weight, as in the real mixture. For dense tensors the mean is the weighted mean `sum_k w_k m_k`. The counts are those of `T` tokens (for dense tensors, the total of all inputs, the same size as a plain merge). They are rounded to whole numbers because the quantizer rounds them on load, and the sums are scaled by the same ratio, so no mean changes. `imatrix.datasets` and `imatrix.chunk_count` are combined as in a plain merge. A tensor that is missing from some files is merged from the files that have it; its weights act relative to each other. Activation sums stay only for tensors that every input has them for. Weighted merging needs F32 raw GGUF files.
+
+The weights enter the input fingerprint, the damage cache key and the quality table check. Unweighted lists keep their old fingerprints, so existing prepared directories stay valid. Changing a weight needs a new prepare directory and a new calibration.
+
+### Calibration text
+
+```json
+"calibration": {"text": ["/data/code.txt:50", "/data/math.txt:30", "/data/roleplay.txt:25"], "chunks": 64, "context": 512}
+```
+
+`calibrate` composes one text from the corpora and writes it with a sidecar record to the prepared directory (`calibration-text-<digest>.txt`). The name holds a digest of the corpus contents, the weights and the parameters, so a different mix never overwrites an earlier text. The quality table records the corpora and the text hash.
+
+1. The text holds `ceil(1.2 * chunks)` pieces. The extra 20 % cover tokenization differences, because `llama-perplexity` scores only the first `chunks` windows.
+2. The pieces are divided among the corpora by weight (largest remainder). A corpus that would get no piece is an error.
+3. A piece is a span of about `context` tokens. The tool has no tokenizer, so it is `context * bytes_per_token` bytes, moved to line starts. This is the documented approximation: the token share follows the weights only as far as `bytes_per_token` holds for each corpus (about 4 for English prose, less for code, math and non-Latin text). Set it per corpus with the object form after measuring tokens per byte, for example with `llama-tokenize -m MODEL -f CORPUS --show-count` (bytes divided by tokens). If `llama-perplexity` runs fewer windows than `chunks`, raise it.
+4. The pieces of a corpus are the non-overlapping slots with the smallest `sha256(text_seed:corpus:slot)`, in file order. Nothing is random at run time.
+5. The pieces of all corpora are interleaved by `(k + 0.5) / n` for the k-th of n pieces, so every prefix of the text keeps the proportions.
+6. A corpus with fewer slots than its pieces is an error that names the file, the bytes needed and the bytes available.
+
+Windows and pieces are not aligned exactly, so a window can span two corpora. A single path is used as it is. Teacher logits are tied to the text hash: `calibrate` stops when an output directory holds logits from another text. With `calibration.teacher` set, the logits must come from the composed text.
+
+### Collecting imatrices per corpus
+
+```json
+"imatrix_collect": {"text": ["/data/code.txt:50", "/data/math.txt:30", "/data/roleplay.txt:25"], "context": 512, "chunks": 0}
+```
+
+```sh
+python tools/auto-quantize/auto_quantize.py collect-imatrix --config config.json --output /tmp/autoq-imatrix
+```
+
+This runs `llama-imatrix` once per corpus. It is expensive and runs only on this command, never inside `prepare`. Each run uses the calibration placement: the first GPU, `-cmoe` when `RAM` is a device, `--numa tensors` and `runtime.env`. `means: true` sets `DELPHI_IMATRIX_MEANS=1`, which adds the activation sums. Outputs are `NN-<corpus>.imatrix.gguf` with `imatrix-collect.json`. A finished output is reused when its corpus hash, model, binary and command match; otherwise the command stops. The command prints the `"imatrix"` entries with the weights; paste them into the configuration. The weights do not affect a run, so a new mix needs a new merge, not a new collection. Use text that is different from `calibration.text` for the imatrix. The KL measurement on the text that trained the imatrix favors the quantized models.
+
+Rejected inputs: weights that are zero, negative or not finite; duplicate files in a weighted list; unknown keys in an entry object; a corpus smaller than its share; a share of zero pieces; `extra_args` that set managed options; an output directory with logits from another text; a quality table made for other weights.
+
 ## Workflow
 
 ```sh
 python tools/auto-quantize/auto_quantize.py inspect --config config.json
+python tools/auto-quantize/auto_quantize.py collect-imatrix --config config.json --output /tmp/autoq-imatrix   # optional, slow
 python tools/auto-quantize/auto_quantize.py prepare --config config.json --output /tmp/autoq-prepared
 python tools/auto-quantize/auto_quantize.py calibrate --config config.json --prepared /tmp/autoq-prepared/prepared.json --output /tmp/autoq-quality
 python tools/auto-quantize/auto_quantize.py plan --config config.json --prepared /tmp/autoq-prepared/prepared.json --output /tmp/autoq-frontier
@@ -87,7 +153,7 @@ python tools/auto-quantize/auto_quantize.py encode --frontier /tmp/autoq-frontie
 
 Prepare samples candidate tensors, measures legal operation signatures, creates one minimum-byte baseline with the permitted other-tensor types, and profiles short/long prefill and decode. The profiler owns the benchmark, warmup, repetitions, identity recording and trace artifacts; all three workloads share one loaded `llama-bench` process. Operation calibration has a 600-second cap, adjustable with `--measurement-seconds`. Completed signatures are saved if the cap is reached. The final GGUF is created only by an explicit encode command. Existing output files are refused.
 
-Prepared inputs include source file size/mtime/metadata, imatrix content hashes, binary identities, runtime and sampling settings. A changed input requires a new prepare directory. Preference weights, budgets and speedup factors can be changed for planning when they do not change the measured layout. Timing caches describe their recorded machine state; remeasure after clock, topology or host-load changes. Source identity uses size/mtime/metadata rather than a full weight-payload hash.
+Prepared inputs include source file size/mtime/metadata, imatrix content hashes and weights, binary identities, runtime and sampling settings. A changed input requires a new prepare directory. Preference weights, budgets and speedup factors can be changed for planning when they do not change the measured layout. Timing caches describe their recorded machine state; remeasure after clock, topology or host-load changes. Source identity uses size/mtime/metadata rather than a full weight-payload hash.
 
 The built-in timing prior measures each qtype/shape on CPU and the first GPU. `timing.link_bandwidth_gb_s` optionally supplies effective host-to-device bandwidth; the default 12 GB/s is an unmeasured prior. Fixed handoff latency, uniform routes, interpolated tail batches and a single positive scale per regime are V1 approximations. CPU/GPU compute is measured, not derived from one global qtype coefficient. Matched expert gate/up uses `test-backend-ops --custom ...,pair=1` to include SwiGLU and fusion eligibility.
 
