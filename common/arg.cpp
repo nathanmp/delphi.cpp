@@ -1710,6 +1710,60 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--ctx-checkpoints-eviction"}, "{fifo,variance}",
+        "which context checkpoint a full slot drops to make room for a new one:\n"
+        "- fifo: the oldest one\n"
+        "- variance: the one whose removal leaves the most uniform spacing of the remaining checkpoints\n"
+        "(default: variance)",
+        [](common_params & params, const std::string & value) {
+            if (value == "fifo") {
+                params.ckpt_evict = COMMON_CKPT_EVICT_FIFO;
+            } else if (value == "variance") {
+                params.ckpt_evict = COMMON_CKPT_EVICT_VARIANCE;
+            } else {
+                throw std::invalid_argument("invalid value for --ctx-checkpoints-eviction, expected fifo or variance");
+            }
+        }
+    ).set_env("LLAMA_ARG_CTX_CHECKPOINTS_EVICTION").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--ctx-checkpoints-pin-first"},
+        {"--no-ctx-checkpoints-pin-first"},
+        string_format("a full slot never drops its oldest context checkpoint, usually the end of the system prompt (default: %s)", params.ckpt_pin_first ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.ckpt_pin_first = value;
+        }
+    ).set_env("LLAMA_ARG_CTX_CHECKPOINTS_PIN_FIRST").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--ctx-checkpoints-turn-step"}, "N",
+        string_format("chat requests: make context checkpoints at the ends of messages, at least N tokens apart "
+            "(default: %d, 0 = off)", params.ckpt_turn_step),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("ctx-checkpoints-turn-step must be non-negative");
+            }
+            params.ckpt_turn_step = value;
+        }
+    ).set_env("LLAMA_ARG_CTX_CHECKPOINTS_TURN_STEP").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--ctx-checkpoints-spill-dir"}, "DIR",
+        "write the context checkpoints that a full slot drops to files in DIR, and read them back when a prompt needs one "
+        "(default: off). The files live as long as the server runs. Reads are skipped when they would be slower than "
+        "processing the tokens again",
+        [](common_params & params, const std::string & value) {
+            params.ckpt_spill_dir = value;
+        }
+    ).set_env("LLAMA_ARG_CTX_CHECKPOINTS_SPILL_DIR").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--ctx-checkpoints-spill-max-mib"}, "N",
+        string_format("the most disk space in MiB that the spilled context checkpoints use (default: %d)", params.ckpt_spill_max_mib),
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("ctx-checkpoints-spill-max-mib must be positive");
+            }
+            params.ckpt_spill_max_mib = value;
+        }
+    ).set_env("LLAMA_ARG_CTX_CHECKPOINTS_SPILL_MAX_MIB").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-cram", "--cache-ram"}, "N",
         string_format("set the maximum cache size in MiB (default: %d, -1 - no limit, 0 - disable)"
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)", params.cache_ram_mib),

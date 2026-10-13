@@ -10,6 +10,7 @@
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
+#include "server-turn.h"
 
 
 enum server_task_type {
@@ -93,6 +94,9 @@ struct task_params {
 
     // message spans for checkpointing
     common_chat_msg_spans message_spans;
+
+    // chat message ends for checkpointing, in token order (server-turn.h)
+    std::vector<server_turn_boundary> turn_boundaries;
 
     // Embeddings
     int32_t embd_normalize = 2; // (-1=none, 0=max absolute int16, 1=taxicab, 2=Euclidean/L2, >2=p-norm)

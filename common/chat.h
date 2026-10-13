@@ -264,6 +264,7 @@ struct common_chat_templates_inputs {
     bool                                  add_bos = false;
     bool                                  add_eos = false;
     bool                                  force_pure_content = false;
+    bool                                  render_only = false; // delphi: give the rendered prompt only, no grammar or parser
 };
 
 struct common_chat_params {

@@ -8,6 +8,7 @@
 #include "base64.hpp"
 
 #include "server-common.h"
+#include "server-turn.h"
 
 #include <random>
 #include <sstream>
@@ -1151,7 +1152,8 @@ static void handle_media(
 json oaicompat_chat_params_parse(
     json & body, /* openai api json semantics */
     const server_chat_params & opt,
-    std::vector<raw_buffer> & out_files)
+    std::vector<raw_buffer> & out_files,
+    bool for_task)
 {
     json llama_params;
 
@@ -1382,6 +1384,11 @@ json oaicompat_chat_params_parse(
     }
 
     llama_params["message_delimiters"] = chat_params.message_delimiters.to_json();
+
+    // delphi: where the messages end in the prompt, for checkpoints (media tokens are not in the text)
+    if (for_task && opt.use_jinja && opt.turn_ckpt_step > 0 && out_files.empty()) {
+        server_turn_params(llama_params, opt.tmpls.get(), inputs, chat_params.prompt, opt.turn_ckpt_step);
+    }
 
     // Reasoning budget: pass parameters through to sampling layer
     {
