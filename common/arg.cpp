@@ -1734,6 +1734,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CTX_CHECKPOINTS_PIN_FIRST").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--ctx-checkpoints-turn-step"}, "N",
+        string_format("chat requests: make context checkpoints at the ends of messages, at least N tokens apart "
+            "(default: %d, 0 = off)", params.ckpt_turn_step),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("ctx-checkpoints-turn-step must be non-negative");
+            }
+            params.ckpt_turn_step = value;
+        }
+    ).set_env("LLAMA_ARG_CTX_CHECKPOINTS_TURN_STEP").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-cram", "--cache-ram"}, "N",
         string_format("set the maximum cache size in MiB (default: %d, -1 - no limit, 0 - disable)"
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)", params.cache_ram_mib),

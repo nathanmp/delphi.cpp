@@ -2,6 +2,7 @@
 #include "server-vram.h"
 #include "server-chat.h"
 #include "server-ckpt.h"
+#include "server-turn.h"
 #include "server-common.h"
 #include "server-http.h"
 #include "server-task.h"
@@ -982,6 +983,14 @@ private:
 
     int64_t t_last_load_progress_ms = 0;
 
+    // checkpoints at the ends of chat messages are made only where the slots make checkpoints at all
+    int32_t ckpt_turn_step() const {
+        return params_base.use_jinja && params_base.n_ctx_checkpoints > 0 && (
+                ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
+                n_swa > 0) ? params_base.ckpt_turn_step : 0;
+    }
+
     void destroy() {
         vram.free();
 
@@ -1412,10 +1421,11 @@ private:
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
         if (params_base.n_ctx_checkpoints > 0) {
-            SRV_TRC("context checkpoints enabled, max = %d, min spacing = %d, eviction = %s, pin first = %s\n",
+            SRV_TRC("context checkpoints enabled, max = %d, min spacing = %d, eviction = %s, pin first = %s, chat turn step = %d\n",
                     params_base.n_ctx_checkpoints, params_base.checkpoint_min_step,
                     params_base.ckpt_evict == COMMON_CKPT_EVICT_FIFO ? "fifo" : "variance",
-                    params_base.ckpt_pin_first ? "yes" : "no");
+                    params_base.ckpt_pin_first ? "yes" : "no",
+                    ckpt_turn_step());
         } else {
             SRV_TRC("%s", "context checkpoints disabled\n");
         }
@@ -1556,7 +1566,8 @@ private:
                 /* reasoning_budget      */ params_base.sampling.reasoning_budget_tokens,
                 /* reasoning_budget_msg  */ params_base.sampling.reasoning_budget_message,
                 /* media_path            */ params_base.media_path,
-                /* force_pure_content    */ params_base.force_pure_content_parser
+                /* force_pure_content    */ params_base.force_pure_content_parser,
+                /* turn_ckpt_step        */ ckpt_turn_step()
             };
 
             {
@@ -3658,6 +3669,22 @@ private:
                     const auto & spans = slot.task->params.message_spans;
                     const auto last_user_pos = spans.last_user_message_pos();
 
+                    // The end of a chat message gets a checkpoint, unless one is close. A required end (the system prompt, the last
+                    // turn) only needs to be a new position.
+                    const auto & turns = slot.task->params.turn_boundaries;
+                    const auto turn_wanted = [&](int64_t pos) {
+                        const auto * turn = server_turn_find(turns, pos);
+                        if (!turn) {
+                            return false;
+                        }
+                        const auto & checkpoints = slot.prompt.checkpoints;
+                        if (checkpoints.empty()) {
+                            return true;
+                        }
+                        return turn->required ? pos > checkpoints.back().n_tokens :
+                                                pos >= checkpoints.back().n_tokens + params_base.ckpt_turn_step;
+                    };
+
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
                         // get next token to process
@@ -3694,6 +3721,11 @@ private:
                             }
                         }
 
+                        // break at the end of a chat message, so that the next batch starts there and takes the checkpoint
+                        if (do_checkpoint && turn_wanted(slot.prompt.n_tokens())) {
+                            break;
+                        }
+
                         // process the last few tokens of the prompt separately in order to allow for a checkpoint to be created.
                         // create checkpoints that many tokens before the end of the prompt:
                         //  - 4 + n_ubatch
@@ -3725,6 +3757,7 @@ private:
 
                     const bool is_user_start = spans.is_user_start(n_tokens_start);
                     const bool is_last_user_message = n_tokens_start == last_user_pos;
+                    const bool is_turn_end = turn_wanted(n_tokens_start);
 
                     // entire prompt has been processed
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
@@ -3741,8 +3774,8 @@ private:
                         slot.init_sampler();
                     } else {
                         // skip ordinary mid-prompt checkpoints, unless the batch starts a user
-                        // message or we are near the end of the prompt
-                        if (!is_user_start && !near_prompt_end) {
+                        // message or a chat message end, or we are near the end of the prompt
+                        if (!is_user_start && !is_turn_end && !near_prompt_end) {
                             do_checkpoint = false;
                         }
                     }
@@ -3762,7 +3795,7 @@ private:
                     // no need to create checkpoints that are too close together, unless it's the last user message
                     do_checkpoint = do_checkpoint && (
                             slot.prompt.checkpoints.empty() ||
-                            is_last_user_message || near_prompt_end ||
+                            is_last_user_message || is_turn_end || near_prompt_end ||
                             n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
@@ -4477,6 +4510,14 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         auto delimiters = common_chat_msg_delimiters_parse(delims);
         delimiters.tokenize(ctx_server.vocab);
 
+        // chat message ends for checkpointing (the tokens of a prompt with media are not the tokens of its text)
+        std::vector<server_turn_boundary> turn_bounds;
+        if (inputs.size() == 1 && prompt.is_string() && files.empty() && params.ckpt_turn_step > 0) {
+            turn_bounds = server_turn_boundaries(data, ctx_server.vocab, prompt.get<std::string>(),
+                                                 inputs[0].get_tokens(), params.ckpt_turn_step);
+            SRV_DBG("turn checkpoint boundaries: %zu\n", turn_bounds.size());
+        }
+
         for (size_t i = 0; i < inputs.size(); i++) {
             server_task task = server_task(type);
 
@@ -4490,6 +4531,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     data);
 
             task.params.message_spans = task.tokens.find_message_spans(delimiters);
+            task.params.turn_boundaries = turn_bounds;
 
             task.id_slot = json_value(data, "id_slot", -1);
             sse_ping_interval = task.params.sse_ping_interval;
@@ -5235,7 +5277,8 @@ void server_routes::init_routes() {
         json data = oaicompat_chat_params_parse(
             body,
             meta->chat_params,
-            files);
+            files,
+            /* for_task */ false);
         res->ok({{ "prompt", std::move(data.at("prompt")) }});
         return res;
     };
@@ -5684,7 +5727,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_count_tokens(const l
     json body_parsed = oaicompat_chat_params_parse(
             body,
             meta->chat_params,
-            files);
+            files,
+            /* for_task */ false);
     json prompt = body_parsed.at("prompt");
     // SRV_DBG("prompt = %s\n", prompt.dump().c_str());
 

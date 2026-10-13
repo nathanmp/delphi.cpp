@@ -1302,6 +1302,13 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
         }
     }
 
+    if (inputs.render_only) {
+        // delphi: the server renders prefixes of a message list to find where the messages end (server-turn.cpp)
+        common_chat_params data;
+        data.prompt = common_chat_template_direct_apply_impl(tmpl, params);
+        return data;
+    }
+
     if (inputs.force_pure_content) {
         LOG_WRN("Forcing pure content template, will not render reasoning or tools separately.");
         // Create the result structure

@@ -319,16 +319,19 @@ struct server_chat_params {
     std::string reasoning_budget_message;
     std::string media_path;
     bool force_pure_content = false;
+    int32_t turn_ckpt_step = 0; // delphi: checkpoints at message ends, min spacing in tokens, 0 = off (server-turn.h)
 };
 
 // used by /completions endpoint
 json oaicompat_completion_params_parse(const json & body);
 
 // used by /chat/completions endpoint
+// for_task = false skips what only a task needs (apply-template, count-tokens)
 json oaicompat_chat_params_parse(
     json & body, /* openai api json semantics */
     const server_chat_params & opt,
-    std::vector<raw_buffer> & out_files);
+    std::vector<raw_buffer> & out_files,
+    bool for_task = true);
 
 // TODO: move it to server-task.cpp
 json format_embeddings_response_oaicompat(

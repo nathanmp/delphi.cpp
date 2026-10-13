@@ -2,7 +2,7 @@
 
 A model with sliding-window attention (SWA), recurrent layers, or a hybrid of both cannot drop the tail of its memory the way a plain KV cache can. When a new prompt shares a prefix with the slot's cached prompt but then differs, the server needs a saved copy of that state at (or before) the point where the prompts differ. These copies are the context checkpoints. Each slot keeps up to `--ctx-checkpoints N` of them (default 32), and the server restores the newest one that is usable for the new prompt. Without a usable checkpoint, the server processes the whole prompt again.
 
-This page describes the delphi.cpp options that decide which checkpoints a slot keeps. The upstream options `--ctx-checkpoints` and `--checkpoint-min-step` are unchanged.
+This page describes the delphi.cpp options that decide which checkpoints a slot takes and keeps. The upstream options `--ctx-checkpoints` and `--checkpoint-min-step` are unchanged.
 
 ## Eviction
 
@@ -38,6 +38,24 @@ How the pin works with each policy:
 The pin does not keep a checkpoint that no longer matches the prompt. When a new prompt differs from the cached one before a checkpoint, the server erases that checkpoint, as it always did. A checkpoint that the server replaces at the same position takes the place of the old one in the list, so it stays the oldest.
 
 Cost: one of the `--ctx-checkpoints` places holds the pinned checkpoint. Its memory is the size of one checkpoint.
+
+## Checkpoints at chat message ends
+
+| option | default | effect |
+| --- | --- | --- |
+| `--ctx-checkpoints-turn-step N` | `4096` | A chat request gets checkpoints at the ends of its messages, at least N tokens apart. `0` turns it off. |
+
+Upstream takes checkpoints a few tokens before the end of the prompt, at the start of the last user message, and at the starts of earlier user messages that are `--checkpoint-min-step` apart. The next request of a chat shares its prompt with this one up to where its new messages start, and a client that edits, regenerates or branches shares it up to the message before. The end of each message is therefore where a checkpoint is useful, for any role, and for any template.
+
+Which message ends: the end of the leading system messages, the end of the last assistant message, and up to three more about N tokens apart, the latest first. The last message is not one of them, as its end is the end of the prompt. The first two are required: they are taken even when a checkpoint is already within N tokens, unless it is at the same position. A required end less than N / 4 tokens from the start is skipped, because a checkpoint there saves little (and the oldest checkpoint of a slot is pinned, so it should be worth it).
+
+How the ends are found: the server renders the chat template for the messages up to the message in question, without the generation prompt, and tokenizes the text the way the prompt is tokenized. The end counts only if that text is the start of the prompt text, and those tokens are the first tokens of the prompt tokens. The prompt is processed in batches that stop at these positions, and the checkpoint is taken there. This needs no knowledge of the template, but some templates change an earlier message when a later one is added, for example by dropping the reasoning of earlier assistant turns. The end of such a message does not pass the test and is left out. Upstream's checkpoints at the starts of user messages still apply there, for templates where the server knows the start of a user message.
+
+When it applies: chat endpoints (the Responses and Anthropic endpoints too) with a jinja template, when the model makes checkpoints at all (SWA, recurrent or hybrid models, `--ctx-checkpoints` above 0). Not for requests that carry images or audio, not for `/completion`, and not for prompts shorter than N bytes.
+
+Limit and eviction: these are ordinary checkpoints. They count against `--ctx-checkpoints`, they are dropped by `--ctx-checkpoints-eviction`, the oldest one is the pinned one, and upstream's spacing rule can drop the ones of earlier requests that are close to an earlier checkpoint. Only the spacing rule for taking one differs: a message end needs N tokens, not `--checkpoint-min-step`, from the newest checkpoint.
+
+Why this default: N is half of upstream's spacing, so any message end of a long chat is at most a few thousand tokens of reprocessing away from a checkpoint. A smaller N takes more checkpoints, and each one is a copy of the SWA window or recurrent state on the host. A larger N leaves long turns without one. It is on by default because the cost is bounded: per request at most five template renders and tokenizations of a prefix (in the HTTP thread, together a few times the cost of tokenizing the prompt), at most five extra batch splits, and no work at all for a short prompt or a model without checkpoints. Use `--ctx-checkpoints-turn-step 0` to remove all of it.
 
 ## Interaction with the host prompt cache (`--cache-ram`)
 

@@ -21,6 +21,8 @@ add_library(${TARGET} STATIC
     server-stream.h
     server-tools.cpp
     server-tools.h
+    server-turn.cpp
+    server-turn.h
     server-mcp.cpp
     server-mcp.h
     server-schema.cpp
