@@ -36,6 +36,7 @@
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
+#include "ggml-cuda/mmid-partial.cuh"
 #include "ggml-cuda/mmvq-q8-tc.cuh"
 #include "ggml-cuda/moe-devsort.cuh"
 #include "ggml-cuda/moe-schedule.cuh"
@@ -2442,7 +2443,12 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
     if (ggml_mul_mat_id_is_partial(dst)) {
-        // only the MMQ path skips the out-of-range ids of a partial MUL_MAT_ID (see supports_op)
+        // the MMQ path and, for small batches, the MMVQ path skip the out-of-range ids of a partial MUL_MAT_ID (see supports_op)
+        if (ggml_cuda_mul_mat_id_partial_mmvq(ctx, src0, src1, ids, dst)) {
+            ggml_exec_trace_dispatch(dst->op, GGML_EXEC_TRACE_DISPATCH_GPU_MMVQ,
+                    GGML_EXEC_TRACE_DISPATCH_VARIANT_DEFAULT, cc, (uint32_t) dst->ne[2]);
+            return;
+        }
         ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
         return;
     }
