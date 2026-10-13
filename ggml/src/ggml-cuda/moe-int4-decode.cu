@@ -607,6 +607,7 @@ std::mutex                    moe_int4_pack_mutex; // one packing at a time; a s
 std::mutex                    moe_int4_scratch_mutex;
 std::map<std::pair<const ggml_backend_cuda_context *, int>, moe_int4_scratch_buffers *> moe_int4_scratch_map;
 std::atomic<int>              moe_int4_override{-1};
+std::atomic<bool>             moe_int4_have_g128{false}; // a Q4_G128 tensor is in a device buffer
 std::atomic<bool>             moe_int4_primed[GGML_CUDA_MAX_DEVICES];
 std::atomic<int64_t>          moe_int4_packs{0}, moe_int4_pack_us{0}, moe_int4_runs{0}, moe_int4_scratch_bytes{0}, moe_int4_shadows{0},
                               moe_int4_shadows_wide{0}, moe_int4_prepare_refused{0};
@@ -810,9 +811,15 @@ bool ggml_cuda_moe_int4_enabled() {
     }
     static const bool env = [] {
         const char * v = getenv("GGML_CUDA_MOE_INT4_DECODE");
-        return v != nullptr && atoi(v) != 0;
+        return v == nullptr || atoi(v) != 0;
     }();
-    return env;
+    return env && moe_int4_have_g128.load(std::memory_order_relaxed);
+}
+
+void ggml_cuda_moe_int4_note_tensor(const ggml_tensor * tensor) {
+    if (tensor->type == GGML_TYPE_Q4_G128) {
+        moe_int4_have_g128.store(true, std::memory_order_relaxed);
+    }
 }
 
 bool ggml_cuda_moe_int4_type_supported(int device) {

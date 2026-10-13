@@ -1136,6 +1136,9 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
 #ifdef GGML_HIP_MOE_INT4_AVAILABLE
     ggml_hip_moe_int4_note_tensor(tensor);
 #endif
+#ifdef GGML_CUDA_MOE_INT4_AVAILABLE
+    ggml_cuda_moe_int4_note_tensor(tensor);
+#endif
 
     if (tensor->view_src != NULL) {
         assert(tensor->view_src->buffer->buft == buffer->buft);

@@ -40,7 +40,8 @@
 // (MMVQ, MMQ, dequantization) read ROWMAJOR weights directly, as four Q4_0 groups under one scale. A buffer that is freed or
 // written forgets its packed sets.
 //
-// Selected by GGML_CUDA_MOE_INT4_DECODE=1 (default 0: the weights stay ROWMAJOR and every node takes the ordinary kernels). A region that the matcher of ggml-cuda.cu accepts runs as
+// On by default once a Q4_G128 tensor is in a CUDA buffer; GGML_CUDA_MOE_INT4_DECODE=0 disables it (the weights stay ROWMAJOR
+// and every node takes the ordinary kernels). A region that the matcher of ggml-cuda.cu accepts runs as
 // five kernels on the compute stream (decode) or about nine (prefill): input bridge + routing, W13, clipped SwiGLU, W2 with router weights,
 // slot sum + output bridge. A region that does not fit (other shapes, unaligned activations) takes the shadow path per node.
 // Arithmetic (rounding points follow the reference): F32 -> BF16 input; INT4 -> BF16 weights, one BF16 scale multiply, FP32 MMA
@@ -68,8 +69,14 @@ struct ggml_cuda_moe_int4_ffn {
     float               limit   = 0.0f;    // 0 for ordinary SwiGLU; NVIDIA requires GLM's clamp
 };
 
-// GGML_CUDA_MOE_INT4_DECODE (opt-in), GGML_HIP_MOE_INT4_DECODE (opt-out), or the test mode override.
+// GGML_CUDA_MOE_INT4_DECODE (opt-out), GGML_HIP_MOE_INT4_DECODE (opt-out), or the test mode override. Without an override, false
+// until a Q4_G128 tensor is in a device buffer: other models do not scan their graphs for regions.
 bool ggml_cuda_moe_int4_enabled();
+
+#ifdef GGML_CUDA_MOE_INT4_AVAILABLE
+// Called for each tensor of a device buffer: a Q4_G128 tensor enables the default mode.
+void ggml_cuda_moe_int4_note_tensor(const ggml_tensor * tensor);
+#endif
 
 // Device eligibility for G128 routed weights: NVIDIA (ordinary shadow path) or RDNA4 (direct G128 path).
 bool ggml_cuda_moe_int4_type_supported(int device);
