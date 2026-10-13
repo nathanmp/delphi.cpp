@@ -81,6 +81,21 @@ def normalized(weights):
     return [float(f"{weight / total:.12g}") for weight in weights]
 
 
+def corpora(value, absolute, name):
+    """[{"path", "weight", optional "bytes_per_token"}] with normalized weights; a plain path counts 1."""
+    entries = weighted_entries(value, name, extra=("bytes_per_token",))
+    if not entries:
+        raise QuantError(f"{name} must name at least one corpus")
+    for entry in entries:
+        entry["path"] = absolute(entry["path"])
+        if "bytes_per_token" in entry:
+            number(entry["bytes_per_token"], f"{name} bytes_per_token of {entry['path']}", positive=True)
+    if len({entry["path"] for entry in entries}) != len(entries):
+        raise QuantError(f"{name} corpora must be distinct files")
+    weights = normalized([1.0 if entry["weight"] is None else entry["weight"] for entry in entries])
+    return [{**entry, "weight": weight} for entry, weight in zip(entries, weights)]
+
+
 def imatrix_inputs(value, absolute):
     """(paths, weights) of the imatrix entries. Weights are normalized (plain paths count 1) and None when no entry has one."""
     entries = weighted_entries(value, "imatrix") if value else []
@@ -237,20 +252,24 @@ def load_config(path):
 
 
 def calibration(c, absolute, cfg):
-    """Calibration inputs: text, teacher, probe design and the devices of the probe sessions."""
+    """Calibration inputs: text (a path or weighted corpora), teacher, probe design and the devices of the probe sessions."""
     if not isinstance(c, dict):
         raise QuantError("calibration must be an object")
     defaults = {"text": None, "teacher": None, "chunks": 64, "context": 512, "batch": 0, "threads": None,
-                "probe_qtypes": None, "bands": 10, "recipes": 8, "seed": 1, "devices": None}
+                "probe_qtypes": None, "bands": 10, "recipes": 8, "seed": 1, "devices": None, "text_seed": 1,
+                "bytes_per_token": 4.0}
     if set(c) - set(defaults):
         raise QuantError(f"unknown calibration keys: {sorted(set(c) - set(defaults))}")
     result = {name: c.get(name, default) for name, default in defaults.items()}
-    for name in ("text", "teacher"):
-        if result[name] is not None:
-            result[name] = absolute(result[name])
-    for name in ("chunks", "context", "bands", "recipes", "seed", "batch"):
+    if result["teacher"] is not None:
+        result["teacher"] = absolute(result["teacher"])
+    number(result["bytes_per_token"], "calibration.bytes_per_token", positive=True)
+    if result["text"] is not None:
+        entries = corpora(result["text"], absolute, "calibration.text")
+        result["text"] = entries[0]["path"] if len(entries) == 1 else entries
+    for name in ("chunks", "context", "bands", "recipes", "seed", "text_seed", "batch"):
         value = result[name]
-        if not isinstance(value, int) or isinstance(value, bool) or value < (0 if name in ("seed", "batch") else 1):
+        if not isinstance(value, int) or isinstance(value, bool) or value < (0 if name in ("seed", "text_seed", "batch") else 1):
             raise QuantError(f"calibration.{name} must be a valid integer")
     if result["recipes"] < 2:
         raise QuantError("calibration.recipes counts the two uniform recipes and must be at least 2")

@@ -11,6 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools/auto-quantize"))
 from config import QuantError, capacity, devices, file_identity, imatrix_identities, imatrix_inputs, load_config, normalized, write_json
+from corpus import calibration_text, compose_text, shares
 from model import classify, merge_imatrices, read_model, tensor_bytes
 from search import dominates, make_options, memory, pareto, search
 from quality import LossModel, damage_digest, load_quality, modelled_groups, role_of
@@ -305,6 +306,86 @@ class Files(unittest.TestCase):
             verify_output(model, types, paths[1])
             with self.assertRaises(QuantError):
                 verify_output(model, types, paths[2])
+
+
+class Corpora(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name).resolve()
+        self.paths = {}
+        for name in ("code", "math", "rp"):
+            self.paths[name] = self.root / f"{name}.txt"
+            self.paths[name].write_text("".join(f"{name} line {i:04d}\n" for i in range(400)))
+
+    def corpora(self, weights=(50, 30, 25)):
+        return [{"path": str(self.paths[n]), "weight": w} for n, w in zip(self.paths, normalized(weights))]
+
+    def compose(self, name="out", seed=1, chunks=21, weights=(50, 30, 25)):
+        # 16 tokens of 4 bytes: pieces of 64 bytes, about four lines
+        return compose_text(self.corpora(weights), 16, chunks, seed, 4.0, self.root / name)
+
+    def test_pieces_follow_the_weights_and_the_text_is_deterministic(self):
+        path, record = self.compose()
+        self.assertEqual([s["pieces"] for s in record["corpora"]], [12, 8, 6])
+        self.assertEqual(shares([.5, .3, .2], 10), [5, 3, 2])
+        body = Path(path).read_bytes()
+        self.assertEqual(record["text"]["bytes"], len(body))
+        self.assertTrue(body.endswith(b"\n"))
+        again, same = self.compose("again")
+        self.assertEqual(Path(again).read_bytes(), body)
+        self.assertEqual(same["key"], record["key"])
+        self.assertNotEqual(Path(self.compose("other", seed=2)[0]).read_bytes(), body)
+        # the order interleaves the corpora, so a prefix keeps the proportions
+        names = [line.split()[0] for line in body.decode().splitlines()]
+        runs = [key for key, _ in itertools.groupby(names)]
+        self.assertEqual(runs[:3], ["code", "math", "rp"])
+        half = names[:len(names) // 2]
+        for name, weight in zip(self.paths, normalized((50, 30, 25))):
+            self.assertAlmostEqual(half.count(name) / len(half), weight, delta=.2)
+
+    def test_reuse_and_digest_names(self):
+        path, record = self.compose()
+        stamp = Path(path).stat().st_mtime_ns
+        self.assertEqual(self.compose()[0], path)
+        self.assertEqual(Path(path).stat().st_mtime_ns, stamp)
+        self.assertNotEqual(self.compose(weights=(50, 30, 30))[0], path)
+        self.assertNotEqual(self.compose(chunks=30)[0], path)
+        self.assertEqual(calibration_text({"text": "plain.txt"}, self.root), ("plain.txt", None))
+        c = {"text": self.corpora(), "context": 16, "chunks": 21, "text_seed": 1, "bytes_per_token": 4.0}
+        self.assertEqual(calibration_text(c, self.root / "out")[0], path)
+
+    def test_small_corpus_and_empty_share_fail(self):
+        self.paths["rp"].write_text("rp line 0000\nrp line 0001\n")
+        with self.assertRaisesRegex(QuantError, "too small for its share"):
+            self.compose()
+        self.paths["rp"].write_text("".join(f"rp line {i:04d}\n" for i in range(400)))
+        with self.assertRaisesRegex(QuantError, "receives no piece"):
+            self.compose(chunks=1, weights=(1000, 1000, 1))
+
+    def test_configuration(self):
+        base = {"schema": "delphi.auto-quantize/1", "model": "/tmp/a.gguf", "devices": "ROCm1:16000,RAM:16000",
+                "primary_qtypes": ["Q2_K"], "other_qtypes": ["Q6_K"]}
+        path = self.root / "config.json"
+        for text, expected in (("one.txt", str(self.root / "one.txt")),
+                               ("one.txt:7", str(self.root / "one.txt")),
+                               ("code.txt:50,math.txt:30,rp.txt:25", None),
+                               (["code.txt:5", {"path": "math.txt", "weight": 3, "bytes_per_token": 3.2}, "rp.txt"], None)):
+            write_json(path, {**base, "calibration": {"text": text, "text_seed": 5}})
+            parsed = load_config(path)["calibration"]
+            self.assertEqual(parsed["text_seed"], 5)
+            if expected:
+                self.assertEqual(parsed["text"], expected)
+            else:
+                self.assertEqual([e["path"] for e in parsed["text"]], [str(self.root / f"{n}.txt") for n in ("code", "math", "rp")])
+                self.assertAlmostEqual(sum(e["weight"] for e in parsed["text"]), 1)
+        self.assertEqual(parsed["text"][1]["bytes_per_token"], 3.2)
+        self.assertAlmostEqual(parsed["text"][0]["weight"], 5 / 9)
+        for bad in ({"text": "a.txt:1,a.txt:2"}, {"text": "a.txt:0,b.txt"}, {"text": []}, {"text_seed": -1},
+                    {"bytes_per_token": 0}, {"text": [{"path": "a.txt", "color": 1}, "b.txt"]}):
+            write_json(path, {**base, "calibration": bad})
+            with self.assertRaises(QuantError):
+                load_config(path)
 
 
 class Timing(unittest.TestCase):
