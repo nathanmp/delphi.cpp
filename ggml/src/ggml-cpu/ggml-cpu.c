@@ -3265,6 +3265,16 @@ static void clear_numa_thread_affinity(void) {
     if (!ggml_is_numa()) {
         return;
     }
+    // delphi: with --numa tensors the calling thread keeps its CPU between graphs. Pinning it again for each graph (one CPU
+    // split) costs two syscalls and often a migration. GGML_NUMA_UNPIN_MAIN=1 unpins it after each graph as before
+    static int unpin = -1;
+    if (unpin < 0) {
+        const char * env = getenv("GGML_NUMA_UNPIN_MAIN");
+        unpin = env != NULL && atoi(env) != 0;
+    }
+    if (ggml_numa_is_tensor_mode() && !unpin) {
+        return;
+    }
 
     size_t setsize = CPU_ALLOC_SIZE(g_state.numa.total_cpus);
 
