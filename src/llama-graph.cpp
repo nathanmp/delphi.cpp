@@ -2284,11 +2284,16 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         return build_moe_ffn_split(cur, up_exps, gate_exps, down_exps, selected_experts, weights, n_expert, il);
     }
 
+    // The cache path has the clipped SwiGLU in one form only (ggml_swiglu_clamp, as these architectures use below).
+    const bool  clamp_arch  = arch == LLM_ARCH_MAPLE || arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK41 ||
+            arch == LLM_ARCH_GLM5NEXT || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0) || arch == LLM_ARCH_HY_V4;
+    const float swiglu_lim  = il >= 0 ? hparams.swiglu_clamp_exp[il] : 0.0f;
     if (expert_cache && expert_cache->active() && ubatch.n_tokens <= expert_cache->graph_rows() && expert_cache->layer(il) &&
             type_op == LLM_FFN_SILU && !weight_before_ffn && !gate_up_exps &&
             !up_exps_s && !gate_exps_s && !down_exps_s && !up_exps_b && !gate_exps_b && !down_exps_b &&
-            (loras == nullptr || loras->empty())) {
-        return build_moe_ffn_cache(cur, selected_experts, weights, up_exps, gate_exps, down_exps, il);
+            (loras == nullptr || loras->empty()) && (swiglu_lim <= 1e-6f || clamp_arch)) {
+        return build_moe_ffn_cache(cur, selected_experts, weights, up_exps, gate_exps, down_exps, il,
+                swiglu_lim > 1e-6f ? swiglu_lim : 0.0f);
     }
 
     if (weight_before_ffn) {
@@ -2504,7 +2509,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
 ggml_tensor * llm_graph_context::build_moe_ffn_cache(
         ggml_tensor * cur, ggml_tensor * ids, ggml_tensor * weights,
-        ggml_tensor * up, ggml_tensor * gate, ggml_tensor * down, int il) const {
+        ggml_tensor * up, ggml_tensor * gate, ggml_tensor * down, int il, float limit) const {
     // Tiers on the layer GPU are named ffn_cache_gpu_*, tiers on another GPU ffn_cache_x<tier>_* (graph_get_cb places them).
     auto name = [&](ggml_tensor * t, const char * label, bool cpu) {
         cb(t, (std::string(cpu ? "ffn_cache_cpu_" : "ffn_cache_gpu_") + label).c_str(), il);
@@ -2587,7 +2592,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn_cache(
         auto * g = ggml_mul_mat_id_partial(ctx0, gu, x, route);
         auto * u = ggml_mul_mat_id_partial(ctx0, uu, x, route);
         label(g, "gate"); label(u, "up");
-        auto * a = ggml_swiglu_split(ctx0, g, u);
+        auto * a = limit > 0.0f ? ggml_swiglu_clamp(ctx0, g, u, limit) : ggml_swiglu_split(ctx0, g, u);
         label(a, "swiglu");
         auto * d = ggml_mul_mat_id_partial(ctx0, du, a, route);
         label(d, "down");

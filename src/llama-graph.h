@@ -1204,10 +1204,11 @@ struct llm_graph_context {
              ggml_tensor * down_exps_s = nullptr,
              ggml_tensor * selected_experts_in = nullptr) const;
 
-    // routed experts split between two devices (LLAMA_MOE_SPLIT), see build_moe_ffn
+    // routed experts with hot experts in the GPU expert cache (LLAMA_MOE_CACHE_MIB), see build_moe_ffn;
+    // limit > 0: clipped SwiGLU (ggml_swiglu_clamp)
     ggml_tensor * build_moe_ffn_cache(
             ggml_tensor * cur, ggml_tensor * selected_experts, ggml_tensor * weights,
-            ggml_tensor * up, ggml_tensor * gate, ggml_tensor * down, int il) const;
+            ggml_tensor * up, ggml_tensor * gate, ggml_tensor * down, int il, float limit) const;
 
     ggml_tensor * build_moe_ffn_split(
              ggml_tensor * cur,
