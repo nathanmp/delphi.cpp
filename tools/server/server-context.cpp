@@ -1,6 +1,7 @@
 #include "server-context.h"
 #include "server-vram.h"
 #include "server-chat.h"
+#include "server-ckpt.h"
 #include "server-common.h"
 #include "server-http.h"
 #include "server-task.h"
@@ -2375,6 +2376,21 @@ private:
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
+        const int64_t n_tokens_new = slot.prompt.n_tokens() - n_tokens_cur;
+
+        // replace an existing checkpoint at the same n_tokens instead of appending a duplicate
+        // note: this comes first, because it can make room for the new checkpoint
+        for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
+            if (it->n_tokens == n_tokens_new) {
+                SLT_TRC(slot, "superseding context checkpoint at n_tokens = %" PRId64 "\n", it->n_tokens);
+                if (it->id_task == id_task) {
+                    ckpt_async_sync();
+                }
+                it = slot.prompt.checkpoints.erase(it);
+            } else {
+                ++it;
+            }
+        }
 
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
@@ -2397,32 +2413,16 @@ private:
 
         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
             // make room for the new checkpoint, if needed
-            const auto & cur = slot.prompt.checkpoints.front();
+            const auto victim = server_ckpt_pick_victim(slot.prompt.checkpoints, n_tokens_new, params_base.ckpt_evict);
 
-            if (cur.id_task == id_task) {
+            if (victim->id_task == id_task) {
                 ckpt_async_sync();
             }
 
             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                    cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+                    victim->pos_min, victim->pos_max, victim->n_tokens, (float) victim->size() / 1024 / 1024);
 
-            slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
-        }
-
-        // replace an existing checkpoint at the same n_tokens instead of appending a duplicate
-        {
-            const int64_t n_tokens_new = slot.prompt.n_tokens() - n_tokens_cur;
-            for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
-                if (it->n_tokens == n_tokens_new) {
-                    SLT_TRC(slot, "superseding context checkpoint at n_tokens = %" PRId64 "\n", it->n_tokens);
-                    if (it->id_task == id_task) {
-                        ckpt_async_sync();
-                    }
-                    it = slot.prompt.checkpoints.erase(it);
-                } else {
-                    ++it;
-                }
-            }
+            slot.prompt.checkpoints.erase(victim);
         }
 
         auto & cur = slot.prompt.checkpoints.emplace_back();
@@ -2432,7 +2432,7 @@ private:
         // [TAG_CHECKPOINTS_FIX_POS_MIN]
         // TODO: here we incorrectly deterimne that the saved checkpoint data covers the [pos_min, pos_max] range
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
-        cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
+        cur.update_pos(n_tokens_new, pos_min, pos_max);
 
         const llama_state_seq_flags flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | (ckpt_async ? LLAMA_STATE_SEQ_FLAGS_ASYNC : 0);
         cur.update_tgt(ctx_tgt, slot.id, flags);

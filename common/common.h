@@ -141,6 +141,12 @@ enum common_conversation_mode {
     COMMON_CONVERSATION_MODE_AUTO     = 2,
 };
 
+// which context checkpoint a full slot drops to make room for a new one
+enum common_ckpt_evict {
+    COMMON_CKPT_EVICT_FIFO,     // the oldest one
+    COMMON_CKPT_EVICT_VARIANCE, // the one whose removal leaves the most uniform spacing
+};
+
 enum common_grammar_trigger_type {
     COMMON_GRAMMAR_TRIGGER_TYPE_TOKEN,
     COMMON_GRAMMAR_TRIGGER_TYPE_WORD,
@@ -651,6 +657,7 @@ struct common_params {
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
+    common_ckpt_evict ckpt_evict = COMMON_CKPT_EVICT_VARIANCE; // which context checkpoint a full slot drops
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
 
     std::string hostname      = "127.0.0.1";
