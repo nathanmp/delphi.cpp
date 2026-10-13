@@ -124,6 +124,11 @@ struct common_params_context {
 // if one argument has invalid value, it will automatically display usage of the specific argument (and not the full usage message)
 bool common_params_parse(int argc, char ** argv, common_params & params, llama_example ex, void(*print_usage)(int, char **) = nullptr);
 
+// apply speculative decoding arguments (CLI form, e.g. {"--spec-draft-n-max", "5"}) to params; only the options that
+// configure common_speculative_init() are accepted; the first --spec-type replaces the types
+// throws std::invalid_argument
+void common_params_apply_spec_args(common_params & params, llama_example ex, const std::vector<std::string> & args);
+
 // load all backends and print the list of available (non-CPU) devices to stdout
 void common_print_available_devices();
 

@@ -190,6 +190,12 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_COUNT          // number of types, unknown type
 };
 
+// controller of the adaptive draft depth (--spec-draft-adaptive-mode)
+enum common_speculative_adaptive_mode {
+    COMMON_SPECULATIVE_ADAPTIVE_BUCKET, // acceptance credit bucket (speculative-adaptive.h)
+    COMMON_SPECULATIVE_ADAPTIVE_COST,   // expected tokens per second from the acceptance and the round time (speculative-cost.h)
+};
+
 // Grammar type enumeration
 enum common_grammar_type {
     COMMON_GRAMMAR_TYPE_NONE,           // no grammar set
@@ -335,8 +341,9 @@ struct common_params_speculative_draft {
 
     // adaptive draft depth (--spec-draft-adaptive): the depth moves within [n_min_adaptive, n_max] with the acceptance
     bool    adaptive       = false;
-    int32_t n_min_adaptive = 3; // floor of the adaptive depth
-    int32_t n_start        = 0; // adaptive depth at the start of a generation (0: n_max - 3, bounded by the floor)
+    enum common_speculative_adaptive_mode adaptive_mode = COMMON_SPECULATIVE_ADAPTIVE_BUCKET;
+    int32_t n_min_adaptive = 0; // floor of the adaptive depth (0: 3 for the bucket, 1 for the cost mode)
+    int32_t n_start        = 0; // adaptive depth at the start of a generation (0: bucket n_max - 3, cost 3; bounded by the floor)
 
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)

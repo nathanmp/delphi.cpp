@@ -1245,6 +1245,23 @@ To know the `id` of the adapter, use GET `/lora-adapters`
 ]
 ```
 
+### GET `/speculative`: Speculative decoding state
+
+Returns the active speculative configuration and, for each implementation, its draft and acceptance counts, the accepted tokens per verified draft by position, the current adaptive depth per slot and, in the cost mode (`--spec-draft-adaptive-mode cost`), its cost table: the calibrated verify time by batch rows, the round time by draft length, the draft time per token, the measured cost of a change of depth (`t_switch_ms`) and the acceptance rate by position. `n_graph_built` counts the compute graphs that the target and draft contexts built instead of reusing one.
+
+### POST `/speculative`: Change speculative decoding without reloading
+
+Rebuilds the speculative state from the launch configuration plus the given arguments. The models, the contexts and the draft context stay loaded. The request waits until every slot is idle; the cached prompts of the slots and the prompt cache are dropped (their draft state belongs to the old configuration).
+
+```json
+{"args": ["--spec-type", "draft-mtp,ngram-mod", "--spec-draft-n-max", "6", "--spec-draft-adaptive-mode", "cost"], "calibrate": false}
+```
+
+- `args`: command-line arguments in the form of the launch command. Accepted: `--spec-type` (replaces the types), the draft length and probability options (`--spec-draft-n-max`, `--spec-draft-n-min`, `--spec-draft-p-min`, `--spec-draft-p-split`), the adaptive options (`--spec-draft-adaptive`, `--no-spec-draft-adaptive`, `--spec-draft-adaptive-mode`, `--spec-draft-n-min-adaptive`, `--spec-draft-n-start`), every `--spec-ngram-*` option and the synthetic acceptance options. An empty list restores the launch configuration.
+- `calibrate`: measure the verify time by batch rows again (the cost mode measures it once).
+
+The largest draft cannot exceed that of the launch, which sized the output buffers, and a draft-model type needs the draft model of the launch. The response is that of GET `/speculative`.
+
 ## OpenAI-compatible API Endpoints
 
 ### GET `/v1/models`: OpenAI-compatible Model Info API

@@ -2241,6 +2241,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     } else {
         gf_res_prev_active = nullptr;
         res->reset();
+        n_graph_built++;
 
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
@@ -5686,6 +5687,10 @@ const float * llama_feature_handoff_nextn(llama_context * ctx, int32_t ticket) {
 
 const float * llama_feature_handoff_layer_inp(llama_context * ctx, int32_t ticket, uint32_t lid) {
     return ctx->feature_handoff_layer_inp(ticket, lid);
+}
+
+uint64_t llama_graph_n_built(const llama_context * ctx) {
+    return ctx->n_graph_built;
 }
 
 void llama_feature_handoff_release(llama_context * ctx, int32_t ticket) {

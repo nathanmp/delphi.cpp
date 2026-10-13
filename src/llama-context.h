@@ -533,6 +533,8 @@ public:
 
     std::vector<state_async_copy> state_async_pending;
 
+    uint64_t n_graph_built = 0; // number of graphs built (not reused); never reset
+
 private:
     std::vector<ggml_backend_buffer_ptr> state_async_bufs;
     std::vector<bool>                    state_async_busy;

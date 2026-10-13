@@ -117,8 +117,10 @@ bool common_speculative_process_async(common_speculative * spec, const llama_bat
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);
 
-// informs the speculative context that n_accepted tokens were accepted by the target model
-void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
+// informs the speculative context that n_accepted tokens were accepted by the target model; id_next is the target's
+// token after the accepted ones (the cost-aware depth compares it with its unverified shadow token)
+void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted,
+                               llama_token id_next = LLAMA_TOKEN_NULL);
 
 // report a partial acceptance that the context could not apply (the server restores a checkpoint and replays the
 // accepted tokens; the replay round's accept is not counted by the adaptive draft depth)
@@ -132,6 +134,43 @@ void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id
 
 // print statistics about the speculative decoding
 void common_speculative_print_stats(const common_speculative * spec);
+
+// cost-aware draft depth (--spec-draft-adaptive-mode cost): the widest verify batch it needs (0: not in use)
+int32_t common_speculative_cost_width(const common_speculative * spec);
+
+// measure the target's verify time of batches of 1..n_width rows (seconds, index = rows; [0] unused); the sequence
+// must be unused and is cleared after each batch
+std::vector<double> common_speculative_calibrate(llama_context * ctx_tgt, llama_seq_id seq_id, int32_t n_width);
+
+// hand the calibrated verify times to the cost-aware implementations
+void common_speculative_set_verify_times(common_speculative * spec, const std::vector<double> & t_verify);
+
+// statistics and adaptive state of one implementation
+struct common_speculative_impl_info {
+    std::string type;
+    int32_t     n_max          = 0;
+    std::string adaptive;          // "", "bucket" or "cost"
+    int32_t     n_min_adaptive = 0;
+
+    size_t n_gen_drafts = 0;
+    size_t n_acc_drafts = 0;
+    size_t n_gen_tokens = 0;
+    size_t n_acc_tokens = 0;
+    size_t n_call_accept = 0;
+    std::vector<double> acc_rate_per_pos; // accepted tokens per verified draft, per position
+
+    std::vector<int32_t> depth;           // [n_seq] current adaptive depth
+
+    // cost mode
+    std::vector<double> t_verify_ms;      // [rows] calibrated verify time
+    std::vector<double> t_round_ms;       // [n] round time estimate per draft length
+    std::vector<double> n_round;          // [n] live samples per draft length
+    double              t_step_ms = 0.0;  // draft time per token
+    double              t_switch_ms = 0.0; // extra time of a change of depth
+    std::vector<double> accept_rate;      // [k - 1] conditional acceptance over all requests
+};
+
+std::vector<common_speculative_impl_info> common_speculative_get_info(const common_speculative * spec);
 
 struct common_speculative_deleter {
     void operator()(common_speculative * s) { common_speculative_free(s); }

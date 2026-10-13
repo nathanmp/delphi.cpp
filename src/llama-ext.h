@@ -156,6 +156,10 @@ LLAMA_API const float * llama_feature_handoff_nextn(struct llama_context * ctx, 
 LLAMA_API const float * llama_feature_handoff_layer_inp(struct llama_context * ctx, int32_t ticket, uint32_t lid);
 LLAMA_API void          llama_feature_handoff_release(struct llama_context * ctx, int32_t ticket);
 
+// number of compute graphs the context has built instead of reusing one (a build costs its construction, allocation
+// and device graph capture; the cost-aware draft depth drops rounds with builds from its round times)
+LLAMA_API uint64_t      llama_graph_n_built(const struct llama_context * ctx);
+
 // Select which appended NextN block the DECODER_MTP graph runs (offset past
 // the trunk: il = n_layer() + offset). Used by the speculative NextN driver to
 // chain multiple trained NextN heads. Default 0 (first head).

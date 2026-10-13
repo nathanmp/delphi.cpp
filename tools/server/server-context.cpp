@@ -11,6 +11,7 @@
 #include "server-schema.h"
 #include "server-stream.h"
 
+#include "arg.h"
 #include "build-info.h"
 #include "common.h"
 #include "fit.h"
@@ -948,6 +949,12 @@ private:
 
     common_speculative_init_result_ptr spec_init;
 
+    // POST /speculative: the launch configuration, its draft limit (the output buffers are sized for it) and the
+    // calibrated verify times of the cost-aware draft depth
+    common_params_speculative spec_params_launch;
+    int32_t                   spec_n_max_launch = 0;
+    std::vector<double>       spec_t_verify;
+
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
 
@@ -1362,6 +1369,10 @@ private:
             SRV_ERR("%s", "synthetic acceptance requires an initialized speculative decoding context\n");
             return false;
         }
+
+        spec_params_launch = params_base.speculative;
+        spec_n_max_launch  = common_speculative_n_max(&params_base.speculative);
+        spec_calibrate();
 
         for (int i = 0; i < params_base.n_parallel; i++) {
             server_slot & slot = slots[i];
@@ -2967,9 +2978,168 @@ private:
                     res->id = task.id;
                     queue_results.send(std::move(res));
                 } break;
+            case SERVER_TASK_TYPE_GET_SPEC:
+                {
+                    auto res = std::make_unique<server_task_result_spec>();
+                    res->id   = task.id;
+                    res->data = spec_to_json();
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_SET_SPEC:
+                {
+                    const bool busy = std::any_of(slots.begin(), slots.end(), [](const server_slot & slot) {
+                        return slot.is_processing();
+                    });
+                    if (busy) {
+                        // the speculative state is shared by the slots: wait until all of them are idle
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
+                    std::string err;
+                    if (!spec_reconfigure(task.spec_args, task.spec_calibrate, err)) {
+                        send_error(task, err, ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    auto res = std::make_unique<server_task_result_spec>();
+                    res->id   = task.id;
+                    res->data = spec_to_json();
+                    queue_results.send(std::move(res));
+                } break;
         }
 
         return true;
+    }
+
+    // measure the verify time by rows for the cost-aware draft depth; the slots must be idle
+    void spec_calibrate(bool force = false) {
+        const int32_t n_width = common_speculative_cost_width(spec.get());
+        if (n_width <= 0) {
+            return;
+        }
+        if (force || (int32_t) spec_t_verify.size() <= n_width) {
+            std::vector<double> t = common_speculative_calibrate(ctx_tgt, slots.empty() ? 0 : slots[0].id,
+                                                                 std::min(n_width, std::max(1, spec_n_max_launch + 1)));
+            if (!t.empty()) {
+                spec_t_verify = std::move(t);
+            }
+        }
+        common_speculative_set_verify_times(spec.get(), spec_t_verify);
+    }
+
+    // replace the speculative state with the launch configuration plus args; the models, the contexts and the draft
+    // context stay; the slots must be idle (their cached prompts are dropped: the draft state of a prompt belongs to
+    // the old configuration)
+    bool spec_reconfigure(const std::vector<std::string> & args, bool calibrate, std::string & err) {
+        if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+            err = "speculative decoding is not supported by this context";
+            return false;
+        }
+
+        common_params params = params_base;
+        params.speculative = spec_params_launch;
+        try {
+            common_params_apply_spec_args(params, LLAMA_EXAMPLE_SERVER, args);
+        } catch (const std::exception & e) {
+            err = e.what();
+            return false;
+        }
+
+        auto & sp = params.speculative;
+        const bool draft_type = std::any_of(sp.types.begin(), sp.types.end(), [](common_speculative_type t) {
+            return t == COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 ||
+                   t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP    || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH ||
+                   t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+        });
+        if (draft_type && ctx_dft == nullptr) {
+            err = "a draft-model type needs the draft context of the launch (start the server with it)";
+            return false;
+        }
+        const int32_t n_max = common_speculative_n_max(&sp);
+        if (n_max > spec_n_max_launch) {
+            err = string_format("the largest draft (%d) exceeds that of the launch (%d), which sized the output buffers",
+                                n_max, spec_n_max_launch);
+            return false;
+        }
+        sp.draft.ctx_tgt = ctx_tgt;
+        sp.draft.ctx_dft = ctx_dft;
+
+        for (auto & slot : slots) {
+            slot.prompt_clear();
+            slot.spec_ckpt.clear();
+            slot.n_accepted_per_pos.clear();
+        }
+        if (prompt_cache) {
+            prompt_cache->states.clear();
+        }
+
+        // the old state goes first: both would register the same draft context for the asynchronous ingest
+        // (init enables the target's feature hand-off again when the new state ingests asynchronously)
+        spec.reset();
+        llama_set_feature_handoff(ctx_tgt, false);
+        try {
+            spec.reset(common_speculative_init(sp, params_base.n_parallel));
+        } catch (const std::exception & e) {
+            err = e.what();
+        }
+        if (!err.empty()) {
+            spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
+        } else {
+            params_base.speculative = sp;
+        }
+        for (auto & slot : slots) {
+            slot.spec = spec.get();
+        }
+        if (!err.empty()) {
+            return false;
+        }
+
+        spec_calibrate(calibrate);
+
+        SRV_INF("speculative decoding reconfigured: types = %s, n_max = %d, adaptive = %s\n",
+                common_speculative_type_name_str(sp.types).c_str(), n_max,
+                !sp.draft.adaptive ? "off" : sp.draft.adaptive_mode == COMMON_SPECULATIVE_ADAPTIVE_COST ? "cost" : "bucket");
+        return true;
+    }
+
+    json spec_to_json() const {
+        const auto & sp = params_base.speculative;
+        json impls = json::array();
+        for (const auto & info : common_speculative_get_info(spec.get())) {
+            json j = {
+                {"type",             info.type},
+                {"n_max",            info.n_max},
+                {"adaptive",         info.adaptive},
+                {"n_min_adaptive",   info.n_min_adaptive},
+                {"n_gen_drafts",     info.n_gen_drafts},
+                {"n_acc_drafts",     info.n_acc_drafts},
+                {"n_gen_tokens",     info.n_gen_tokens},
+                {"n_acc_tokens",     info.n_acc_tokens},
+                {"n_verify",         info.n_call_accept},
+                {"acc_rate_per_pos", info.acc_rate_per_pos},
+                {"depth",            info.depth},
+            };
+            if (info.adaptive == "cost") {
+                j["cost"] = {
+                    {"t_verify_ms", info.t_verify_ms},
+                    {"t_round_ms",  info.t_round_ms},
+                    {"n_round",     info.n_round},
+                    {"t_step_ms",   info.t_step_ms},
+                    {"t_switch_ms", info.t_switch_ms},
+                    {"accept_rate", info.accept_rate},
+                };
+            }
+            impls.push_back(std::move(j));
+        }
+        return json {
+            {"types",         common_speculative_type_name_str(sp.types)},
+            {"n_max",         common_speculative_n_max(&sp)},
+            {"n_max_launch",  spec_n_max_launch},
+            {"adaptive",      !sp.draft.adaptive ? "off" : sp.draft.adaptive_mode == COMMON_SPECULATIVE_ADAPTIVE_COST ? "cost" : "bucket"},
+            {"p_min",         sp.draft.p_min},
+            {"draft_context", ctx_dft != nullptr},
+            {"n_graph_built", {{"target", ctx_tgt ? llama_graph_n_built(ctx_tgt) : 0}, {"draft", ctx_dft ? llama_graph_n_built(ctx_dft) : 0}}},
+            {"impls",         impls},
+        };
     }
 
     void iterate(std::vector<server_slot> & slots, std::function<void(server_slot &)> callback) {
@@ -4281,7 +4451,7 @@ private:
                     SLT_INF(slot, "accepted %2zu/%2zu draft tokens\n", accepted.size() - 1, n_draft);
                 }
 
-                common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
+                common_speculative_accept(spec.get(), slot.id, accepted.size() - 1, accepted.back());
 
                 common_spec_ledger_span(COMMON_SPEC_LEDGER_ACCEPT, t_accept, (uint32_t) n_draft, (uint32_t) (accepted.size() - 1));
                 if (common_spec_ledger_on()) {
@@ -5592,6 +5762,62 @@ void server_routes::init_routes() {
         }
 
         GGML_ASSERT(dynamic_cast<server_task_result_get_lora*>(result.get()) != nullptr);
+        res->ok(result->to_json());
+        return res;
+    };
+
+    this->get_speculative = [this](const server_http_req & req) {
+        auto res = create_response();
+        auto & rd = res->rd;
+        {
+            server_task task(SERVER_TASK_TYPE_GET_SPEC);
+            task.id = rd.get_new_id();
+            rd.post_task(std::move(task));
+        }
+        auto result = rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+        res->ok(result->to_json());
+        return res;
+    };
+
+    // body: {"args": ["--spec-draft-n-max", "5", ...], "calibrate": false}; the args apply over the launch
+    // configuration (an empty list restores it); waits until every slot is idle
+    this->post_speculative = [this](const server_http_req & req) {
+        auto res = create_response();
+        const json body = json::parse(req.body);
+        if (!body.is_object()) {
+            res->error(format_error_response("Request body must be an object", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        std::vector<std::string> args;
+        for (const auto & a : body.value("args", json::array())) {
+            args.push_back(a.is_string() ? a.get<std::string>() : a.dump());
+        }
+
+        auto & rd = res->rd;
+        {
+            server_task task(SERVER_TASK_TYPE_SET_SPEC);
+            task.id             = rd.get_new_id();
+            task.spec_args      = std::move(args);
+            task.spec_calibrate = body.value("calibrate", false);
+            rd.post_task(std::move(task));
+        }
+        auto result = rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
         res->ok(result->to_json());
         return res;
     };
