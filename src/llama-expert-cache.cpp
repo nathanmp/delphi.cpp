@@ -473,7 +473,10 @@ std::unique_ptr<llama_expert_cache> llama_expert_cache::create(
             reuse = v;
         }
         const char * max_env = getenv("LLAMA_MOE_PREFILL_MAX_ROWS");
+        const char * min_env = getenv("LLAMA_MOE_PREFILL_MIN_ROWS");
+        c.prefill_min_rows = std::max<int64_t>(max_rows + 1, min_env ? atoll(min_env) : 512);
         c.prefill_max_rows = std::max<int64_t>(max_rows, max_env ? atoll(max_env) : 2047);
+        if (c.prefill_min_rows > c.prefill_max_rows) { throw std::runtime_error("moe-prefill minimum rows exceeds maximum rows"); }
         c.init_prefill(reuse, gpu_only);
     }
 

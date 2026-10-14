@@ -27,7 +27,7 @@ struct llama_expert_cache {
     // Most rows of a batch that runs the cache graph. LLAMA_MOE_CACHE_PROMPT_ROWS raises it above max_rows, so that prompt
     // batches the CPU runs (below GGML_SCHED_STAGE_MIN_TOKENS) also run their hot experts on the GPU beside the CPU part.
     int64_t graph_rows() const { return std::max({max_rows, prompt_rows, prefill_max_rows}); }
-    bool prefill_enabled(int64_t rows) const { return rows > max_rows && rows <= prefill_max_rows; }
+    bool prefill_enabled(int64_t rows) const { return rows >= prefill_min_rows && rows <= prefill_max_rows; }
     bool prefill_staging(int64_t rows, int il) const;
     ggml_tensor * prefill_bank(int il, int p) const;
     ggml_tensor * prefill_route(int il) const;
@@ -141,6 +141,7 @@ private:
 
     struct prefill_share;
     std::unique_ptr<prefill_share> prefill;
+    int64_t prefill_min_rows = 512; // LLAMA_MOE_PREFILL_MIN_ROWS
     int64_t prefill_max_rows = 0; // LLAMA_MOE_PREFILL_SHARE, LLAMA_MOE_PREFILL_MAX_ROWS
     void init_prefill(uint32_t min_reuse, bool gpu_only);
 
