@@ -31,8 +31,10 @@ struct llama_expert_cache {
     bool prefill_staging(int64_t rows, int il) const;
     ggml_tensor * prefill_bank(int il, int p) const;
     ggml_tensor * prefill_route(int il) const;
-    // The plan starts selected uploads. The second CPU op publishes IDs after the upload records have been issued.
+    // The plan starts selected uploads. The second CPU op waits, or preserves a split boundary for the submission worker.
     ggml_tensor * build_prefill_ready(ggml_context * ctx, ggml_tensor * plan, int il);
+    bool prefill_overlap() const;
+    static bool prefill_worker_ready(const ggml_cgraph * graph, bool ask, void * userdata);
     // run-time tiers; each adds a partial expert pass per layer to the graph
     static constexpr int max_tiers = 8;
 

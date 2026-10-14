@@ -3415,7 +3415,11 @@ void llama_context::sched_set_workers(ggml_backend_sched_t s) {
         for (int t = 0; enabled && expert_cache && t < expert_cache->n_tiers(); ++t) {
             remote |= expert_cache->tier_backend(t) == b.get() && b.get() != expert_cache->backend();
         }
-        ggml_backend_sched_set_worker(s, b.get(), remote, remote ? share_worker_cpu(dev) : -1);
+        const bool prefill = expert_cache && expert_cache->prefill_overlap() && b.get() == expert_cache->backend();
+        const bool worker = remote || (enabled && prefill);
+        ggml_backend_sched_set_worker(s, b.get(), worker, worker ? share_worker_cpu(dev) : -1);
+        ggml_backend_sched_set_worker_ready(s, b.get(), prefill ? llama_expert_cache::prefill_worker_ready : nullptr,
+                prefill ? expert_cache.get() : nullptr);
     }
 }
 

@@ -39,6 +39,7 @@ struct llama_expert_cache::prefill_share {
     std::vector<size_t> capacity;
     uint32_t min_reuse = 1;
     bool gpu_only = false;
+    bool overlap = false;
     size_t stride = 0;
     size_t ids_offset = 0, host_size = 0;
     void (*upload)(ggml_backend_t, void *, const void *, size_t, ggml_backend_event_t) = nullptr;
@@ -50,6 +51,10 @@ struct llama_expert_cache::prefill_share {
     void (*forget)(ggml_backend_t, const ggml_tensor *) = nullptr;
     ggml_backend_event_t done[n_bounce] = {};
     bool recorded[n_bounce] = {};
+    ggml_backend_event_t route_done = nullptr;
+    bool route_recorded = false;
+    ggml_tensor * route = nullptr;
+    size_t route_bytes = 0;
     int next = 0, last = -1;
     ggml_backend_sched_stage_copier copier;
     std::thread worker;
@@ -91,6 +96,12 @@ struct llama_expert_cache::prefill_share {
                 recorded[b] = true;
                 last = b;
             }
+            if (overlap) {
+                // One stream orders all bank uploads and the route table. Publish only after its event record exists.
+                const void * ids = static_cast<char *>(ggml_backend_buffer_get_base(host.get())) + ids_offset;
+                upload(copy.get(), route->data, ids, route_bytes, route_done);
+                route_recorded = true;
+            }
             {
                 std::lock_guard<std::mutex> lock(mutex);
                 queued = false;
@@ -118,6 +129,8 @@ struct llama_expert_cache::prefill_share {
             if (recorded[b]) { ggml_backend_event_synchronize(done[b]); }
             ggml_backend_event_free(done[b]);
         }
+        if (route_recorded) { ggml_backend_event_synchronize(route_done); }
+        ggml_backend_event_free(route_done);
         if (forget) { for (auto & group : banks) { for (auto * bank : group) { if (bank) { forget(gpu, bank); } } } }
         if (trace) { fclose(trace); }
         if (batches) {
@@ -134,6 +147,8 @@ void llama_expert_cache::init_prefill(uint32_t min_reuse, bool gpu_only) {
     s->gpu = gpu;
     s->min_reuse = min_reuse;
     s->gpu_only = gpu_only;
+    const char * overlap_env = getenv("LLAMA_MOE_PREFILL_OVERLAP");
+    s->overlap = overlap_env && atoi(overlap_env) != 0;
     const auto dev = ggml_backend_get_device(gpu);
     const auto reg = ggml_backend_dev_backend_reg(dev);
     ggml_backend_dev_props props = {};
@@ -213,6 +228,10 @@ void llama_expert_cache::init_prefill(uint32_t min_reuse, bool gpu_only) {
         s->done[b] = ggml_backend_event_new(dev);
         if (!s->done[b]) { LLAMA_LOG_WARN("moe-prefill: cannot allocate events; cold experts stay on CPU\n"); return; }
     }
+    if (s->overlap) {
+        s->route_done = ggml_backend_event_new(dev);
+        if (!s->route_done) { LLAMA_LOG_WARN("moe-prefill: cannot allocate route event; cold experts stay on CPU\n"); return; }
+    }
     if (const char * path = getenv("LLAMA_MOE_PREFILL_TRACE"); path && *path) {
         s->trace = fopen(path, "a");
         if (!s->trace) { throw std::runtime_error("cannot open LLAMA_MOE_PREFILL_TRACE"); }
@@ -233,6 +252,32 @@ ggml_tensor * llama_expert_cache::prefill_bank(int il, int p) const {
 
 bool llama_expert_cache::prefill_staging(int64_t rows, int il) const {
     return prefill_enabled(rows) && prefill_bank(il, 0);
+}
+
+bool llama_expert_cache::prefill_overlap() const {
+    return prefill && prefill->overlap;
+}
+
+bool llama_expert_cache::prefill_worker_ready(const ggml_cgraph * graph, bool ask, void * userdata) {
+    auto & c = *static_cast<llama_expert_cache *>(userdata);
+    auto & s = *c.prefill;
+    for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+        const auto * node = ggml_graph_node(graph, i);
+        if (node->op != GGML_OP_MUL_MAT_ID) { continue; }
+        for (size_t g = 0; g < s.banks.size(); ++g) {
+            if (!s.banks[g][0] || node->src[0] != s.banks[g][0]) { continue; }
+            if (ask) { return true; }
+            s.wait();
+            // queued=false publishes the final record. Independent GPU compute streams must see banks and IDs ready.
+            GGML_ASSERT(s.route_recorded);
+            GGML_ASSERT(node->src[2] == s.route || node->src[2]->view_src == s.route);
+            ggml_backend_event_wait(s.gpu, s.route_done);
+            if (s.prepare && s.last >= 0) { for (auto * bank : s.banks[g]) { s.prepare(s.gpu, bank); } }
+            ggml_backend_synchronize(s.gpu);
+            return true;
+        }
+    }
+    return false;
 }
 
 ggml_tensor * llama_expert_cache::prefill_route(int il) const {
@@ -822,6 +867,13 @@ void llama_expert_cache::op_prefill_plan(ggml_tensor * dst, int ith, int nth, vo
     ggml_backend_synchronize(c.gpu);
     {
         std::lock_guard<std::mutex> lock(s.mutex);
+        if (s.overlap) {
+            s.route = s.routes[l.il];
+            s.route_bytes = dst->nb[2];
+            GGML_ASSERT(s.route_bytes <= s.host_size - s.ids_offset);
+            void * host_ids = static_cast<char *>(ggml_backend_buffer_get_base(s.host.get())) + s.ids_offset;
+            memcpy(host_ids, static_cast<const char *>(dst->data) + dst->nb[2], s.route_bytes);
+        }
         s.slabs.clear();
         const auto & layer = c.model->layers[l.il];
         const ggml_tensor * weights[] = {layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps};
@@ -851,6 +903,11 @@ void llama_expert_cache::op_prefill_ready(ggml_tensor * dst, int ith, int nth, v
     if (ith != 0) { return; }
     auto & l = *static_cast<entry *>(userdata);
     auto & s = *l.owner->prefill;
+    if (s.overlap) {
+        // Retain the CPU split boundary, but let the transient GPU consumer's worker perform the wait.
+        *static_cast<int32_t *>(dst->data) = 0;
+        return;
+    }
     s.wait();
     const auto * plan = dst->src[0];
     const size_t bytes = plan->nb[2];

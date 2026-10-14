@@ -2648,8 +2648,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn_cache(
         remote.push_back(reduce(d, remote_input(t).weights, label));
     }
     if (sharing) {
-        // Residents are already queued while the copy workers fill the compact bank. After readiness, submit the transient
-        // GPU FFN before the CPU FFN so that their compute can overlap.
+        // The CPU callback separates resident and transient splits. In overlap mode, the transient submission worker waits
+        // for readiness while this thread runs the cold CPU FFN; otherwise the callback waits as in S1.
         auto * ready = expert_cache->build_prefill_ready(ctx0, plan, il);
         name(ready, "prefill_ready", true);
         ggml_build_forward_expand(gf, ready);
