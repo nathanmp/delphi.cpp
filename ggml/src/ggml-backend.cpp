@@ -1048,6 +1048,8 @@ struct ggml_backend_sched {
 
     // delphi: backend workers (ggml_backend_sched_set_worker), NULL where none
     struct ggml_backend_sched_worker * workers[GGML_SCHED_MAX_BACKENDS];
+    ggml_backend_sched_worker_ready_t worker_ready[GGML_SCHED_MAX_BACKENDS];
+    void * worker_ready_data[GGML_SCHED_MAX_BACKENDS];
 };
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
@@ -3650,6 +3652,17 @@ void ggml_backend_sched_stage_allow(ggml_backend_sched_t sched, ggml_backend_t b
 
 // delphi: backend workers (see ggml_backend_sched_worker)
 
+static void ggml_backend_sched_worker_ready(ggml_backend_sched_t sched, int split_id) {
+    const auto & split = sched->splits[split_id];
+    const int b = split.backend_id;
+    if (sched->worker_ready[b] && sched->worker_ready[b](&split.graph, true, sched->worker_ready_data[b])) {
+        const uint64_t start = ggml_backend_sched_trace_span_begin();
+        sched->worker_ready[b](&split.graph, false, sched->worker_ready_data[b]);
+        ggml_backend_sched_trace_span_end(sched, start, GGML_EXEC_TRACE_EVENT_BACKEND_WAIT,
+                GGML_EXEC_TRACE_WAIT_WORKER_READY, split_id, b, GGML_EXEC_TRACE_ID_NONE, 0);
+    }
+}
+
 static void ggml_backend_sched_worker_run(ggml_backend_sched_worker * w) {
     ggml_backend_sched_t sched = w->sched;
     ggml_exec_trace_set_thread_context(w->trace_ctx);
@@ -3665,6 +3678,8 @@ static void ggml_backend_sched_worker_run(ggml_backend_sched_worker * w) {
         }
     }
     ggml_backend_event_record(w->pulled_event, backend);
+
+    ggml_backend_sched_worker_ready(sched, w->split_id);
 
     const uint64_t compute_start = ggml_backend_sched_trace_span_begin();
     if (ggml_exec_trace_observing()) {
@@ -3815,6 +3830,11 @@ static bool ggml_backend_sched_worker_device_ok(ggml_backend_sched_t sched, ggml
 // a split the worker can run: device inputs only (no user inputs, host memory or weights)
 static bool ggml_backend_sched_worker_split_ok(ggml_backend_sched_t sched, ggml_backend_sched_worker * w,
         const struct ggml_backend_sched_split * split) {
+    if (sched->worker_ready[w->backend_id]) {
+        // The caller still submits ordinary local work. A ready split uses only local storage, so no pull or push is needed.
+        // Select it at submission, after an earlier CPU split can publish the actual routing decision.
+        return split->n_inputs == 0;
+    }
     for (int i = 0; i < split->n_inputs; i++) {
         struct ggml_tensor * input = split->inputs[i];
         ggml_backend_buffer_t buf = input->view_src ? input->view_src->buffer : input->buffer;
@@ -4011,6 +4031,15 @@ void ggml_backend_sched_set_worker(ggml_backend_sched_t sched, ggml_backend_t ba
             cpu >= 0 ? (" on CPU " + std::to_string(cpu)).c_str() : "");
 }
 
+void ggml_backend_sched_set_worker_ready(ggml_backend_sched_t sched, ggml_backend_t backend,
+        ggml_backend_sched_worker_ready_t callback, void * user_data) {
+    const int b = ggml_backend_sched_backend_id(sched, backend);
+    GGML_ASSERT(b >= 0);
+    ggml_backend_sched_worker_join(sched->workers[b]);
+    sched->worker_ready[b] = callback;
+    sched->worker_ready_data[b] = user_data;
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     bool backends_idle = sched->backends_idle;
@@ -4090,13 +4119,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         if (workers_on) {
             ggml_backend_sched_worker * w = sched->workers[split_backend_id];
-            if (w != nullptr && w->ok[split_id]) {
+            const auto ready = sched->worker_ready[split_backend_id];
+            if (w != nullptr && w->ok[split_id] &&
+                    (!ready || ready(&split->graph, true, sched->worker_ready_data[split_backend_id]))) {
                 ggml_backend_sched_worker_post(sched, w, split_id);
                 prev_backend_id = split_backend_id;
                 continue;
             }
             // this thread queues work on the split backend below
+            const uint64_t join_start = w != nullptr ? ggml_backend_sched_trace_span_begin() : 0;
             ggml_backend_sched_worker_join(w);
+            ggml_backend_sched_trace_span_end(sched, join_start, GGML_EXEC_TRACE_EVENT_BACKEND_WAIT,
+                    GGML_EXEC_TRACE_WAIT_PREVIOUS_SPLIT, split_id, split_backend_id, GGML_EXEC_TRACE_ID_NONE, 0);
             ggml_backend_sched_workers_fence_pulls(sched, split_backend_id);
         }
 
@@ -4414,6 +4448,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         if (split_is_meta) {
             backends_idle = false;
         }
+
+        // Also keep readiness when workers are unavailable, staging is active, or an eval callback requires serial execution.
+        ggml_backend_sched_worker_ready(sched, split_id);
 
         if (!sched->callback_eval) {
             const uint64_t compute_start = ggml_backend_sched_trace_span_begin();

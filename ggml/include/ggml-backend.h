@@ -345,6 +345,13 @@ extern "C" {
     // backend take only device inputs; other splits run on the calling thread as before. enable=false stops the thread.
     GGML_API void                 ggml_backend_sched_set_worker(ggml_backend_sched_t sched, ggml_backend_t backend, bool enable, int cpu);
 
+    // delphi: select local splits whose external inputs need readiness before submission. ask=true must have no side effects.
+    // Selected splits with no cross-backend inputs can run on the existing worker. Other splits wait on the calling thread.
+    // The callback and its data must outlive scheduler computation; change them only while the scheduler is idle.
+    typedef bool (*ggml_backend_sched_worker_ready_t)(const struct ggml_cgraph * graph, bool ask, void * user_data);
+    GGML_API void ggml_backend_sched_set_worker_ready(ggml_backend_sched_t sched, ggml_backend_t backend,
+            ggml_backend_sched_worker_ready_t callback, void * user_data);
+
     GGML_API int                  ggml_backend_sched_get_n_backends(ggml_backend_sched_t sched);
     GGML_API ggml_backend_t       ggml_backend_sched_get_backend(ggml_backend_sched_t sched, int i);
 

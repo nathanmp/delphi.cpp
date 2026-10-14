@@ -31,8 +31,10 @@ struct llama_expert_cache {
     bool prefill_staging(int64_t rows, int il) const;
     ggml_tensor * prefill_bank(int il, int p) const;
     ggml_tensor * prefill_route(int il) const;
-    // The plan starts selected uploads. The second CPU op publishes IDs after the upload records have been issued.
+    // The plan starts selected uploads. The second CPU op waits, or preserves a split boundary for the submission worker.
     ggml_tensor * build_prefill_ready(ggml_context * ctx, ggml_tensor * plan, int il);
+    bool prefill_overlap() const;
+    static bool prefill_worker_ready(const ggml_cgraph * graph, bool ask, void * userdata);
     // run-time tiers; each adds a partial expert pass per layer to the graph
     static constexpr int max_tiers = 8;
 
@@ -49,7 +51,8 @@ struct llama_expert_cache {
         int64_t rows = 0;
     };
 
-    static std::unique_ptr<llama_expert_cache> create(const llama_model & model, const std::vector<ggml_backend_ptr> & backends);
+    static std::unique_ptr<llama_expert_cache> create(const llama_model & model, const std::vector<ggml_backend_ptr> & backends,
+            bool allow_prefill_overlap);
     // LLAMA_MOE_CACHE_MIB unset or "auto" (and no LLAMA_MOE_CACHE_SHARED): the cache is on when the model allows it, and its
     // tiers are sized from the free memory of the GPUs at the first decode (llama_context::expert_cache_auto). An unsupported
     // model then gets no cache instead of an error.
@@ -143,7 +146,7 @@ private:
     std::unique_ptr<prefill_share> prefill;
     int64_t prefill_min_rows = 512; // LLAMA_MOE_PREFILL_MIN_ROWS
     int64_t prefill_max_rows = 0; // LLAMA_MOE_PREFILL_SHARE, LLAMA_MOE_PREFILL_MAX_ROWS
-    void init_prefill(uint32_t min_reuse, bool gpu_only);
+    void init_prefill(uint32_t min_reuse, bool gpu_only, bool allow_overlap);
 
     const llama_model * model = nullptr;
     ggml_backend_t gpu = nullptr;

@@ -106,6 +106,7 @@ WAIT_REASONS = {
     4: "scheduler_synchronize",
     5: "graph_reallocation",
     6: "copy_dst_reuse",
+    7: "worker_ready",
 }
 WAIT_APIS = {1: "backend_synchronize", 2: "event_synchronize"}
 COPY_PATHS = {
