@@ -245,6 +245,19 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "error: cannot create the context\n");
         return 1;
     }
+    ggml_threadpool_t threadpool = nullptr;
+    decltype(&ggml_threadpool_free) free_pool = nullptr;
+    if (numa_tensors) {
+        // A one-task CPU split still needs a pool with workers on both NUMA nodes.
+        auto pool_params = ggml_threadpool_params_default(threads);
+        auto cpu_reg = ggml_backend_dev_backend_reg(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU));
+        auto new_pool = (decltype(&ggml_threadpool_new)) ggml_backend_reg_get_proc_address(cpu_reg, "ggml_threadpool_new");
+        free_pool = (decltype(free_pool)) ggml_backend_reg_get_proc_address(cpu_reg, "ggml_threadpool_free");
+        if (!new_pool || !free_pool) { fprintf(stderr, "error: CPU threadpool API is unavailable\n"); return 1; }
+        threadpool = new_pool(&pool_params);
+        if (!threadpool) { fprintf(stderr, "error: cannot create the NUMA threadpool\n"); return 1; }
+        llama_attach_threadpool(ctx, threadpool, threadpool);
+    }
 
     std::vector<record_head> heads;
     std::vector<float>       logits;
@@ -396,6 +409,7 @@ int main(int argc, char ** argv) {
     }
 
     llama_free(ctx);
+    if (threadpool) { free_pool(threadpool); }
     llama_model_free(model);
     return ret;
 }
