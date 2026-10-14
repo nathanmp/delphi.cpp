@@ -151,13 +151,8 @@ void llama_expert_cache::init_prefill(uint32_t min_reuse, bool gpu_only, bool al
     // Overlap is on by default; set LLAMA_MOE_PREFILL_OVERLAP=0 to disable it.
     const char * overlap_env = getenv("LLAMA_MOE_PREFILL_OVERLAP");
     const bool requested = allow_overlap && (!overlap_env || atoi(overlap_env) != 0);
-    const bool g128 = std::all_of(group_types.begin(), group_types.end(), [](const auto & types) {
-        return std::all_of(types.begin(), types.end(), [](ggml_type type) { return type == GGML_TYPE_Q4_G128; });
-    });
-    // Other projection types retain S1 until their concurrent path passes the same logits checks.
     // The GPU endpoint has no cold CPU work to overlap. Keep its original readiness and submission path.
-    s->overlap = requested && g128 && !gpu_only;
-    if (requested && !g128) { LLAMA_LOG_WARN("moe-prefill: upload overlap requires G128 expert projections; using S1 readiness\n"); }
+    s->overlap = requested && !gpu_only;
     const auto dev = ggml_backend_get_device(gpu);
     const auto reg = ggml_backend_dev_backend_reg(dev);
     ggml_backend_dev_props props = {};
