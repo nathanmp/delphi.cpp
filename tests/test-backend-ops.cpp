@@ -1323,6 +1323,11 @@ struct test_case {
     virtual bool run_whole_graph() { return false; }
     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
     virtual bool use_weight_context() { return false; }
+    virtual int test_iterations() { return 1; }
+    virtual void reinit_test_iteration(ggml_context * ctx, int iteration) {
+        GGML_UNUSED(ctx);
+        GGML_UNUSED(iteration);
+    }
 
     ggml_cgraph * gf = nullptr;
     ggml_cgraph * gb = nullptr;
@@ -1595,9 +1600,15 @@ struct test_case {
         if (fused_nodes_to_verify.size() == 0 && run_whole_graph()) {
             fused_nodes_to_verify.push_back(out);
         }
-        const bool cmp_ok = ggml_backend_compare_graph_backend(backend1, backend2, gf, callback, &ud,
-                                                               run_whole_graph() ? fused_nodes_to_verify.data() : nullptr,
-                                                               fused_nodes_to_verify.size());
+        bool cmp_ok = true;
+        for (int iteration = 0; iteration < test_iterations() && cmp_ok && ud.ok; ++iteration) {
+            if (iteration > 0) {
+                reinit_test_iteration(ctx.get(), iteration);
+            }
+            cmp_ok = ggml_backend_compare_graph_backend(backend1, backend2, gf, callback, &ud,
+                                                       run_whole_graph() ? fused_nodes_to_verify.data() : nullptr,
+                                                       fused_nodes_to_verify.size());
+        }
 
         // Create test result
         bool        test_passed = ud.ok && cmp_ok;
@@ -5483,50 +5494,91 @@ struct test_mul_mat_id_partial : public test_case {
     }
 };
 
-// Complete masked FFNs cover the cache's GPU branch, including entirely cold batches and different projection types.
+// Complete routed FFNs cover CPU/GPU fusion, inactive outputs and mask changes on a reused graph.
 struct test_partial_ffn : public test_mul_mat_id_partial {
     const int mask;
     const ggml_type type_up, type_down;
     const float limit;
+    const bool partial, up_first;
+    int current_mask = 1;
+    std::vector<ggml_tensor *> outputs;
     test_partial_ffn(int64_t rows, int mask, ggml_type type_gate = GGML_TYPE_Q4_G128,
-            ggml_type type_up = GGML_TYPE_Q4_G128, ggml_type type_down = GGML_TYPE_Q4_G128, float limit = 0.0f) :
-        test_mul_mat_id_partial(type_gate, 16, 6, true, 512, rows, 256), mask(mask), type_up(type_up), type_down(type_down), limit(limit) {}
+            ggml_type type_up = GGML_TYPE_Q4_G128, ggml_type type_down = GGML_TYPE_Q4_G128, float limit = 0.0f,
+            bool partial = true, bool up_first = false) :
+        test_mul_mat_id_partial(type_gate, 16, 6, true, 512, rows, 256), mask(mask), type_up(type_up), type_down(type_down),
+        limit(limit), partial(partial), up_first(up_first) {}
     std::string vars() override {
         return test_mul_mat_id_partial::vars() + ",ffn_mask=" + std::to_string(mask) + ",up=" + ggml_type_name(type_up) +
-                ",down=" + ggml_type_name(type_down) + ",limit=" + std::to_string(limit);
+                ",down=" + ggml_type_name(type_down) + ",limit=" + std::to_string(limit) +
+                ",partial=" + std::to_string(partial) + ",up_first=" + std::to_string(up_first);
     }
     double max_nmse_err() override { return 2e-3; }
+    bool active_slot(int slot) const {
+        return current_mask == 1 || (current_mask == 2 && slot % 2 == 0) || (current_mask == 4 && slot % 2 != 0);
+    }
+    double err(const float * a, const float * b, size_t size) override {
+        if (partial && (size == size_t(m * n_used * n) || size == size_t(k * n_used * n))) {
+            const size_t width = size / (n_used * n);
+            for (size_t row = 0; row < size_t(n_used * n); ++row) {
+                if (active_slot(row % n_used)) { continue; }
+                for (size_t j = 0; j < width; ++j) {
+                    if (a[row * width + j] != 0.0f || b[row * width + j] != 0.0f) { return INFINITY; }
+                }
+            }
+        }
+        return nmse(a, b, size);
+    }
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return outputs; }
+    int test_iterations() override { return mask == 3 ? 5 : 1; }
     bool use_weight_context() override { return true; }
     ggml_tensor * build_graph(ggml_context * ctx) override { return build_graph(ctx, ctx); }
     ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
         auto * gate = ggml_new_tensor_3d(ctx_weights, type_a, k, m, n_mats);
         auto * up = ggml_new_tensor_3d(ctx_weights, type_up, k, m, n_mats);
         auto * down = ggml_new_tensor_3d(ctx_weights, type_down, m, k, n_mats);
+        for (auto * t : {gate, up, down}) { t->flags |= GGML_TENSOR_FLAG_NUMA_EXPERT; }
         auto * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, 1, n);
         auto * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n);
         auto * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, n);
         ggml_set_name(ids, "cache_ids");
-        auto * g = ggml_mul_mat_id_partial(ctx, gate, x, ids);
-        auto * u = ggml_mul_mat_id_partial(ctx, up, x, ids);
+        auto matmul = partial ? ggml_mul_mat_id_partial : ggml_mul_mat_id;
+        auto * first = matmul(ctx, up_first ? up : gate, x, ids);
+        auto * second = matmul(ctx, up_first ? gate : up, x, ids);
+        auto * g = up_first ? second : first;
+        auto * u = up_first ? first : second;
+        if (gf && up_first) { ggml_build_forward_expand(gf, u); }
         auto * a = limit > 0.0f ? ggml_swiglu_clamp(ctx, g, u, limit) : ggml_swiglu_split(ctx, g, u);
-        auto * d = ggml_mul_mat_id_partial(ctx, down, a, ids);
+        auto * d = matmul(ctx, down, a, ids);
+        ggml_set_name(a, "cache_activation");
+        ggml_set_name(d, "cache_down");
+        // Inspect both slot tensors: the reduction alone could hide stale inactive rows.
+        ggml_set_output(a);
+        ggml_set_output(d);
         auto * w = ggml_mul(ctx, d, weights);
         ggml_tensor * y = nullptr;
         for (int i = 0; i < n_used; ++i) {
             auto * v = ggml_view_2d(ctx, w, k, n, w->nb[2], i * w->nb[1]);
             y = y ? ggml_add(ctx, y, v) : v;
         }
+        outputs = {a, d, y};
         return y;
     }
     void initialize_tensors(ggml_context * ctx) override {
         test_mul_mat_id_partial::initialize_tensors(ctx);
+        reinit_test_iteration(ctx, 0);
+    }
+    void reinit_test_iteration(ggml_context * ctx, int iteration) override {
+        // All valid -> mixed -> all invalid -> complementary mixed -> all valid.
+        const int masks[] = {1, 2, 0, 4, 1};
+        current_mask = mask == 3 ? masks[iteration] : mask;
         for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
             if (strcmp(t->name, "cache_ids") != 0) { continue; }
             std::vector<int32_t> ids(n_used * n);
             for (int64_t r = 0; r < n; ++r) {
                 for (int i = 0; i < n_used; ++i) {
                     // Reuse experts across tokens, as a router does; each token's active IDs are distinct.
-                    ids[r * n_used + i] = mask == 0 ? -1 : mask == 1 ? i : i % 2 ? -1 : i;
+                    ids[r * n_used + i] = active_slot(i) ? i : i % 2 ? -1 : n_mats;
                 }
             }
             ggml_backend_tensor_set(t, ids.data(), 0, ids.size() * sizeof(int32_t));
@@ -11353,6 +11405,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    // IQK fusion below and above the weight-repack threshold, with either projection order.
+    // Mixed gate/up types above must keep using separate matmuls.
+    for (ggml_type type : {GGML_TYPE_IQ3_K, GGML_TYPE_IQ4_KS}) {
+        for (int64_t rows : {1, 6, 33}) {
+            for (float limit : {0.0f, 2.0f}) {
+                for (int mask : {0, 1, 2, 3}) {
+                    test_cases.emplace_back(new test_partial_ffn(rows, mask, type, type, type, limit, true, rows == 6));
+                }
+                test_cases.emplace_back(new test_partial_ffn(rows, 1, type, type, type, limit, false, rows == 6));
+            }
+        }
+    }
+    for (float limit : {0.0f, 2.0f}) {
+        test_cases.emplace_back(new test_partial_ffn(6, 3, GGML_TYPE_IQ3_K, GGML_TYPE_IQ4_KS, GGML_TYPE_IQ3_KS, limit));
+    }
+    test_cases.emplace_back(new test_partial_ffn(6, 3));
+    // A zero clipping limit is still SWIGLU_CLAMP, not the plain SwiGLU selector.
+    test_cases.emplace_back(new test_moe_up_gate(GGML_TYPE_IQ3_K, GGML_TYPE_F32, 8, 4, 512, 6, 256, 0.0f));
     // partial MUL_MAT_ID (expert split): broadcast gate/up and per-slot down, few and many tokens
     // delphi: the expert cache runs partial MUL_MAT_ID on its GPU banks and the host experts, for any expert type
     for (ggml_type type_a : {GGML_TYPE_Q2_K, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q3_K, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_XS,
