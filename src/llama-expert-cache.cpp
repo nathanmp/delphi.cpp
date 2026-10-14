@@ -141,14 +141,14 @@ struct llama_expert_cache::prefill_share {
     }
 };
 
-void llama_expert_cache::init_prefill(uint32_t min_reuse, bool gpu_only) {
+void llama_expert_cache::init_prefill(uint32_t min_reuse, bool gpu_only, bool allow_overlap) {
     if (min_reuse == std::numeric_limits<uint32_t>::max()) { return; }
     auto s = std::make_unique<prefill_share>();
     s->gpu = gpu;
     s->min_reuse = min_reuse;
     s->gpu_only = gpu_only;
     const char * overlap_env = getenv("LLAMA_MOE_PREFILL_OVERLAP");
-    s->overlap = overlap_env && atoi(overlap_env) != 0;
+    s->overlap = allow_overlap && overlap_env && atoi(overlap_env) != 0;
     const auto dev = ggml_backend_get_device(gpu);
     const auto reg = ggml_backend_dev_backend_reg(dev);
     ggml_backend_dev_props props = {};
@@ -384,7 +384,7 @@ bool llama_expert_cache::auto_requested() {
 }
 
 std::unique_ptr<llama_expert_cache> llama_expert_cache::create(
-        const llama_model & model, const std::vector<ggml_backend_ptr> & backends) {
+        const llama_model & model, const std::vector<ggml_backend_ptr> & backends, bool allow_prefill_overlap) {
     // LLAMA_MOE_CACHE_SHARED=1: a cache without a static tier, for tiers leased at run time (VRAM sharing)
     const char * budget_env = getenv("LLAMA_MOE_CACHE_MIB");
     const char * shared_env = getenv("LLAMA_MOE_CACHE_SHARED");
@@ -523,7 +523,7 @@ std::unique_ptr<llama_expert_cache> llama_expert_cache::create(
         c.prefill_min_rows = std::max<int64_t>(max_rows + 1, min_env ? atoll(min_env) : 512);
         c.prefill_max_rows = std::max<int64_t>(max_rows, max_env ? atoll(max_env) : 2047);
         if (c.prefill_min_rows > c.prefill_max_rows) { throw std::runtime_error("moe-prefill minimum rows exceeds maximum rows"); }
-        c.init_prefill(reuse, gpu_only);
+        c.init_prefill(reuse, gpu_only, allow_prefill_overlap);
     }
 
     std::string desc;

@@ -614,7 +614,8 @@ llama_context::llama_context(
 
         if (params.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && params.ctx_other == nullptr) {
             try {
-                expert_cache = llama_expert_cache::create(model, backends);
+                // Eval callbacks execute subgraphs. Preserve their original CPU readiness boundary.
+                expert_cache = llama_expert_cache::create(model, backends, cparams.cb_eval == nullptr);
             } catch (const std::exception & e) {
                 if (!llama_expert_cache::auto_requested()) {
                     throw;

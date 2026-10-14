@@ -51,7 +51,8 @@ struct llama_expert_cache {
         int64_t rows = 0;
     };
 
-    static std::unique_ptr<llama_expert_cache> create(const llama_model & model, const std::vector<ggml_backend_ptr> & backends);
+    static std::unique_ptr<llama_expert_cache> create(const llama_model & model, const std::vector<ggml_backend_ptr> & backends,
+            bool allow_prefill_overlap);
     // LLAMA_MOE_CACHE_MIB unset or "auto" (and no LLAMA_MOE_CACHE_SHARED): the cache is on when the model allows it, and its
     // tiers are sized from the free memory of the GPUs at the first decode (llama_context::expert_cache_auto). An unsupported
     // model then gets no cache instead of an error.
@@ -145,7 +146,7 @@ private:
     std::unique_ptr<prefill_share> prefill;
     int64_t prefill_min_rows = 512; // LLAMA_MOE_PREFILL_MIN_ROWS
     int64_t prefill_max_rows = 0; // LLAMA_MOE_PREFILL_SHARE, LLAMA_MOE_PREFILL_MAX_ROWS
-    void init_prefill(uint32_t min_reuse, bool gpu_only);
+    void init_prefill(uint32_t min_reuse, bool gpu_only, bool allow_overlap);
 
     const llama_model * model = nullptr;
     ggml_backend_t gpu = nullptr;
