@@ -2288,8 +2288,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     const bool  clamp_arch  = arch == LLM_ARCH_MAPLE || arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK41 ||
             arch == LLM_ARCH_GLM5NEXT || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0) || arch == LLM_ARCH_HY_V4;
     const float swiglu_lim  = il >= 0 ? hparams.swiglu_clamp_exp[il] : 0.0f;
-    if (expert_cache && (expert_cache->active() || expert_cache->prefill_enabled(ubatch.n_tokens)) &&
-            ubatch.n_tokens <= expert_cache->graph_rows() && expert_cache->layer(il) &&
+    if (expert_cache && ((expert_cache->active() && ubatch.n_tokens <= expert_cache->graph_rows()) ||
+            expert_cache->prefill_enabled(ubatch.n_tokens)) && expert_cache->layer(il) &&
             type_op == LLM_FFN_SILU && !weight_before_ffn && !gate_up_exps &&
             !up_exps_s && !gate_exps_s && !down_exps_s && !up_exps_b && !gate_exps_b && !down_exps_b &&
             (loras == nullptr || loras->empty()) && (swiglu_lim <= 1e-6f || clamp_arch)) {
@@ -2648,8 +2648,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn_cache(
         remote.push_back(reduce(d, remote_input(t).weights, label));
     }
     if (sharing) {
-        // Residents are already queued while the copy workers fill the compact bank. The CPU FFN follows the transient
-        // GPU FFN, so it can run while the GPU uploads and computes the selected cold experts.
+        // Residents are already queued while the copy workers fill the compact bank. After readiness, submit the transient
+        // GPU FFN before the CPU FFN so that their compute can overlap.
         auto * ready = expert_cache->build_prefill_ready(ctx0, plan, il);
         name(ready, "prefill_ready", true);
         ggml_build_forward_expand(gf, ready);
