@@ -4407,6 +4407,43 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+// delphi: sibling MUL_MATs (ggml_cuda_mul_mat_vec_q_siblings). GGML_CUDA_FUSE_SIBLING_MM=0 turns them off.
+static bool ggml_cuda_sibling_mm_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_CUDA_FUSE_SIBLING_MM");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return enabled;
+}
+
+// Whether ggml_cuda_mul_mat sends this quantized MUL_MAT to the plain MMVQ kernel.
+static bool ggml_cuda_mul_mat_takes_mmvq(const ggml_tensor * mm, const int cc) {
+    const ggml_tensor * src0 = mm->src[0];
+    const ggml_tensor * src1 = mm->src[1];
+    if (mm->op != GGML_OP_MUL_MAT || src0->buffer == nullptr || !ggml_is_quantized(src0->type) ||
+        src1->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32 ||
+        ggml_get_op_params_i32(mm, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
+        return false;
+    }
+    if (ggml_cuda_mmvq_q8_smallk_supported(src0, src1, mm, cc) || ggml_cuda_mmvq_q8_tc_supported(src0, src1, mm, cc)) {
+        return false;
+    }
+    return ggml_cuda_should_use_mmvq(src0->type, cc, src1->ne[1], src0->ne[1]);
+}
+
+// Sorts mm[0..n) by weight address and returns whether they can run as one MMVQ launch.
+static bool ggml_cuda_sibling_mm_group(ggml_tensor ** mm, const int n, const int cc) {
+    for (int k = 0; k < n; ++k) {
+        if (!ggml_cuda_mul_mat_takes_mmvq(mm[k], cc)) {
+            return false;
+        }
+    }
+    std::sort(mm, mm + n, [](const ggml_tensor * a, const ggml_tensor * b) {
+        return (const char *) a->src[0]->data < (const char *) b->src[0]->data;
+    });
+    return ggml_cuda_mul_mat_vec_q_siblings_supported(mm, n);
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -5273,6 +5310,29 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // delphi: sibling MUL_MATs, put next to each other by ggml_backend_cuda_graph_optimize
+    if (node->op == GGML_OP_MUL_MAT && ggml_cuda_sibling_mm_enabled()) {
+        const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+        int n = 1;
+        while (n < GGML_CUDA_MMVQ_MAX_SIBLINGS && i + n < cgraph->n_nodes && cgraph->nodes[i + n]->op == GGML_OP_MUL_MAT &&
+               cgraph->nodes[i + n]->src[1] == node->src[1] && (cgraph->nodes[i + n]->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+            ++n;
+        }
+        for (; n >= 2; --n) {
+            ggml_tensor * mm[GGML_CUDA_MMVQ_MAX_SIBLINGS] = {};
+            for (int k = 0; k < n; ++k) {
+                mm[k] = cgraph->nodes[i + k];
+            }
+            if (ggml_cuda_sibling_mm_group(mm, n, cc)) {
+                for (int k = 0; k < n; ++k) {
+                    trace_fused_mul_mat(i + k, GGML_OP_MUL_MAT, GGML_EXEC_TRACE_DISPATCH_GPU_MMVQ);
+                }
+                ggml_cuda_mul_mat_vec_q_siblings(*cuda_ctx, mm, n);
+                return n - 1;
+            }
+        }
+    }
+
     return 0;
 }
 
@@ -5772,6 +5832,44 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
+
+    // delphi: move the later sibling MUL_MATs (same src1, weights back to back) right after the first, ggml_cuda_try_fuse
+    // then runs them as one launch. Safe: a MUL_MAT needs only its weights and the src1 the first one already needs.
+    if (!disable_fusion && ggml_cuda_sibling_mm_enabled()) {
+        const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            ggml_tensor * a = cgraph->nodes[i];
+            if (a->op != GGML_OP_MUL_MAT || !ggml_cuda_mul_mat_takes_mmvq(a, cc)) {
+                continue;
+            }
+            ggml_tensor * group[GGML_CUDA_MMVQ_MAX_SIBLINGS] = { a };
+            int           idx[GGML_CUDA_MMVQ_MAX_SIBLINGS]   = { i };
+            int           n        = 1;
+            for (int j = i + 1; j < cgraph->n_nodes && n < GGML_CUDA_MMVQ_MAX_SIBLINGS; ++j) {
+                ggml_tensor * b = cgraph->nodes[j];
+                if (b->op != GGML_OP_MUL_MAT || b->src[1] != a->src[1]) {
+                    continue;
+                }
+                ggml_tensor * test[GGML_CUDA_MMVQ_MAX_SIBLINGS];
+                std::copy(group, group + GGML_CUDA_MMVQ_MAX_SIBLINGS, test);
+                test[n] = b;
+                if (ggml_cuda_sibling_mm_group(test, n + 1, cc)) {
+                    group[n] = b;
+                    idx[n]   = j;
+                    ++n;
+                }
+            }
+            for (int k = 1; k < n; ++k) {
+                // idx[k] grows with k, so moving one member does not shift the later ones
+                for (int j = idx[k]; j > i + k; --j) {
+                    cgraph->nodes[j] = cgraph->nodes[j - 1];
+                }
+                cgraph->nodes[i + k] = group[k];
+            }
+            i += n - 1;
+        }
+    }
+
     if (!disable_fusion) {
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT_ID) {

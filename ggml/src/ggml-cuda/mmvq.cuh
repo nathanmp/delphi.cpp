@@ -12,6 +12,12 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc);
 void ggml_cuda_mul_mat_vec_q(ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion = nullptr);
 
+// delphi: n (2 to GGML_CUDA_MMVQ_MAX_SIBLINGS) MUL_MATs whose weights sit back to back in one buffer and read the
+// same src1, as one launch
+#define GGML_CUDA_MMVQ_MAX_SIBLINGS 4
+bool ggml_cuda_mul_mat_vec_q_siblings_supported(const ggml_tensor * const * mm, int n);
+void ggml_cuda_mul_mat_vec_q_siblings(ggml_backend_cuda_context & ctx, const ggml_tensor * const * mm, int n);
+
 bool ggml_cuda_moe_down_q_reduction_supported(
     const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
     const ggml_tensor * weights, const ggml_tensor * dst);

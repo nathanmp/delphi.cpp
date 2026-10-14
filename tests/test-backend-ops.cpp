@@ -7645,6 +7645,62 @@ struct test_moe_down_q_reduction : public test_case {
     }
 };
 
+// delphi: sibling MUL_MATs, weights back to back in one weight buffer that read the same src1. The CUDA backend runs them
+// as one MMVQ launch and writes each output to its own tensor.
+struct test_mul_mat_siblings : public test_case {
+    const ggml_type            type;
+    const std::vector<int64_t> ms; // rows of each weight
+    const int64_t              n;
+    const int64_t              k;
+    std::vector<ggml_tensor *> outs;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_SIBLINGS";
+    }
+
+    std::string vars() override {
+        std::string s;
+        for (const int64_t m : ms) {
+            s += (s.empty() ? "" : "+") + std::to_string(m);
+        }
+        return "type=" + std::string(ggml_type_name(type)) + ",ms=" + s + ",n=" + std::to_string(n) + ",k=" + std::to_string(k);
+    }
+
+    bool run_whole_graph() override { return true; }
+    bool use_weight_context() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return outs; }
+    double max_nmse_err() override { return 5e-4; }
+
+    test_mul_mat_siblings(ggml_type type, std::vector<int64_t> ms, int64_t n, int64_t k)
+        : type(type), ms(std::move(ms)), n(n), k(k) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        GGML_UNUSED(ctx);
+        GGML_ABORT("needs the weight context");
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(x, "x");
+        std::vector<ggml_tensor *> ws;
+        for (const int64_t m : ms) {
+            // the global function: no overflow sentinel between the weights, they must be back to back
+            ws.push_back(::ggml_new_tensor_2d(ctx_weights, type, k, m));
+        }
+        // consecutive graph nodes, as ggml_backend_cuda_graph_optimize leaves them
+        outs.clear();
+        for (ggml_tensor * w : ws) {
+            ggml_tensor * o = ggml_mul_mat(ctx, w, x);
+            if (mode == MODE_TEST) {
+                ggml_build_forward_expand(gf, o);
+            }
+            outs.push_back(o);
+        }
+        return outs.back();
+    }
+};
+
 struct test_mul_mat_vec_fusion : public test_case {
     const ggml_type type;
     const ggml_glu_op glu_op;
@@ -12091,6 +12147,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (bool b : {false, true}) {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_IQ2_S, GGML_GLU_OP_SWIGLU_CLAMP, 1, 32, 256,
             true, 16, 8, b, false, true, false));
+    }
+
+    // delphi: sibling MUL_MATs (Qwen-like shapes: hc down + inject, GDN qkv + gate + beta + alpha, attention q + k + v)
+    for (int64_t n : { 1, 2, 3, 4, 5, 8 }) {
+        test_cases.emplace_back(new test_mul_mat_siblings(GGML_TYPE_Q8_0, { 48, 48 },              n, 2560));
+        test_cases.emplace_back(new test_mul_mat_siblings(GGML_TYPE_Q8_0, { 320, 4 },              n, 10240));
+        test_cases.emplace_back(new test_mul_mat_siblings(GGML_TYPE_Q8_0, { 1024, 512, 48, 48 },   n, 2560));
+        test_cases.emplace_back(new test_mul_mat_siblings(GGML_TYPE_Q8_0, { 1536, 128, 128 },      n, 2560));
+        test_cases.emplace_back(new test_mul_mat_siblings(GGML_TYPE_Q4_0, { 256, 32, 32 },         n, 2560));
     }
 
     // Fused row-pair coverage: minimum rows, an even pair, and an odd tail.
