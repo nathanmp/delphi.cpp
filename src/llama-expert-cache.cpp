@@ -261,8 +261,9 @@ bool llama_expert_cache::prefill_overlap() const {
 bool llama_expert_cache::prefill_worker_ready(const ggml_cgraph * graph, bool ask, void * userdata) {
     auto & c = *static_cast<llama_expert_cache *>(userdata);
     auto & s = *c.prefill;
-    for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
-        const auto * node = ggml_graph_node(graph, i);
+    auto * view = const_cast<ggml_cgraph *>(graph);
+    for (int i = 0; i < ggml_graph_n_nodes(view); ++i) {
+        const auto * node = ggml_graph_node(view, i);
         if (node->op != GGML_OP_MUL_MAT_ID) { continue; }
         for (size_t g = 0; g < s.banks.size(); ++g) {
             if (!s.banks[g][0] || node->src[0] != s.banks[g][0]) { continue; }
