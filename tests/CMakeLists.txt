@@ -328,6 +328,7 @@ llama_build(test-backend-ops.cpp)
 
 # Grouped routed-MoE schedule: host builder, device builders and grouped reference execution.
 llama_build_and_test(test-moe-schedule.cpp)
+llama_build_and_test(test-moe-prefill.cpp)
 llama_build_and_test(test-offload-cost.cpp)
 
 # Logits of a model over a mixed prefill/decode sequence, saved or compared with another run (needs a model: build only).

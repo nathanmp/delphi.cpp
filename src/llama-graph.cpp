@@ -2288,7 +2288,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     const bool  clamp_arch  = arch == LLM_ARCH_MAPLE || arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK41 ||
             arch == LLM_ARCH_GLM5NEXT || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0) || arch == LLM_ARCH_HY_V4;
     const float swiglu_lim  = il >= 0 ? hparams.swiglu_clamp_exp[il] : 0.0f;
-    if (expert_cache && expert_cache->active() && ubatch.n_tokens <= expert_cache->graph_rows() && expert_cache->layer(il) &&
+    if (expert_cache && (expert_cache->active() || expert_cache->prefill_enabled(ubatch.n_tokens)) &&
+            ubatch.n_tokens <= expert_cache->graph_rows() && expert_cache->layer(il) &&
             type_op == LLM_FFN_SILU && !weight_before_ffn && !gate_up_exps &&
             !up_exps_s && !gate_exps_s && !down_exps_s && !up_exps_b && !gate_exps_b && !down_exps_b &&
             (loras == nullptr || loras->empty()) && (swiglu_lim <= 1e-6f || clamp_arch)) {
@@ -2564,6 +2565,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn_cache(
     auto * cx = ggml_view_3d(ctx0, input, cur->ne[0], 1, cur->ne[2], cur->ne[0] * sizeof(float), cur->ne[0] * sizeof(float), 0);
     auto * ci = expert_cache->build_cold_ids(ctx0,
             ggml_view_2d(ctx0, input, ids->ne[0], ids->ne[1], ids->ne[0] * sizeof(float), nx * sizeof(float)), il);
+    auto * plan = ci;
+    const bool sharing = expert_cache->prefill_staging(ids->ne[1], il);
+    if (sharing) {
+        name(plan, "prefill_plan", true);
+        // The first plane is still read by the CPU FFN after the ready callback has consumed the second plane.
+        ggml_set_output(plan);
+        ci = ggml_view_2d(ctx0, plan, ids->ne[0], ids->ne[1], plan->nb[1], 0);
+    }
     name(cx, "input", true); name(ci, "ids", true);
     ggml_build_forward_expand(gf, cx);
     ggml_build_forward_expand(gf, ci);
@@ -2638,6 +2647,22 @@ ggml_tensor * llm_graph_context::build_moe_ffn_cache(
         auto * d = part(remote_input(t).x, hot, expert_cache->bank(t, il, 0), expert_cache->bank(t, il, 1), expert_cache->bank(t, il, 2), label);
         remote.push_back(reduce(d, remote_input(t).weights, label));
     }
+    if (sharing) {
+        // Residents are already queued while the copy workers fill the compact bank. The CPU FFN follows the transient
+        // GPU FFN, so it can run while the GPU uploads and computes the selected cold experts.
+        auto * ready = expert_cache->build_prefill_ready(ctx0, plan, il);
+        name(ready, "prefill_ready", true);
+        ggml_build_forward_expand(gf, ready);
+        auto * bank_ids = expert_cache->prefill_route(il);
+        auto * route = ggml_view_2d(ctx0, bank_ids, ids->ne[0], ids->ne[1], bank_ids->nb[1], 0);
+        name(route, "prefill_ids", false);
+        const labeler label = [&](ggml_tensor * x, const char * l) {
+            name(x, (std::string("prefill_") + l).c_str(), false);
+        };
+        auto * d = part(cur, route, expert_cache->prefill_bank(il, 0), expert_cache->prefill_bank(il, 1),
+                expert_cache->prefill_bank(il, 2), label);
+        remote.push_back(reduce(d, weights, label));
+    }
     auto * experts = part(cx, ci, gate, up, down, [&](ggml_tensor * x, const char * l) { name(x, l, true); });
     ggml_tensor * out = nullptr;
     if (prompt) {
@@ -2656,6 +2681,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn_cache(
     for (auto * r : remote) {
         out = ggml_add(ctx0, out, r);
         name(out, "remote", false);
+        ggml_build_forward_expand(gf, out);
+    }
+    if (expert_cache->prefill_enabled(ids->ne[1]) && remote.empty()) {
+        // Keep the following dense operations on the same device in the CPU endpoint, including an empty resident set.
+        out = ggml_dup(ctx0, out);
+        name(out, "prefill_merge", false);
         ggml_build_forward_expand(gf, out);
     }
     return out;

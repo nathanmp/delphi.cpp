@@ -2,6 +2,7 @@
 
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -25,7 +26,13 @@ struct llama_expert_cache {
     static constexpr int64_t max_rows = 16;
     // Most rows of a batch that runs the cache graph. LLAMA_MOE_CACHE_PROMPT_ROWS raises it above max_rows, so that prompt
     // batches the CPU runs (below GGML_SCHED_STAGE_MIN_TOKENS) also run their hot experts on the GPU beside the CPU part.
-    int64_t graph_rows() const { return std::max(max_rows, prompt_rows); }
+    int64_t graph_rows() const { return std::max({max_rows, prompt_rows, prefill_max_rows}); }
+    bool prefill_enabled(int64_t rows) const { return rows > max_rows && rows <= prefill_max_rows; }
+    bool prefill_staging(int64_t rows, int il) const;
+    ggml_tensor * prefill_bank(int il, int p) const;
+    ggml_tensor * prefill_route(int il) const;
+    // The plan starts selected uploads. The second CPU op publishes IDs after the upload records have been issued.
+    ggml_tensor * build_prefill_ready(ggml_context * ctx, ggml_tensor * plan, int il);
     // run-time tiers; each adds a partial expert pass per layer to the graph
     static constexpr int max_tiers = 8;
 
@@ -129,6 +136,13 @@ private:
     void forget(const tier & t) const;
     static void op_cold_ids(ggml_tensor * dst, int ith, int nth, void * userdata);
     static void op_record(ggml_tensor * dst, int ith, int nth, void * userdata);
+    static void op_prefill_plan(ggml_tensor * dst, int ith, int nth, void * userdata);
+    static void op_prefill_ready(ggml_tensor * dst, int ith, int nth, void * userdata);
+
+    struct prefill_share;
+    std::unique_ptr<prefill_share> prefill;
+    int64_t prefill_max_rows = 0; // LLAMA_MOE_PREFILL_SHARE, LLAMA_MOE_PREFILL_MAX_ROWS
+    void init_prefill(uint32_t min_reuse, bool gpu_only);
 
     const llama_model * model = nullptr;
     ggml_backend_t gpu = nullptr;

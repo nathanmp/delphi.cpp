@@ -5483,25 +5483,32 @@ struct test_mul_mat_id_partial : public test_case {
     }
 };
 
-// Complete masked G128 FFNs cover the cache's GPU branch, including entirely cold batches.
-struct test_g128_partial_ffn : public test_mul_mat_id_partial {
+// Complete masked FFNs cover the cache's GPU branch, including entirely cold batches and different projection types.
+struct test_partial_ffn : public test_mul_mat_id_partial {
     const int mask;
-    test_g128_partial_ffn(int64_t rows, int mask) : test_mul_mat_id_partial(GGML_TYPE_Q4_G128, 16, 6, true, 512, rows, 256), mask(mask) {}
-    std::string vars() override { return test_mul_mat_id_partial::vars() + ",ffn_mask=" + std::to_string(mask); }
+    const ggml_type type_up, type_down;
+    const float limit;
+    test_partial_ffn(int64_t rows, int mask, ggml_type type_gate = GGML_TYPE_Q4_G128,
+            ggml_type type_up = GGML_TYPE_Q4_G128, ggml_type type_down = GGML_TYPE_Q4_G128, float limit = 0.0f) :
+        test_mul_mat_id_partial(type_gate, 16, 6, true, 512, rows, 256), mask(mask), type_up(type_up), type_down(type_down), limit(limit) {}
+    std::string vars() override {
+        return test_mul_mat_id_partial::vars() + ",ffn_mask=" + std::to_string(mask) + ",up=" + ggml_type_name(type_up) +
+                ",down=" + ggml_type_name(type_down) + ",limit=" + std::to_string(limit);
+    }
     double max_nmse_err() override { return 2e-3; }
     bool use_weight_context() override { return true; }
     ggml_tensor * build_graph(ggml_context * ctx) override { return build_graph(ctx, ctx); }
     ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
         auto * gate = ggml_new_tensor_3d(ctx_weights, type_a, k, m, n_mats);
-        auto * up = ggml_new_tensor_3d(ctx_weights, type_a, k, m, n_mats);
-        auto * down = ggml_new_tensor_3d(ctx_weights, type_a, m, k, n_mats);
+        auto * up = ggml_new_tensor_3d(ctx_weights, type_up, k, m, n_mats);
+        auto * down = ggml_new_tensor_3d(ctx_weights, type_down, m, k, n_mats);
         auto * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, 1, n);
         auto * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n);
         auto * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, n);
         ggml_set_name(ids, "cache_ids");
         auto * g = ggml_mul_mat_id_partial(ctx, gate, x, ids);
         auto * u = ggml_mul_mat_id_partial(ctx, up, x, ids);
-        auto * a = ggml_swiglu_split(ctx, g, u);
+        auto * a = limit > 0.0f ? ggml_swiglu_clamp(ctx, g, u, limit) : ggml_swiglu_split(ctx, g, u);
         auto * d = ggml_mul_mat_id_partial(ctx, down, a, ids);
         auto * w = ggml_mul(ctx, d, weights);
         ggml_tensor * y = nullptr;
@@ -5518,7 +5525,8 @@ struct test_g128_partial_ffn : public test_mul_mat_id_partial {
             std::vector<int32_t> ids(n_used * n);
             for (int64_t r = 0; r < n; ++r) {
                 for (int i = 0; i < n_used; ++i) {
-                    ids[r * n_used + i] = mask == 0 ? -1 : mask == 1 ? i % 3 : i % 2 ? -1 : i % 3;
+                    // Reuse experts across tokens, as a router does; each token's active IDs are distinct.
+                    ids[r * n_used + i] = mask == 0 ? -1 : mask == 1 ? i : i % 2 ? -1 : i;
                 }
             }
             ggml_backend_tensor_set(t, ids.data(), 0, ids.size() * sizeof(int32_t));
@@ -11333,9 +11341,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     // 64 and 300 rows: prompt batches that run the expert cache (LLAMA_MOE_CACHE_PROMPT_ROWS) and the CPU G128 GEMM
     for (int64_t rows : {1, 3, 6, 64, 300}) {
-        for (int mask : {0, 1, 2}) { test_cases.emplace_back(new test_g128_partial_ffn(rows, mask)); }
+        for (int mask : {0, 1, 2}) { test_cases.emplace_back(new test_partial_ffn(rows, mask)); }
         test_cases.emplace_back(new test_mul_mat_id_partial(GGML_TYPE_Q4_G128, 16, 6, true, 256, rows, 512));
         test_cases.emplace_back(new test_mul_mat_id_partial(GGML_TYPE_Q4_G128, 16, 6, false, 512, rows, 256));
+    }
+    for (int64_t rows : {3, 64}) {
+        for (int mask : {0, 1, 2}) {
+            test_cases.emplace_back(new test_partial_ffn(rows, mask, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
+            for (float limit : {0.0f, 2.0f}) {
+                test_cases.emplace_back(new test_partial_ffn(rows, mask, GGML_TYPE_IQ3_K, GGML_TYPE_IQ4_KS, GGML_TYPE_IQ3_KS, limit));
+            }
+        }
     }
     // partial MUL_MAT_ID (expert split): broadcast gate/up and per-slot down, few and many tokens
     // delphi: the expert cache runs partial MUL_MAT_ID on its GPU banks and the host experts, for any expert type
