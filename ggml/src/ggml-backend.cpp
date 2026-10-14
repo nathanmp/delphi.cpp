@@ -3832,8 +3832,8 @@ static bool ggml_backend_sched_worker_split_ok(ggml_backend_sched_t sched, ggml_
         const struct ggml_backend_sched_split * split) {
     if (sched->worker_ready[w->backend_id]) {
         // The caller still submits ordinary local work. A ready split uses only local storage, so no pull or push is needed.
-        return split->n_inputs == 0 &&
-                sched->worker_ready[w->backend_id](&split->graph, true, sched->worker_ready_data[w->backend_id]);
+        // Select it at submission, after an earlier CPU split can publish the actual routing decision.
+        return split->n_inputs == 0;
     }
     for (int i = 0; i < split->n_inputs; i++) {
         struct ggml_tensor * input = split->inputs[i];
@@ -4119,7 +4119,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         if (workers_on) {
             ggml_backend_sched_worker * w = sched->workers[split_backend_id];
-            if (w != nullptr && w->ok[split_id]) {
+            const auto ready = sched->worker_ready[split_backend_id];
+            if (w != nullptr && w->ok[split_id] &&
+                    (!ready || ready(&split->graph, true, sched->worker_ready_data[split_backend_id]))) {
                 ggml_backend_sched_worker_post(sched, w, split_id);
                 prev_backend_id = split_backend_id;
                 continue;

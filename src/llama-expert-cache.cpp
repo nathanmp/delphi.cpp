@@ -55,6 +55,7 @@ struct llama_expert_cache::prefill_share {
     bool route_recorded = false;
     ggml_tensor * route = nullptr;
     size_t route_bytes = 0;
+    uint64_t current_cpu_groups = 0;
     int next = 0, last = -1;
     ggml_backend_sched_stage_copier copier;
     std::thread worker;
@@ -274,7 +275,7 @@ bool llama_expert_cache::prefill_worker_ready(const ggml_cgraph * graph, bool as
         if (node->op != GGML_OP_MUL_MAT_ID) { continue; }
         for (size_t g = 0; g < s.banks.size(); ++g) {
             if (!s.banks[g][0] || node->src[0] != s.banks[g][0]) { continue; }
-            if (ask) { return true; }
+            if (ask) { return s.current_cpu_groups > 0; }
             s.wait();
             // queued=false publishes the final record. Independent GPU compute streams must see banks and IDs ready.
             GGML_ASSERT(s.route_recorded);
@@ -875,6 +876,7 @@ void llama_expert_cache::op_prefill_plan(ggml_tensor * dst, int ith, int nth, vo
     ggml_backend_synchronize(c.gpu);
     {
         std::lock_guard<std::mutex> lock(s.mutex);
+        s.current_cpu_groups = cpu;
         if (s.overlap) {
             s.route = s.routes[l.il];
             s.route_bytes = dst->nb[2];
@@ -913,6 +915,13 @@ void llama_expert_cache::op_prefill_ready(ggml_tensor * dst, int ith, int nth, v
     auto & s = *l.owner->prefill;
     if (s.overlap) {
         // Retain the CPU split boundary, but let the transient GPU consumer's worker perform the wait.
+        if (s.current_cpu_groups == 0) {
+            // There is no CPU work to hide. Keep readiness here and submit the GPU FFN on the caller.
+            s.wait();
+            ggml_backend_event_wait(s.gpu, s.route_done);
+            if (s.prepare && s.last >= 0) { for (auto * bank : s.banks[l.group]) { s.prepare(s.gpu, bank); } }
+            ggml_backend_synchronize(s.gpu);
+        }
         *static_cast<int32_t *>(dst->data) = 0;
         return;
     }
