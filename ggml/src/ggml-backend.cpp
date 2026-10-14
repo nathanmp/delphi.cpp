@@ -4125,7 +4125,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 continue;
             }
             // this thread queues work on the split backend below
+            const uint64_t join_start = w != nullptr ? ggml_backend_sched_trace_span_begin() : 0;
             ggml_backend_sched_worker_join(w);
+            ggml_backend_sched_trace_span_end(sched, join_start, GGML_EXEC_TRACE_EVENT_BACKEND_WAIT,
+                    GGML_EXEC_TRACE_WAIT_PREVIOUS_SPLIT, split_id, split_backend_id, GGML_EXEC_TRACE_ID_NONE, 0);
             ggml_backend_sched_workers_fence_pulls(sched, split_backend_id);
         }
 
