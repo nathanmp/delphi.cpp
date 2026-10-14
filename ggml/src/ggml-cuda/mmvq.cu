@@ -1522,6 +1522,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
             calc_nwarps(type, c_ncols, MMVQ_PARAMETERS_RDNA4, false, true) != calc_nwarps(type, c_ncols, MMVQ_PARAMETERS_RDNA4, false, false);
 #else
         constexpr bool c_wide_k = false;
+        GGML_UNUSED(wide_k_tag);
 #endif
         const std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id, c_wide, c_wide_k);
         mul_mat_vec_q_switch_fusion<type, c_ncols, c_wide, c_wide_k>(vx, vy, ids, fusion, dst, split, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
