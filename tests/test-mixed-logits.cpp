@@ -8,6 +8,8 @@
 // per position the KL divergence from the file, the top-1 token, the NLL of the next text token, and bitwise identity.
 
 #include "llama.h"
+#include "common.h"
+#include "ggml-cpu.h"
 
 #include <algorithm>
 #include <chrono>
@@ -113,7 +115,7 @@ static double log_sum_exp(const float * x, int n, int & argmax) {
 static void usage(const char * argv0) {
     fprintf(stderr,
         "usage: %s -m model.gguf -f text [--save FILE] [--compare FILE] [-ngl N] [-t N] [-fa on|off|auto] [-ub N] [--plan PLAN]\n"
-        "       [--keep-pp N] [--expect-bitwise R,...] [-v]\n"
+        "       [--keep-pp N] [--expect-bitwise R,...] [--numa tensors] [--device NAME] [-cmoe] [-v]\n"
         "  --plan            requests separated by '|', each a list of P:T steps (default: %s)\n"
         "  --keep-pp         stored logits per prefill, its last tokens (default: 8)\n"
         "  --expect-bitwise  exit 1 unless every stored position of these requests is bitwise identical to --compare\n",
@@ -132,6 +134,9 @@ int main(int argc, char ** argv) {
     int threads = 8;
     int n_ub    = 512;
     int keep_pp = 8;
+    bool numa_tensors = false;
+    bool cpu_moe = false;
+    std::string device_name;
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -152,6 +157,12 @@ int main(int argc, char ** argv) {
         else if (a == "-t")               { threads = atoi(next().c_str()); }
         else if (a == "-ub")              { n_ub    = atoi(next().c_str()); }
         else if (a == "--keep-pp")        { keep_pp = atoi(next().c_str()); }
+        else if (a == "-cmoe")            { cpu_moe = true; }
+        else if (a == "--device")         { device_name = next(); }
+        else if (a == "--numa") {
+            if (next() != "tensors") { usage(argv[0]); return 1; }
+            numa_tensors = true;
+        }
         else if (a == "--expect-bitwise") {
             for (const std::string & r : split(next(), ',')) {
                 expect_bitwise.push_back(atoi(r.c_str()));
@@ -169,9 +180,18 @@ int main(int argc, char ** argv) {
 
     llama_log_set(log_filter, nullptr);
     ggml_backend_load_all();
+    if (numa_tensors) { llama_numa_init(GGML_NUMA_STRATEGY_TENSORS); }
 
     llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = ngl;
+    ggml_backend_dev_t devices[] = { nullptr, nullptr };
+    if (!device_name.empty()) {
+        devices[0] = ggml_backend_dev_by_name(device_name.c_str());
+        if (!devices[0]) { fprintf(stderr, "error: unknown device %s\n", device_name.c_str()); return 1; }
+        mparams.devices = devices;
+    }
+    const llama_model_tensor_buft_override overrides[] = { llm_ffn_exps_cpu_override(), { nullptr, nullptr } };
+    if (cpu_moe) { mparams.tensor_buft_overrides = overrides; }
     llama_model * model = llama_model_load_from_file(model_path.c_str(), mparams);
     if (model == nullptr) {
         fprintf(stderr, "error: cannot load %s\n", model_path.c_str());
