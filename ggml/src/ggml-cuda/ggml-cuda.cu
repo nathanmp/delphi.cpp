@@ -3202,9 +3202,9 @@ static uint64_t ggml_cuda_graph_get_topo_key(const ggml_cgraph * cgraph) {
 
 // When the KV cache view grows by a padding step, only the attention nodes of a graph change shape, and every
 // such graph gets a new key. The new graph can take over the executable of the previous size through
-// cudaGraphExecUpdate instead of instantiating its own: with HIP an instantiation costs about 1 ms, and tensor
-// split steps about 50 graphs per device at once. Graphs that differ in more than half of the node shapes
-// (another batch size) are left alone, since those usually stay in use.
+// cudaGraphExecUpdate instead of instantiating its own (tensor split steps about 50 graphs per device at once).
+// Graphs that differ in more than half of the node shapes (another batch size) are left alone, since those
+// usually stay in use.
 static ggml_cuda_graph * ggml_cuda_graph_find_sibling(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, ggml_cuda_graph * self) {
     if (self->topo_key == 0) {
         self->topo_key = ggml_cuda_graph_get_topo_key(cgraph);
@@ -3281,8 +3281,33 @@ static bool ggml_cuda_graph_update_required(
     return res;
 }
 
+// With HIP, hipGraphExecUpdate grows about with the square of the node count (gfx1201: 0.7 ms at 150 nodes,
+// 6 ms at 500, 25 ms at 1000) and hipGraphInstantiate about linearly (1.2, 2.4, 4.7 ms). Decode graphs have
+// 450-2600 nodes, so a large graph is instantiated again instead of updated, and does not take over the
+// executable of a sibling.
+static bool ggml_cuda_graph_prefer_instantiate(int n_nodes) {
+#if defined(GGML_USE_HIP)
+    return n_nodes > 256;
+#else
+    GGML_UNUSED(n_nodes);
+    return false;
+#endif // defined(GGML_USE_HIP)
+}
+
 static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, uint64_t graph_key) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+
+    if (ggml_cuda_graph_prefer_instantiate(graph->num_nodes)) {
+        // the last launch of the executable can still run on the stream; HIP does not document a deferred destruction
+        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+        CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
+        graph->instance = nullptr;
+        CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+        graph->trace_id = ggml_exec_trace_next_gpu_graph_id();
+        ggml_exec_trace_gpu_graph(GGML_EXEC_TRACE_GPU_GRAPH_UPDATE, graph->trace_id, graph->num_nodes,
+                GGML_EXEC_TRACE_GPU_GRAPH_REASON_UPDATE_REINSTANTIATED);
+        return;
+    }
 
 #if CUDART_VERSION >= 12000
     cudaGraphExecUpdateResultInfo result_info;
@@ -5512,7 +5537,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             cuda_ctx->graph_topo_no_lend.insert(graph->topo_key);
             graph->instance_lent = false;
         }
-        ggml_cuda_graph * sibling = graph->instance == nullptr ? ggml_cuda_graph_find_sibling(cuda_ctx, cgraph, graph) : nullptr;
+        ggml_cuda_graph * sibling = graph->instance == nullptr && !ggml_cuda_graph_prefer_instantiate(cgraph->n_nodes) ?
+            ggml_cuda_graph_find_sibling(cuda_ctx, cgraph, graph) : nullptr;
         if (sibling != nullptr) {
             // cuda_graph_update_required is set whenever there is no instance, so the executable is updated below
             graph->instance    = sibling->instance;
@@ -5522,7 +5548,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 graph->trace_id = ggml_exec_trace_next_gpu_graph_id();
             }
         }
-        if (graph->instance == nullptr) { // Create executable graph from captured graph.
+        const bool instantiated = graph->instance == nullptr;
+        if (instantiated) { // Create executable graph from captured graph.
             const int64_t prefill_inst_t0 = prefill_timelog ? ggml_time_us() : 0;
             CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
             if (prefill_timelog) {
@@ -5534,8 +5561,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 graph->trace_id = ggml_exec_trace_next_gpu_graph_id();
             }
         }
-        if (cuda_graph_update_required) { // Update graph executable
-            ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
+        if (cuda_graph_update_required) {
+            // an executable instantiated just now already matches the captured graph: an update would only
+            // repeat the work (with HIP, at the cost of several instantiations)
+            if (!instantiated) {
+                ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
+            }
         } else {
             ggml_exec_trace_dispatch_replay(graph->trace_dispatches.data(), graph->trace_dispatches.size());
         }
