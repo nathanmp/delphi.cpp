@@ -148,8 +148,9 @@ void llama_expert_cache::init_prefill(uint32_t min_reuse, bool gpu_only, bool al
     s->gpu = gpu;
     s->min_reuse = min_reuse;
     s->gpu_only = gpu_only;
+    // Overlap is on by default; set LLAMA_MOE_PREFILL_OVERLAP=0 to disable it.
     const char * overlap_env = getenv("LLAMA_MOE_PREFILL_OVERLAP");
-    const bool requested = allow_overlap && overlap_env && atoi(overlap_env) != 0;
+    const bool requested = allow_overlap && (!overlap_env || atoi(overlap_env) != 0);
     const bool g128 = std::all_of(group_types.begin(), group_types.end(), [](const auto & types) {
         return std::all_of(types.begin(), types.end(), [](ggml_type type) { return type == GGML_TYPE_Q4_G128; });
     });
