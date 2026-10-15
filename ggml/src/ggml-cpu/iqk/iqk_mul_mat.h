@@ -30,16 +30,14 @@ bool iqk_mul_mat_moe(long nx, long ny, long ne00, int ne11,
         float * c, long nb1, long nb2, const void * row_mapping,
         int rot, int ith, int nth);
 
-// Fused MoE up+gate: computes swiglu_clamp(gate*B, up*B) into `c` in one pass over the
-// routed rows. Only the clamped variant is implemented, because its combine is scalar and
-// so stays bit-for-bit equal to ggml_compute_forward_swiglu_clamp_f32; plain SwiGLU uses a
-// vectorized silu that this kernel would not reproduce exactly. Layout requirements and
-// `rot` are the same as iqk_mul_mat_moe.
+// Fused MoE up+gate: computes SwiGLU(gate*B, up*B), optionally clamped, into `c`.
+// Layout requirements and `rot` are the same as iqk_mul_mat_moe. The row map must
+// contain only valid routes; the caller clears inactive partial outputs.
 bool iqk_moe_fused_up_gate(long nx, long ny, long ne00, int ne11,
         int type_a, const void * a_gate, const void * a_up, long stride_a,
         int type_b, const void * b, long stride_b,
         float * c, long nb1, long nb2, const void * row_mapping,
-        float limit, int rot, int ith, int nth);
+        bool clamp, float limit, int rot, int ith, int nth);
 
 // Whether iqk_mul_mat_moe has kernels for this type pair. Diagnostics only: the
 // caller must still meet the layout conditions checked in iqk_mul_mat_moe.

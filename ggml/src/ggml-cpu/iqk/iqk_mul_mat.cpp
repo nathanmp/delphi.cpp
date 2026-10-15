@@ -9,6 +9,7 @@
 
 #include "iqk_gemm_iqk_quants.h"
 #include "../moe-prof.h"
+#include "../vec.h"
 
 #include <algorithm>
 #include <array>
@@ -123,7 +124,7 @@ struct MulMat {
     // tile buffer bounds how many columns can be held between the two GEMMs.
     void mul_mat_up_gate_nxm(
             int n, const void * vx_gate, const void * vx_up, size_t bx,
-            DataInfo & info, int nrc_x, int nrc_y, float limit) const {
+            DataInfo & info, int nrc_x, int nrc_y, bool clamp, float limit) const {
         constexpr int x_step = 64;
         float tmp[x_step * IQK_MAX_NY_HI];
 
@@ -134,7 +135,13 @@ struct MulMat {
             }
             func(n, (const char *) vx_up + ix * bx, bx, this_info, this_nrc_x);
             for (int ky = 0; ky < ny; ++ky) {
-                iqk_swiglu_clamp(this_nrc_x, this_info.dst_row(ky), tmp + ky * x_step, limit);
+                float * dst = this_info.dst_row(ky);
+                const float * gate = tmp + ky * x_step;
+                if (clamp) {
+                    iqk_swiglu_clamp(this_nrc_x, dst, gate, limit);
+                } else {
+                    ggml_vec_swiglu_f32(this_nrc_x, dst, gate, dst);
+                }
             }
         };
 
@@ -435,7 +442,7 @@ extern "C" bool iqk_moe_fused_up_gate(
         int type_a, const void * a_gate, const void * a_up, long stride_a,
         int type_b, const void * b, long stride_b,
         float * c, long nb1, long nb2, const void * vrow_mapping,
-        float limit, int rot, int ith, int nth) {
+        bool clamp, float limit, int rot, int ith, int nth) {
     if (!is_iqk_type(type_a) || (ggml_type) type_b != GGML_TYPE_Q8_K ||
         !vrow_mapping || nx <= 0 || ny <= 0 || ne00 % QK_K != 0 || nth <= 0) {
         return false;
@@ -479,7 +486,7 @@ extern "C" bool iqk_moe_fused_up_gate(
             }
             const int64_t t1 = prof ? ggml_time_us() : 0;
             mm.mul_mat_up_gate_nxm((int) ne00, work.data(), work.data() + tile_size,
-                row_size, this_info, this_nrc_x, (int) ny, limit);
+                row_size, this_info, this_nrc_x, (int) ny, clamp, limit);
             if (prof) {
                 ggml_moe_prof_add(GGML_MOE_PROF_REPACK, t1 - t0);
                 ggml_moe_prof_add(GGML_MOE_PROF_GEMM, ggml_time_us() - t1);
@@ -501,7 +508,7 @@ extern "C" bool iqk_moe_fused_up_gate(
     mm.mul_mat_up_gate_nxm((int) ne00,
         (const char *) a_gate + first_x * stride_a,
         (const char *) a_up   + first_x * stride_a,
-        (size_t) stride_a, info, nrc_x, (int) ny, limit);
+        (size_t) stride_a, info, nrc_x, (int) ny, clamp, limit);
     if (t0) {
         ggml_moe_prof_add(GGML_MOE_PROF_GEMM, ggml_time_us() - t0);
     }
@@ -518,7 +525,7 @@ extern "C" bool iqk_mul_mat_4d(long, long, long, long, long, long, long,
 extern "C" bool iqk_mul_mat_moe(long, long, long, int, int, const void *, long,
         int, const void *, long, float *, long, long, const void *, int, int, int) { return false; }
 extern "C" bool iqk_moe_fused_up_gate(long, long, long, int, int, const void *, const void *, long,
-        int, const void *, long, float *, long, long, const void *, float, int, int, int) { return false; }
+        int, const void *, long, float *, long, long, const void *, bool, float, int, int, int) { return false; }
 extern "C" bool iqk_mul_mat_moe_supported(long, int, int) { return false; }
 
 #endif

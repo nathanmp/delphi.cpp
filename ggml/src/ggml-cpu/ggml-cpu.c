@@ -2259,7 +2259,7 @@ static void ggml_mmid_piece(
 // `fuse_up` and `fuse_dst` are the up-projection MUL_MAT_ID node and the GLU node of a
 // fused MoE up+gate subgraph, or NULL for a plain MUL_MAT_ID. When set, `dst` supplies the
 // gate weights and every other shape, and the routed rows are written to `fuse_dst`
-// combined by swiglu_clamp; `dst` itself is never written.
+// combined by SwiGLU or swiglu_clamp; `dst` itself is never written.
 static void ggml_compute_forward_mul_mat_id_impl(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst,
@@ -2589,7 +2589,7 @@ static void ggml_compute_forward_mul_mat_id_impl(
                 vec_dot_type, wdata, row_size,
                 (float *) fuse_dst->data + numa_row0_start, fuse_dst->nb[1], fuse_dst->nb[2],
                 matrix_rows + cur_a * ids->ne[0] * ids->ne[1],
-                fuse_limit, cur_a, work_ith, work_nth);
+                ggml_get_glu_op(fuse_dst) == GGML_GLU_OP_SWIGLU_CLAMP, fuse_limit, cur_a, work_ith, work_nth);
             // There is no fallback: the eligibility test in ggml_cpu_try_fuse_ops already
             // ran the same kernel checks, so a refusal here means they disagree.
             GGML_ASSERT(fused);
@@ -4275,8 +4275,8 @@ static bool ggml_cpu_moe_fuse_up_gate_match(
 
     // G128 experts fuse through the row kernels (ggml_compute_forward_mul_mat_id_impl), the others through IQK
     const bool g128 = ggml_cpu_g128_rows_supported(gate0) && ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU;
-    if (!g128 && (!ggml_cpu_iqk_mul_mat_enabled() || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU_CLAMP ||
-                  ggml_mul_mat_id_is_partial(mm0) || ggml_mul_mat_id_is_partial(mm1))) {
+    const bool clamp = ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU_CLAMP;
+    if (!g128 && (!ggml_cpu_iqk_mul_mat_enabled() || (!clamp && ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU))) {
         return false;
     }
     if (ggml_mul_mat_id_is_partial(mm0) != ggml_mul_mat_id_is_partial(mm1)) {
@@ -4314,7 +4314,7 @@ static bool ggml_cpu_moe_fuse_up_gate_match(
     *gate_out  = gate;
     *up_out    = up;
     *glu_out   = glu;
-    *limit_out = g128 ? 0.0f : ggml_get_op_params_f32(glu, 3);
+    *limit_out = clamp ? ggml_get_op_params_f32(glu, 3) : 0.0f;
     return true;
 }
 
