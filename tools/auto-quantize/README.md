@@ -140,6 +140,19 @@ This runs `llama-imatrix` once per corpus. It is expensive and runs only on this
 
 Rejected inputs: weights that are zero, negative or not finite; duplicate files in a weighted list; unknown keys in an entry object; a corpus smaller than its share; a share of zero pieces; `extra_args` that set managed options; an output directory with logits from another text; a quality table made for other weights.
 
+## Command-line wrapper
+
+`quant_cli.py` wraps the workflow below for ordinary use. `setup` runs prepare and calibrate once into a work directory; `plan` turns a query into planning-only changes (weights, budgets, bounds), runs the existing planner on the prepared inputs and shows at most `--rows` recipes thinned from the whole frontier (best score, the extreme of each metric, then farthest-point samples in log space). A pick (`--pick`, or a prompt on a terminal when `--output` is set) can be encoded at once.
+
+```sh
+python tools/auto-quantize/quant_cli.py setup --config config.json --work /tmp/autoq
+python tools/auto-quantize/quant_cli.py plan --config config.json --work /tmp/autoq --weights loss=.4,decode=.3,short=.2,long=.1
+python tools/auto-quantize/quant_cli.py plan --config config.json --work /tmp/autoq --minimize kld --budget RAM=300GiB --pick min-kld --output /models/out.gguf
+python tools/auto-quantize/quant_cli.py show --frontier /tmp/autoq/plans/plan-001/frontier.json --detail best
+```
+
+`--minimize size` (smallest recipe under `--max-kld`) is not implemented yet. Run `python tests/test-quant-cli.py` for the offline checks.
+
 ## Workflow
 
 ```sh
