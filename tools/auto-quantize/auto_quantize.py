@@ -132,6 +132,23 @@ def encode(info, cfg, choices, imatrix, output, quality=None):
     return str(output)
 
 
+def encode_from_frontier(frontier, recipe_id, output):
+    """Encode one recipe of a plan after checking that the source and the encoder inputs are unchanged."""
+    if frontier.get("schema") != SCHEMA:
+        raise QuantError("unsupported frontier schema")
+    cfg = frontier["config"]
+    info = frontier["prepared"]["model"]
+    if read_model(cfg["model"])["identity"] != info["identity"]:
+        raise QuantError("source model changed since planning")
+    current = configured_model(cfg)
+    if digest(inputs(cfg, current)) != frontier["prepared"]["input_key"]:
+        raise QuantError("encoder, imatrix or runtime inputs changed since planning")
+    recipe = next((r for r in frontier["recipes"] if r["id"] == recipe_id), None)
+    if recipe is None:
+        raise QuantError(f"unknown recipe {recipe_id}")
+    return encode(info, cfg, recipe["choices"], frontier["prepared"]["imatrix"], output, frontier["quality"])
+
+
 def prepare(cfg, directory, timeout):
     directory = Path(directory).resolve()
     directory.mkdir(parents=True, exist_ok=True)
@@ -419,20 +436,7 @@ def main():
             print(f"Saved {merge_imatrices(paths, args.output.resolve(), weights)}")
             return
         if args.command == "encode":
-            frontier = json.loads(args.frontier.read_text())
-            if frontier.get("schema") != SCHEMA:
-                raise QuantError("unsupported frontier schema")
-            cfg = frontier["config"]
-            info = frontier["prepared"]["model"]
-            if read_model(cfg["model"])["identity"] != info["identity"]:
-                raise QuantError("source model changed since planning")
-            current = configured_model(cfg)
-            if digest(inputs(cfg, current)) != frontier["prepared"]["input_key"]:
-                raise QuantError("encoder, imatrix or runtime inputs changed since planning")
-            recipe = next((r for r in frontier["recipes"] if r["id"] == args.recipe), None)
-            if recipe is None:
-                raise QuantError(f"unknown recipe {args.recipe}")
-            encode(info, cfg, recipe["choices"], frontier["prepared"]["imatrix"], args.output, frontier["quality"])
+            encode_from_frontier(json.loads(args.frontier.read_text()), args.recipe, args.output)
             return
         cfg = load_config(args.config)
         if args.command == "inspect":
