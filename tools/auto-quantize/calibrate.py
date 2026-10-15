@@ -362,6 +362,18 @@ def teacher_logits(cfg, c, output, timeout):
     return teacher
 
 
+def measured(output, devices, shares, direct):
+    """Whether every pass has a result that run_session and the direct runs would reuse."""
+    for device in devices:
+        session = output / f"session-{device}"
+        record = session / "run.json"
+        done = {j["label"] for j in json.loads(record.read_text())["jobs"]} if record.exists() else set()
+        if not (session / "floor.f32").exists() or any(j["label"] not in done or not (session / f"{j['label']}.f32").exists()
+                                                       for j in shares[device]):
+            return False
+    return all((output / f"session-{devices[0]}" / f"{j['label']}.f32").exists() for j in direct)
+
+
 def calibrate(data, cfg, output, encode, verify, timeout=7200, text_dir=None):
     """Measure the probes and write the quality table; encode/verify are the advisor's model writer and checker.
 
@@ -378,8 +390,15 @@ def calibrate(data, cfg, output, encode, verify, timeout=7200, text_dir=None):
     records = damage_records(data["damage"])
     mid, top = probe_qtypes(groups, records, c)
     print(f"Probe qtypes: mid {mid}, top {top}", flush=True)
+    jobs = design(groups, mid, top, c)
+    devices = c["devices"] or [gpu(cfg)]
+    hot = [j for j in jobs if "direct" not in j]
+    direct = [j for j in jobs if "direct" in j]
+    shares = {d: hot[i::len(devices)] for i, d in enumerate(devices)}
+    # The passes depend on the floor, probes and teacher, not on the other candidates, so a table refitted after the
+    # candidate pool changes reuses them; the probe models are only needed while a pass is missing.
     paths = {}
-    for q in (mid, top):
+    for q in (mid, top) if not measured(output, devices, shares, direct) else ():
         choices = dict(floor_choices)
         choices.update({g["name"]: q for g in groups})
         path = output / f"probe-{q}.gguf"
@@ -389,13 +408,8 @@ def calibrate(data, cfg, output, encode, verify, timeout=7200, text_dir=None):
             encode(info, cfg, choices, data["imatrix"], path)
         paths[q] = str(path)
     teacher = teacher_logits(cfg, c, output, timeout)
-    jobs = design(groups, mid, top, c)
-    devices = c["devices"] or [gpu(cfg)]
     sources = Sources(paths)
     sources.members = {g["name"]: g["members"] for g in info["groups"]}
-    hot = [j for j in jobs if "direct" not in j]
-    direct = [j for j in jobs if "direct" in j]
-    shares = {d: hot[i::len(devices)] for i, d in enumerate(devices)}
     results, errors = {}, []
     env = measure_env(cfg)
     previous = signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
