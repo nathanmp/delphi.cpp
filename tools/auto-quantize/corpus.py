@@ -16,7 +16,7 @@ from pathlib import Path
 
 from config import QuantError, digest, file_identity, write_json
 from model import lazy_args, read_model
-from timing import gpu, measure_cmoe, run
+from timing import gpu, measure_cmoe, measure_env, run
 
 MARGIN = 1.2
 FORMAT = 1
@@ -146,7 +146,7 @@ def collect_imatrices(cfg, directory, timeout=86400):
         raise QuantError("collect-imatrix needs the imatrix_collect configuration")
     directory = Path(directory).resolve()
     directory.mkdir(parents=True, exist_ok=True)
-    environment = dict(cfg["runtime"]["env"])
+    environment = measure_env(cfg)
     if c["means"]:
         environment["DELPHI_IMATRIX_MEANS"] = "1"
     record = directory / "imatrix-collect.json"

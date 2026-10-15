@@ -61,6 +61,12 @@ def measure_cmoe(cfg):
     return "RAM" in cfg["devices"] or gpu_only(cfg)
 
 
+def measure_env(cfg):
+    """Quality and imatrix runs turn the expert cache off. Its default tier leaves the uncached experts of a prompt on the
+    CPU, which takes hours for a BF16 source on a CPU without BF16 dot products; op offload streams them to the GPU."""
+    return dict(cfg["runtime"]["env"], LLAMA_MOE_CACHE_MIB="0")
+
+
 def requires_backend_signature(sig, cfg):
     return not (sig["expert"] and sig["device"] == gpu(cfg) and "RAM" in cfg["devices"] and not cfg["cache_mib"])
 

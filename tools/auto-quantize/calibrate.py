@@ -33,7 +33,7 @@ from config import ROOT, QuantError, file_identity, imatrix_identities, write_js
 from corpus import calibration_text
 from model import lazy_args
 from quality import METHOD, METRIC, SCHEMA, damage_digest, damage_records, modelled_groups, sensitivity
-from timing import gpu, gpu_only, measure_cmoe
+from timing import gpu, gpu_only, measure_cmoe, measure_env
 
 
 def hotswap_module():
@@ -354,7 +354,7 @@ def teacher_logits(cfg, c, output, timeout):
     partial = output / "teacher.partial.kld"
     command = perplexity_command(cfg, c, cfg["model"], gpu(cfg), partial, base=True)
     print("Computing teacher logits from the source model", flush=True)
-    run_direct(command, output / "teacher.tokens.f32", output / "teacher.log", cfg["runtime"]["env"], timeout)
+    run_direct(command, output / "teacher.tokens.f32", output / "teacher.log", measure_env(cfg), timeout)
     partial.replace(teacher)
     write_json(output / "teacher.json", {"command": command, "text": text})
     return teacher
@@ -395,7 +395,7 @@ def calibrate(data, cfg, output, encode, verify, timeout=7200, text_dir=None):
     direct = [j for j in jobs if "direct" in j]
     shares = {d: hot[i::len(devices)] for i, d in enumerate(devices)}
     results, errors = {}, []
-    env = dict(cfg["runtime"]["env"])
+    env = measure_env(cfg)
     previous = signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
 
     def worker(device):

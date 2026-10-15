@@ -17,7 +17,7 @@ from calibrate import calibrate, per_chunk, perplexity_command, run_direct
 from corpus import collect_imatrices
 from quality import LossModel, load_quality, quality_metadata
 from search import make_options, memory, search
-from timing import MODEL_REVISION, Predictor, fit_slopes, gpu, gpu_only, gpus, machine_settings, measure_ops, profile_model, profile_times, projected, run
+from timing import MODEL_REVISION, Predictor, fit_slopes, gpu, gpu_only, gpus, machine_settings, measure_env, measure_ops, profile_model, profile_times, projected, run
 
 
 def inputs(cfg, info):
@@ -331,7 +331,7 @@ def witness_loss(cfg, table, model, directory, name, timeout=7200):
         command = perplexity_command(cfg, c, model, table["execution"]["devices"][0], teacher["path"])
         print(f"Measuring witness {name} KL against the teacher", flush=True)
         partial = directory / f"{name}-kl.partial.f32"
-        run_direct(command, partial, directory / f"{name}-kl.log", cfg["runtime"]["env"], timeout)
+        run_direct(command, partial, directory / f"{name}-kl.log", measure_env(cfg), timeout)
         partial.replace(tokens)
     chunks = per_chunk(tokens, table["teacher"]["chunks"])
     return float(chunks.mean()), float(chunks.std(ddof=1) / len(chunks) ** 0.5)
