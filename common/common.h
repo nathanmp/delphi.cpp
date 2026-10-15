@@ -685,6 +685,7 @@ struct common_params {
     std::string prefix_cache_dir;         // directory for the snapshots on disk, empty = RAM only
     int32_t prefix_cache_disk_mib = 16384; // the most disk space that the snapshots of one model use
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
+    bool    cache_ram_explicit  = false; // set by --cache-ram, decision models disable the cache otherwise
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT
