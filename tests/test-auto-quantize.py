@@ -144,6 +144,49 @@ class Frontier(unittest.TestCase):
         self.assertTrue(result["frontier"])
         self.assertTrue(all(s["damage"] <= 3 for s in result["frontier"]))
 
+    def exhaustive(self, model):
+        """(damage, total tensor bytes, choices) of every combination of group options."""
+        result = []
+        for combination in itertools.product(*(g["options"] for g in model["groups"])):
+            choices = {g["name"]: q["qtype"] for g, q in zip(model["groups"], combination)}
+            result.append((sum(q["damage"] for q in combination), sum(q["bytes"] for q in combination), choices))
+        return result
+
+    def test_smallest_recipe_matches_exhaustive_search(self):
+        model, predictor, baseline = self.fixture()
+        every = self.exhaustive(model)
+        best = min(d for d, _, _ in every)
+        for ceiling in (best, best + 1, best + 2, best + 3):
+            feasible = [b for d, b, _ in every if d <= ceiling]
+            result = search(model, cfg(bounds={"max_damage": ceiling}, search={"display": 8, "minimize": "size"}), predictor, baseline)
+            smallest = [s for s in result["frontier"] if s.get("smallest")]
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(len(smallest), 1)
+            self.assertLessEqual(smallest[0]["damage"], ceiling)
+            self.assertEqual(sum(o["bytes"] for o in (next(o for o in g["options"] if o["qtype"] == smallest[0]["choices"][g["name"]])
+                                                     for g in model["groups"])), min(feasible))
+
+    def test_smallest_recipe_unreachable_bound(self):
+        model, predictor, baseline = self.fixture()
+        floor = min(d for d, _, _ in self.exhaustive(model))
+        result = search(model, cfg(bounds={"max_damage": floor - 0.5}, search={"display": 8, "minimize": "size"}), predictor, baseline)
+        self.assertEqual(result["status"], "loss_bound_unreachable")
+        self.assertFalse(result["frontier"])
+        with self.assertRaises(QuantError):
+            search(model, cfg(search={"display": 8, "minimize": "size"}), predictor, baseline)
+
+    def test_total_byte_cap_pools_the_devices(self):
+        model, predictor, baseline = self.fixture()
+        every = self.exhaustive(model)
+        sizes = sorted({b for _, b, _ in every})
+        cap = sizes[len(sizes) // 2]
+        result = search(model, cfg(bounds={"max_total_bytes": cap}), predictor, baseline)
+        total = lambda s: sum(s["memory"]["used_bytes"].values())
+        self.assertTrue(result["frontier"])
+        self.assertTrue(all(total(s) <= cap for s in result["frontier"]))
+        best = min(d for d, b, _ in every if b <= cap)
+        self.assertEqual(min(s["damage"] for s in result["frontier"]), best)
+
     def test_budget_failure_and_byte_budget(self):
         model, predictor, baseline = self.fixture()
         self.assertEqual(search(model, cfg(devices={"ROCm1": 1, "RAM": 1}), predictor, baseline)["status"], "infeasible_minimum_bytes")
@@ -655,6 +698,27 @@ class Quality(unittest.TestCase):
         # the fastest recipe that meets the ceiling is found at the edge of the bound
         fastest = min(result["frontier"], key=lambda s: s["axes"][1])
         self.assertGreater(fastest["loss"], .04)
+
+    def test_smallest_recipe_with_the_quality_model(self):
+        config = dict(self.config, bounds={"max_loss": .06}, search={"display": 8, "minimize": "size"})
+        loss = LossModel(self.model, self.load(), self.damage)
+        make_options(self.model, self.damage, {}, config)
+        ops = {}
+        for group, members, paired in regions(self.model):
+            for dtype in group["pool"]:
+                for n in set(token_counts(config).values()):
+                    for device in (["CPU", "ROCm1"] if members[0]["expert"] else ["ROCm1"]):
+                        sig = signature(members, paired, dtype, device, n, self.model["top_k"])
+                        ops[digest(sig)] = {"signature": sig, "ms": {"Q2_K": 1, "Q4_K": 2, "Q6_K": 3}.get(dtype, 1)}
+        predictor = Predictor(self.model, config, ops, self.floor, {"decode": 20, "short": 30, "long": 50})
+        plain = search(self.model, dict(config, search={"display": 8}), predictor, self.floor, loss)
+        result = search(self.model, config, predictor, self.floor, loss)
+        total = lambda s: sum(s["memory"]["used_bytes"].values())
+        smallest = [s for s in result["frontier"] if s.get("smallest")]
+        self.assertEqual(len(smallest), 1)
+        self.assertLessEqual(smallest[0]["loss"], .06)
+        self.assertLessEqual(total(smallest[0]), min(total(s) for s in plain["frontier"]))
+        self.assertLess(total(smallest[0]), max(total(s) for s in plain["frontier"]))
 
     def test_fit_recovers_a_known_model(self):
         groups = modelled_groups(self.model, self.floor)

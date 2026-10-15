@@ -227,8 +227,10 @@ def load_config(path):
     if cfg["sampling"]["max_samples"] < cfg["sampling"]["samples"] or not isinstance(cfg["sampling"]["row_stats"], bool):
         raise QuantError("invalid sampling range or row_stats flag")
     cfg.setdefault("search", {})
-    if set(cfg["search"]) - {"display"}:
-        raise QuantError("search accepts only display; the knapsack search has no beam or evaluation cap")
+    if set(cfg["search"]) - {"display", "minimize"}:
+        raise QuantError("search accepts only display and minimize; the knapsack search has no beam or evaluation cap")
+    if cfg["search"].get("minimize", "size") != "size":
+        raise QuantError("search.minimize can only be size")
     cfg["search"].setdefault("display", 8)
     if not isinstance(cfg["search"]["display"], int) or cfg["search"]["display"] <= 0:
         raise QuantError("search.display must be a positive integer")
@@ -237,9 +239,9 @@ def load_config(path):
         cfg["imatrix_collect"] = imatrix_collect(cfg["imatrix_collect"], absolute, cfg)
     cfg.setdefault("bounds", {})
     for name, value in cfg["bounds"].items():
-        if name not in {"max_damage", "max_loss", "min_decode_t_s", "min_short_t_s", "min_long_t_s"}:
+        if name not in {"max_damage", "max_loss", "max_total_bytes", "min_decode_t_s", "min_short_t_s", "min_long_t_s"}:
             raise QuantError(f"unknown bound {name}")
-        number(value, f"bounds.{name}")
+        number(value, f"bounds.{name}", positive=name == "max_total_bytes")
     if "max_loss" in cfg["bounds"] and "quality" not in cfg:
         raise QuantError("max_loss requires a calibrated quality table")
     if "max_damage" in cfg["bounds"] and "quality" in cfg:

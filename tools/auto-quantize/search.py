@@ -170,6 +170,12 @@ def search(info, cfg, predictor, baseline_choices, model=None):
                       if n in costs else 0.0 for q in options[n]} for n in options}
     bounds = cfg["bounds"]
     loss_bound = "max_loss" if model is not None else "max_damage"
+    # Pooled mode: one knapsack over all groups under a cap on the summed tensor bytes (without reserves), whatever the
+    # device. The cap of the bounds is a hard limit; the knapsack cap moves during the search for the smallest recipe.
+    hard_cap = bounds.get("max_total_bytes")
+    pool = {"cap": hard_cap}
+    reserved = sum(cfg["reserve"].values())
+    minimize = cfg["search"].get("minimize")
     evaluated, feasible, rejected, frontier = {}, [], defaultdict(int), []
 
     def evaluate(choices):
@@ -182,6 +188,9 @@ def search(info, cfg, predictor, baseline_choices, model=None):
             mem = memory(info, cfg, choices)
             if any(value < 0 for value in mem["headroom_bytes"].values()):
                 rejected["memory"] += 1
+                return None
+            if hard_cap is not None and sum(mem["used_bytes"].values()) - reserved > hard_cap:
+                rejected["total_bytes"] += 1
                 return None
             times = predictor.predict(choices, mem["cache_hit_prior"])
         except QuantError as exc:
@@ -213,13 +222,18 @@ def search(info, cfg, predictor, baseline_choices, model=None):
             frontier = pareto([*frontier, state])
         return state
 
+    def knapsacks():
+        """(group names, byte budget) per knapsack: one per device, or one pooled knapsack under a total cap."""
+        if pool["cap"] is None:
+            return {d: ([n for n, dev in placement.items() if dev == d], b) for d, b in budgets.items()}
+        return {"pool": (list(placement), pool["cap"])}
+
     def solve_for(theta):
         """Knapsack recipe for a loss multiplier; the model's composition point is iterated to a fixed point."""
         marginal, previous = 1.0, None
         for _ in range(8):
             picked = {}
-            for device, budget in budgets.items():
-                names = [n for n, d in placement.items() if d == device]
+            for device, (names, budget) in knapsacks().items():
                 if not names:
                     continue
                 table = {}
@@ -242,11 +256,57 @@ def search(info, cfg, predictor, baseline_choices, model=None):
             marginal = model.marginal(model.predict(picked)["u"])
         return picked
 
+    def smallest_recipe():
+        """Smallest total bytes whose minimum-loss recipe meets the loss bound; sets the pooled cap to it.
+
+        The minimum-loss knapsack is exact for a byte cap and its loss does not increase with the cap, so the cap is
+        bisected. The loss multiplier is large, so time terms only break ties. Speed bounds and device capacities
+        are checked on the final recipe only."""
+        if loss_bound not in bounds:
+            raise QuantError("minimizing size needs a loss bound: max_loss with a quality table, otherwise max_damage")
+        ceiling = bounds[loss_bound]
+        theta = 2.0 ** 10
+        low = sum(min(o["bytes"] for o in options[n].values()) for n in options)
+        high = sum(max(o["bytes"] for o in options[n].values()) for n in options)
+        if hard_cap is not None:
+            high = min(high, hard_cap)
+        if high < low:
+            return None, "infeasible_minimum_bytes"
+
+        def meets(cap):
+            pool["cap"] = cap
+            choices = solve_for(theta)
+            return choices if choices is not None and loss_of(choices) <= ceiling else None
+
+        best = meets(high)
+        if best is None:
+            return None, "loss_bound_unreachable"
+        found = meets(low)
+        if found is not None:
+            best, high = found, low
+        while high - low > max(1, high * 1e-4):
+            mid = (low + high) // 2
+            found = meets(mid)
+            if found is None:
+                low = mid
+            else:
+                best, high = found, mid
+        pool["cap"] = high
+        return best, "ok"
+
     def separable(n, q, marginal):
         if model is not None:
             return -model.kl_floor * marginal * model.gain(n, q) / loss_ref
         return local(n, q) / loss_ref
 
+    smallest, smallest_status = None, None
+    if minimize == "size":
+        choices, smallest_status = smallest_recipe()
+        smallest = evaluate(choices) if choices is not None else None
+        if choices is not None and (smallest is None or smallest["constraint_violation"] > 0):
+            smallest_status = "smallest_violates_device_or_speed_bounds"
+        if smallest is not None:
+            smallest["smallest"] = True
     thetas = sorted({0.0, weights["precision"], *(2.0 ** k for k in range(-10, 11))})
     states = []
     for theta in thetas:
@@ -286,7 +346,11 @@ def search(info, cfg, predictor, baseline_choices, model=None):
     minimum = {g["name"]: min(options[g["name"]].values(), key=lambda o: (o["bytes"], o["damage"], o["qtype"]))["qtype"] for g in groups}
     minimum_memory = memory(info, cfg, minimum)
     infeasible_minimum = any(value < 0 for value in minimum_memory["headroom_bytes"].values()) and not cfg["cache_mib"]
+    if smallest is not None and smallest["constraint_violation"] == 0 and all(smallest is not f for f in frontier):
+        # the smallest recipe can be dominated on loss and speed; it stays in the result because size was the objective
+        frontier = [*frontier, smallest]
     return {"frontier": sorted(frontier, key=lambda s: (s["score"], s["key"])), "evaluated": len(evaluated),
             "feasible": len(feasible), "rejected": dict(rejected), "cap_reached": False,
             "budgets_bytes": budgets, "reference_scales": reference,
-            "status": "ok" if frontier else ("infeasible_minimum_bytes" if infeasible_minimum else "no_feasible_recipe")}
+            "minimize": minimize, "pool_cap_bytes": pool["cap"],
+            "status": smallest_status if smallest_status not in (None, "ok") else "ok" if frontier else ("infeasible_minimum_bytes" if infeasible_minimum else "no_feasible_recipe")}
