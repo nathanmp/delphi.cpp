@@ -137,11 +137,13 @@ def design(groups, mid, top, c):
 
 
 def perplexity_command(cfg, c, model, device, teacher, base=False):
+    # No --numa tensors: op offload runs the experts on the GPU, so the node-local copy of every CPU expert only costs
+    # RAM (the KL is bit-identical without it, and a big source plus probes in /dev/shm left no room for the copy).
     ram = measure_cmoe(cfg) and (device == gpu(cfg) or gpu_only(cfg))
     batch = c["batch"] or (16 * c["context"] if ram else c["context"])
     command = [str(Path(cfg["bindir"]) / "llama-perplexity"), "-m", str(model), "-f", c["text"], "--chunks", str(c["chunks"]),
                "--kl-divergence-base", str(teacher), "-c", str(c["context"]), "-b", str(batch), "-ub", str(batch),
-               "-t", str(c["threads"]), "-tb", str(c["threads"]), "--numa", "tensors", "--device", device, "-ngl", "999"]
+               "-t", str(c["threads"]), "-tb", str(c["threads"]), "--device", device, "-ngl", "999"]
     if ram:
         command.append("-cmoe")
     command += lazy_args(cfg)
@@ -451,7 +453,7 @@ def calibrate(data, cfg, output, encode, verify, timeout=7200, text_dir=None):
              "teacher": {**teacher_identity, "text": {**file_identity(c["text"], content=True), **({"corpora": corpora} if corpora else {})},
                          "chunks": c["chunks"], "context": c["context"]},
              "execution": {"devices": devices, "ram_routed": measure_cmoe(cfg) and (devices == [gpu(cfg)] or gpu_only(cfg)),
-                           "numa": "tensors", "command": perplexity_command(cfg, c, "FLOOR", devices[0], "TEACHER"),
+                           "numa": "off", "command": perplexity_command(cfg, c, "FLOOR", devices[0], "TEACHER"),
                            "env": env},
              "probe_qtypes": {"mid": mid, "top": top}, "n_layer": n_layer, "roles": params,
              "composition": {"kappa_inf": kinf, "u0": u0},
