@@ -7,11 +7,16 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <random>
 #include <string>
 #include <vector>
+
+#if defined(__linux__)
+#include <sched.h>
+#endif
 
 static bool check_row(const std::vector<float> & data, const char * name, ggml_from_float_t quantize) {
     const size_t n = data.size();
@@ -106,6 +111,20 @@ static bool test_parity(ggml_from_float_t quantize) {
 }
 
 static void benchmark(ggml_from_float_t quantize) {
+#if defined(__linux__)
+    // Discover both tensor NUMA nodes before pinning this single-thread converter benchmark.
+    cpu_set_t allowed;
+    if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) { perror("sched_getaffinity"); exit(1); }
+    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+        if (!CPU_ISSET(cpu, &allowed)) { continue; }
+        cpu_set_t pinned;
+        CPU_ZERO(&pinned);
+        CPU_SET(cpu, &pinned);
+        if (sched_setaffinity(0, sizeof(pinned), &pinned) != 0) { perror("sched_setaffinity"); exit(1); }
+        printf("Q8_K bench CPU=%d\n", cpu);
+        break;
+    }
+#endif
     std::mt19937 rng(5678);
     std::normal_distribution<float> dist(0.0f, 1.0f);
     using clock = std::chrono::steady_clock;
