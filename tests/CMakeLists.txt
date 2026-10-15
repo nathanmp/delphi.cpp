@@ -375,6 +375,8 @@ if (NOT GGML_BACKEND_DL)
     # these tests use the backends directly and cannot be built with dynamic loading
     llama_build_and_test(test-barrier.cpp)
     llama_build_and_test(test-quantize-fns.cpp)
+    llama_build_and_test(test-quantize-q8-k.cpp LABEL "quant")
+    target_include_directories(test-quantize-q8-k PRIVATE ../ggml/src)
     llama_build_and_test(test-row-meta.cpp)
     llama_build_and_test(test-quantize-perf.cpp)
     llama_build_and_test(test-rope.cpp)
