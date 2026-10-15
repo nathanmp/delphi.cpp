@@ -523,10 +523,6 @@ void quantize_row_q8_1(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, i
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-#if defined(_MSC_VER)
-#pragma float_control(precise, on, push)
-#pragma fp_contract(off)
-#endif
 void quantize_row_q8_K(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
 #if defined(__AVX2__)
     assert(k % QK_K == 0);
@@ -575,9 +571,12 @@ void quantize_row_q8_K(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, i
             __m256i v[4];
             for (int q = 0; q < 4; ++q) {
                 __m256 p = _mm256_mul_ps(mul, _mm256_loadu_ps(x + j + 8*q));
-#if defined(__GNUC__) || defined(__clang__)
                 // nearest_int rounds the product before the magic add. FMA changes half-way cases.
+#if defined(__GNUC__) || defined(__clang__)
                 __asm__("" : "+x"(p));
+#else
+                const volatile __m256 rounded_product = p;
+                p = rounded_product;
 #endif
                 const __m256 t = _mm256_add_ps(p, magic);
                 v[q] = _mm256_min_epi32(_mm256_sub_epi32(_mm256_and_si256(_mm256_castps_si256(t), mantissa), offset), max_value);
@@ -598,9 +597,6 @@ void quantize_row_q8_K(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, i
     quantize_row_q8_K_ref(x, vy, k);
 #endif
 }
-#if defined(_MSC_VER)
-#pragma float_control(pop)
-#endif
 
 //===================================== Dot products =================================
 
