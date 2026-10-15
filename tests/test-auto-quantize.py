@@ -72,6 +72,16 @@ class LazyTables(unittest.TestCase):
         group = next(g for g in model["groups"] if g["name"] == "per_layer_token_embd.weight")
         self.assertEqual([o["bytes"] for o in group["options"]], [0])
 
+    def test_a_pin_stores_a_lazy_table_below_the_source_type(self):
+        model = classify(self.info(), cfg(pins={"per_layer_token_embd.weight": "q8_0"}))
+        lazy = next(t for t in model["tensors"] if t["name"] == "per_layer_token_embd.weight")
+        self.assertFalse(lazy["preserved"])
+        self.assertEqual(lazy["pool"], ["Q8_0"])
+        # still a lookup outside the budgets: no timing region, lazy bytes at the pinned type
+        self.assertFalse(any(m["name"] == lazy["name"] for _, members, _ in regions(model) for m in members))
+        result = memory(model, cfg(), {g["name"]: g["pool"][0] for g in model["groups"]})
+        self.assertEqual(result["lazy_bytes"], tensor_bytes(lazy["shape"], "Q8_0"))
+
     def test_load_options_follow_the_model_tensors(self):
         with tempfile.TemporaryDirectory() as d:
             for name, tensors, expected in (("lazy", ["per_layer_token_embd.weight", "blk.0.attn_norm.weight"],

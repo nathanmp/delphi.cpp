@@ -172,7 +172,7 @@ def make_options(info, damage, operations, cfg):
             error, variance, reason, uncertainty_known = 0.0, 0.0, None, True
             for name in group["members"]:
                 t = by_name[name]
-                if t["preserved"] or dtype == t["source_dtype"]:
+                if t["preserved"] or dtype == t["source_dtype"] or is_lazy(name):
                     continue
                 record = records.get((name, dtype))
                 if record is None:

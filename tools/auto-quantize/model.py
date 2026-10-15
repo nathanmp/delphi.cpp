@@ -71,7 +71,8 @@ def mtp_layers(info):
     return sorted(found | declared)
 
 
-# Large lookup tables that the runtime reads row by row from disk (lazy mode); they stay fixed and do not count as device bytes.
+# Large lookup tables that the runtime reads row by row from disk (lazy mode); they stay fixed (at the source type or a pin)
+# and do not count as device bytes.
 LAZY = ("engram_embd", "per_layer_token_embd")
 
 
@@ -96,8 +97,7 @@ def lazy_args(cfg):
 # Conservative preservation mirrors the ordinary quantizer exclusions. Encoding is independently checked against the plan.
 PRESERVE = ("_norm.weight", "ffn_gate_inp.weight", "position_embd", "token_types", "ssm_conv1d", "shortconv.conv.weight",
             "indexer.k_proj.weight", "indexer.q_proj.weight", "time_mix_", "attn_rel_b.weight", ".patch_embd",
-            ".patch_merger", ".rel_pos", "sam.pos_embd", "sam.neck.", "sam.net_", "a.rvq.codebook", "mm.a.code_embd",
-            *LAZY)
+            ".patch_merger", ".rel_pos", "sam.pos_embd", "sam.neck.", "sam.net_", "a.rvq.codebook", "mm.a.code_embd")
 GLM_PRESERVE = ("hc_", "indexer_compressor_ape", "indexer_compressor_gate", "indexer.proj", "indexer.attn_k",
                 "indexer.attn_q_b", "ssm_f_a", "ssm_f_b", "ssm_g_a", "ssm_g_b", "ssm_beta", "attn_kv_a_mqa",
                 "attn_k_b", "attn_v_b")
@@ -122,6 +122,8 @@ def classify(info, cfg):
         t["mtp"] = t["layer"] in info["mtp_layers"]
         preserve = (len(shape) < 2 or not name.endswith("weight") or t["source_bytes"] < cfg["preserve_below_mib"] * (1 << 20)
                     or any(part in name for part in PRESERVE)
+                    # a pin can store a lazy table below the source precision (a BF16 table can be ~100 GB)
+                    or (is_lazy(name) and name not in cfg["pins"])
                     or (info["architecture"] == "glm5next" and any(part in name for part in GLM_PRESERVE))
                     or any(re.search(pattern, name) for pattern in cfg["preserve_regex"])
                     or t["source_dtype"].startswith("I") and t["source_dtype"] in ("I8", "I16", "I32", "I64"))

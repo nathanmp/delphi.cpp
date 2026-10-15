@@ -54,7 +54,8 @@ def get_damage(info, cfg, directory, imatrix):
     artifacts = []
     paths = []
     for category in ("primary", "other"):
-        selected = [t for t in info["tensors"] if t["category"] == category and not t["preserved"]
+        # a pinned lazy table has one option and no device cost, so its damage cannot change a decision
+        selected = [t for t in info["tensors"] if t["category"] == category and not t["preserved"] and not is_lazy(t["name"])
                     and any(q != t["source_dtype"] for q in t["pool"])]
         if not selected:
             continue

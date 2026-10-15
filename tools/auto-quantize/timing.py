@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 
 from config import ROOT, QuantError, digest, file_identity, write_json
-from model import lazy_args, tensor_bytes
+from model import is_lazy, lazy_args, tensor_bytes
 
 sys.path.insert(0, str(ROOT))
 from tools.bottlenecks.profile import BenchArm, Recipe, ProfileError, GPU_SETTING_KEYS, _gpu_state, run_recipe
@@ -156,8 +156,8 @@ def regions(info):
         if group.get("quality_fixed"):
             continue
         members = [by_name[name] for name in group["members"]]
-        # MTP layers do not run in the profiled main-model workloads
-        if all(t["preserved"] for t in members) or all(t.get("mtp") for t in members):
+        # MTP layers do not run in the profiled main-model workloads; lazy tables are row lookups, not products
+        if all(t["preserved"] or is_lazy(t["name"]) for t in members) or all(t.get("mtp") for t in members):
             continue
         # A separate embedding is a lookup. A tied output also performs a vocabulary projection when its type varies.
         if all(t["name"] == "token_embd.weight" for t in members) and ("output.weight" in by_name or len(group["pool"]) == 1):
