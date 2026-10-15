@@ -189,6 +189,9 @@ def load_config(path):
     if set(speedups) - {"decode", "short", "long"}:
         raise QuantError("multi_gpu_speedup_percent keys are decode, short, long")
     cfg["multi_gpu_speedup_percent"] = {axis: number(speedups.get(axis, 0), f"speedup.{axis}") for axis in AXES[1:]}
+    # timing imports this module, so the GPU-only condition of timing.gpu_only is repeated here
+    if sum(name != "RAM" for name in cfg["devices"]) > 1 and "RAM" not in cfg["devices"] and any(cfg["multi_gpu_speedup_percent"].values()):
+        raise QuantError("GPU-only placement profiles the real layer split; multi_gpu_speedup_percent applies only to RAM-routed projections")
     cfg.setdefault("runtime", {})
     runtime = cfg["runtime"]
     defaults = {"threads": 32, "depth_tokens": 0, "batch": 2048, "ubatch": 512, "short_tokens": 128,

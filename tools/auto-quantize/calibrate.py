@@ -33,7 +33,7 @@ from config import ROOT, QuantError, file_identity, imatrix_identities, write_js
 from corpus import calibration_text
 from model import lazy_args
 from quality import METHOD, METRIC, SCHEMA, damage_digest, damage_records, modelled_groups, sensitivity
-from timing import gpu
+from timing import gpu, gpu_only, measure_cmoe
 
 
 def hotswap_module():
@@ -137,7 +137,7 @@ def design(groups, mid, top, c):
 
 
 def perplexity_command(cfg, c, model, device, teacher, base=False):
-    ram = "RAM" in cfg["devices"] and device == gpu(cfg)
+    ram = measure_cmoe(cfg) and (device == gpu(cfg) or gpu_only(cfg))
     batch = c["batch"] or (16 * c["context"] if ram else c["context"])
     command = [str(Path(cfg["bindir"]) / "llama-perplexity"), "-m", str(model), "-f", c["text"], "--chunks", str(c["chunks"]),
                "--kl-divergence-base", str(teacher), "-c", str(c["context"]), "-b", str(batch), "-ub", str(batch),
@@ -450,7 +450,7 @@ def calibrate(data, cfg, output, encode, verify, timeout=7200, text_dir=None):
                        **file_identity(data["baseline"]["path"])},
              "teacher": {**teacher_identity, "text": {**file_identity(c["text"], content=True), **({"corpora": corpora} if corpora else {})},
                          "chunks": c["chunks"], "context": c["context"]},
-             "execution": {"devices": devices, "ram_routed": "RAM" in cfg["devices"] and devices == [gpu(cfg)],
+             "execution": {"devices": devices, "ram_routed": measure_cmoe(cfg) and (devices == [gpu(cfg)] or gpu_only(cfg)),
                            "numa": "tensors", "command": perplexity_command(cfg, c, "FLOOR", devices[0], "TEACHER"),
                            "env": env},
              "probe_qtypes": {"mid": mid, "top": top}, "n_layer": n_layer, "roles": params,

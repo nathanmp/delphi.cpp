@@ -17,7 +17,7 @@ from calibrate import calibrate, per_chunk, perplexity_command, run_direct
 from corpus import collect_imatrices
 from quality import LossModel, load_quality, quality_metadata
 from search import make_options, memory, search
-from timing import MODEL_REVISION, Predictor, fit_slopes, gpu, machine_settings, measure_ops, profile_model, profile_times, run
+from timing import MODEL_REVISION, Predictor, fit_slopes, gpu, gpu_only, gpus, machine_settings, measure_ops, profile_model, profile_times, projected, run
 
 
 def inputs(cfg, info):
@@ -31,6 +31,8 @@ def inputs(cfg, info):
             "machine_settings": machine_settings(),
             "inherited_environment": {name: value for name, value in os.environ.items()
                                       if name.startswith(("GGML_", "LLAMA_", "CUDA_", "HIP_", "HSA_", "ROCR_", "OMP_", "LD_LIBRARY_PATH"))}}
+    if gpu_only(cfg):
+        result["layer_split_gpus"] = gpus(cfg)  # only here, so the digests of earlier prepared snapshots stay valid
     return result
 
 
@@ -149,6 +151,27 @@ def encode_from_frontier(frontier, recipe_id, output):
     return encode(info, cfg, recipe["choices"], frontier["prepared"]["imatrix"], output, frontier["quality"])
 
 
+def gpu_descriptions(listed, names):
+    """{device: description} from `--list-devices` lines like 'ROCm0: AMD Radeon AI PRO R9700 (32624 MiB, 32000 MiB free)'.
+
+    The memory part is dropped, so equal models compare equal whatever is free. A missing device is absent."""
+    found = {}
+    for line in listed.splitlines():
+        m = re.match(r"\s*(\S+):\s*(.*?)\s*\(\d+ MiB, \d+ MiB free\)\s*$", line)
+        if m and m[1] in names:
+            found[m[1]] = m[2]
+    return {name: found[name] for name in names if name in found}
+
+
+def require_identical_gpus(listed, names):
+    """GPU-only timings come from operation measurements on the first GPU, which stand for all of them only when the GPUs match."""
+    found = gpu_descriptions(listed, names)
+    if set(found) != set(names):
+        raise QuantError(f"could not read the descriptions of {sorted(set(names) - set(found))} from llama-bench --list-devices")
+    if len(set(found.values())) != 1:
+        raise QuantError("GPU-only placement across different GPU models is not implemented: operation timings are measured on the first GPU")
+
+
 def prepare(cfg, directory, timeout):
     directory = Path(directory).resolve()
     directory.mkdir(parents=True, exist_ok=True)
@@ -158,8 +181,8 @@ def prepare(cfg, directory, timeout):
         if device != "RAM" and not re.search(r"\b" + re.escape(device) + r"\b", listed):
             raise QuantError(f"unavailable device {device}")
     info = configured_model(cfg)
-    if len([name for name in cfg["devices"] if name != "RAM"]) > 1 and "RAM" not in cfg["devices"]:
-        raise QuantError("GPU-only multiple-device placement is not implemented; use one GPU or a RAM-routed speed projection")
+    if gpu_only(cfg):
+        require_identical_gpus(listed, gpus(cfg))
     key = digest(inputs(cfg, info))
     snapshot = directory / "prepared.json"
     if snapshot.exists():
@@ -182,7 +205,7 @@ def prepare(cfg, directory, timeout):
     else:
         encode(info, cfg, baseline_choices, imatrix, baseline)
     print("Profiling baseline short/long prefill and decode", flush=True)
-    profile = profile_model(cfg, baseline, directory / "baseline-profile.json")
+    profile = profile_model(cfg, baseline, directory / "baseline-profile.json", placement=mem.get("layer_split"))
     result = {"schema": SCHEMA, "input_key": key, "config": cfg, "model": info, "damage": damage,
               "operations": operations, "excluded": excluded, "imatrix": imatrix,
               "baseline": {"path": str(baseline), "choices": baseline_choices, "measured_ms": profile_times(profile, cfg),
@@ -240,7 +263,7 @@ def plan(data, cfg, output):
         state["tensor_types"] = tensor_plan(data["model"], state["choices"])
         write_json(outdir / f"{state['id']}.json", state)
         recipes.append(state)
-    projection = sum(name != "RAM" for name in cfg["devices"]) > 1 and any(cfg["multi_gpu_speedup_percent"].values())
+    projection = projected(cfg) and any(cfg["multi_gpu_speedup_percent"].values())
     qualified = data["timing_qualified"] and not projection
     payload = {"schema": SCHEMA, "config": cfg, "source": data["model"]["identity"], "prepared": data,
                "search": result, "recipes": recipes, "timing_qualified": qualified,
@@ -251,6 +274,8 @@ def plan(data, cfg, output):
                                "link bandwidth and handoff latency are priors unless supplied",
                                "cache hits use a uniform residency prior; cache policy replay is not calibrated",
                                "tail ubatches use interpolation; trace integrity has not been certified",
+                               "the layers are split over the GPUs by memory (layer_split), with timings from operations measured on the first GPU and summed over the devices; pipeline overlap between GPUs is not modelled"
+                               if gpu_only(cfg) else
                                "multiple GPUs use user throughput factors, without pooled capacity or a runtime layout"]}
     payload["effective_cpu_decode_gb_s"] = (predictor.cpu_bytes_per_ms or 0) / 1e6
     write_json(outdir / "frontier.json", payload)
@@ -341,7 +366,7 @@ def validate(data, cfg, specification, directory):
             profile = json.loads(profile_file.read_text())
         else:
             print(f"Profiling witness {name} ({spec['role']})", flush=True)
-            profile = profile_model(cfg, model, profile_file)
+            profile = profile_model(cfg, model, profile_file, placement=mem.get("layer_split"))
         witnesses.append({"name": name, "role": spec["role"], "choices": choices, "hit_fraction": mem["cache_hit_prior"],
                           "measured": profile_times(profile, cfg), "profile": str(profile_file)})
         if table is not None:

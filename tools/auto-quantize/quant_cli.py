@@ -161,6 +161,8 @@ def choose(payload, path, args, default_pick=None):
         return
     row = fr.pick(shown, all_rows, spec)
     print(f"Selected {row['id']}: {row['size'] / fr.GIB:.2f} GiB, KL {row['kld']:.4g}, decode {row['decode']:.2f} t/s")
+    if row["recipe"]["memory"].get("runtime_args"):
+        print("Run with: " + " ".join(row["recipe"]["memory"]["runtime_args"]))
     if getattr(args, "output", None):
         import auto_quantize as aq
         print(f"Encoding to {args.output}")

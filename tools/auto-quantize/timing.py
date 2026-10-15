@@ -40,13 +40,46 @@ def gpu(cfg):
     return next(name for name in cfg["devices"] if name != "RAM")
 
 
+def gpus(cfg):
+    """The GPU devices in configuration order."""
+    return [name for name in cfg["devices"] if name != "RAM"]
+
+
+def gpu_only(cfg):
+    """Several GPUs and no RAM: the model is split over the GPUs by layer and nothing is routed to the CPU."""
+    return len(gpus(cfg)) > 1 and "RAM" not in cfg["devices"]
+
+
+def projected(cfg):
+    """Several GPUs next to RAM: the user's throughput factors project the single-GPU timings."""
+    return len(gpus(cfg)) > 1 and "RAM" in cfg["devices"]
+
+
+def measure_cmoe(cfg):
+    """Quality and imatrix runs keep the routed experts in RAM (-cmoe) on the first GPU, also for a GPU-only deployment:
+    a big model does not fit on one GPU and the numerics do not depend on the placement."""
+    return "RAM" in cfg["devices"] or gpu_only(cfg)
+
+
 def requires_backend_signature(sig, cfg):
     return not (sig["expert"] and sig["device"] == gpu(cfg) and "RAM" in cfg["devices"] and not cfg["cache_mib"])
 
 
-def profile_model(cfg, model, output, trace=True):
+def profile_model(cfg, model, output, trace=True, placement=None):
+    """Fixed short/long prefill and decode with one model load. A GPU-only deployment needs its layer split
+    (memory()['layer_split']) and is profiled with the real placement.
+
+    The timing model sums the per-layer region costs over the devices, which is right for sequential decode. Pipeline
+    overlap between GPUs in multi-ubatch prefill is not modelled; the fitted slopes of validate absorb a uniform scale."""
     r = cfg["runtime"]
-    command = [str(Path(cfg["bindir"]) / "llama-bench"), "-m", str(model), "--numa", "tensors", "--device", gpu(cfg),
+    if gpu_only(cfg):
+        if not placement:
+            raise QuantError("GPU-only profiling needs the layer split of the recipe")
+        # llama-bench separates devices (and tensor-split entries) of one test value with '/'; ',' would start another test
+        place = ["--device", "/".join(gpus(cfg)), "-sm", "layer", "-ts", "/".join(str(c) for c in placement)]
+    else:
+        place = ["--device", gpu(cfg)]
+    command = [str(Path(cfg["bindir"]) / "llama-bench"), "-m", str(model), "--numa", "tensors", *place,
                "-ngl", "999", "-t", str(r["threads"]), "-b", str(r["batch"]), "-ub", str(r["ubatch"]),
                "-p", f"{r['short_tokens']},{r['long_tokens']}", "-n", str(r["decode_tokens"]),
                "-d", str(r["depth_tokens"]), "-r", str(r["repetitions"]), *lazy_args(cfg), *r["extra_args"]]
@@ -283,7 +316,7 @@ class Predictor:
         if any(not math.isfinite(value) or value <= 0 for value in result.values()):
             raise QuantError("anchored time estimate is nonpositive; recipe exceeds the calibrated model")
         factors = self.cfg["multi_gpu_speedup_percent"]
-        if sum(name != "RAM" for name in self.cfg["devices"]) > 1:
+        if projected(self.cfg):
             result = {r: value / (1 + factors[r] / 100) for r, value in result.items()}
         return result
 

@@ -21,7 +21,7 @@ def rows(payload):
     result = []
     for r in payload["recipes"]:
         ms = r["predicted_ms"]
-        result.append({"id": r["id"], "size": sum(r["memory"]["used_bytes"].values()) - reserve, "kld": r["loss"],
+        result.append({"id": r["id"], "size": r["memory"].get("total_bytes", sum(r["memory"]["used_bytes"].values()) - reserve), "kld": r["loss"],
                        "decode": 1000 / ms["decode"], "short": 1000 * runtime["short_tokens"] / ms["short"],
                        "long": 1000 * runtime["long_tokens"] / ms["long"], "score": r["score"],
                        "experts": qtype_mix(r["tensor_types"]), "recipe": r})

@@ -151,7 +151,7 @@ python tools/auto-quantize/quant_cli.py plan --config config.json --work /tmp/au
 python tools/auto-quantize/quant_cli.py show --frontier /tmp/autoq/plans/plan-001/frontier.json --detail best
 ```
 
-`--max-size 55GiB` caps the summed tensor bytes over all devices (`bounds.max_total_bytes`: one pooled knapsack, device capacities still checked). `--minimize size --max-kld 0.05` finds the smallest recipe whose predicted KL is within the ceiling (`search.minimize: size`): it bisects the pooled byte cap on the exact minimum-loss knapsack, then plans under that cap. Speed bounds and device capacities are checked on the result only. Run `python tests/test-quant-cli.py` for the offline checks.
+`--max-size 55GiB` caps the summed tensor bytes over all devices (`bounds.max_total_bytes`: one pooled knapsack, device capacities still checked). `--minimize size --max-kld 0.05` finds the smallest recipe whose predicted KL is within the ceiling (`search.minimize: size`): it bisects the pooled byte cap on the exact minimum-loss knapsack, then plans under that cap. Speed bounds and device capacities are checked on the result only. With a GPU-only configuration, the chosen recipe is followed by a `Run with:` line holding its `--device`, `-sm` and `-ts` arguments, and sizes count the host-resident input embedding. Run `python tests/test-quant-cli.py` for the offline checks.
 
 ## Workflow
 
@@ -188,13 +188,17 @@ Lazy tables (`engram_embd`, `per_layer_token_embd`) are read row by row from dis
 
 With RAM supplied, routed experts remain authoritative in RAM and dense weights stay on the first GPU. `cache_mib` enables the existing first-GPU expert cache; default zero. Cache group rounding, maps, device scratch and pinned refill buffers are counted. Backend allocator/repack overhead and unprovided runtime allowances still need runtime validation. Cache hit predictions currently use a uniform residency prior, not a measured temporal-policy replay; validate cache-enabled mixes separately. Partial cache paths have different fusion eligibility.
 
-Multiple GPUs do not pool VRAM or create a multi-GPU cache command. The first GPU's budget still governs its weights/cache. The other budgets are reported as unassigned. Supply throughput assumptions for the requested multi-GPU deployment:
+With RAM supplied, several GPUs do not pool VRAM or create a multi-GPU cache command. The first GPU's budget still governs its weights/cache. The other budgets are reported as unassigned. Supply throughput assumptions for the requested multi-GPU deployment:
 
 ```json
 "multi_gpu_speedup_percent": {"decode": 30, "short": 10, "long": 50}
 ```
 
-The predicted times divide by 1.30, 1.10 and 1.50 respectively. These are assumed whole-workload throughput gains, not percentages of saved wall time. Validation executes on the first GPU and does not certify these assumptions. GPU-only multiple-device placement is not implemented.
+The predicted times divide by 1.30, 1.10 and 1.50 respectively. These are assumed whole-workload throughput gains, not percentages of saved wall time. Validation executes on the first GPU and does not certify these assumptions.
+
+## GPU-only placement over several GPUs
+
+`"devices": {"ROCm0": "32GiB", "ROCm1": "32GiB", "ROCm2": "32GiB"}` (several GPUs, no `RAM`) plans a layer split like `-sm layer -ts`: blocks `0..n_layer-1` go to the GPUs in the configured order in contiguous runs, the output (and a tied embedding copy) to the last GPU, and `token_embd` stays on the host (`host_bytes`, outside every budget). The split minimizes the largest `(reserve + bytes) / capacity`; all search constraints use the per-GPU headroom, and the byte pool is the summed `capacity - reserve`. Each recipe records `layer_split` (the last count includes the output) and `runtime_args` (`--device ROCm0,ROCm1,ROCm2 -sm layer -ts 20,21,22`, the llama-server form; llama-bench takes `/` inside a value). The baseline and the validation witnesses are profiled with their real split. The GPUs must be identical models, since operation timings are measured on the first GPU; the timing model sums the layer costs over the devices, so pipeline overlap in multi-ubatch prefill is not modelled and the fitted slopes absorb a uniform scale. `multi_gpu_speedup_percent` must stay zero here. `cache_mib` needs RAM-routed experts. Calibration and imatrix runs use the first GPU with `-cmoe`, because a big model does not fit on one GPU and quality does not depend on the placement.
 
 ## Bounded validation
 
