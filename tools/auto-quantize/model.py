@@ -71,11 +71,33 @@ def mtp_layers(info):
     return sorted(found | declared)
 
 
+# Large lookup tables that the runtime reads row by row from disk (lazy mode); they stay fixed and do not count as device bytes.
+LAZY = ("engram_embd", "per_layer_token_embd")
+
+
+def is_lazy(name):
+    return any(part in name for part in LAZY)
+
+
+_lazy_args = {}
+
+
+def lazy_args(cfg):
+    """Load options for models with lazy tables: memory-mapped, lazy reads on, tables kept on the host (empty without tables).
+
+    The model's tensor names are read once per path."""
+    path = cfg["model"]
+    if path not in _lazy_args:
+        found = [part for part in LAZY if any(part in t["name"] for t in read_model(path)["tensors"])]
+        _lazy_args[path] = ["-lm", "mmap", "-lzm", "on", "-ot", "|".join(found) + "=CPU"] if found else []
+    return list(_lazy_args[path])
+
+
 # Conservative preservation mirrors the ordinary quantizer exclusions. Encoding is independently checked against the plan.
 PRESERVE = ("_norm.weight", "ffn_gate_inp.weight", "position_embd", "token_types", "ssm_conv1d", "shortconv.conv.weight",
             "indexer.k_proj.weight", "indexer.q_proj.weight", "time_mix_", "attn_rel_b.weight", ".patch_embd",
             ".patch_merger", ".rel_pos", "sam.pos_embd", "sam.neck.", "sam.net_", "a.rvq.codebook", "mm.a.code_embd",
-            "engram_embd", "per_layer_token_embd")
+            *LAZY)
 GLM_PRESERVE = ("hc_", "indexer_compressor_ape", "indexer_compressor_gate", "indexer.proj", "indexer.attn_k",
                 "indexer.attn_q_b", "ssm_f_a", "ssm_f_b", "ssm_g_a", "ssm_g_b", "ssm_beta", "attn_kv_a_mqa",
                 "attn_k_b", "attn_v_b")

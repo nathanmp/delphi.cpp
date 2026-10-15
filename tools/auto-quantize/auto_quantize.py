@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 
 from config import AXES, SCHEMA, QuantError, digest, file_identity, imatrix_identities, imatrix_inputs, load_config, write_json
-from model import classify, merge_imatrices, read_model
+from model import classify, is_lazy, merge_imatrices, read_model
 from calibrate import calibrate, per_chunk, perplexity_command, run_direct
 from corpus import collect_imatrices
 from quality import LossModel, load_quality, quality_metadata
@@ -158,8 +158,6 @@ def prepare(cfg, directory, timeout):
         if device != "RAM" and not re.search(r"\b" + re.escape(device) + r"\b", listed):
             raise QuantError(f"unavailable device {device}")
     info = configured_model(cfg)
-    if any("engram_embd" in t["name"] or "per_layer_token_embd" in t["name"] for t in info["tensors"]):
-        raise QuantError("lazy-table residency planning needs explicit resident-byte accounting and is not implemented")
     if len([name for name in cfg["devices"] if name != "RAM"]) > 1 and "RAM" not in cfg["devices"]:
         raise QuantError("GPU-only multiple-device placement is not implemented; use one GPU or a RAM-routed speed projection")
     key = digest(inputs(cfg, info))
@@ -442,8 +440,9 @@ def main():
         if args.command == "inspect":
             info = configured_model(cfg)
             print(json.dumps({"model": info["architecture"], "devices_bytes": cfg["devices"],
-                              "classification": {c: sum(t["source_bytes"] for t in info["tensors"] if t["category"] == c)
-                                                 for c in ("primary", "other")}, "groups": info["groups"]}, indent=2))
+                              "classification": {c: sum(t["source_bytes"] for t in info["tensors"] if t["category"] == c and not is_lazy(t["name"]))
+                                                 for c in ("primary", "other")},
+                              "lazy_bytes": sum(t["source_bytes"] for t in info["tensors"] if is_lazy(t["name"])), "groups": info["groups"]}, indent=2))
         elif args.command == "prepare":
             prepare(cfg, args.output, args.measurement_seconds)
         elif args.command == "collect-imatrix":

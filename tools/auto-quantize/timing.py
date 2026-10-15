@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 
 from config import ROOT, QuantError, digest, file_identity, write_json
-from model import tensor_bytes
+from model import lazy_args, tensor_bytes
 
 sys.path.insert(0, str(ROOT))
 from tools.bottlenecks.profile import BenchArm, Recipe, ProfileError, GPU_SETTING_KEYS, _gpu_state, run_recipe
@@ -49,7 +49,7 @@ def profile_model(cfg, model, output, trace=True):
     command = [str(Path(cfg["bindir"]) / "llama-bench"), "-m", str(model), "--numa", "tensors", "--device", gpu(cfg),
                "-ngl", "999", "-t", str(r["threads"]), "-b", str(r["batch"]), "-ub", str(r["ubatch"]),
                "-p", f"{r['short_tokens']},{r['long_tokens']}", "-n", str(r["decode_tokens"]),
-               "-d", str(r["depth_tokens"]), "-r", str(r["repetitions"]), *r["extra_args"]]
+               "-d", str(r["depth_tokens"]), "-r", str(r["repetitions"]), *lazy_args(cfg), *r["extra_args"]]
     if "RAM" in cfg["devices"]:
         command += ["-ncmoe", "999"]
     environment = dict(r["env"])

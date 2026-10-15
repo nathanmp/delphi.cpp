@@ -31,6 +31,7 @@ import numpy as np
 
 from config import ROOT, QuantError, file_identity, imatrix_identities, write_json
 from corpus import calibration_text
+from model import lazy_args
 from quality import METHOD, METRIC, SCHEMA, damage_digest, damage_records, modelled_groups, sensitivity
 from timing import gpu
 
@@ -143,6 +144,7 @@ def perplexity_command(cfg, c, model, device, teacher, base=False):
                "-t", str(c["threads"]), "-tb", str(c["threads"]), "--numa", "tensors", "--device", device, "-ngl", "999"]
     if ram:
         command.append("-cmoe")
+    command += lazy_args(cfg)
     if not base:
         command.append("--kl-divergence")
     return command

@@ -6,13 +6,14 @@ import json
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools/auto-quantize"))
 from config import QuantError, capacity, devices, file_identity, imatrix_identities, imatrix_inputs, load_config, normalized, write_json
 from corpus import calibration_text, collect_imatrices, compose_text, imatrix_command, shares
-from model import classify, merge_imatrices, read_model, tensor_bytes
+from model import classify, is_lazy, lazy_args, merge_imatrices, read_model, tensor_bytes
 from search import dominates, make_options, memory, pareto, search
 from quality import LossModel, damage_digest, load_quality, modelled_groups, role_of
 from calibrate import Fit, design, probe_qtypes
@@ -42,6 +43,50 @@ def info():
     return {"architecture": "olmoe", "n_expert": 8, "top_k": 2, "tensors": [
         tensor("blk.0.ffn_up_exps.weight"), tensor("blk.0.ffn_gate_exps.weight"), tensor("blk.0.ffn_down_exps.weight"),
         tensor("blk.0.ffn_gate_inp.weight", (256, 8)), tensor("output.weight", (256, 256))]}
+
+
+class LazyTables(unittest.TestCase):
+    def info(self):
+        base = info()
+        base["tensors"].append(tensor("per_layer_token_embd.weight", (256, 1024)))
+        return base
+
+    def test_lazy_tables_are_fixed_and_outside_every_budget(self):
+        model = classify(self.info(), cfg())
+        lazy = next(t for t in model["tensors"] if t["name"] == "per_layer_token_embd.weight")
+        self.assertTrue(lazy["preserved"] and is_lazy(lazy["name"]))
+        choices = {g["name"]: g["pool"][0] for g in model["groups"]}
+        result = memory(model, cfg(), choices)
+        plain = memory(classify(info(), cfg()), cfg(), {g["name"]: g["pool"][0] for g in classify(info(), cfg())["groups"]})
+        self.assertEqual(result["used_bytes"], plain["used_bytes"])
+        self.assertEqual(result["lazy_bytes"], lazy["source_bytes"])
+        self.assertEqual(plain["lazy_bytes"], 0)
+
+    def test_options_exclude_lazy_bytes_so_budgets_stay_consistent(self):
+        model = classify(self.info(), cfg())
+        for g in model["groups"]:
+            g["options"] = [{"qtype": q, "damage": 0, "sampling_se": 0,
+                             "bytes": sum(tensor_bytes(next(t["shape"] for t in model["tensors"] if t["name"] == n), q)
+                                          for n in g["members"] if not is_lazy(n))} for q in g["pool"]]
+        group = next(g for g in model["groups"] if g["name"] == "per_layer_token_embd.weight")
+        self.assertEqual([o["bytes"] for o in group["options"]], [0])
+
+    def test_load_options_follow_the_model_tensors(self):
+        with tempfile.TemporaryDirectory() as d:
+            for name, tensors, expected in (("lazy", ["per_layer_token_embd.weight", "blk.0.attn_norm.weight"],
+                                              ["-lm", "mmap", "-lzm", "on", "-ot", "per_layer_token_embd=CPU"]),
+                                             ("engram", ["blk.0.engram_embd.weight", "blk.0.attn_norm.weight"],
+                                              ["-lm", "mmap", "-lzm", "on", "-ot", "engram_embd=CPU"]),
+                                             ("plain", ["blk.0.attn_norm.weight"], [])):
+                path = Path(d) / f"{name}.gguf"
+                writer = GGUFWriter(str(path), "olmoe")
+                for t in tensors:
+                    writer.add_tensor(t, np.ones(256, dtype=np.float32))
+                writer.write_header_to_file()
+                writer.write_kv_data_to_file()
+                writer.write_tensors_to_file()
+                writer.close()
+                self.assertEqual(lazy_args({"model": str(path)}), expected)
 
 
 class Inputs(unittest.TestCase):
@@ -492,8 +537,10 @@ class Collect(unittest.TestCase):
 
     def test_command_and_configuration(self):
         c = {"context": 512, "chunks": 0, "threads": 4, "extra_args": []}
-        command = imatrix_command({"bindir": "/b", "model": "/m.gguf", "devices": {"ROCm1": 1}}, c, "/t.txt", "/o.gguf")
+        with mock.patch("corpus.lazy_args", return_value=["-lzm", "on"]):
+            command = imatrix_command({"bindir": "/b", "model": "/m.gguf", "devices": {"ROCm1": 1}}, c, "/t.txt", "/o.gguf")
         self.assertEqual(command[0], "/b/llama-imatrix")
+        self.assertIn("-lzm", command)
         self.assertNotIn("-cmoe", command)
         self.assertNotIn("--chunks", command)
         self.assertEqual(self.config(text="a.txt")["imatrix_collect"]["means"], True)

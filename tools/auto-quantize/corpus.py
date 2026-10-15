@@ -15,7 +15,7 @@ import re
 from pathlib import Path
 
 from config import QuantError, digest, file_identity, write_json
-from model import read_model
+from model import lazy_args, read_model
 from timing import gpu, run
 
 MARGIN = 1.2
@@ -119,6 +119,7 @@ def imatrix_command(cfg, c, text, output):
                "--device", gpu(cfg), "-ngl", "999", "--no-ppl"]
     if "RAM" in cfg["devices"]:
         command.append("-cmoe")
+    command += lazy_args(cfg)
     if c["chunks"]:
         command += ["--chunks", str(c["chunks"])]
     return command + [str(arg) for arg in c["extra_args"]]

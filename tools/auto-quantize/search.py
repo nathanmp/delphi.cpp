@@ -6,7 +6,7 @@ from collections import defaultdict
 
 from config import AXES, QuantError
 from knapsack import solve
-from model import tensor_bytes
+from model import is_lazy, tensor_bytes
 from timing import gpu, requires_backend_signature
 
 
@@ -14,9 +14,14 @@ def memory(info, cfg, choices):
     used = {name: cfg["reserve"].get(name, 0) for name in cfg["devices"]}
     types = {name: choices[group["name"]] for group in info["groups"] for name in group["members"]}
     experts = defaultdict(dict)
+    lazy_bytes = 0
     for t in info["tensors"]:
         dtype = types[t["name"]]
         size = tensor_bytes(t["shape"], dtype)
+        if is_lazy(t["name"]):
+            # read on demand from disk: not resident, so outside every device budget
+            lazy_bytes += size
+            continue
         device = "RAM" if t["expert"] and "RAM" in used else gpu(cfg)
         used[device] += size
         if t["expert"]:
@@ -57,10 +62,10 @@ def memory(info, cfg, choices):
         used[gpu(cfg)] += cache_bytes + scratch + sum(ws["gate"][2][2] * 4 for ws in experts.values())
         used["RAM"] += scratch
     return {"used_bytes": used, "headroom_bytes": {name: cfg["devices"][name] - value for name, value in used.items()},
-            "cache_bytes": cache_bytes, "cache_slots": slots,
+            "lazy_bytes": lazy_bytes, "cache_bytes": cache_bytes, "cache_slots": slots,
             "cache_groups": [{"types": list(key), **value} for key, value in groups.items()],
             "cache_hit_prior": min(1.0, slots / max(1, info["n_expert"] * len(experts))),
-            "allocation_scope": "tensor payloads, cache banks/maps/scratch and supplied reserves; allocator/repack overhead needs witness validation",
+            "allocation_scope": "tensor payloads without lazy tables, cache banks/maps/scratch and supplied reserves; allocator/repack overhead needs witness validation; lazy tables sit on disk and use page cache as the system allows",
             "secondary_gpus": "unassigned; percentages change speed predictions only"}
 
 
@@ -104,7 +109,7 @@ def make_options(info, damage, operations, cfg):
                 excluded.append({"group": group["name"], "qtype": dtype, "reason": reason})
             else:
                 options.append({"qtype": dtype, "damage": error, "sampling_se": math.sqrt(variance) if uncertainty_known else None,
-                                "bytes": sum(tensor_bytes(by_name[n]["shape"], dtype) for n in group["members"])})
+                                "bytes": sum(tensor_bytes(by_name[n]["shape"], dtype) for n in group["members"] if not is_lazy(n))})
         if not options:
             raise QuantError(f"no measured legal candidates for {group['name']}")
         group["options"] = options

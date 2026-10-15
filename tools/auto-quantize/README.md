@@ -178,7 +178,9 @@ With staging enabled and a positive threshold, the runtime selects the GPU above
 
 CPU expert probes also set `numa_expert=1`. `--numa tensors` alone pins workers but does not select the model loader's flagged expert kernel path. Both the flag and the NUMA mode are required to reproduce that execution contract.
 
-`runtime.depth_tokens` sets the benchmark's existing context depth before each workload; default zero. KV types can use the benchmark's `-ctk`/`-ctv` options in `extra_args`. The benchmark derives its allocation from depth and workload lengths. Models with large lazy engram/per-layer embedding tables are explicitly unsupported until resident-byte accounting is added.
+`runtime.depth_tokens` sets the benchmark's existing context depth before each workload; default zero. KV types can use the benchmark's `-ctk`/`-ctv` options in `extra_args`. The benchmark derives its allocation from depth and workload lengths.
+
+Lazy tables (`engram_embd`, `per_layer_token_embd`) are read row by row from disk. They stay at the source type, are not part of any qtype pool and do not count in device budgets, `bounds.max_total_bytes` or the reported sizes; plans report them as `lazy_bytes`. Every run of the tool on such a model (`llama-bench`, `llama-perplexity`, `llama-imatrix`) adds `-lm mmap -lzm on -ot <tables>=CPU`, so the tables are not loaded into a device. The measured speeds include the lazy lookups of the baseline's page-cache state (the same for every recipe), and the page cache decides how much RAM they use: size the RAM budget for the page cache you want to leave to them. `encode` copies the tables unchanged and verifies the copy.
 
 `runtime.trace_max_events` sets the profiler trace capacity; default 1048576. Increase it for larger models or workloads if the profiler reports dropped events. A truncated trace is rejected rather than used for CPU calibration.
 

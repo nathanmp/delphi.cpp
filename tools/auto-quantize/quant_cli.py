@@ -142,6 +142,9 @@ def choose(payload, path, args, default_pick=None):
         raise QuantError(f"the plan has no feasible recipe ({payload['search']['status']})")
     if payload["search"]["status"] != "ok":
         print(f"Warning: search status {payload['search']['status']}")
+    lazy = all_rows[0]["recipe"]["memory"].get("lazy_bytes", 0)
+    if lazy:
+        print(f"Lazy tables ({lazy / fr.GIB:.2f} GiB) stay on disk and are not counted in sizes or budgets.")
     shown = fr.thin(all_rows, args.rows)
     print(f"{len(all_rows)} nondominated recipes; showing {len(shown)}. * marks the best score; dKL is relative to it.")
     print(fr.table(shown, "pred KL" if payload.get("quality") else "local R"))
