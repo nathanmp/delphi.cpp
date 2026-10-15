@@ -51,14 +51,17 @@ def parse_weights(text):
 def apply_query(cfg, args):
     """A copy of the loaded configuration with the query applied. Only planning inputs change, never the prepared ones."""
     cfg = copy.deepcopy(cfg)
-    if args.minimize == "size":
-        raise QuantError("--minimize size is not implemented yet (planned: bisect the byte budget on the exact "
-                         "minimum-loss knapsack; needs a total-size cap across devices)")
     weights = parse_weights(args.weights) if args.weights else None
-    if args.minimize == "kld":
+    if args.minimize in ("kld", "size"):
         if weights:
-            raise QuantError("--minimize kld and --weights are exclusive")
+            raise QuantError(f"--minimize {args.minimize} and --weights are exclusive")
         weights = {axis: float(axis == "precision") for axis in AXES}
+    if args.minimize == "size":
+        if args.max_kld is None:
+            raise QuantError("--minimize size needs --max-kld")
+        cfg["search"]["minimize"] = "size"
+    if args.max_size is not None:
+        cfg["bounds"]["max_total_bytes"] = capacity(args.max_size)
     if weights:
         total = sum(weights.values())
         cfg["importance"] = {axis: v / total for axis, v in weights.items()}
@@ -117,10 +120,11 @@ def command_plan(args):
     log = io.StringIO()
     with contextlib.redirect_stdout(log):
         aq.plan(data, cfg, out)
-    summary = [line for line in log.getvalue().splitlines() if line.startswith(("Saved", "Predicted KL", "infeasible", "no_feasible"))]
+    lines = log.getvalue().splitlines()
+    summary = lines[:1] + [line for line in lines[1:] if line.startswith(("Saved", "Predicted KL"))]
     print("\n".join(summary))
     return choose(json.loads((out / "frontier.json").read_text()), out / "frontier.json", args,
-                  default_pick="min-kld" if args.minimize == "kld" else None)
+                  default_pick={"kld": "min-kld", "size": "min-size"}.get(args.minimize))
 
 
 def command_show(args):
@@ -136,6 +140,8 @@ def choose(payload, path, args, default_pick=None):
     all_rows = fr.rows(payload)
     if not all_rows:
         raise QuantError(f"the plan has no feasible recipe ({payload['search']['status']})")
+    if payload["search"]["status"] != "ok":
+        print(f"Warning: search status {payload['search']['status']}")
     shown = fr.thin(all_rows, args.rows)
     print(f"{len(all_rows)} nondominated recipes; showing {len(shown)}. * marks the best score; dKL is relative to it.")
     print(fr.table(shown, "pred KL" if payload.get("quality") else "local R"))
@@ -183,8 +189,9 @@ def build_parser():
     common(p)
     p.add_argument("--weights", help="loss=.4,decode=.3,short=.2,long=.1 (relative; omitted axes count 0)")
     p.add_argument("--minimize", choices=("score", "kld", "size"), default="score",
-                   help="score: the weighted objective; kld: precision only; size: smallest recipe under --max-kld")
+                   help="score: the weighted objective; kld: precision only; size: smallest recipe with predicted KL <= --max-kld")
     p.add_argument("--budget", help="DEVICE=SIZE,... replaces device budgets for this plan, e.g. ROCm1=24GiB,RAM=400GiB")
+    p.add_argument("--max-size", help="ceiling on the summed tensor bytes over all devices, e.g. 55GiB (reserves excluded)")
     p.add_argument("--max-kld", type=float, help="ceiling on the predicted KL (needs a quality table)")
     for option in RATE_BOUNDS:
         p.add_argument("--" + option.replace("_", "-"), dest=option, type=float, help="minimum predicted t/s")

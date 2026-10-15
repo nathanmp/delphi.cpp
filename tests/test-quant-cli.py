@@ -28,7 +28,7 @@ def payload(n=40, quality=True):
 
 
 def cfg():
-    return {"devices": {"ROCm1": 24 * GIB, "RAM": 100 * GIB}, "reserve": {"RAM": GIB}, "quality": {"table": "q.json"},
+    return {"search": {"display": 8}, "devices": {"ROCm1": 24 * GIB, "RAM": 100 * GIB}, "reserve": {"RAM": GIB}, "quality": {"table": "q.json"},
             "importance": {"precision": .25, "decode": .25, "short": .25, "long": .25}, "bounds": {}}
 
 
@@ -54,9 +54,15 @@ class Query(unittest.TestCase):
         with self.assertRaises(QuantError):
             apply_query(cfg(), args("--minimize", "kld", "--weights", "loss=1"))
 
-    def test_size_mode_is_not_available_yet(self):
+    def test_size_mode(self):
+        out = apply_query(cfg(), args("--minimize", "size", "--max-kld", "0.05", "--max-size", "400GiB"))
+        self.assertEqual(out["search"]["minimize"], "size")
+        self.assertEqual(out["importance"]["precision"], 1.0)
+        self.assertEqual(out["bounds"], {"max_loss": 0.05, "max_total_bytes": 400 * GIB})
         with self.assertRaises(QuantError):
-            apply_query(cfg(), args("--minimize", "size", "--max-kld", "0.05"))
+            apply_query(cfg(), args("--minimize", "size"))
+        with self.assertRaises(QuantError):
+            apply_query(cfg(), args("--minimize", "size", "--max-kld", "0.05", "--weights", "loss=1"))
 
     def test_budget_and_bounds(self):
         out = apply_query(cfg(), args("--budget", "ROCm1=20GiB,RAM=400GiB", "--max-kld", "0.05", "--min-decode", "30"))

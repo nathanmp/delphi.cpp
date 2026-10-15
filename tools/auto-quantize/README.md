@@ -151,7 +151,7 @@ python tools/auto-quantize/quant_cli.py plan --config config.json --work /tmp/au
 python tools/auto-quantize/quant_cli.py show --frontier /tmp/autoq/plans/plan-001/frontier.json --detail best
 ```
 
-`--minimize size` (smallest recipe under `--max-kld`) is not implemented yet. Run `python tests/test-quant-cli.py` for the offline checks.
+`--max-size 55GiB` caps the summed tensor bytes over all devices (`bounds.max_total_bytes`: one pooled knapsack, device capacities still checked). `--minimize size --max-kld 0.05` finds the smallest recipe whose predicted KL is within the ceiling (`search.minimize: size`): it bisects the pooled byte cap on the exact minimum-loss knapsack, then plans under that cap. Speed bounds and device capacities are checked on the result only. Run `python tests/test-quant-cli.py` for the offline checks.
 
 ## Workflow
 
