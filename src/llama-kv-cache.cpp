@@ -1255,7 +1255,18 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
 
     // pad the n_kv value so that the graph remains constant across batches and can be reused
     // note: this also helps some backends with performance (f.ex https://github.com/ggml-org/llama.cpp/pull/16812#issuecomment-3455112220)
-    const uint32_t n_pad_cur = std::max(n_pad, 256u);
+    // LLAMA_KV_N_PAD (multiple of 256): a larger step makes the KV view grow less often, so the graphs of idle
+    // batch widths (e.g. speculative verify widths) stay reusable longer, at the cost of more masked cells
+    static const uint32_t n_pad_env = [] {
+        const char * env = getenv("LLAMA_KV_N_PAD");
+        const long   v   = env ? atol(env) : 0;
+        if (env && (v < 256 || v % 256 != 0)) {
+            LLAMA_LOG_WARN("%s: LLAMA_KV_N_PAD=%s is not a multiple of 256, ignored\n", __func__, env);
+            return 256u;
+        }
+        return v > 0 ? (uint32_t) v : 256u;
+    }();
+    const uint32_t n_pad_cur = std::max(n_pad, n_pad_env);
 
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const auto & cells = v_cells[sinfo.strm[s]];
