@@ -24,6 +24,11 @@ enum common_speculative_type common_speculative_type_from_name(const std::string
 std::string common_speculative_type_to_str(enum common_speculative_type type);
 
 // return the max number of draft tokens based on the speculative parameters
+// delphi: draft-mtp without an explicit adaptive option and without synthetic acceptance uses the conf mode, up to
+// COMMON_SPECULATIVE_CONF_N_MAX_DEFAULT tokens unless --spec-draft-n-max is given. Call after the options are applied.
+#define COMMON_SPECULATIVE_CONF_N_MAX_DEFAULT 7
+void common_speculative_params_resolve(common_params_speculative & spec);
+
 int32_t common_speculative_n_max(const common_params_speculative * spec);
 
 // return the max number of draft tokens from the initialized implementations

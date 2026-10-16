@@ -341,8 +341,13 @@ struct common_params_speculative_draft {
     int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding
 
     // adaptive draft depth (--spec-draft-adaptive): the depth moves within [n_min_adaptive, n_max] with the acceptance
+    // delphi: draft-mtp defaults to the conf mode (common_speculative_params_resolve); the *_set flags record explicit options
     bool    adaptive       = false;
     enum common_speculative_adaptive_mode adaptive_mode = COMMON_SPECULATIVE_ADAPTIVE_BUCKET;
+    bool    adaptive_set      = false; // --spec-draft-adaptive, --no-spec-draft-adaptive or --spec-draft-adaptive-mode given
+    bool    adaptive_mode_set = false; // --spec-draft-adaptive-mode given
+    bool    n_max_set         = false; // --spec-draft-n-max given
+    bool    n_max_auto        = false; // n_max is the default cap of the conf mode
     int32_t n_min_adaptive = 0; // floor of the adaptive depth (0: 3 for the bucket, 1 for the cost mode)
     int32_t n_start        = 0; // adaptive depth at the start of a generation (0: bucket n_max - 3, cost 3; bounded by the floor)
 

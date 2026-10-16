@@ -2646,6 +2646,35 @@ static uint32_t common_get_enabled_speculative_configs(const std::vector<common_
     return result;
 }
 
+void common_speculative_params_resolve(common_params_speculative & spec) {
+    auto & d = spec.draft;
+    bool mtp = false;
+    bool other_draft = false;
+    for (const auto type : spec.types) {
+        mtp         |= type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP;
+        other_draft |= type == COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE || type == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 ||
+                       type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+    }
+    // conf supports only draft-mtp; synthetic acceptance measures a fixed depth
+    const bool conf_ok = mtp && !other_draft && !spec.has_synth();
+
+    if (!d.adaptive_set) {
+        d.adaptive = conf_ok;
+    }
+    if (!d.adaptive_mode_set) {
+        d.adaptive_mode = conf_ok ? COMMON_SPECULATIVE_ADAPTIVE_CONF : COMMON_SPECULATIVE_ADAPTIVE_BUCKET;
+    }
+
+    const bool conf = d.adaptive && d.adaptive_mode == COMMON_SPECULATIVE_ADAPTIVE_CONF;
+    if (conf && !d.n_max_set) {
+        d.n_max      = COMMON_SPECULATIVE_CONF_N_MAX_DEFAULT;
+        d.n_max_auto = true;
+    } else if (!conf && d.n_max_auto) {
+        d.n_max      = common_params_speculative_draft().n_max;
+        d.n_max_auto = false;
+    }
+}
+
 int32_t common_speculative_n_max(const common_params_speculative * spec) {
     int32_t n_max = 0;
 
@@ -3098,7 +3127,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                 impl->conf_ctl.seqs.assign(n_seq, {});
             }
             SPC_TRC("adaptive draft depth for %s (%s): %d..%d, start %d\n", common_speculative_type_to_str(impl->type).c_str(),
-                    cost ? "cost" : "bucket", impl->n_min_adaptive, impl->n_max,
+                    cost ? "cost" : conf ? "conf" : "bucket", impl->n_min_adaptive, impl->n_max,
                     cost ? impl->cost_ctrl[0].n_cur : impl->adaptive_ctrl[0].n_cur);
         }
     }

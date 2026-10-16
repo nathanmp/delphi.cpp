@@ -20,7 +20,7 @@ The gain depends on how evenly the weights are spread and how slow the device li
 | --- | --- | --- | --- |
 | `LLAMA_SAMPLER_RESERVE_ALWAYS` | off | `1` | Reserve the compute buffers again at each sampler change (upstream behavior) |
 
-The server sets a new sampler object for each request and removes it at the end. A reservation recreates the scheduler and all its compute buffers, and with staging the staging slots: 0.6 s per request on GLM-5.3 and Qwen 3.8, 1.7 s on DeepSeek V4.1 (measured from the execution trace of the first prompt batch). By default, the context reserves again only when the sampler chains of the sequences (the sampler names in each chain) are not the same as at the last reservation. A new sampler object always causes a new graph, not the reuse of a graph that was built with the old object. A sampler parameter that changes a tensor size (for example a larger top-k) can make the compute buffer grow on the next batch.
+The server keeps the sampler object of a slot between requests when the sampling parameters are equal and the chain has no grammar or reasoning-budget sampler (it is reset, not made again); otherwise it sets a new sampler object. A reservation recreates the scheduler and all its compute buffers, and with staging the staging slots: 0.6 s per request on GLM-5.3 and Qwen 3.8, 1.7 s on DeepSeek V4.1 (measured from the execution trace of the first prompt batch). By default, the context reserves again only when the sampler chains of the sequences (the sampler names in each chain) are not the same as at the last reservation. A new sampler object always causes a new graph, not the reuse of a graph that was built with the old object. A sampler parameter that changes a tensor size (for example a larger top-k) can make the compute buffer grow on the next batch.
 
 ## Multi-device scheduler
 
@@ -74,6 +74,20 @@ hipBLASLt can pick a different kernel for the same GEMM in different processes, 
 | `GGML_CUDA_GRAPH_CACHE_SIZE` | `2048` | number of captured graphs a device keeps; graphs with more than 256 nodes stay bounded at 64 |
 
 Every distinct graph (each verify width and each draft step of speculative decoding, on every device) takes an entry. With 256 entries, Qwen 3.8 Flash Next with MTP on three R9700s (layer split) sometimes evicted its decode graphs: a whole request at draft depth 3 ran at 18 instead of 58 t/s, and at depth 5 most requests ran at 7-17 t/s. With 2048 entries every request ran at full speed, at under 0.1 GiB more memory per device.
+
+## Speculative decoding: graphs of the verify widths
+
+A per-round draft depth (the default conf mode of `draft-mtp`, see `speculative-draft-depth.md`) verifies a different number of tokens in most rounds, so the target and the draft context keep one graph per width. These switches keep those graphs valid.
+
+| variable | default | effect |
+| --- | --- | --- |
+| `LLAMA_KV_N_PAD` | unset: 256, 2048 with a per-round draft depth | the KV view grows in steps of this many cells (multiple of 256). A step makes the graphs of all widths stale. Set, it wins over the reservation of the conf mode: `256` gives the upstream step |
+| `GGML_CUDA_FA_KV_MAX_DECODE` | `1` | flash attention scans the mask for a fully masked tail also for fewer than 1024 query rows, so that the masked cells of a padded KV view cost nothing. `0`: upstream behavior. Outputs are identical |
+| `LLAMA_GRAPH_ALT_SLOTS` | `4`, n_max + 2 with a per-round draft depth | graphs kept for small batches (up to `LLAMA_GRAPH_ALT_MAX_TOKENS`, default 32, tokens); set, it wins |
+| `LLAMA_GRAPH_BUILD_LOG` | off | `1` logs each graph build with the reuse check that failed, and its host times (build, scheduler allocation, first compute) |
+| `DELPHI_SPEC_PLOG` | off | a file name: the MTP draft writes the top-1 probability of each draft step and the accepted count per round (JSON lines), for offline replays of stop rules |
+
+On GLM-5.3 Flash (3x CMP 170HX) a graph build of a target width costs about 2 ms (build) + 10 ms (allocation) + 20 ms (first run); with the step 256 the conf mode built 68 graphs per 2048-token request and lost to a fixed depth, with 2048 it was the fastest mode. The masked cells cost GLM's sparse attention about 0.5 ms per round at the step 2048. On Qwen 3.8 Flash Next (3x R9700) they cost 4.4 ms per round (44.0 instead of 39.6 ms) until the flash-attention scan skipped them.
 
 ## Weight streaming (staging ring)
 

@@ -1379,6 +1379,7 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
             exit(0);
         }
         params.lr.init();
+        common_speculative_params_resolve(params.speculative);
     } catch (const std::invalid_argument & ex) {
         fprintf(stderr, "%s\n", ex.what());
         ctx_arg.params = params_org;
@@ -4258,12 +4259,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
 
     add_opt(common_arg(
         {"--spec-draft-n-max"}, "N",
-        string_format("number of tokens to draft for speculative decoding (default: %d)", params.speculative.draft.n_max),
+        string_format("number of tokens to draft for speculative decoding (default: %d; %d for the default conf mode of draft-mtp)", params.speculative.draft.n_max, COMMON_SPECULATIVE_CONF_N_MAX_DEFAULT),
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("invalid value");
             }
-            params.speculative.draft.n_max = value;
+            params.speculative.draft.n_max      = value;
+            params.speculative.draft.n_max_set  = true;
+            params.speculative.draft.n_max_auto = false;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX"));
     add_opt(common_arg(
@@ -4287,9 +4290,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--spec-draft-adaptive"}, {"--no-spec-draft-adaptive"},
         "adapt the draft depth of a draft model (draft-simple, eagle3, dflash, dspark, draft-mtp) to its acceptance, "
-        "between --spec-draft-n-min-adaptive and --spec-draft-n-max (default: off)",
+        "between --spec-draft-n-min-adaptive and --spec-draft-n-max (default: on in the conf mode for draft-mtp without synthetic "
+        "acceptance, else off; --no-spec-draft-adaptive gives the fixed depth --spec-draft-n-max)",
         [](common_params & params, bool value) {
-            params.speculative.draft.adaptive = value;
+            params.speculative.draft.adaptive     = value;
+            params.speculative.draft.adaptive_set = true;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_ADAPTIVE"));
     add_opt(common_arg(
@@ -4297,7 +4302,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "controller of --spec-draft-adaptive (implies it): bucket follows the acceptance alone; cost chooses the depth "
         "with the most expected tokens per second from the acceptance per position, the measured round time per "
         "draft length and the measured cost of a change of depth; conf stops each draft at the step whose calibrated "
-        "confidence no longer pays for its verify row, up to --spec-draft-n-max (default: bucket)",
+        "confidence no longer pays for its verify row, up to --spec-draft-n-max (draft-mtp only; default: conf for draft-mtp, else bucket)",
         [](common_params & params, const std::string & value) {
             if (value == "bucket") {
                 params.speculative.draft.adaptive_mode = COMMON_SPECULATIVE_ADAPTIVE_BUCKET;
@@ -4308,7 +4313,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             } else {
                 throw std::invalid_argument("invalid value");
             }
-            params.speculative.draft.adaptive = true;
+            params.speculative.draft.adaptive          = true;
+            params.speculative.draft.adaptive_set      = true;
+            params.speculative.draft.adaptive_mode_set = true;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_ADAPTIVE_MODE"));
     add_opt(common_arg(

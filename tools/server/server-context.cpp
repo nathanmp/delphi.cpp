@@ -3050,6 +3050,7 @@ private:
         params.speculative = spec_params_launch;
         try {
             common_params_apply_spec_args(params, LLAMA_EXAMPLE_SERVER, args);
+            common_speculative_params_resolve(params.speculative);
         } catch (const std::exception & e) {
             err = e.what();
             return false;
@@ -3108,7 +3109,8 @@ private:
 
         SRV_INF("speculative decoding reconfigured: types = %s, n_max = %d, adaptive = %s\n",
                 common_speculative_type_name_str(sp.types).c_str(), n_max,
-                !sp.draft.adaptive ? "off" : sp.draft.adaptive_mode == COMMON_SPECULATIVE_ADAPTIVE_COST ? "cost" : "bucket");
+                !sp.draft.adaptive ? "off" : sp.draft.adaptive_mode == COMMON_SPECULATIVE_ADAPTIVE_COST ? "cost" :
+                    sp.draft.adaptive_mode == COMMON_SPECULATIVE_ADAPTIVE_CONF ? "conf" : "bucket");
         return true;
     }
 
@@ -3154,7 +3156,8 @@ private:
             {"types",         common_speculative_type_name_str(sp.types)},
             {"n_max",         common_speculative_n_max(&sp)},
             {"n_max_launch",  spec_n_max_launch},
-            {"adaptive",      !sp.draft.adaptive ? "off" : sp.draft.adaptive_mode == COMMON_SPECULATIVE_ADAPTIVE_COST ? "cost" : "bucket"},
+            {"adaptive",      !sp.draft.adaptive ? "off" : sp.draft.adaptive_mode == COMMON_SPECULATIVE_ADAPTIVE_COST ? "cost" :
+                    sp.draft.adaptive_mode == COMMON_SPECULATIVE_ADAPTIVE_CONF ? "conf" : "bucket"},
             {"p_min",         sp.draft.p_min},
             {"draft_context", ctx_dft != nullptr},
             {"n_graph_built", {{"target", ctx_tgt ? llama_graph_n_built(ctx_tgt) : 0}, {"draft", ctx_dft ? llama_graph_n_built(ctx_dft) : 0}}},
