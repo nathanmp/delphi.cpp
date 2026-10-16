@@ -28,6 +28,21 @@ The conf mode supports only `draft-mtp`. `cost` (per-request depth from a cost m
 
 `POST /speculative` with `{"args": ["--spec-draft-n-max", "5", "--no-spec-draft-adaptive"]}` applies speculative options over those of the launch without a reload (the draft cannot be larger than at the launch). `GET /speculative` returns the active settings, the graph build counts and, for the conf mode, the verify times, the step time, the throughput and the calibration table.
 
+## Probabilistic draft sampling
+
+`--spec-draft-sampling probabilistic` makes `draft-simple` and `draft-mtp` sample each draft token from the draft distribution q, instead of taking its top-1 token (`greedy`, the default). The target then accepts a draft token x with probability min(1, p(x)/q(x)). After a rejection it samples from norm(max(0, p - q)). The output distribution of the target stays exact. At temperature above 0 this accepts more draft tokens than greedy drafting. At temperature 0 both modes give the same text, because the option has no effect there. Requests with a grammar or a JSON schema also work. The option can be changed at run time with `POST /speculative` (`{"args": ["--spec-draft-sampling", "probabilistic"]}`), and `GET /speculative` shows it as `draft_sampling`.
+
+In the conf mode, the draft probability `p_i` of a sampled draft token is the probability of the token that the draft sampled, not the top-1 probability.
+
+Measured on GLM-5.3 Flash INT4 (3x CMP 170HX), temperature 1.0, seeded, 8 prompts, 512 tokens, 2 rounds:
+
+| arm | tokens per second | accepted / drafted |
+| --- | --- | --- |
+| greedy, fixed-3 | 70.4 | 0.515 |
+| probabilistic, fixed-3 | 72.6 | 0.541 |
+| greedy, conf | 71.5 | 0.680 |
+| probabilistic, conf | 73.9 | 0.723 |
+
 ## Measurements
 
 Greedy, 8 prompts (prose, math, code, JSON, explanation, C++, travel, SQL), 2 rounds, total tokens per second; fixed-3 is the upstream default depth.
