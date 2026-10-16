@@ -599,11 +599,10 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
                 continue;
             }
 
-            if (dp.result->size() < (size_t) params.n_min) {
+            // a probabilistic draft is not cut by n_min: the length depends on the later draft distributions, which depend on
+            // the sampled tokens, and dropping a sampled token on that basis would make the verification inexact
+            if (!dp.result_q && dp.result->size() < (size_t) params.n_min) {
                 dp.result->clear();
-                if (dp.result_q) {
-                    dp.result_q->clear();
-                }
             }
         }
     }
@@ -2046,11 +2045,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 continue;
             }
 
-            if (dp.result->size() < (size_t) params.n_min) {
+            // a probabilistic draft is not cut by n_min: the length depends on the later draft distributions, which depend on
+            // the sampled tokens, and dropping a sampled token on that basis would make the verification inexact
+            if (!dp.result_q && dp.result->size() < (size_t) params.n_min) {
                 dp.result->clear();
-                if (dp.result_q) {
-                    dp.result_q->clear();
-                }
             }
         }
     }
