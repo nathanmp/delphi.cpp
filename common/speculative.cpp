@@ -1502,6 +1502,18 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 };
 
+static FILE * spec_plog() {
+    static FILE * f = [] {
+        const char * path = getenv("DELPHI_SPEC_PLOG");
+        FILE * fp = path ? fopen(path, "a") : nullptr;
+        if (fp) {
+            setvbuf(fp, nullptr, _IOLBF, 0);
+        }
+        return fp;
+    }();
+    return f;
+}
+
 struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     common_params_speculative_draft params; // reuses the draft-model params slot (ctx_tgt/ctx_dft)
 
@@ -1526,6 +1538,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // The last h-row of one process() call needs the first token of the NEXT
     // call to pair with, so it's stashed here until that next call fires.
     std::vector<std::vector<float>> pending_h;   // [n_seq][n_embd]
+
+    // DELPHI_SPEC_PLOG=<file>: per verified round, the top-1 probability of each draft step (also of a step that
+    // p_min cut) and the accepted count, for offline simulation of stop rules
+    std::vector<std::vector<float>> plog_p;      // [n_seq][step]
+    std::vector<int32_t>            plog_n;      // [n_seq] drafted tokens
 
     std::vector<int32_t> i_batch_beg;
     std::vector<int32_t> i_batch_end;
@@ -1614,6 +1631,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         this->n_max = this->params.n_max;
 
         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
+        plog_p.assign(n_seq, {});
+        plog_n.assign(n_seq, 0);
 
         i_last.assign(n_seq, -1);
         i_batch_beg.assign(n_seq, -1);
@@ -1863,6 +1882,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 // add drafted token for each sequence
                 const llama_token id = cur_p->data[0].id;
 
+                if (spec_plog()) {
+                    if (i == 0) {
+                        plog_p[seq_id].clear();
+                        plog_n[seq_id] = 0;
+                    }
+                    plog_p[seq_id].push_back(cur_p->data[0].p);
+                }
+
                 // only collect very high-confidence draft tokens
                 if (cur_p->data[0].p < params.p_min) {
                     drafting[seq_id] = false;
@@ -1877,6 +1904,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 auto & result = *dp.result;
 
                 result.push_back(id);
+                plog_n[seq_id] = (int32_t) result.size();
 
                 if (params.n_max <= (int) result.size() || (dp.n_max > 0 && dp.n_max <= (int) result.size())) {
                     drafting[seq_id] = false;
@@ -1934,6 +1962,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
+        }
+
+        if (FILE * f = spec_plog(); f && !plog_p[seq_id].empty()) {
+            fprintf(f, "{\"n\":%d,\"acc\":%d,\"p\":[", plog_n[seq_id], (int) n_accepted);
+            for (size_t k = 0; k < plog_p[seq_id].size(); ++k) {
+                fprintf(f, "%s%.4f", k ? "," : "", plog_p[seq_id][k]);
+            }
+            fprintf(f, "]}\n");
+            plog_p[seq_id].clear();
         }
 
         const int32_t n_rows = verify_h_rows[seq_id];
