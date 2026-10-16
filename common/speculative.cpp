@@ -1971,16 +1971,29 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 // add drafted token for each sequence
                 const llama_token id = dparams.at(seq_id).result_q ? id_sampled : cur_p->data[0].id;
 
+                // the confidence of the draft token: the top-1 probability when it is the argmax; when the draft samples
+                // (probabilistic), the probability of the token it sampled, which is what the verifier weighs
+                float p_tok = cur_p->data[0].p;
+                if (dparams.at(seq_id).result_q) {
+                    p_tok = 0.0f;
+                    for (size_t k = 0; k < cur_p->size; ++k) {
+                        if (cur_p->data[k].id == id) {
+                            p_tok = cur_p->data[k].p;
+                            break;
+                        }
+                    }
+                }
+
                 if (spec_plog()) {
                     if (i == 0) {
                         plog_p[seq_id].clear();
                         plog_n[seq_id] = 0;
                     }
-                    plog_p[seq_id].push_back(cur_p->data[0].p);
+                    plog_p[seq_id].push_back(p_tok);
                 }
 
                 // only collect very high-confidence draft tokens
-                if (cur_p->data[0].p < params.p_min || !conf_keep(seq_id, i, cur_p->data[0].p)) {
+                if (cur_p->data[0].p < params.p_min || !conf_keep(seq_id, i, p_tok)) {
                     drafting[seq_id] = false;
                     n_drafting--;
 
