@@ -160,6 +160,11 @@ LLAMA_API void          llama_feature_handoff_release(struct llama_context * ctx
 // and device graph capture; the cost-aware draft depth drops rounds with builds from its round times)
 LLAMA_API uint64_t      llama_graph_n_built(const struct llama_context * ctx);
 
+// keep the graphs of at least n_slots small ubatch shapes of up to n_max_tokens tokens (alternate schedulers), e.g. every
+// verify width of a per-round draft depth. Only grows; LLAMA_GRAPH_ALT_SLOTS / LLAMA_GRAPH_ALT_MAX_TOKENS, when set, win.
+// Call between decodes.
+LLAMA_API void          llama_graph_alt_slots_reserve(struct llama_context * ctx, uint32_t n_slots, uint32_t n_max_tokens);
+
 // Select which appended NextN block the DECODER_MTP graph runs (offset past
 // the trunk: il = n_layer() + offset). Used by the speculative NextN driver to
 // chain multiple trained NextN heads. Default 0 (first head).

@@ -3103,6 +3103,21 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         }
     }
 
+    // a per-round depth (conf mode, p_min) verifies every width 1..n_max + 1, and the draft context ingests as many: keep a
+    // graph per width, else the alternate schedulers evict each other (LLAMA_GRAPH_ALT_SLOTS default 4)
+    for (auto & impl : impls) {
+        const bool per_round = impl->conf || (params.draft.p_min > 0.0f && impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP);
+        if (!per_round) {
+            continue;
+        }
+        const uint32_t n_width = (uint32_t) impl->n_max + 1;
+        for (llama_context * ctx : { params.draft.ctx_tgt, params.draft.ctx_dft }) {
+            if (ctx) {
+                llama_graph_alt_slots_reserve(ctx, n_width + 1, n_width);
+            }
+        }
+    }
+
     if (impls.empty()) {
         SPC_TRC("%s", "no implementations specified for speculative decoding\n");
         return nullptr;

@@ -534,6 +534,8 @@ public:
     std::vector<state_async_copy> state_async_pending;
 
     uint64_t n_graph_built = 0; // number of graphs built (not reused); never reset
+    // grow the alternate slots (llama_graph_alt_slots_reserve)
+    void graph_alt_slots_reserve(uint32_t n_slots, uint32_t n_max_tokens);
 
 private:
     std::vector<ggml_backend_buffer_ptr> state_async_bufs;
