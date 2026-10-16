@@ -2239,6 +2239,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         n_reused++;
     } else {
+        static const bool build_log = getenv("LLAMA_GRAPH_BUILD_LOG") != nullptr;
+        if (build_log) {
+            const bool fresh = gf_res_prev_active != res || res->get_gf() == nullptr;
+            LLAMA_LOG_WARN("graph build: ctx %p n_tokens %u slot %d reason %s\n", (void *) this, ubatch.n_tokens, graph_slot_live,
+                    fresh ? "slot" : gf_res_prev_threads != backend_n_threads ? "threads" : res->reuse_fail_reason(gparams).c_str());
+        }
         gf_res_prev_active = nullptr;
         res->reset();
         n_graph_built++;

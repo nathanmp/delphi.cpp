@@ -1,4 +1,5 @@
 #include "llama-graph.h"
+#include <typeinfo>
 #include "llama-expert-cache.h"
 
 #include "llama-impl.h"
@@ -1551,6 +1552,18 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
     }
 
     return res;
+}
+
+std::string llm_graph_result::reuse_fail_reason(const llm_graph_params & params) {
+    if (!this->params.allow_reuse(params)) {
+        return "params";
+    }
+    for (auto & input : inputs) {
+        if (!input->can_reuse(params)) {
+            return typeid(*input).name();
+        }
+    }
+    return "";
 }
 
 llm_graph_input_i * llm_graph_result::add_input(llm_graph_input_ptr input) {
