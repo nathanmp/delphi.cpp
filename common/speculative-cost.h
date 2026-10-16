@@ -406,6 +406,7 @@ struct common_speculative_conf {
         std::vector<float> p;            // top-1 probabilities of the kept tokens
         int64_t            t_last = 0;   // start of the open round (us), 0: none
         int                tok    = 1;   // tokens of the open round (1 until its verify is fed back)
+        int                steps  = 0;   // draft steps of the open draft, the cut step included
     };
 
     double hits[N_POS][N_BIN]   = {};
@@ -440,6 +441,7 @@ struct common_speculative_conf {
             st.q = 1.0;
             st.p.clear();
         }
+        st.steps = k + 1;
         st.q *= cal(k, p);
         const double dv = tab.verify(k + 2) - tab.verify(k + 1);
         if (tab.calibrated() && dv > 0.0 && st.q < rate()*(dv + tab.t_step)) {

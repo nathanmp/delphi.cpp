@@ -3398,14 +3398,21 @@ void common_speculative_draft(common_speculative * spec) {
             common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
             const int64_t  t0 = ggml_time_us();
             const uint64_t b0 = impl->cost || impl->conf ? n_builds() : 0;
+            if (impl->conf) {
+                for (auto & st : impl->conf_ctl.seqs) {
+                    st.steps = 0;
+                }
+            }
             impl->draft(dparams);
             impl->n_call_draft++;
             if (impl->cost || impl->conf) {
-                // the sequences draft together: the time per token is that of the longest draft
+                // the sequences draft together: the time per token is that of the longest draft (in conf mode, of
+                // the most draft steps: a cut step runs but does not give a token)
                 size_t n_long = 0;
-                for (auto & dp : dparams) {
+                for (size_t s = 0; s < dparams.size(); ++s) {
+                    const auto & dp = dparams[s];
                     if (dp.drafting && dp.result) {
-                        n_long = std::max(n_long, dp.result->size());
+                        n_long = std::max(n_long, impl->conf ? (size_t) impl->conf_ctl.seqs[s].steps : dp.result->size());
                     }
                 }
                 impl->cost_tab.observe_draft((int) n_long, 1e-6*(ggml_time_us() - t0), n_builds() != b0);
@@ -3754,6 +3761,20 @@ std::vector<common_speculative_impl_info> common_speculative_get_info(const comm
             info.t_switch_ms = 1e3*tab.t_switch;
             for (int k = 1; k <= impl->n_max + 1; ++k) {
                 info.accept_rate.push_back(tab.global_rate(k));
+            }
+        }
+        if (impl->conf) {
+            const auto & tab = impl->cost_tab;
+            for (const double v : tab.t_verify) {
+                info.t_verify_ms.push_back(1e3*v);
+            }
+            info.t_step_ms = 1e3*tab.t_step;
+            info.conf_rate = impl->conf_ctl.rate();
+            for (int i = 0; i < common_speculative_conf::N_POS; ++i) {
+                for (int b = 0; b < common_speculative_conf::N_BIN; ++b) {
+                    info.conf_cal.push_back(impl->conf_ctl.hits[i][b]/std::max(1e-9, impl->conf_ctl.trials[i][b]));
+                    info.conf_trials.push_back(impl->conf_ctl.trials[i][b]);
+                }
             }
         }
         res.push_back(std::move(info));

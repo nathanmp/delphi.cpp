@@ -168,6 +168,11 @@ struct common_speculative_impl_info {
     double              t_step_ms = 0.0;  // draft time per token
     double              t_switch_ms = 0.0; // extra time of a change of depth
     std::vector<double> accept_rate;      // [k - 1] conditional acceptance over all requests
+
+    // conf mode (also t_verify_ms, t_step_ms)
+    double              conf_rate = 0.0;  // tokens per second of the recent rounds
+    std::vector<double> conf_cal;         // [pos][bin] observed acceptance
+    std::vector<double> conf_trials;      // [pos][bin] decayed trials
 };
 
 std::vector<common_speculative_impl_info> common_speculative_get_info(const common_speculative * spec);

@@ -3128,6 +3128,15 @@ private:
                     {"accept_rate", info.accept_rate},
                 };
             }
+            if (info.adaptive == "conf") {
+                j["conf"] = {
+                    {"t_verify_ms", info.t_verify_ms},
+                    {"t_step_ms",   info.t_step_ms},
+                    {"rate",        info.conf_rate},
+                    {"cal",         info.conf_cal},
+                    {"trials",      info.conf_trials},
+                };
+            }
             impls.push_back(std::move(j));
         }
         return json {
