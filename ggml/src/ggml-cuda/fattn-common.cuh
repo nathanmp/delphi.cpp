@@ -1137,11 +1137,12 @@ void launch_fattn(
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths.
-    // delphi: GGML_CUDA_FA_KV_MAX_DECODE=1 also scans for few query rows, so that a KV view padded in large steps
-    // (LLAMA_KV_N_PAD, llama_kv_cache_n_pad_reserve) does not pay for its masked tail
+    // delphi: also scan for few query rows, so that a KV view padded in large steps (LLAMA_KV_N_PAD,
+    // llama_kv_cache_n_pad_reserve) does not pay for its masked tail (Qwen on HIP: 44.0 -> 39.6 ms per verify round at
+    // the step 2048). GGML_CUDA_FA_KV_MAX_DECODE=0 turns it off.
     static const bool kv_max_decode = [] {
         const char * env = getenv("GGML_CUDA_FA_KV_MAX_DECODE");
-        return env != nullptr && atoi(env) != 0;
+        return env == nullptr || atoi(env) != 0;
     }();
     if (!use_sparse && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 &&
             (Q->ne[1] >= 1024 || Q->ne[3] > 1 || (kv_max_decode && K->ne[1] >= 2*FATTN_KQ_STRIDE))) {
