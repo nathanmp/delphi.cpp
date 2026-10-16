@@ -959,6 +959,9 @@ public:
     // return true if the graph was updated and can be reused
     bool can_reuse(const llm_graph_params & params);
 
+    // diagnostic: why can_reuse() fails ("params" or the type of the first input that refuses), nullptr if it does not
+    std::string reuse_fail_reason(const llm_graph_params & params);
+
     // the graph was built for parameters of the same topology; its inputs may no longer match them
     bool same_topology(const llm_graph_params & params) const { return this->params.allow_reuse(params); }
 

@@ -28,6 +28,8 @@ enum server_task_type {
     SERVER_TASK_TYPE_SLOT_ERASE,
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
+    SERVER_TASK_TYPE_GET_SPEC,
+    SERVER_TASK_TYPE_SET_SPEC,
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
@@ -178,6 +180,10 @@ struct server_task {
 
     // used by SERVER_TASK_TYPE_SET_LORA
     std::map<int, float> set_lora; // mapping adapter ID -> scale
+
+    // used by SERVER_TASK_TYPE_SET_SPEC
+    std::vector<std::string> spec_args;      // speculative arguments over the launch configuration
+    bool                     spec_calibrate = false;
 
     server_task() = default;
 
@@ -565,6 +571,12 @@ struct server_task_result_get_lora : server_task_result {
 
 struct server_task_result_apply_lora : server_task_result {
     virtual json to_json() override;
+};
+
+// GET and POST /speculative
+struct server_task_result_spec : server_task_result {
+    json data;
+    virtual json to_json() override { return data; }
 };
 
 struct server_prompt {

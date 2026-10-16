@@ -506,6 +506,44 @@ void common_sampler_reset(struct common_sampler * gsmpl) {
     gsmpl->reset();
 }
 
+bool common_sampler_params_reusable(const common_params_sampling & a, const common_params_sampling & b) {
+    // no grammar sampler and no reasoning budget sampler (the conditions of common_sampler_init); without a grammar the
+    // triggers, the lazy flag and the preserved tokens of a chat template have no effect on the chain
+    auto plain = [](const common_params_sampling & p) {
+        const bool rbudget = !p.reasoning_budget_start.empty() && !p.reasoning_budget_end.empty() &&
+                             (p.grammar_lazy || p.reasoning_budget_tokens >= 0 || p.reasoning_control);
+        return common_grammar_value(p.grammar).empty() && !rbudget;
+    };
+    auto bias_eq = [](const std::vector<llama_logit_bias> & x, const std::vector<llama_logit_bias> & y) {
+        if (x.size() != y.size()) {
+            return false;
+        }
+        for (size_t i = 0; i < x.size(); ++i) {
+            if (x[i].token != y[i].token || x[i].bias != y[i].bias) {
+                return false;
+            }
+        }
+        return true;
+    };
+    return plain(a) && plain(b) &&
+           a.print()              == b.print() &&
+           a.seed                 == b.seed &&
+           a.n_prev               == b.n_prev &&
+           a.n_probs              == b.n_probs &&
+           a.min_keep             == b.min_keep &&
+           a.dynatemp_range       == b.dynatemp_range &&
+           a.dynatemp_exponent    == b.dynatemp_exponent &&
+           a.ignore_eos           == b.ignore_eos &&
+           a.no_perf              == b.no_perf &&
+           a.user_sampling_config == b.user_sampling_config &&
+           a.backend_sampling     == b.backend_sampling &&
+           a.samplers             == b.samplers &&
+           a.dry_sequence_breakers == b.dry_sequence_breakers &&
+           a.generation_prompt    == b.generation_prompt &&
+           bias_eq(a.logit_bias, b.logit_bias) &&
+           bias_eq(a.logit_bias_eog, b.logit_bias_eog);
+}
+
 struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
     return new common_sampler {
         /* .params  = */ gsmpl->params,

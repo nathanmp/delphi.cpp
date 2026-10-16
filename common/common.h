@@ -190,6 +190,13 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_COUNT          // number of types, unknown type
 };
 
+// controller of the adaptive draft depth (--spec-draft-adaptive-mode)
+enum common_speculative_adaptive_mode {
+    COMMON_SPECULATIVE_ADAPTIVE_BUCKET, // acceptance credit bucket (speculative-adaptive.h)
+    COMMON_SPECULATIVE_ADAPTIVE_COST,   // expected tokens per second from the acceptance and the round time (speculative-cost.h)
+    COMMON_SPECULATIVE_ADAPTIVE_CONF,   // per-round stop from the draft confidence and the verify cost per row (speculative-cost.h)
+};
+
 // Grammar type enumeration
 enum common_grammar_type {
     COMMON_GRAMMAR_TYPE_NONE,           // no grammar set
@@ -334,9 +341,15 @@ struct common_params_speculative_draft {
     int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding
 
     // adaptive draft depth (--spec-draft-adaptive): the depth moves within [n_min_adaptive, n_max] with the acceptance
+    // delphi: draft-mtp defaults to the conf mode (common_speculative_params_resolve); the *_set flags record explicit options
     bool    adaptive       = false;
-    int32_t n_min_adaptive = 3; // floor of the adaptive depth
-    int32_t n_start        = 0; // adaptive depth at the start of a generation (0: n_max - 3, bounded by the floor)
+    enum common_speculative_adaptive_mode adaptive_mode = COMMON_SPECULATIVE_ADAPTIVE_BUCKET;
+    bool    adaptive_set      = false; // --spec-draft-adaptive, --no-spec-draft-adaptive or --spec-draft-adaptive-mode given
+    bool    adaptive_mode_set = false; // --spec-draft-adaptive-mode given
+    bool    n_max_set         = false; // --spec-draft-n-max given
+    bool    n_max_auto        = false; // n_max is the default cap of the conf mode
+    int32_t n_min_adaptive = 0; // floor of the adaptive depth (0: 3 for the bucket, 1 for the cost mode)
+    int32_t n_start        = 0; // adaptive depth at the start of a generation (0: bucket n_max - 3, cost 3; bounded by the floor)
 
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
