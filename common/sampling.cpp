@@ -507,9 +507,12 @@ void common_sampler_reset(struct common_sampler * gsmpl) {
 }
 
 bool common_sampler_params_reusable(const common_params_sampling & a, const common_params_sampling & b) {
+    // no grammar sampler and no reasoning budget sampler (the conditions of common_sampler_init); without a grammar the
+    // triggers, the lazy flag and the preserved tokens of a chat template have no effect on the chain
     auto plain = [](const common_params_sampling & p) {
-        return p.grammar.grammar.empty() && !p.grammar_lazy && p.grammar_triggers.empty() && p.preserved_tokens.empty() &&
-               p.reasoning_budget_tokens < 0 && !p.reasoning_control;
+        const bool rbudget = !p.reasoning_budget_start.empty() && !p.reasoning_budget_end.empty() &&
+                             (p.grammar_lazy || p.reasoning_budget_tokens >= 0 || p.reasoning_control);
+        return common_grammar_value(p.grammar).empty() && !rbudget;
     };
     auto bias_eq = [](const std::vector<llama_logit_bias> & x, const std::vector<llama_logit_bias> & y) {
         if (x.size() != y.size()) {

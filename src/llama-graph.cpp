@@ -1556,7 +1556,34 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
 
 std::string llm_graph_result::reuse_fail_reason(const llm_graph_params & params) {
     if (!this->params.allow_reuse(params)) {
-        return "params";
+        const auto & a = this->params;
+        const auto & b = params;
+        if (a.ubatch.n_tokens != b.ubatch.n_tokens || a.ubatch.n_seqs != b.ubatch.n_seqs) {
+            return "params:ubatch";
+        }
+        if (a.n_outputs != b.n_outputs) {
+            return "params:n_outputs";
+        }
+        if (!llm_graph_params::samplers_equal(a.samplers, b.samplers)) {
+            return "params:samplers";
+        }
+        if (a.samplers.size() > 0 && (!a.ubatch.data || !b.ubatch.data)) {
+            return "params:ubatch_data";
+        }
+        if (a.samplers.size() > 0) {
+            for (uint32_t i = 0; i < a.ubatch.n_tokens; ++i) {
+                if (a.ubatch.output[i] != b.ubatch.output[i] || a.ubatch.seq_id[i][0] != b.ubatch.seq_id[i][0]) {
+                    return "params:outputs";
+                }
+            }
+        }
+        if (a.share_gen != b.share_gen) {
+            return "params:share_gen";
+        }
+        if (a.samplers_gen != b.samplers_gen) {
+            return "params:samplers_gen";
+        }
+        return "params:other";
     }
     for (auto & input : inputs) {
         if (!input->can_reuse(params)) {
