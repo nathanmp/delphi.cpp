@@ -3116,6 +3116,9 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                 llama_graph_alt_slots_reserve(ctx, n_width + 1, n_width);
             }
         }
+        // every KV view step makes the graphs of all widths stale (GLM: ~30 ms per target width); 2048 measured best
+        // on GLM (conf-7 +6 % vs the step 256; the masked cells cost ~0.5 ms per verify round)
+        llama_kv_cache_n_pad_reserve(2048);
     }
 
     if (impls.empty()) {

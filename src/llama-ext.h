@@ -165,6 +165,10 @@ LLAMA_API uint64_t      llama_graph_n_built(const struct llama_context * ctx);
 // Call between decodes.
 LLAMA_API void          llama_graph_alt_slots_reserve(struct llama_context * ctx, uint32_t n_slots, uint32_t n_max_tokens);
 
+// grow the KV views of all KV caches of the process in steps of at least n_pad cells (multiple of 256), so that the graphs
+// of idle ubatch shapes stay valid longer. Only grows; LLAMA_KV_N_PAD, when set, wins. Call between decodes.
+LLAMA_API void          llama_kv_cache_n_pad_reserve(uint32_t n_pad);
+
 // Select which appended NextN block the DECODER_MTP graph runs (offset past
 // the trunk: il = n_layer() + offset). Used by the speculative NextN driver to
 // chain multiple trained NextN heads. Default 0 (first head).
