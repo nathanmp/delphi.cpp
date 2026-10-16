@@ -1284,7 +1284,7 @@ static bool common_arg_is_spec_runtime(const std::string & arg) {
         "--spec-draft-p-min", "--draft-p-min",
         "--spec-draft-p-split", "--draft-p-split",
         "--spec-draft-adaptive", "--no-spec-draft-adaptive", "--spec-draft-adaptive-mode",
-        "--spec-draft-n-min-adaptive", "--spec-draft-n-start",
+        "--spec-draft-n-min-adaptive", "--spec-draft-n-start", "--spec-draft-sampling",
         "--spec-synth-len", "--spec-synth-rates",
     };
     return names.count(arg) > 0 || arg.rfind("--spec-ngram-", 0) == 0;
@@ -4394,6 +4394,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.backend_sampling = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_BACKEND_SAMPLING"));
+    add_opt(common_arg(
+        {"--spec-draft-sampling"}, "{greedy,probabilistic}",
+        string_format("how the draft is sampled: greedy takes its argmax, probabilistic samples it and has "
+                      "the target verify by rejection sampling (default: %s)",
+                      params.speculative.draft.probabilistic ? "probabilistic" : "greedy"),
+        [](common_params & params, const std::string & value) {
+            if (value == "greedy") {
+                params.speculative.draft.probabilistic = false;
+            } else if (value == "probabilistic") {
+                params.speculative.draft.probabilistic = true;
+            } else {
+                throw std::invalid_argument("invalid value, must be one of: greedy, probabilistic");
+            }
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_SAMPLING"));
     add_opt(common_arg(
         {"--spec-draft-device", "-devd", "--device-draft"}, "<dev1,dev2,..>",
         "comma-separated list of devices to use for offloading the draft model (none = don't offload, default: follows --device)\n"

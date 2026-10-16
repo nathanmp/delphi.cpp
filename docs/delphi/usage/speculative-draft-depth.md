@@ -28,6 +28,23 @@ The conf mode supports only `draft-mtp`. `cost` (per-request depth from a cost m
 
 `POST /speculative` with `{"args": ["--spec-draft-n-max", "5", "--no-spec-draft-adaptive"]}` applies speculative options over those of the launch without a reload (the draft cannot be larger than at the launch). `GET /speculative` returns the active settings, the graph build counts and, for the conf mode, the verify times, the step time, the throughput and the calibration table.
 
+## Probabilistic draft sampling
+
+`--spec-draft-sampling probabilistic` makes `draft-simple` and `draft-mtp` sample each draft token from the draft distribution q, instead of taking its top-1 token (`greedy`, the default). The target then accepts a draft token x with probability min(1, p(x)/q(x)). After a rejection it samples from norm(max(0, p - q)). The output distribution of the target stays exact. At temperature above 0 this accepts more draft tokens than greedy drafting. At temperature 0 both modes give the same text, because the option has no effect there. Requests with a grammar or a JSON schema also work. The option can be changed at run time with `POST /speculative` (`{"args": ["--spec-draft-sampling", "probabilistic"]}`), and `GET /speculative` shows it as `draft_sampling`.
+
+The rule that stops a draft must not depend on the value of the token that it drops, or the output is not exact. For this reason the conf mode and `--spec-draft-p-min` use the top-1 probability of the draft, also with probabilistic sampling. For the same reason `--spec-draft-n-min` does not cut a probabilistic draft (its default is 0).
+
+Measured on GLM-5.3 Flash INT4 (3x CMP 170HX), temperature 1.0, seeded, 8 prompts, 512 tokens, 2 rounds:
+
+| arm | tokens per second | accepted / drafted |
+| --- | --- | --- |
+| greedy, fixed-3 | 70.6 | 0.515 |
+| probabilistic, fixed-3 | 73.7 | 0.552 |
+| greedy, conf | 72.4 | 0.687 |
+| probabilistic, conf | 71.9 | 0.674 |
+
+With a fixed depth, probabilistic drafting gives more accepted tokens. In the conf mode it gave no gain in this test: the calibration is by the top-1 probability, and a sampled token is accepted less often than the top-1 token.
+
 ## Measurements
 
 Greedy, 8 prompts (prose, math, code, JSON, explanation, C++, travel, SQL), 2 rounds, total tokens per second; fixed-3 is the upstream default depth.
