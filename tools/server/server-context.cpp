@@ -384,6 +384,7 @@ struct server_slot {
     json json_schema;
 
     common_sampler_ptr smpl;
+    common_params_sampling smpl_params; // parameters smpl was created from (before common_sampler_init adjusted them)
 
     llama_token sampled; // in speculative mode, this is the last accepted token
 
@@ -435,7 +436,8 @@ struct server_slot {
 
         n_predict_max = -1;
 
-        llama_set_sampler(ctx_tgt, id, nullptr);
+        // the sampler stays attached: a next request with equal parameters reuses it and the graphs built with it
+        // (see launch_slot_with_task); a different one replaces or detaches it before it is freed
 
         // clear alora start
         alora_invocation_start = -1;
@@ -1911,7 +1913,15 @@ private:
         // initialize samplers
         if (task.need_sampling()) {
             try {
-                slot.smpl.reset(common_sampler_init(model_tgt, task.params.sampling));
+                if (slot.smpl && common_sampler_params_reusable(slot.smpl_params, task.params.sampling)) {
+                    // no grammar or reasoning budget, so common_sampler_init() would not change backend_sampling either
+                    common_sampler_reset(slot.smpl.get());
+                } else {
+                    common_params_sampling params_in = task.params.sampling;
+                    llama_set_sampler(ctx_tgt, slot.id, nullptr); // the old object is freed next
+                    slot.smpl.reset(common_sampler_init(model_tgt, task.params.sampling));
+                    slot.smpl_params = std::move(params_in);
+                }
             } catch (std::exception & e) {
                 std::string err_msg = std::string("Failed to initialize samplers: ") + e.what();
                 send_error(task, err_msg, ERROR_TYPE_INVALID_REQUEST);
@@ -1942,6 +1952,7 @@ private:
                 slot.spec_synth_rng.seed(seed);
             }
         } else {
+            llama_set_sampler(ctx_tgt, slot.id, nullptr);
             slot.smpl.reset();
         }
 

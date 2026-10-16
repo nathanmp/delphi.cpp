@@ -46,6 +46,11 @@ void common_sampler_free(struct common_sampler * gsmpl);
 // if is_generated is true, the token is accepted by the sampling chain, the reasoning budget sampler, and the grammar sampler
 void                    common_sampler_accept(struct common_sampler * gsmpl, llama_token token, bool is_generated);
 void                    common_sampler_reset (struct common_sampler * gsmpl);
+
+// a sampler created from a can serve b after common_sampler_reset(): equal parameters and nothing that holds
+// per-request state outside the sampler chain (grammar, reasoning budget). Keeping the object lets llama reuse the
+// graphs that contain its backend sampling nodes.
+bool common_sampler_params_reusable(const common_params_sampling & a, const common_params_sampling & b);
 struct common_sampler * common_sampler_clone (struct common_sampler * gsmpl);
 void                    common_sampler_copy  (const struct common_sampler * src, struct common_sampler * dst);
 

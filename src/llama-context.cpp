@@ -2073,6 +2073,13 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
         llama_sampler_chain_n(sampler) > 0;
 
     if (sampler && can_offload) {
+        auto it = sampling.samplers.find(seq_id);
+        if (it != sampling.samplers.end() && it->second == sampler) {
+            // the same object stays attached (the server keeps it between requests with equal parameters): its
+            // backend state and the graphs built with it remain valid
+            return true;
+        }
+
         auto * buft = ggml_backend_dev_buffer_type(model.dev_output());
 
         sampler->iface->backend_init(sampler, buft, cparams.n_outputs_max_per_seq);
@@ -5697,6 +5704,30 @@ const float * llama_feature_handoff_layer_inp(llama_context * ctx, int32_t ticke
 
 uint64_t llama_graph_n_built(const llama_context * ctx) {
     return ctx->n_graph_built;
+}
+
+void llama_graph_alt_slots_reserve(llama_context * ctx, uint32_t n_slots, uint32_t n_max_tokens) {
+    ctx->graph_alt_slots_reserve(n_slots, n_max_tokens);
+}
+
+void llama_context::graph_alt_slots_reserve(uint32_t n_slots, uint32_t n_max_tokens) {
+    if (graph_reuse_disable) {
+        return;
+    }
+    if (!getenv("LLAMA_GRAPH_ALT_MAX_TOKENS")) {
+        graph_alt_max_tokens = std::max(graph_alt_max_tokens, n_max_tokens);
+    }
+    if (!getenv("LLAMA_GRAPH_ALT_SLOTS")) {
+        graph_alt_slots = std::max(graph_alt_slots, n_slots);
+    }
+    if (graph_alt_max_tokens > 0 && graph_alt_slots > 0) {
+        // new slots are empty; their schedulers are created on first use (graph_slot_activate)
+        const size_t n = 1 + (size_t) graph_alt_slots;
+        if (graph_slots.size() < n) {
+            graph_slots.resize(n);
+            LLAMA_LOG_INFO("%s: %u alternate graph slots of up to %u tokens\n", __func__, graph_alt_slots, graph_alt_max_tokens);
+        }
+    }
 }
 
 void llama_feature_handoff_release(llama_context * ctx, int32_t ticket) {
