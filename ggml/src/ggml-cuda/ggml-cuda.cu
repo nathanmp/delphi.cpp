@@ -3952,6 +3952,17 @@ static bool ggml_cuda_match_moe_down_reduction(
     return true;
 }
 
+// delphi: GGML_CUDA_DISABLE_FUSION does not disable the INT4 FFN region on NVIDIA. Packed weights have no unfused kernel there:
+// ggml_cuda_mul_mat_id converts all experts of the tensor to Q4_0 in the pool (1.3 GiB per op on GLM), which is slow, and the
+// pool keeps it. HIP runs packed weights per node with the direct G128 kernel, so there the switch disables the region too.
+static constexpr bool ggml_cuda_moe_int4_ffn_ignores_disable_fusion() {
+#ifdef GGML_HIP_MOE_INT4_AVAILABLE
+    return false;
+#else
+    return true;
+#endif
+}
+
 // delphi: one complete routed FFN for the INT4 path (moe-int4-decode.cuh): the gate and up MUL_MAT_ID in either order, the
 // SWIGLU_CLAMP, the down MUL_MAT_ID and the weighted slot reduction (MUL, views, adds). This only recognizes the structure; the
 // tensor types, shapes and weights are checked by ggml_cuda_moe_int4_prepare and ggml_cuda_moe_int4_ready.
@@ -4448,11 +4459,10 @@ static bool ggml_cuda_sibling_mm_group(ggml_tensor ** mm, const int n, const int
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
-    if (disable_fusion) {
+    ggml_tensor * node = cgraph->nodes[i];
+    if (disable_fusion && (node->op != GGML_OP_MUL_MAT_ID || !ggml_cuda_moe_int4_ffn_ignores_disable_fusion())) {
         return 0;
     }
-
-    ggml_tensor * node = cgraph->nodes[i];
 
     const auto trace_fused_mul_mat = [&](int node_index, ggml_op op, enum ggml_exec_trace_dispatch_impl implementation) {
         if (!ggml_exec_trace_observing()) {
@@ -4495,6 +4505,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             }
 #endif
         }
+    }
+
+    if (disable_fusion) {
+        return 0;
     }
 
     if (node->op == GGML_OP_MUL_MAT_ID) {
@@ -5870,7 +5884,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         }
     }
 
-    if (!disable_fusion) {
+    if (!disable_fusion || ggml_cuda_moe_int4_ffn_ignores_disable_fusion()) {
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT_ID) {
                 ggml_cuda_moe_int4_ffn ffn;
@@ -5882,6 +5896,12 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                     i += ffn_nodes - 1;
                     continue;
                 }
+            }
+            if (disable_fusion) {
+                continue;
+            }
+
+            if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT_ID) {
                 ggml_cuda_moe_down_reduction_match match;
                 if (ggml_cuda_match_moe_down_reduction(cgraph, i, match)) {
                     params->add_alloc_dep(

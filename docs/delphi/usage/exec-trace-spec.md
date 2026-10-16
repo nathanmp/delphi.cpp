@@ -25,7 +25,7 @@ python3 tools/exec-trace/exec-trace-spec.py TRACE [--top N] [--node-regex REGEX]
 
 ## Recording
 
-Device times need GPU timing. Record with `GGML_EXEC_TRACE=<file>` and `GGML_EXEC_TRACE_GPU_TIMING=submit` for production timing, or `=op` with graphs and fusion disabled (`GGML_CUDA_DISABLE_GRAPHS=1`, `GGML_HIP_DISABLE_GRAPHS=1`, `GGML_CUDA_DISABLE_FUSION=1`, `GGML_CPU_DISABLE_FUSION=1`) to rank operations. Operation-mode times are inflated by the missing graphs and fusion: use them to compare operations, not to measure throughput. CPU operations are listed when the trace has CPU node timing.
+Device times need GPU timing. Record with `GGML_EXEC_TRACE=<file>` and `GGML_EXEC_TRACE_GPU_TIMING=submit` for production timing, or `=op` with graphs and fusion disabled (`GGML_CUDA_DISABLE_GRAPHS=1`, `GGML_HIP_DISABLE_GRAPHS=1`, `GGML_CUDA_DISABLE_FUSION=1`, `GGML_CPU_DISABLE_FUSION=1`) to rank operations. Operation-mode times are inflated by the missing graphs and fusion: use them to compare operations, not to measure throughput. On NVIDIA, the fused INT4 FFN of `Q4_G128` routed experts stays on with fusion disabled; the trace shows it as one `MUL_MAT_ID` operation. CPU operations are listed when the trace has CPU node timing.
 
 Acceptance is not in the trace. The server reports `draft_n` and `draft_n_accepted` in each response's `timings`. Divide the accepted tokens by the number of verify passes the tool reports for `--accepted-per-verify`. A synthetic acceptance arm (`--spec-synth-rates 1,1,1,0`) accepts a fixed number per pass.
 
