@@ -194,6 +194,7 @@ enum common_speculative_type {
 enum common_speculative_adaptive_mode {
     COMMON_SPECULATIVE_ADAPTIVE_BUCKET, // acceptance credit bucket (speculative-adaptive.h)
     COMMON_SPECULATIVE_ADAPTIVE_COST,   // expected tokens per second from the acceptance and the round time (speculative-cost.h)
+    COMMON_SPECULATIVE_ADAPTIVE_CONF,   // per-round stop from the draft confidence and the verify cost per row (speculative-cost.h)
 };
 
 // Grammar type enumeration

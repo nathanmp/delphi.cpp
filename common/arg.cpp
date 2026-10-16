@@ -4293,15 +4293,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_ADAPTIVE"));
     add_opt(common_arg(
-        {"--spec-draft-adaptive-mode"}, "{bucket,cost}",
+        {"--spec-draft-adaptive-mode"}, "{bucket,cost,conf}",
         "controller of --spec-draft-adaptive (implies it): bucket follows the acceptance alone; cost chooses the depth "
         "with the most expected tokens per second from the acceptance per position, the measured round time per "
-        "draft length and the measured cost of a change of depth (default: bucket)",
+        "draft length and the measured cost of a change of depth; conf stops each draft at the step whose calibrated "
+        "confidence no longer pays for its verify row, up to --spec-draft-n-max (default: bucket)",
         [](common_params & params, const std::string & value) {
             if (value == "bucket") {
                 params.speculative.draft.adaptive_mode = COMMON_SPECULATIVE_ADAPTIVE_BUCKET;
             } else if (value == "cost") {
                 params.speculative.draft.adaptive_mode = COMMON_SPECULATIVE_ADAPTIVE_COST;
+            } else if (value == "conf") {
+                params.speculative.draft.adaptive_mode = COMMON_SPECULATIVE_ADAPTIVE_CONF;
             } else {
                 throw std::invalid_argument("invalid value");
             }

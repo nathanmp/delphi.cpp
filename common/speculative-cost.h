@@ -380,3 +380,104 @@ struct common_speculative_cost_ctrl {
         }
     }
 };
+
+// Confidence stop (--spec-draft-adaptive-mode conf): the depth is chosen inside each round, one draft step at a time.
+//
+// The draft keeps token k (0-based) while the chance that tokens 0..k are all accepted pays for its verify row:
+//
+//   q_k = prod_{i<=k} cal(i, p_i) >= lam * (t_verify[k + 2] - t_verify[k + 1] + t_step)
+//
+//   p_i: top-1 probability of draft step i; cal(i, p): observed acceptance of draft tokens at position i with that
+//   probability (the draft probabilities are overconfident), decayed over all requests, with p itself as prior
+//   lam: tokens per second of the recent rounds, so a row must give more tokens per time than the average round
+//
+// On GLM 5.3 Flash (3x CMP 170HX) an offline replay of a fixed-7 log gave +11.5 % over the best fixed depth with this
+// rule, against +1 % for the best fixed depth per prompt. It needs cheap changes of verify width: every width keeps its
+// own graph (LLAMA_GRAPH_ALT_SLOTS >= n_max + 1) and the KV view grows seldom (LLAMA_KV_N_PAD); it ignores t_switch.
+struct common_speculative_conf {
+    static constexpr int    N_POS      = 3;     // position classes: 1st, 2nd, 3rd and later draft token
+    static constexpr int    N_BIN      = 8;     // classes of the top-1 probability
+    static constexpr double GAMMA_CAL  = 0.999; // decay of the calibration per verified round
+    static constexpr double PRIOR_W    = 4.0;   // weight of p itself as the prior of cal(i, p), in trials
+    static constexpr double GAMMA_RATE = 0.98;  // decay of the throughput per round
+
+    struct seq_state {
+        double             q      = 1.0; // chance that the kept tokens of the open draft are all accepted
+        std::vector<float> p;            // top-1 probabilities of the kept tokens
+        int64_t            t_last = 0;   // start of the open round (us), 0: none
+        int                tok    = 1;   // tokens of the open round (1 until its verify is fed back)
+    };
+
+    double hits[N_POS][N_BIN]   = {};
+    double trials[N_POS][N_BIN] = {};
+    double e_tok  = 0.0;
+    double e_time = 0.0; // seconds
+    std::vector<seq_state> seqs;
+
+    static int bin(float p) {
+        static const float edges[N_BIN - 1] = { 0.3f, 0.5f, 0.7f, 0.8f, 0.9f, 0.95f, 0.98f };
+        int b = 0;
+        while (b < N_BIN - 1 && p >= edges[b]) {
+            b++;
+        }
+        return b;
+    }
+
+    double cal(int k, float p) const {
+        const int i = std::min(k, N_POS - 1);
+        const int b = bin(p);
+        return (hits[i][b] + PRIOR_W*p)/(trials[i][b] + PRIOR_W);
+    }
+
+    double rate() const {
+        return e_time > 0.0 ? e_tok/e_time : 0.0;
+    }
+
+    // keep draft token k of sequence s, whose top-1 probability is p?
+    bool keep(const common_speculative_cost_table & tab, int s, int k, float p) {
+        auto & st = seqs[s];
+        if (k == 0) {
+            st.q = 1.0;
+            st.p.clear();
+        }
+        st.q *= cal(k, p);
+        const double dv = tab.verify(k + 2) - tab.verify(k + 1);
+        if (tab.calibrated() && dv > 0.0 && st.q < rate()*(dv + tab.t_step)) {
+            return false;
+        }
+        st.p.push_back(p);
+        return true;
+    }
+
+    // the verify of the last draft of s: n_draft tokens, n_accepted of them accepted
+    void observe(int s, int n_draft, int n_accepted) {
+        auto & st = seqs[s];
+        for (auto & h : hits) for (double & x : h) x *= GAMMA_CAL;
+        for (auto & t : trials) for (double & x : t) x *= GAMMA_CAL;
+        const int n = std::min({ n_accepted + 1, n_draft, (int) st.p.size() });
+        for (int k = 0; k < n; ++k) {
+            const int i = std::min(k, N_POS - 1);
+            const int b = bin(st.p[k]);
+            trials[i][b] += 1.0;
+            hits[i][b]   += k < n_accepted ? 1.0 : 0.0;
+        }
+        st.tok = n_accepted + 1;
+    }
+
+    // a new draft of s starts at t_us: the previous one is a closed round
+    void round(int s, int64_t t_us) {
+        auto & st = seqs[s];
+        if (st.t_last > 0) {
+            e_tok  = GAMMA_RATE*e_tok  + st.tok;
+            e_time = GAMMA_RATE*e_time + 1e-6*(t_us - st.t_last);
+        }
+        st.t_last = t_us;
+        st.tok    = 1;
+    }
+
+    // a new request: the prompt in between is not a round
+    void begin(int s) {
+        seqs[s].t_last = 0;
+        seqs[s].tok    = 1;
+    }
+};
