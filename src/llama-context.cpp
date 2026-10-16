@@ -2188,6 +2188,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     auto gparams = graph_params(res, ubatch, mctx, gtype);
 
+    static const bool build_log = getenv("LLAMA_GRAPH_BUILD_LOG") != nullptr;
+    int64_t t_build_us = -1;
+    int64_t t_alloc_us = -1;
+
     auto can_reuse = [&]() {
         return !graph_reuse_disable && gf_res_prev_active == res && gf_res_prev_threads == backend_n_threads && res->can_reuse(gparams);
     };
@@ -2246,7 +2250,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         n_reused++;
     } else {
-        static const bool build_log = getenv("LLAMA_GRAPH_BUILD_LOG") != nullptr;
         if (build_log) {
             const bool fresh = gf_res_prev_active != res || res->get_gf() == nullptr;
             LLAMA_LOG_WARN("graph build: ctx %p n_tokens %u slot %d reason %s\n", (void *) this, ubatch.n_tokens, graph_slot_live,
@@ -2261,7 +2264,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //const auto t_start_us = ggml_time_us();
 
+        t_build_us = ggml_time_us();
         gf = model.build_graph(gparams);
+        t_build_us = ggml_time_us() - t_build_us;
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
@@ -2272,12 +2277,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        t_alloc_us = ggml_time_us();
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             ggml_exec_trace_ubatch_end(trace_ubatch_id, ret);
             return nullptr;
         }
+        t_alloc_us = ggml_time_us() - t_alloc_us;
 
         gf_res_prev_active  = res;
         gf_res_prev_threads = backend_n_threads;
@@ -2293,12 +2300,18 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    const int64_t t_compute_us0 = build_log ? ggml_time_us() : 0;
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         ggml_exec_trace_ubatch_end(trace_ubatch_id, ret);
         return nullptr;
+    }
+    if (build_log && t_build_us >= 0) {
+        // host times; the first compute of a new graph includes its eager run or CUDA/HIP graph capture
+        LLAMA_LOG_WARN("graph build time: ctx %p n_tokens %u build %.2f alloc %.2f compute %.2f ms\n", (void *) this,
+                ubatch.n_tokens, t_build_us/1e3, t_alloc_us/1e3, (ggml_time_us() - t_compute_us0)/1e3);
     }
 
     ret = GGML_STATUS_SUCCESS;
