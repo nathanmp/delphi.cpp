@@ -129,6 +129,9 @@ struct common_sampler {
         prev.clear();
 
         llama_sampler_reset(chain);
+
+        // as at init: the rejection draws repeat with the chain, so a reused sampler matches a new one
+        rng.seed(llama_sampler_get_seed(chain) ^ 0x9e3779b9u);
     }
 
     void set_logits(struct llama_context * ctx, int idx) {

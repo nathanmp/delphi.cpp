@@ -601,6 +601,9 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
 
             if (dp.result->size() < (size_t) params.n_min) {
                 dp.result->clear();
+                if (dp.result_q) {
+                    dp.result_q->clear();
+                }
             }
         }
     }
@@ -2045,6 +2048,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             if (dp.result->size() < (size_t) params.n_min) {
                 dp.result->clear();
+                if (dp.result_q) {
+                    dp.result_q->clear();
+                }
             }
         }
     }
@@ -3581,6 +3587,9 @@ void common_speculative_draft(common_speculative * spec) {
                         impl->cost_shadow[seq_id]     = result.back();
                         impl->cost_has_shadow[seq_id] = 1;
                         result.pop_back();
+                        if (dp.result_q && !dp.result_q->empty()) {
+                            dp.result_q->pop_back();
+                        }
                     }
                     impl->cost_t_start[seq_id] = t_round_us;
                     impl->cost_n_round[seq_id] = (int) result.size();

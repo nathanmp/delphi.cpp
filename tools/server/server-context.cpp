@@ -3192,6 +3192,7 @@ private:
             {"adaptive",      !sp.draft.adaptive ? "off" : sp.draft.adaptive_mode == COMMON_SPECULATIVE_ADAPTIVE_COST ? "cost" :
                     sp.draft.adaptive_mode == COMMON_SPECULATIVE_ADAPTIVE_CONF ? "conf" : "bucket"},
             {"p_min",         sp.draft.p_min},
+            {"draft_sampling", sp.draft.probabilistic ? "probabilistic" : "greedy"},
             {"draft_context", ctx_dft != nullptr},
             {"n_graph_built", {{"target", ctx_tgt ? llama_graph_n_built(ctx_tgt) : 0}, {"draft", ctx_dft ? llama_graph_n_built(ctx_dft) : 0}}},
             {"impls",         impls},

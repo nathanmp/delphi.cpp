@@ -1284,7 +1284,7 @@ static bool common_arg_is_spec_runtime(const std::string & arg) {
         "--spec-draft-p-min", "--draft-p-min",
         "--spec-draft-p-split", "--draft-p-split",
         "--spec-draft-adaptive", "--no-spec-draft-adaptive", "--spec-draft-adaptive-mode",
-        "--spec-draft-n-min-adaptive", "--spec-draft-n-start",
+        "--spec-draft-n-min-adaptive", "--spec-draft-n-start", "--spec-draft-sampling",
         "--spec-synth-len", "--spec-synth-rates",
     };
     return names.count(arg) > 0 || arg.rfind("--spec-ngram-", 0) == 0;
