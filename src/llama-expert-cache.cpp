@@ -951,6 +951,34 @@ ggml_tensor * llama_expert_cache::build_record(ggml_context * ctx, ggml_tensor *
     return ggml_custom_4d(ctx, GGML_TYPE_I32, 1, 1, 1, 1, args, 1, op_record, 1, &layers[il]);
 }
 
+void llama_expert_cache::op_weighted_sum(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    GGML_UNUSED(userdata);
+    const ggml_tensor * x = dst->src[0];
+    const ggml_tensor * w = dst->src[1];
+    const int64_t n = x->ne[0], k = x->ne[1], rows = x->ne[2];
+    const int64_t per = (n + nth - 1) / nth;
+    const int64_t i0 = std::min(n, ith * per), i1 = std::min(n, i0 + per);
+    for (int64_t r = 0; r < rows; ++r) {
+        float * out = reinterpret_cast<float *>((char *) dst->data + r * dst->nb[1]);
+        for (int64_t j = 0; j < k; ++j) {
+            const float wj = *reinterpret_cast<const float *>((const char *) w->data + j * w->nb[1] + r * w->nb[2]);
+            const float * xj = reinterpret_cast<const float *>((const char *) x->data + j * x->nb[1] + r * x->nb[2]);
+            if (j == 0) {
+                for (int64_t i = i0; i < i1; ++i) { out[i] = xj[i] * wj; }
+            } else {
+                for (int64_t i = i0; i < i1; ++i) { out[i] += xj[i] * wj; }
+            }
+        }
+    }
+}
+
+ggml_tensor * llama_expert_cache::build_weighted_sum(ggml_context * ctx, ggml_tensor * experts, ggml_tensor * weights) {
+    GGML_ASSERT(experts->type == GGML_TYPE_F32 && weights->type == GGML_TYPE_F32 && experts->nb[0] == sizeof(float));
+    GGML_ASSERT(weights->ne[0] == 1 && weights->ne[1] == experts->ne[1] && weights->ne[2] == experts->ne[2]);
+    ggml_tensor * args[] = { experts, weights };
+    return ggml_custom_4d(ctx, GGML_TYPE_F32, experts->ne[0], experts->ne[2], 1, 1, args, 2, op_weighted_sum, GGML_N_TASKS_MAX, nullptr);
+}
+
 bool llama_expert_cache::needs_refresh(int64_t n_tokens, bool is_warmup) {
     // Graph reuse ignores warmup, so the ops read this flag at execution time.
     warmup = is_warmup;
