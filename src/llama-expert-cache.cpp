@@ -1179,10 +1179,23 @@ void llama_expert_cache::upload(const std::vector<upload_job> & jobs) {
     char * host = static_cast<char *>(ggml_backend_buffer_get_base(pinned.get()));
     for (const auto & [backend, slabs] : by_backend) {
         ggml_backend_dev_t dev = ggml_backend_get_device(backend);
-        ggml_context_ptr sctx(ggml_init({ggml_tensor_overhead(), nullptr, true}));
-        ggml_tensor * scratch = ggml_new_tensor_1d(sctx.get(), GGML_TYPE_I8, 2 * per_half * bytes);
-        ggml_backend_buffer_ptr sbuf(ggml_backend_alloc_ctx_tensors_from_buft(sctx.get(), ggml_backend_get_default_buffer_type(backend)));
+        // Fewer slabs per batch when the device has no room for the full scratch (its free memory is the auto cache margin, which
+        // the compute buffers of a long prompt can use up): a slower refill, not a failed decode.
+        int half_n = per_half;
+        ggml_context_ptr sctx;
+        ggml_tensor * scratch = nullptr;
+        ggml_backend_buffer_ptr sbuf;
+        for (; half_n >= 1 && !sbuf; half_n /= 2) {
+            sctx.reset(ggml_init({ggml_tensor_overhead(), nullptr, true}));
+            scratch = ggml_new_tensor_1d(sctx.get(), GGML_TYPE_I8, 2 * half_n * bytes);
+            sbuf.reset(ggml_backend_alloc_ctx_tensors_from_buft(sctx.get(), ggml_backend_get_default_buffer_type(backend)));
+            if (sbuf) { break; }
+        }
         if (!sbuf) { throw std::runtime_error("expert-cache: cannot allocate refill scratch"); }
+        if (half_n < per_half) {
+            LLAMA_LOG_WARN("expert-cache: refill scratch on %s: %d of %d slabs per batch, the memory for more is not available\n",
+                    ggml_backend_name(backend), half_n, per_half);
+        }
         ggml_backend_event_t ev[2] = { ggml_backend_event_new(dev), ggml_backend_event_new(dev) };
 
         // workers copy batch `batch` when it changes; each takes an interleaved share of every slab
@@ -1220,7 +1233,7 @@ void llama_expert_cache::upload(const std::vector<upload_job> & jobs) {
                 }
             });
         }
-        const size_t n_batches = (slabs.size() + per_half - 1) / per_half;
+        const size_t n_batches = (slabs.size() + half_n - 1) / half_n;
         for (size_t b = 0; b < n_batches; ++b) {
             const int half = b % 2;
             int64_t t = ggml_time_us();
@@ -1229,9 +1242,9 @@ void llama_expert_cache::upload(const std::vector<upload_job> & jobs) {
             t = ggml_time_us();
             {
                 std::lock_guard<std::mutex> lock(mutex);
-                first = b * per_half;
-                n = std::min<size_t>(per_half, slabs.size() - first);
-                dst = host + half * per_half * bytes;
+                first = b * half_n;
+                n = std::min<size_t>(half_n, slabs.size() - first);
+                dst = host + half * half_n * bytes;
                 done = 0;
                 batch = b;
             }
@@ -1241,10 +1254,10 @@ void llama_expert_cache::upload(const std::vector<upload_job> & jobs) {
                 cv_done.wait(lock, [&] { return done == n_threads; });
             }
             upload_copy_us += ggml_time_us() - t;
-            ggml_backend_tensor_set_async(backend, scratch, dst, half * per_half * bytes, n * bytes);
+            ggml_backend_tensor_set_async(backend, scratch, dst, half * half_n * bytes, n * bytes);
             for (size_t i = 0; i < n; ++i) {
                 const auto & x = slabs[first + i];
-                set_expert(backend, x.bank, x.slot, static_cast<const char *>(scratch->data) + (half * per_half + i) * bytes);
+                set_expert(backend, x.bank, x.slot, static_cast<const char *>(scratch->data) + (half * half_n + i) * bytes);
             }
             ggml_backend_event_record(ev[half], backend);
         }

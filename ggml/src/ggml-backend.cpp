@@ -2935,6 +2935,7 @@ struct ggml_backend_sched_stage_ring {
     bool busy[GGML_SCHED_STAGE_MAX_SLOTS]          = {};            // queued, and the read is not recorded yet
     bool free_recorded[GGML_SCHED_STAGE_MAX_SLOTS] = {};
     size_t slot_size = 0;
+    int n_slots = 0; // slots in use: GGML_SCHED_STAGE_SLOTS, or fewer when the memory for all of them is not available
     int next = 0;
 
     // pinned host bounce buffers, used by the staging thread only; bounce == nullptr uploads from the weight directly
@@ -3247,6 +3248,7 @@ static void ggml_backend_sched_stage_drop_slots(ggml_backend_sched_stage_ring & 
     }
     ring.lent = false;
     ring.slot_size = 0;
+    ring.n_slots = 0;
     ring.next = 0;
 }
 
@@ -3433,7 +3435,7 @@ static void ggml_backend_sched_stage_pump(ggml_backend_sched_t sched) {
         }
         w->cv_job.notify_one();
         ring.busy[slot] = true;
-        ring.next = (slot + 1) % stage->n_slots;
+        ring.next = (slot + 1) % ring.n_slots;
         item.slot = slot;
         stage->n_queued++;
     }
@@ -3487,32 +3489,53 @@ static void ggml_backend_sched_stage_begin(ggml_backend_sched_t sched) {
         ggml_backend_t backend = sched->backends[b];
         ggml_backend_dev_t dev = ggml_backend_get_device(backend);
         ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend);
-        // lent memory first; the lender cannot lend part of the slots
-        ring.lent = stage->lend != nullptr && stage->lend(stage->lend_user, backend, stage->n_slots, need[b], ring.slots);
-        if (!ring.lent) {
-            std::fill(std::begin(ring.slots), std::end(ring.slots), nullptr);
-        }
-        bool ok = true;
-        for (int s = 0; s < stage->n_slots && ok; s++) {
+        // Fewer slots when the memory for all of them is not there (an expert cache tier too small to lend them, next to a
+        // draft model): a split holds at most split_weights slots at a time, so that many still run, with less overlap. The
+        // graph is already split, and a redirected input has no memory but its slot, so giving up is not an option.
+        const int n_min = std::min(stage->n_slots, stage->redirect ? stage->split_weights : 1);
+        bool ok = false;
+        int n = stage->n_slots;
+        for (; n >= n_min && !ok; n--) {
+            // lent memory first; the lender cannot lend part of the slots
+            ring.lent = stage->lend != nullptr && stage->lend(stage->lend_user, backend, n, need[b], ring.slots);
             if (!ring.lent) {
-                ring.buffers[s] = ggml_backend_buft_alloc_buffer(buft, need[b]);
-                ring.slots[s] = ring.buffers[s] != nullptr ? ggml_backend_buffer_get_base(ring.buffers[s]) : nullptr;
+                std::fill(std::begin(ring.slots), std::end(ring.slots), nullptr);
             }
-            ok = ring.slots[s] != nullptr;
-            if (ok && ring.done[s] == nullptr) {
-                ring.done[s] = ggml_backend_event_new(dev);
-                ring.free[s] = ggml_backend_event_new(dev);
-                ok = ring.done[s] != nullptr && ring.free[s] != nullptr;
+            ok = true;
+            for (int s = 0; s < n && ok; s++) {
+                if (!ring.lent) {
+                    ring.buffers[s] = ggml_backend_buft_alloc_buffer(buft, need[b]);
+                    ring.slots[s] = ring.buffers[s] != nullptr ? ggml_backend_buffer_get_base(ring.buffers[s]) : nullptr;
+                }
+                ok = ring.slots[s] != nullptr;
+                if (ok && ring.done[s] == nullptr) {
+                    ring.done[s] = ggml_backend_event_new(dev);
+                    ring.free[s] = ggml_backend_event_new(dev);
+                    ok = ring.done[s] != nullptr && ring.free[s] != nullptr;
+                }
+            }
+            if (!ok) {
+                ggml_backend_sched_stage_drop_slots(ring);
             }
         }
         if (!ok) {
             ggml_backend_sched_stage_release_ring(ring);
+            bool redirected = false;
+            for (const auto & item : stage->items) {
+                redirected |= item.backend_id == b && item.input_cpy->buffer == ring.anchor;
+            }
+            if (redirected) {
+                GGML_ABORT("staging: cannot allocate %d slot(s) of %.1f MiB on %s for the redirected inputs of this graph; "
+                        "free memory on the device (LLAMA_MOE_CACHE_AUTO_MARGIN_MIB, a smaller LLAMA_MOE_CACHE_MIB) or set "
+                        "GGML_SCHED_STAGE_REDIRECT=0", n_min, need[b]/1048576.0, ggml_backend_name(backend));
+            }
             GGML_LOG_WARN("%s: staging disabled: cannot allocate %d slots of %.1f MiB on %s\n", __func__,
-                    stage->n_slots, need[b]/1048576.0, ggml_backend_name(backend));
+                    n_min, need[b]/1048576.0, ggml_backend_name(backend));
             stage->enabled = false;
             stage->items.clear();
             return;
         }
+        ring.n_slots = n + 1;
         ring.slot_size = need[b];
 
         ggml_backend_buffer_type_t host_buft = stage->use_bounce ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
@@ -3528,8 +3551,12 @@ static void ggml_backend_sched_stage_begin(ggml_backend_sched_t sched) {
                 }
             }
         }
+        if (ring.n_slots < stage->n_slots) {
+            GGML_LOG_WARN("%s: staging ring on %s: %d of %d slots of %.1f MiB, the memory for more is not available\n", __func__,
+                    ggml_backend_name(backend), ring.n_slots, stage->n_slots, need[b]/1048576.0);
+        }
         GGML_LOG_INFO("%s: staging ring on %s: %d %s slots of %.1f MiB, %s\n", __func__, ggml_backend_name(backend),
-                stage->n_slots, ring.lent ? "lent" : "own", need[b]/1048576.0, ring.bounce != nullptr ? "pinned bounce buffers" : "direct uploads");
+                ring.n_slots, ring.lent ? "lent" : "own", need[b]/1048576.0, ring.bounce != nullptr ? "pinned bounce buffers" : "direct uploads");
     }
 
     ggml_backend_sched_stage_pump(sched);
