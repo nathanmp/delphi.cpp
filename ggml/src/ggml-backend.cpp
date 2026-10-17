@@ -4089,6 +4089,8 @@ static void ggml_backend_sched_host_read_fence(ggml_backend_sched_t sched) {
 //   synchronizes the GPU once, after all inputs of the split. Before: once before the copy and once in it.
 // - host to GPU (a GPU split reads a CPU output, HOST_ASYNC_H2D): the stream orders the copy after the earlier reads of the
 //   destination, so the host does not wait for the GPU. The caller records host_read_events after the inputs of the split.
+//   Not with pipeline parallelism (n_copies > 1): the upload is queued behind the previous graph on that GPU, and the fences
+//   that protect the host memory it reads would then wait for that graph, so the host could not run ahead.
 enum ggml_backend_sched_host_async { HOST_ASYNC_NONE, HOST_ASYNC_D2H, HOST_ASYNC_H2D };
 
 static ggml_backend_sched_host_async ggml_backend_sched_host_async_kind(ggml_backend_sched_t sched, ggml_backend_t input_backend,
@@ -4107,7 +4109,7 @@ static ggml_backend_sched_host_async ggml_backend_sched_host_async_kind(ggml_bac
             sched->host_read_events[input_backend_id] != NULL && input_backend->iface.get_tensor_async != NULL) {
         return HOST_ASYNC_D2H;
     }
-    if (ggml_backend_dev_type(split_dev) != GGML_BACKEND_DEVICE_TYPE_CPU && input_host && !cpy_host &&
+    if (sched->n_copies == 1 && ggml_backend_dev_type(split_dev) != GGML_BACKEND_DEVICE_TYPE_CPU && input_host && !cpy_host &&
             ggml_backend_dev_type(input_dev) == GGML_BACKEND_DEVICE_TYPE_CPU &&
             sched->host_read_events[split_backend_id] != NULL && split_backend->iface.set_tensor_async != NULL) {
         return HOST_ASYNC_H2D;
