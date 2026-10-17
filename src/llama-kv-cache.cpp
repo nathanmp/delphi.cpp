@@ -1252,6 +1252,8 @@ const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
 }
 
 static std::atomic<uint32_t> kv_n_pad_reserved{0};
+// largest batch (tokens) that uses the reserved step
+static constexpr size_t kv_n_pad_reserve_max_tokens = 64;
 
 void llama_kv_cache_n_pad_reserve(uint32_t n_pad) {
     if (n_pad % 256 != 0) {
@@ -1280,7 +1282,11 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
         }
         return v > 0 ? (uint32_t) v : 0u;
     }();
-    const uint32_t n_pad_cur = std::max(n_pad, n_pad_env > 0 ? n_pad_env : std::max(256u, kv_n_pad_reserved.load(std::memory_order_relaxed)));
+    // The reservation is for small batches only (draft and verify widths). Prompt ubatches change the view at every ubatch
+    // anyway, and on a pipelined layer split (Qwen on 3 ROCm GPUs) the large step cost 40 % of the prefill speed.
+    const bool small_batch = !sinfo.empty() && !sinfo.idxs[0].empty() && sinfo.idxs[0].size() <= kv_n_pad_reserve_max_tokens;
+    const uint32_t n_pad_rsv = small_batch ? kv_n_pad_reserved.load(std::memory_order_relaxed) : 0u;
+    const uint32_t n_pad_cur = std::max(n_pad, n_pad_env > 0 ? n_pad_env : std::max(256u, n_pad_rsv));
 
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const auto & cells = v_cells[sinfo.strm[s]];
