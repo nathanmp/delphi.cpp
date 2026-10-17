@@ -1646,6 +1646,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     common_params_speculative_draft params; // reuses the draft-model params slot (ctx_tgt/ctx_dft)
 
     llama_batch batch;
+    std::vector<int8_t> embd_logits; // no-output flags for media batches, see process()
 
     std::vector<common_sampler_ptr> smpls;
 
@@ -1820,10 +1821,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return true;
         }
 
-        // TODO: how to make it work with vision tokens?
-        if (batch_in.token == nullptr || batch_in.embd != nullptr) {
+        if (batch_in.token == nullptr && batch_in.embd == nullptr) {
             return true;
         }
+
+        // media (mtmd) batches carry embeddings instead of token ids: the draft reads them in place of the token embeddings
+        // (ref: ggml-org/llama.cpp#30257)
+        const bool is_embd = batch_in.token == nullptr;
 
         const int32_t n_tokens = batch_in.n_tokens;
 
@@ -1852,8 +1856,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (!is_mem_shared) {
             common_batch_clear(batch);
 
-            for (int k = 0; k < n_tokens; ++k) {
-                common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { batch_in.seq_id[k][0] }, 0);
+            if (is_embd) {
+                // the embd rows and the positions (several per token with M-RoPE) are read from batch_in, only the hidden
+                // state rows go into batch.embd_h; no outputs are needed
+                GGML_ASSERT(n_tokens <= (int32_t) llama_n_batch(ctx_dft) && "media batch is larger than the draft n_batch");
+                embd_logits.assign(n_tokens, 0);
+                batch.n_tokens = n_tokens;
+            } else {
+                for (int k = 0; k < n_tokens; ++k) {
+                    common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { batch_in.seq_id[k][0] }, 0);
+                }
             }
 
             // shift the tgt embeddings to the right by one position
@@ -1894,7 +1906,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     llama_set_nextn_layer_offset(ctx_dft, head);
                 }
 
-                const int32_t rc = llama_decode(ctx_dft, batch);
+                llama_batch batch_dec = batch;
+                if (is_embd) {
+                    batch_dec.token    = nullptr;
+                    batch_dec.embd     = batch_in.embd;
+                    batch_dec.pos      = batch_in.pos;
+                    batch_dec.n_seq_id = batch_in.n_seq_id;
+                    batch_dec.seq_id   = batch_in.seq_id;
+                    batch_dec.logits   = embd_logits.data();
+                }
+                const int32_t rc = llama_decode(ctx_dft, batch_dec);
                 if (rc != 0) {
                     SPC_ERR("llama_decode(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
                             head, (int) rc, (int) batch_in.pos[0]);
