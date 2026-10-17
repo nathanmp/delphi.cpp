@@ -215,6 +215,35 @@ def _union_duration_ns(intervals: Iterable[tuple[int, int]]) -> int:
     return total + (end - start)
 
 
+def _union_intervals(intervals: Iterable[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Merged intervals, so overlaps count once."""
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted((start, end) for start, end in intervals if end > start):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _multi_busy_duration_ns(intervals_by_device: Iterable[Iterable[tuple[int, int]]]) -> int:
+    """Time during which two or more devices are busy at the same time."""
+    points: list[tuple[int, int]] = []
+    for intervals in intervals_by_device:
+        for start, end in _union_intervals(intervals):
+            points.extend(((start, 1), (end, -1)))
+    points.sort()
+    total = 0
+    active = 0
+    previous = 0
+    for timestamp, delta in points:
+        if active >= 2:
+            total += timestamp - previous
+        active += delta
+        previous = timestamp
+    return total
+
+
 def _metric_value(item: Any) -> float | None:
     """Read a scalar from either an aggregate float or a _stats() dictionary."""
     if isinstance(item, dict):
@@ -885,6 +914,7 @@ def _trace_summary(path: Path, family_rules: Sequence[FamilyRule], *, decode_win
         exec_cpu_busy: dict[int, float] = {}
         exec_device_busy: dict[int, float] = {}
         exec_device_union: dict[int, float] = {}
+        exec_device_multi: dict[int, float] = {}
         exec_combined: dict[int, float] = {}
         for item in ids:
             wall_ns = execution_info[item]["wall_ms"] * 1e6
@@ -896,6 +926,7 @@ def _trace_summary(path: Path, family_rules: Sequence[FamilyRule], *, decode_win
             exec_cpu_busy[item] = cpu_ns
             exec_device_busy[item] = sum(_union_duration_ns(intervals) for intervals in exec_device_spans[item].values())
             exec_device_union[item] = device_union_ns
+            exec_device_multi[item] = _multi_busy_duration_ns(exec_device_spans[item].values())
             exec_combined[item] = _union_duration_ns(exec_cpu_spans[item] + device_intervals)
 
         def per_token_ms(values: Mapping[int, float]) -> dict[str, Any]:
@@ -906,6 +937,7 @@ def _trace_summary(path: Path, family_rules: Sequence[FamilyRule], *, decode_win
             "cpu": per_token_ms(exec_cpu_busy),
             "device": per_token_ms(exec_device_busy),
             "device_union": per_token_ms(exec_device_union),
+            "device_multi": per_token_ms(exec_device_multi),
             "combined": per_token_ms(exec_combined),
             "overlap": per_token_ms({item: max(0.0, exec_cpu_busy[item] + exec_device_union[item] - exec_combined[item]) for item in ids}),
             "idle": per_token_ms({item: max(0.0, execution_info[item]["wall_ms"] * 1e6 - exec_combined[item]) for item in ids}),
@@ -976,17 +1008,29 @@ def _trace_summary(path: Path, family_rules: Sequence[FamilyRule], *, decode_win
                 for name in backend_names
             }
             aggregate["unaccounted_ms"] = sum(exec_unaccounted[item] for item in ids) / client_tokens / 1e6
+            # Device work runs past the host call that queued it, so the intervals of consecutive executions (a draft and
+            # its verify) can share time. Union them over all executions, not per execution, so shared time counts once.
+            all_cpu = [interval for item in ids for interval in exec_cpu_spans[item]]
+            all_device_by_name = {
+                name: [interval for item in ids for interval in exec_device_spans[item].get(name, [])]
+                for name in device_names
+            }
+            all_device = [interval for intervals in all_device_by_name.values() for interval in intervals]
+            cpu_busy_ns = _union_duration_ns(all_cpu)
+            device_union_ns = _union_duration_ns(all_device)
+            combined_ns = _union_duration_ns(all_cpu + all_device)
             aggregate["resource_busy_ms"] = {
-                "cpu": sum(exec_cpu_busy[item] for item in ids) / client_tokens / 1e6,
-                "device": sum(exec_device_busy[item] for item in ids) / client_tokens / 1e6,
-                "device_union": sum(exec_device_union[item] for item in ids) / client_tokens / 1e6,
-                "combined": sum(exec_combined[item] for item in ids) / client_tokens / 1e6,
-                "overlap": sum(max(0.0, exec_cpu_busy[item] + exec_device_union[item] - exec_combined[item]) for item in ids) / client_tokens / 1e6,
-                "idle": sum(max(0.0, execution_info[item]["wall_ms"] * 1e6 - exec_combined[item]) for item in ids) / client_tokens / 1e6,
+                "cpu": cpu_busy_ns / client_tokens / 1e6,
+                "device": sum(_union_duration_ns(intervals) for intervals in all_device_by_name.values()) / client_tokens / 1e6,
+                "device_union": device_union_ns / client_tokens / 1e6,
+                "device_multi": _multi_busy_duration_ns(all_device_by_name.values()) / client_tokens / 1e6,
+                "combined": combined_ns / client_tokens / 1e6,
+                "overlap": max(0, cpu_busy_ns + device_union_ns - combined_ns) / client_tokens / 1e6,
+                "idle": max(0.0, sum(execution_info[item]["wall_ms"] for item in ids) * 1e6 - combined_ns) / client_tokens / 1e6,
             }
             aggregate["device_busy_by_backend_ms"] = {
-                name: sum(_union_duration_ns(exec_device_spans[item].get(name, [])) for item in ids) / client_tokens / 1e6
-                for name in device_names
+                name: _union_duration_ns(intervals) / client_tokens / 1e6
+                for name, intervals in all_device_by_name.items()
             }
             if counter_names:
                 aggregate["counters_per_client_token"] = {
@@ -1397,12 +1441,9 @@ def _render_resource_table(lines: list[str], group: Mapping[str, Any], wall_ms: 
         idle = max(0.0, wall_ms - combined)
     rows: list[tuple[str, Any]] = [("CPU compute", resource.get("cpu"))]
     rows.extend((f"device {name}", value) for name, value in sorted(device.items()))
-    rows.append(("all devices", resource.get("device")))
     if len(device) > 1:
-        device_sum = _metric_value(resource.get("device"))
-        device_union = _metric_value(resource.get("device_union"))
-        if device_sum is not None and device_union is not None:
-            rows.append(("devices busy at the same time", device_sum - device_union))
+        rows.append(("any device busy", resource.get("device_union")))
+        rows.append(("two or more devices busy", resource.get("device_multi")))
     rows.append(("CPU and device both busy", resource.get("overlap")))
     rows.append(("neither CPU nor device", idle))
     lines.extend(("", f"| resource | busy {unit} | utilization |", "| --- | ---: | ---: |"))
@@ -1413,9 +1454,7 @@ def _render_resource_table(lines: list[str], group: Mapping[str, Any], wall_ms: 
         utilization = 100.0 * value / wall_ms if wall_ms else None
         lines.append(f"| {label} | {_fmt(value)} | {_fmt(utilization, '%')} |")
     if device:
-        lines.append(f"With {len(device)} device(s), all-device utilization can reach {len(device) * 100}% when every device is busy at once.")
-    if len(device) > 1:
-        lines.append("`devices busy at the same time` is the device-device overlap from the host-clock device placement; near zero means the device intervals do not overlap there. Per-device utilization is the more reliable figure.")
+        lines.append("Device intervals are placed on the host clock at the synchronize that completed them; a blocked synchronize fixes the placement to within 0.05 ms. Copies outside the timed device work (expert staging uploads) count as neither CPU nor device.")
 
 
 def _render_counters(lines: list[str], group: Mapping[str, Any], *, unit: str) -> None:
