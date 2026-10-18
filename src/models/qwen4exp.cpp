@@ -586,7 +586,8 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
     ggml_set_input(inp->tokens);
 
-    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hc_dim, n_tokens);
+    // media rows: the batch row width (n_embd_inp), as in build_inp_embd
+    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_inp(), n_tokens);
     ggml_set_input(inp->embd);
 
     inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hc_dim, n_tokens);
@@ -597,8 +598,10 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     if (tok_embd_w == nullptr) {
         tok_embd_w = qwen4exp_shared_model(cparams, model, "token_embd.weight").tok_embd;
     }
-    // media positions arrive as embeddings (ref: ggml-org/llama.cpp#30397)
-    ggml_tensor * tok_embd   = ubatch.token ? ggml_get_rows(ctx0, tok_embd_w, inp->tokens) : inp->embd;
+    // media positions arrive as embeddings (ref: ggml-org/llama.cpp#30397); their rows can be wider than n_embd (deepstack
+    // features after the main embedding), and the head reads only the main embedding, like the trunk input
+    ggml_tensor * tok_embd   = ubatch.token ? ggml_get_rows(ctx0, tok_embd_w, inp->tokens) :
+                                              ggml_view_2d(ctx0, inp->embd, n_embd, n_tokens, inp->embd->nb[1], 0);
     cb(tok_embd, "mtp_tok_embd", il);
 
     ggml_tensor * h_state = ggml_reshape_3d(ctx0, inp->h, n_embd, hc, n_tokens);

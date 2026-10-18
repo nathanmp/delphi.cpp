@@ -2596,7 +2596,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const auto & hparams = model.hparams;
 
     const int64_t n_vocab = vocab.n_tokens();
-    const bool    mtp_embd = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && batch_inp.embd;
+    // an MTP batch with embd and no embd_h carries the hidden state in embd; with embd_h, embd holds input (media) embeddings
+    const bool    mtp_embd = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && batch_inp.embd && !batch_inp.embd_h;
     // DFlash embd batches carry the fused target features at the encoder input width
     const bool    dflash_embd = model.arch == LLM_ARCH_DFLASH && batch_inp.embd;
     const int64_t n_embd  = mtp_embd ? hparams.n_embd_out() : dflash_embd ? hparams.n_embd_inp_enc() : hparams.n_embd_inp();
