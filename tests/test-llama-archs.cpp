@@ -1412,6 +1412,8 @@ int main(int argc, char ** argv) {
     // init the logger at max verbosity. filter with a custom callback respecting the user-configure verbosity
     common_log_set_verbosity_thold(LOG_LEVEL_DEBUG);
     common_init();
+    // with GGML_BACKEND_DL nothing else loads the backends
+    ggml_backend_load_all();
 
     std::random_device rd;
 
