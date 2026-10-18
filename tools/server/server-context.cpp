@@ -2483,7 +2483,8 @@ private:
     // A full slot drops this checkpoint. With --ctx-checkpoints-spill-dir the data goes to the writer thread first, which takes it
     // out of the checkpoint. The caller has synced the async copy of the checkpoint.
     void ckpt_spill_put(server_slot & slot, common_prompt_checkpoint & ckpt) {
-        if (!ckpt_spill.enabled() || ckpt.empty()) {
+        // a prompt with media has no plain token list to key the file with
+        if (!ckpt_spill.enabled() || ckpt.empty() || slot.prompt.tokens.has_mtmd) {
             return;
         }
 
@@ -2510,7 +2511,7 @@ private:
     // and reads it into out. A file is usable under the rule of the search in memory, and if the prompt of the slot still starts with
     // the tokens that it was made for.
     bool ckpt_spill_load(server_slot & slot, llama_pos pos_next, llama_pos pos_min_thold, int64_t n_ram, common_prompt_checkpoint & out) {
-        if (!ckpt_spill.enabled()) {
+        if (!ckpt_spill.enabled() || slot.prompt.tokens.has_mtmd) {
             return false;
         }
 
@@ -4892,7 +4893,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         std::vector<server_turn_boundary> turn_bounds;
         if (inputs.size() == 1 && prompt.is_string() && files.empty() && params.ckpt_turn_step > 0) {
             turn_bounds = server_turn_boundaries(data, ctx_server.vocab, prompt.get<std::string>(),
-                                                 inputs[0].get_tokens(), params.ckpt_turn_step);
+                                                 inputs[0].get_text_tokens(), params.ckpt_turn_step);
             SRV_DBG("turn checkpoint boundaries: %zu\n", turn_bounds.size());
         }
 
