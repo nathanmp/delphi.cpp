@@ -3771,8 +3771,7 @@ struct ggml_cuda_moe_weighted_reduction_match {
 static bool ggml_cuda_match_moe_weighted_reduction(
         const ggml_cgraph * cgraph,
         int node_idx,
-        ggml_cuda_moe_weighted_reduction_match & match,
-        bool allow_single_token = false) {
+        ggml_cuda_moe_weighted_reduction_match & match) {
     const ggml_tensor * first = cgraph->nodes[node_idx];
     if (first->op != GGML_OP_MUL || first->type != GGML_TYPE_F32 || !ggml_is_contiguous(first)) {
         return false;
@@ -3833,11 +3832,12 @@ static bool ggml_cuda_match_moe_weighted_reduction(
 
     const int n_expert_used = (int) weighted->ne[1];
     const int64_t n_tokens = weighted->ne[2] * weighted->ne[3];
-    // For single-token decode, launching one reduction kernel is slower than the
-    // existing chain of vector operations. Keep the fusion for multi-token
-    // prefill and speculative verification batches.
+    // The fused kernel is not bit-identical to the unfused MUL/ADD chain: the kernel's accumulate can contract to an
+    // FMA, while the chain rounds each product and each sum. GGML_SPEC_INVARIANT therefore keeps widths 1-8 unfused so
+    // that a verify batch matches a 1-token decode. Outside that mode the fusion runs at 1 token too: one kernel
+    // replaces the MUL + (k-1) ADD chain and its intermediate global-memory traffic.
     if (n_expert_used < 2 || n_expert_used > MOE_WEIGHTED_REDUCTION_MAX_EXPERTS ||
-            (n_tokens <= 1 && !allow_single_token) || ggml_cuda_spec_inv(n_tokens)) {
+            n_tokens < 1 || ggml_cuda_spec_inv(n_tokens)) {
         return false;
     }
 
@@ -3929,7 +3929,7 @@ static bool ggml_cuda_match_moe_down_reduction(
     }
 
     ggml_cuda_moe_weighted_reduction_match reduction;
-    if (!ggml_cuda_match_moe_weighted_reduction(cgraph, node_idx + 1, reduction, true) ||
+    if (!ggml_cuda_match_moe_weighted_reduction(cgraph, node_idx + 1, reduction) ||
             reduction.experts != mmid || reduction.expert_scale != nullptr) {
         return false;
     }
@@ -4014,7 +4014,7 @@ static bool ggml_cuda_match_moe_int4_ffn(
 #endif
 
     ggml_cuda_moe_weighted_reduction_match reduction;
-    if (!ggml_cuda_match_moe_weighted_reduction(cgraph, node_idx + 4, reduction, true) || reduction.experts != down ||
+    if (!ggml_cuda_match_moe_weighted_reduction(cgraph, node_idx + 4, reduction) || reduction.experts != down ||
             reduction.expert_scale != nullptr) {
         return false;
     }

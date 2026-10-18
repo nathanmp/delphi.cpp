@@ -12339,8 +12339,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // Cover the supported boundaries, common k = 8 shapes, interleaved views and adds, and k = 16 fallback.
+    // The n_tokens = 1 cases run the fused kernel on CUDA and HIP since decode fusion is enabled.
     test_cases.emplace_back(new test_moe_weighted_reduction(63,  2, 17));
     test_cases.emplace_back(new test_moe_weighted_reduction(2048, 8, 1, false, true));
+    test_cases.emplace_back(new test_moe_weighted_reduction(2048, 2, 1));
+    test_cases.emplace_back(new test_moe_weighted_reduction(2048, 3, 1, false, false, true));
+    test_cases.emplace_back(new test_moe_weighted_reduction(5120, 8, 1));
     test_cases.emplace_back(new test_moe_weighted_reduction(2048, 8, 128));
     test_cases.emplace_back(new test_moe_weighted_reduction(2048, 8, 128, false, true));
     test_cases.emplace_back(new test_moe_weighted_reduction(63,   12, 33, true,  true, true));
