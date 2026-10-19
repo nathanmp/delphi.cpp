@@ -1176,8 +1176,8 @@ void llama_expert_cache::upload(const std::vector<upload_job> & jobs) {
         }
         return;
     }
-    static const int per_half = [] { const char * e = getenv("LLAMA_MOE_CACHE_REFILL_SLABS"); return e ? std::max(1, atoi(e)) : 32; }();
-    static const char * env_threads = getenv("LLAMA_MOE_CACHE_REFILL_THREADS");
+    const int per_half = [] { const char * e = getenv("LLAMA_MOE_CACHE_REFILL_SLABS"); return e ? std::max(1, atoi(e)) : 32; }();
+    const char * env_threads = getenv("LLAMA_MOE_CACHE_REFILL_THREADS");
     // Two options for --numa tensors (experts in CPU_NUMA buffers), off by default; for NPS4 set both (MiMo V2.6 Flash, NPS4:
     // refresh 210 -> ~150 ms per prompt; NPS1 is bound by the PCIe upload and not measured with them).
     // The pinned staging buffer next to the GPU is one node's memory, which at NPS4 is one quadrant: its 2 channels take all
@@ -1185,9 +1185,9 @@ void llama_expert_cache::upload(const std::vector<upload_job> & jobs) {
     // An expert stores its rows node by node, in node order. With LLAMA_MOE_CACHE_REFILL_NUMA=1, thread t copies part t of
     // each slab and runs on the node that holds that part (at least 2 threads per node), so that it reads local memory. By
     // default all threads run next to the GPU.
-    static const std::vector<std::vector<int>> node_cpus = numa_node_cpus();
-    static const bool stage_interleave = [] { const char * e = getenv("LLAMA_MOE_CACHE_REFILL_INTERLEAVE"); return e && atoi(e) != 0; }();
-    static const bool pin_nodes = [] { const char * e = getenv("LLAMA_MOE_CACHE_REFILL_NUMA"); return e && atoi(e) != 0; }();
+    const std::vector<std::vector<int>> node_cpus = numa_node_cpus();
+    const bool stage_interleave = [] { const char * e = getenv("LLAMA_MOE_CACHE_REFILL_INTERLEAVE"); return e && atoi(e) != 0; }();
+    const bool pin_nodes = [] { const char * e = getenv("LLAMA_MOE_CACHE_REFILL_NUMA"); return e && atoi(e) != 0; }();
     const ggml_tensor * src0 = model->layers[jobs[0].il].ffn_gate_exps;
     const int n_nodes = (int) node_cpus.size();
     const bool numa = n_nodes > 1 && src0->buffer && strcmp(ggml_backend_buffer_name(src0->buffer), "CPU_NUMA") == 0;

@@ -3459,7 +3459,7 @@ static int share_worker_cpu(ggml_backend_dev_t dev) {
 // delphi: the splits of an expert cache tier on another GPU are submitted by a scheduler worker, so that their host time
 // overlaps the CPU expert part (LLAMA_MOE_CACHE_WORKER=0 turns this off)
 void llama_context::sched_set_workers(ggml_backend_sched_t s) {
-    static const bool enabled = [] { const char * e = getenv("LLAMA_MOE_CACHE_WORKER"); return e == nullptr || atoi(e) != 0; }();
+    const bool enabled = [] { const char * e = getenv("LLAMA_MOE_CACHE_WORKER"); return e == nullptr || atoi(e) != 0; }();
     if (s == nullptr) {
         return;
     }
@@ -3496,7 +3496,7 @@ void llama_context::expert_cache_auto() {
         return;
     }
     expert_cache->auto_size = false;
-    static const size_t margin = [] {
+    const size_t margin = [] {
         const char * e = getenv("LLAMA_MOE_CACHE_AUTO_MARGIN_MIB");
         return size_t(e ? std::max(0LL, atoll(e)) : 1536LL) << 20;
     }();
