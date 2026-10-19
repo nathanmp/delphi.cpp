@@ -310,6 +310,19 @@ class PlacementPolicy(unittest.TestCase):
             self.assertEqual(plan['split_reserve_mib']['ROCm0'], 151)
             self.assertIn('projected', plan['candidates'][0])
 
+    def test_reference_footprint_calibrates_unmeasured_runtime_memory(self):
+        with tempfile.TemporaryDirectory() as d:
+            c = cfg(d, devices={'ROCm0': {'min_free_mib': 100}})
+            command = K.remove_option(BASE, '--spec-type')
+            facts = {'architecture': 'dense', 'experts': 0, 'expert_layers': [], 'layers': 10, 'nextn': 0,
+                     'mtp_mib': 0, 'model_mib': 500, 'files': []}
+            observed = {'command': command, 'metrics': {'vram': {'a': {'used_mib': 700}}}}
+            with patch('placement.model_info', return_value=facts):
+                plan = PL.prepare(c, command, {}, {'ROCm0': 'a'}, {'a': (0, 1000)}, None,
+                                  lambda command, label: self.rows(500), observed)
+            self.assertEqual(plan['runtime_overhead_mib']['ROCm0'], 164)
+            self.assertEqual(plan['extra_mib']['ROCm0'], 164)
+
     def test_failed_reference_can_use_verified_policy(self):
         with tempfile.TemporaryDirectory() as d:
             c = cfg(d, knobs={'only': ['--no-repack'], 'include': [], 'exclude': ['--no-repack'], 'levels': {}})

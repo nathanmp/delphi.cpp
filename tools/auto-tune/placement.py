@@ -215,7 +215,7 @@ def candidates(command, env, devices, full, dense, info, extra=None):
     return result
 
 
-def prepare(cfg, command, env, pci_map, state, cpu, probe=None):
+def prepare(cfg, command, env, pci_map, state, cpu, probe=None, observed=None):
     """No-allocation measurements first; candidates are verified by the normal profiler launches."""
     import os
     devices = devices_from_state(command, cfg['devices'], pci_map, state, int(env.get('LLAMA_MOE_CACHE_AUTO_MARGIN_MIB', '1536')))
@@ -280,6 +280,17 @@ def prepare(cfg, command, env, pci_map, state, cpu, probe=None):
                 extra[name] = extra.get(name, 0) + sum(row.values())
     if K.option_value(command, '--mmproj') and not cfg['placement']['reserve_mib']:
         raise TuneError('mmproj needs placement.reserve_mib from a server memory report; the fit CLI cannot measure it')
+    calibration = {}
+    if observed and not any(flag in observed['command'] for flag in ('-cmoe', '--cpu-moe', '--n-cpu-moe', '-ncmoe')):
+        projected = measure(observed['command'], 'reference')
+        for d in devices:
+            peak = observed['metrics'].get('vram', {}).get(pci_map[d.name])
+            if not peak or d.name not in projected:
+                continue
+            overhead = peak['used_mib'] - sum(projected[d.name].values()) - extra.get(d.name, 0)
+            if overhead > 0:
+                calibration[d.name] = math.ceil(overhead) + 64
+                extra[d.name] = extra.get(d.name, 0) + calibration[d.name]
     options = candidates(command, env, devices, full, dense, info, extra)
     if mtp_reserve:
         for _ in range(len(devices)):
@@ -317,6 +328,7 @@ def prepare(cfg, command, env, pci_map, state, cpu, probe=None):
         if K.option_value(command, '--mmproj'):
             option['warnings'].append('check mmproj load order: auto cache sizing must run after mmproj allocation')
     result = {'devices': [asdict(d) for d in devices], 'model': info, 'full': full, 'dense': dense,
-              'extra_mib': extra, 'draft_estimate': draft_estimate, 'split_reserve_mib': corrections, 'dry_runs': commands, 'candidates': options}
+              'extra_mib': extra, 'runtime_overhead_mib': calibration, 'draft_estimate': draft_estimate,
+              'split_reserve_mib': corrections, 'dry_runs': commands, 'candidates': options}
     (out / 'plan.json').write_text(json.dumps(result, indent=2) + '\n')
     return result

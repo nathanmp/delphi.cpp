@@ -69,7 +69,7 @@ class Tuner:
                  launcher: Callable[..., dict[str, Any]], kld_runner: Callable[..., float | None] | None,
                  vram_check: Callable[[Mapping[str, Any], Sequence[str]], list[str]] = lambda metrics, command: [],
                  budget: Budget | None = None, log: Callable[[str], None] = print, *, launch_only: bool = False,
-                 placement_factory=None, cpu_budget=None) -> None:
+                 placement_factory=None, cpu_budget=None, placement_feedback=None) -> None:
         self.cfg = cfg
         self.base = (tuple(base_command), dict(base_env))
         self.identity = dict(identity)
@@ -81,6 +81,7 @@ class Tuner:
         self.log = log
         self.launch_only = launch_only
         self.placement_factory = placement_factory
+        self.placement_feedback = placement_feedback
         self.cpu_budget = cpu_budget
         self.weights = S.metric_weights(cfg["weights"], cfg["prefill"]["lengths"])
         self.measure_spec = {"prefill": cfg["prefill"] if cfg["weights"].get("prefill", 0) > 0 else None,
@@ -261,6 +262,14 @@ class Tuner:
                 raise TuneError(f"no placement loaded within the constraints: {self.state['reference_failure']}")
         reference = base_row["metrics"]
         self.state["base"] = base_row["key"]
+        if self.placement_feedback:
+            self.log('placement: calibrate the dry run against the verified reference footprint')
+            started = time.time()
+            self.state['placement'] = self.placement_feedback(command, base_row['metrics'])
+            placement_options = self.state['placement']['candidates']
+            stage = self.state['stages']['placement']
+            stage['wall_s'] += time.time() - started
+            stage['dry_runs'] += len(self.state['placement']['dry_runs'])
         incumbent = {"command": command, "env": env, "row": base_row, "score": 1.0}
         for option in placement_options:
             step = {'knob': 'placement', 'candidate': option['name']}
@@ -431,10 +440,14 @@ def make_tuner(cfg: Mapping[str, Any], log: Callable[[str], None] = print) -> Tu
     def placement_factory():
         return placement.prepare(cfg, command, env, pci_map, M.vram_state(), cpu)
 
+    def placement_feedback(observed_command, metrics):
+        return placement.prepare(cfg, command, env, pci_map, M.vram_state(), cpu,
+                                 observed={'command': observed_command, 'metrics': metrics})
+
     run_identity = {**identity(cfg, arm, command), 'cpu_budget': cpu.summary(), 'devices': cfg['devices'],
                     'clock_mode': cfg['clock_mode']}
     tuner = Tuner(cfg, command, env, run_identity, launcher, kld_runner, vram_check, log=log,
-                  launch_only=True, placement_factory=placement_factory, cpu_budget=cpu)
+                  launch_only=True, placement_factory=placement_factory, cpu_budget=cpu, placement_feedback=placement_feedback)
     tuner.shm = shm
     return tuner
 
