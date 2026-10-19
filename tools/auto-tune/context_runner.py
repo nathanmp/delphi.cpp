@@ -281,6 +281,9 @@ class ContextRunner:
                 if collector:
                     self.close()
                     result['speculation'] = collector.finish()
+                    for key in ('wall_s', 'requests', 'policy_updates'):
+                        name = 'spec_' + key
+                        self.stats[name] = self.stats.get(name, 0) + result['speculation'][key]
                 elif spec_status:
                     result['speculation'] = spec_status
                 (directory / 'metrics.json').write_text(json.dumps(result, indent=2) + '\n')

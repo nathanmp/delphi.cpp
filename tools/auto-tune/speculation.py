@@ -31,7 +31,7 @@ class Policy:
     def __post_init__(self):
         if (any(type(v) is not int for v in (self.n_max, self.n_min, self.n_min_adaptive, self.n_start))
                 or self.n_max < 1 or not 0 <= self.n_min <= self.n_max or not 1 <= self.n_min_adaptive <= self.n_max
-                or self.n_start < 0 or not math.isfinite(self.p_min) or not 0 <= self.p_min <= 1
+                or self.n_start < 0 or type(self.p_min) not in (int, float) or not math.isfinite(self.p_min) or not 0 <= self.p_min <= 1
                 or self.adaptive not in ('off', 'bucket')):
             raise SpecError('invalid fixed/bucket replay policy')
 
@@ -125,12 +125,13 @@ def cost_table(trace, windows, settle=3, minimum=3):
     for window in windows:
         width, prompt = window['width'], str(window['prompt'])
         lo, hi = window['start_ns'], window['end_ns']
-        target = sorted((e for e in executions.values() if e['phase'] == 'generation_target' and lo <= e['begin'] <= hi), key=lambda e: e['begin'])
+        # A partial accept on a recurrent model can replay narrower target batches after checkpoint restoration.
+        # Bracket the full verify passes; their interval also owns those replay calls.
+        target = sorted((e for e in executions.values() if e['phase'] == 'generation_target' and e['tokens'] == width
+                         and lo <= e['begin'] <= hi), key=lambda e: e['begin'])
         pairs = list(zip(target, target[1:]))[settle:]
         samples = []
         for a, b in pairs:
-            if a['tokens'] != width or b['tokens'] != width:
-                continue
             if a['end'] is None or b['end'] is None:
                 raise SpecError('incomplete execution in a measured request')
             draft = [e for e in executions.values() if e['phase'] == 'generation_draft' and a['begin'] <= e['begin'] < b['begin']]
@@ -201,12 +202,14 @@ def policies(command, env, cfg, cap, info=None):
     if not selected:
         return []
     mode = info.get('adaptive', 'bucket' if '--spec-draft-adaptive' in command else 'off')
+    def current(suffix, default):
+        return K.option_value(command, '--spec-draft-' + suffix) or env.get('LLAMA_ARG_SPEC_DRAFT_' + suffix.upper().replace('-', '_'), str(default))
     domains = {
-        '--spec-draft-n-max': [K.option_value(command, '--spec-draft-n-max') or str(min(info.get('n_max', cap), cap))],
-        '--spec-draft-n-min': [K.option_value(command, '--spec-draft-n-min') or '0'],
-        '--spec-draft-p-min': [str(info.get('p_min', K.option_value(command, '--spec-draft-p-min') or '0'))],
+        '--spec-draft-n-max': [current('n-max', min(info.get('n_max', cap), cap))],
+        '--spec-draft-n-min': [current('n-min', 0)],
+        '--spec-draft-p-min': [str(info.get('p_min', current('p-min', 0)))],
         '--spec-draft-adaptive': [mode],
-        '--spec-draft-n-min-adaptive': [K.option_value(command, '--spec-draft-n-min-adaptive') or '3'],
+        '--spec-draft-n-min-adaptive': [current('n-min-adaptive', 3)],
     }
     domains.update(selected)
     result = set()
@@ -216,7 +219,7 @@ def policies(command, env, cfg, cap, info=None):
         try:
             adaptive = 'bucket' if adaptive in (K.ON, 'bucket') else 'off'
             policy = Policy(int(n), int(minimum), float(prob), adaptive,
-                            int(floor) if adaptive == 'bucket' else 1, int(K.option_value(command, '--spec-draft-n-start') or '0'))
+                            int(floor) if adaptive == 'bucket' else 1, int(current('n-start', 0)))
         except SpecError:
             continue
         if policy.n_max <= cap:

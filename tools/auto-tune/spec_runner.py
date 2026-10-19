@@ -11,7 +11,7 @@ import knobs as K
 import measure as M
 from config import digest
 from prefill_client import post
-from speculation import Policy, SpecError, Unavailable, cost_table, policies, rank, read_plog
+from speculation import Policy, SpecError, Unavailable, cost_table, policies, rank, read_plog, replay
 
 
 def unavailable(command):
@@ -28,7 +28,9 @@ class Collector:
         self.cfg = runner.cfg['speculation']
         self.continue_measure = continue_measure
         self.windows, self.requests, self.operations = [], [], []
-        self.point = digest([command, env, runner.cfg['speculation']])
+        launch = directory / 'launch.json'
+        self.launch = json.loads(launch.read_text()) if launch.exists() else {}
+        self.point = digest([command, env, runner.cfg['speculation'], self.launch, time.time_ns()])
         self.started = time.monotonic()
 
     def save(self, name, value):
@@ -77,7 +79,7 @@ class Collector:
         if self.cfg['prompt_tokens'] + self.cfg['osl'] + self.cap + 1 > self.runner.cfg['context']:
             raise SpecError('loop-3 workload exceeds the verified context floor')
         prompts = [ids[i:i + self.cfg['prompt_tokens']] for i in range(0, count, self.cfg['prompt_tokens'])]
-        self.save('source.json', {'point': self.point, 'speculative': info, 'capture_policy': asdict(Policy(self.cap)),
+        self.save('source.json', {'point': self.point, 'launch': self.launch, 'speculative': info, 'capture_policy': asdict(Policy(self.cap)),
                                  'command': list(self.command), 'env': self.env, 'prompt_tokens': prompts})
         try:
             # Empty synth rates and -1 restore normal acceptance even if the launch had an environment override.
@@ -116,9 +118,11 @@ class Collector:
             for key in ('types', 'n_max', 'adaptive', 'p_min', 'draft_sampling'):
                 if restored.get(key) != info.get(key):
                     raise SpecError(f'failed to restore speculative {key}')
+        self.collection_wall_s = time.monotonic() - self.started
 
     def finish(self):
         # There is no live flush endpoint. The caller stops this process before reading the trace.
+        started = time.monotonic()
         trace = M.P.TRACE_SPEC.T.read_trace(self.runner.trace_path, kinds={M.P.TRACE.K_EXECUTION_BEGIN, M.P.TRACE.K_EXECUTION_END})
         table = cost_table(trace, self.windows, self.cfg['settle_cycles'], self.cfg['min_cycles'])
         table['point'] = self.point
@@ -126,9 +130,13 @@ class Collector:
         # Also retain the existing diagnostic summary; T(w) is based on full cycle wall intervals above.
         self.save('exec-trace-spec.json', M.P.TRACE_SPEC.summarize(trace, 0, None,
                   [(w['start_ns'], w['end_ns']) for w in self.windows]))
+        source_prediction = replay(self.requests, Policy(self.cap), table['widths'])
+        observed = [r['timings'].get('predicted_per_second') for r in self.requests]
         result = {**rank(self.requests, self.candidates, table), 'status': 'ok', 'point': self.point,
-                  'cap': self.cap, 'path': str(self.directory), 'wall_s': time.monotonic() - self.started,
-                  'requests': len(self.windows) + len(self.requests), 'policy_updates': len(self.operations),
+                  'cap': self.cap, 'path': str(self.directory), 'wall_s': self.collection_wall_s + time.monotonic() - started,
+                  'collection_wall_s': self.collection_wall_s,
+                  'capture_prediction': source_prediction, 'capture_observed_t_s': observed,
+                  'requests': len(self.windows) + len(self.requests), 'policy_updates': len(self.operations) + 1,
                   'trace_fallback': 'Trace flush requires process exit; loop-2 points use fresh launches for this opt-in mode.'}
         self.save('replay.json', result)
         return result

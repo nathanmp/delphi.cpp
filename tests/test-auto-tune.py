@@ -779,6 +779,13 @@ class Speculation(unittest.TestCase):
         self.assertFalse(SP.policies(BASE, {}, c, 4))
         self.assertIn('DSpark', unavailable(K.set_option(BASE, '--spec-type', 'draft-dspark')))
 
+    def test_request_domains_keep_excluded_environment_settings(self):
+        c = cfg('unused', knobs={'only': ['--spec-draft-n-max']})
+        policies = SP.policies(BASE, {'LLAMA_ARG_SPEC_DRAFT_N_MIN': '2', 'LLAMA_ARG_SPEC_DRAFT_P_MIN': '.6',
+                                     'LLAMA_ARG_SPEC_DRAFT_N_START': '2'}, c, 4)
+        self.assertTrue(policies)
+        self.assertTrue(all(p.n_min == 2 and p.p_min == .6 and p.n_start == 2 for p in policies))
+
     def trace(self):
         events = []
         def execution(i, phase, tokens, start, end):
@@ -824,6 +831,19 @@ class Speculation(unittest.TestCase):
             self.assertEqual(len(selected['events']), 2)
             self.assertEqual(selected['trace_stats']['dropped_event_count'], 1)
 
+    def test_checkpoint_replay_is_part_of_the_full_verify_cycle(self):
+        trace = self.trace()
+        for i in range(7):
+            # Narrow target replays run between the width-3 verification calls.
+            trace['events'].extend([{'kind': 2, 'execution_id': 1000 + i, 'timestamp_ns': (i * 20 + 6) * 1_000_000,
+                                     'flags': 2 << 8, 'args': [2]},
+                                    {'kind': 3, 'execution_id': 1000 + i, 'timestamp_ns': (i * 20 + 8) * 1_000_000,
+                                     'flags': 2 << 8, 'args': [2]}])
+        trace['events'].sort(key=lambda e: e['timestamp_ns'])
+        table = SP.cost_table(trace, [{'width': 3, 'prompt': 0, 'start_ns': 0, 'end_ns': 160_000_000}])
+        self.assertEqual(table['widths']['3']['cycle_ms'], 20)
+        self.assertEqual(table['widths']['3']['cycles'], 4)
+
     def test_collector_restores_launch_policy_on_measurement_error(self):
         with tempfile.TemporaryDirectory() as d:
             c = cfg(d, speculation={'enabled': True, 'text': str(Path(d) / 'text')})
@@ -838,6 +858,49 @@ class Speculation(unittest.TestCase):
                     collector.collect()
             self.assertEqual(runner.request.call_args, unittest.mock.call({'args': [], 'calibrate': False}, path='/speculative'))
             self.assertTrue((Path(d) / 'restored.json').exists())
+
+    def test_collector_captures_request_boundaries_and_all_widths_on_one_server(self):
+        with tempfile.TemporaryDirectory() as d:
+            c = cfg(d, speculation={'enabled': True, 'text': str(Path(d) / 'text'), 'prompts': 2, 'max_draft': 2, 'osl': 32})
+            Path(c['speculation']['text']).write_text('some text')
+            info = {'types': 'draft-mtp', 'draft_sampling': 'greedy', 'draft_context': True, 'n_max_launch': 2,
+                    'n_max': 2, 'adaptive': 'off', 'p_min': 0}
+            runner = Mock(cfg=c, url='url', arm=Mock(request_timeout_s=10), plog_path=Path(d) / 'plog')
+            def request(body=None, *, path='/speculative'):
+                if path == '/props':
+                    return {'total_slots': 1}
+                if body and body['args']:
+                    return {**info, 'n_max': int(K.option_value(body['args'], '--spec-draft-n-max') or '0')}
+                return info
+            runner.request.side_effect = request
+            def post(url, path, body, timeout):
+                if path == '/tokenize':
+                    return {'tokens': list(range(1000))}
+                with runner.plog_path.open('a') as handle:
+                    handle.write('{"n":2,"acc":1,"p":[0.9,0.6]}\n')
+                return {'tokens_predicted': 32, 'timings': {'predicted_per_second': 50}}
+            collector = Collector(runner, BASE, {}, Path(d), lambda: True)
+            with patch('spec_runner.post', side_effect=post):
+                collector.collect()
+            self.assertEqual([len(r['passes']) for r in collector.requests], [1, 1])
+            self.assertEqual(len(collector.windows), 6)
+            self.assertEqual({w['width'] for w in collector.windows}, {1, 2, 3})
+            self.assertGreater(collector.collection_wall_s, 0)
+            self.assertEqual(json.loads((Path(d) / 'restored.json').read_text()), info)
+
+    def test_loop_three_budget_failure_restores_policy(self):
+        with tempfile.TemporaryDirectory() as d:
+            c = cfg(d, speculation={'enabled': True, 'text': str(Path(d) / 'text')})
+            Path(c['speculation']['text']).write_text('some text')
+            info = {'types': 'draft-mtp', 'draft_sampling': 'greedy', 'draft_context': True, 'n_max_launch': 4,
+                    'n_max': 4, 'adaptive': 'off', 'p_min': 0}
+            runner = Mock(cfg=c, url='url', arm=Mock(request_timeout_s=10))
+            runner.request.side_effect = [info, {'total_slots': 1}, info]
+            collector = Collector(runner, BASE, {}, Path(d), lambda: False)
+            with patch('spec_runner.post', return_value={'tokens': list(range(1000))}):
+                with self.assertRaisesRegex(SP.SpecError, 'budget ended'):
+                    collector.collect()
+            self.assertEqual(runner.request.call_args, unittest.mock.call({'args': [], 'calibrate': False}, path='/speculative'))
 
     def test_replay_points_cost_no_launch_and_need_real_confirmation(self):
         with tempfile.TemporaryDirectory() as d:
