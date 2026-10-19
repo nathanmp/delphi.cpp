@@ -719,6 +719,7 @@ struct common_params {
     bool endpoint_slots   = true;
     bool endpoint_props   = false; // only control POST requests, not GET
     bool endpoint_metrics = false;
+    bool endpoint_tune    = false; // POST/GET /tune/context, POST /tune/kld (delphi: auto-tuner hooks)
 
     // enable built-in tools
     std::vector<std::string> server_tools;
@@ -986,9 +987,17 @@ struct common_init_result {
 
     std::vector<llama_adapter_lora_ptr> & lora();
 
+    // delphi: free the context (and its samplers and thread pools) and create it again on the same model, with the
+    // context parameters of params; the weights stay. Returns false if the context cannot be created.
+    // t_warmup_us (optional) gets the time of the warmup run.
+    void free_context();
+    bool recreate_context(common_params & params, int64_t * t_warmup_us = nullptr);
+
 private:
     struct impl;
     std::unique_ptr<impl> pimpl;
+
+    bool init_context(common_params & params, llama_context_params cparams);
 };
 
 using common_init_result_ptr = std::unique_ptr<common_init_result>;
@@ -1021,6 +1030,7 @@ struct common_threadpools {
     common_threadpools & operator=(const common_threadpools &) = delete;
 
     void init(llama_context * ctx, const common_params & params);
+    void reset(); // free the pools; the context that they are attached to must be gone
 
 private:
     ggml_threadpool * threadpool       = nullptr;

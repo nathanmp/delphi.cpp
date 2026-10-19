@@ -1290,7 +1290,9 @@ static bool common_arg_is_spec_runtime(const std::string & arg) {
     return names.count(arg) > 0 || arg.rfind("--spec-ngram-", 0) == 0;
 }
 
-void common_params_apply_spec_args(common_params & params, llama_example ex, const std::vector<std::string> & args) {
+// apply the options of args to params; only those that allowed() accepts
+static void common_params_apply_runtime_args(common_params & params, llama_example ex, const std::vector<std::string> & args,
+        bool (*allowed)(const common_arg &, const std::string &)) {
     common_params scratch;
     auto ctx_arg = common_params_parser_init(scratch, ex);
 
@@ -1311,7 +1313,7 @@ void common_params_apply_spec_args(common_params & params, llama_example ex, con
             std::replace(arg.begin(), arg.end(), '_', '-');
         }
         auto it = arg_to_options.find(arg);
-        if (it == arg_to_options.end() || !it->second.first->is_spec || !common_arg_is_spec_runtime(arg)) {
+        if (it == arg_to_options.end() || !allowed(*it->second.first, arg)) {
             throw std::invalid_argument(string_format("argument %s cannot be changed at run time", arg.c_str()));
         }
         const common_arg & opt = *it->second.first;
@@ -1347,6 +1349,35 @@ void common_params_apply_spec_args(common_params & params, llama_example ex, con
             throw std::invalid_argument(string_format("error while handling argument %s: %s", arg.c_str(), e.what()));
         }
     }
+}
+
+void common_params_apply_spec_args(common_params & params, llama_example ex, const std::vector<std::string> & args) {
+    common_params_apply_runtime_args(params, ex, args, [](const common_arg & opt, const std::string & arg) {
+        return opt.is_spec && common_arg_is_spec_runtime(arg);
+    });
+}
+
+// delphi: the context options that POST /tune/context changes by creating the context again
+static bool common_arg_is_ctx_runtime(const std::string & arg) {
+    static const std::set<std::string> names = {
+        "-c", "--ctx-size", "-b", "--batch-size", "-ub", "--ubatch-size",
+        "-ctk", "--cache-type-k", "-ctv", "--cache-type-v", "-fa", "--flash-attn",
+        "-t", "--threads", "-tb", "--threads-batch",
+        "-C", "--cpu-mask", "-Cr", "--cpu-range", "-Cb", "--cpu-mask-batch", "-Crb", "--cpu-range-batch",
+        "--spec-draft-ubatch-size", "-ubd",
+        "-td", "--spec-draft-threads", "-tbd", "--spec-draft-threads-batch",
+    };
+    return names.count(arg) > 0;
+}
+
+void common_params_apply_ctx_args(common_params & params, llama_example ex, const std::vector<std::string> & args) {
+    common_params_apply_runtime_args(params, ex, args, [](const common_arg &, const std::string & arg) {
+        return common_arg_is_ctx_runtime(arg);
+    });
+    postprocess_cpu_params(params.cpuparams,       nullptr);
+    postprocess_cpu_params(params.cpuparams_batch, &params.cpuparams);
+    postprocess_cpu_params(params.speculative.draft.cpuparams,       &params.cpuparams);
+    postprocess_cpu_params(params.speculative.draft.cpuparams_batch, &params.cpuparams_batch);
 }
 
 bool common_params_parse(int argc, char ** argv, common_params & params, llama_example ex, void(*print_usage)(int, char **)) {
@@ -3723,6 +3754,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.endpoint_props = true;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_ENDPOINT_PROPS"));
+    add_opt(common_arg(
+        {"--tune-endpoints"},
+        "enable the auto-tuner endpoints POST/GET /tune/context and POST /tune/kld (default: disabled)",
+        [](common_params & params) {
+            params.endpoint_tune = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_TUNE_ENDPOINTS"));
     add_opt(common_arg(
         {"--slots"},
         {"--no-slots"},

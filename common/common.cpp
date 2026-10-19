@@ -1,4 +1,5 @@
 #include "ggml.h"
+#include "ggml-cpuset.h"
 #include "gguf.h"
 
 #include "build-info.h"
@@ -1288,8 +1289,14 @@ struct common_init_result::impl {
     std::vector<llama_sampler_seq_config> samplers_seq_config;
 };
 
+// the helper threads of ggml and llama (staging, scheduler workers, expert cache refill) pin themselves inside --cpu-mask
+static void common_cpuset_apply(const common_params & params) {
+    ggml_cpuset_restrict(params.cpuparams.mask_valid ? params.cpuparams.cpumask : nullptr, GGML_MAX_N_THREADS);
+}
+
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
+    common_cpuset_apply(params);
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
@@ -1382,6 +1389,15 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
                 params.sampling.logit_bias_eog.begin(), params.sampling.logit_bias_eog.end());
     }
 
+    init_context(params, cparams);
+}
+
+// the part of the constructor that makes the context: shared with recreate_context()
+bool common_init_result::init_context(common_params & params, llama_context_params cparams) {
+    llama_model * model = pimpl->model.get();
+
+    common_cpuset_apply(params);
+
     // init the backend samplers as part of the context creation
     pimpl->samplers.resize(cparams.n_seq_max);
     pimpl->samplers_seq_config.resize(cparams.n_seq_max);
@@ -1399,7 +1415,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     llama_context * lctx = llama_init_from_model(model, cparams);
     if (lctx == NULL) {
         COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
-        return;
+        return false;
     }
 
     pimpl->context.reset(lctx);
@@ -1407,6 +1423,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     set_process_priority(params.cpuparams.priority);
 
     pimpl->threadpools.init(lctx, params);
+    return true;
 }
 
 llama_model * common_init_result::model() {
@@ -1434,24 +1451,10 @@ std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
     return pimpl->lora;
 }
 
-common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
-    common_init_result_ptr res(new common_init_result(params, model_only));
-
-    llama_model * model = res->model();
-    if (model == NULL) {
-        COM_ERR("failed to load model '%s'\n", params.model.path.c_str());
-        return res;
-    }
-
-    if (model_only) {
-        return res;
-    }
-
-    llama_context * lctx = res->context();
-    if (lctx == NULL) {
-        COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
-        return res;
-    }
+// what follows the context creation: control vectors, adapters, warmup (shared by the first load and recreate_context())
+static bool common_init_post_context(common_init_result * res, common_params & params, int64_t * t_warmup_us) {
+    llama_model   * model = res->model();
+    llama_context * lctx  = res->context();
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
@@ -1466,7 +1469,7 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
 
         const auto cvec = common_control_vector_load(params.control_vectors);
         if (cvec.n_embd == -1) {
-            return res;
+            return false;
         }
 
         int err = llama_set_adapter_cvec(
@@ -1477,7 +1480,7 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
                 params.control_vector_layer_start,
                 params.control_vector_layer_end);
         if (err) {
-            return res;
+            return false;
         }
     }
 
@@ -1501,7 +1504,7 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         }
 
         if (!ok) {
-            return res;
+            return false;
         }
     }
 
@@ -1511,6 +1514,7 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
 
     if (params.warmup) {
         COM_TRC("%s", "warming up the model with an empty run - please wait ... (--no-warmup to disable)\n");
+        const int64_t t_warmup_start = ggml_time_us();
 
         std::vector<llama_token> tmp;
         llama_token bos = llama_vocab_bos(vocab);
@@ -1542,6 +1546,9 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         llama_memory_clear(llama_get_memory(lctx), true);
         llama_synchronize(lctx);
         llama_perf_context_reset(lctx);
+        if (t_warmup_us) {
+            *t_warmup_us = ggml_time_us() - t_warmup_start;
+        }
 
         // reset samplers to reset RNG state after warmup to the seeded state
         res->reset_samplers();
@@ -1554,7 +1561,48 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         llama_expert_cache_auto(lctx);
     }
 
+    return true;
+}
+
+common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
+    common_init_result_ptr res(new common_init_result(params, model_only));
+
+    llama_model * model = res->model();
+    if (model == NULL) {
+        COM_ERR("failed to load model '%s'\n", params.model.path.c_str());
+        return res;
+    }
+
+    if (model_only) {
+        return res;
+    }
+
+    llama_context * lctx = res->context();
+    if (lctx == NULL) {
+        COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
+        return res;
+    }
+
+    common_init_post_context(res.get(), params, nullptr);
+
     return res;
+}
+
+void common_init_result::free_context() {
+    pimpl->samplers.clear();
+    pimpl->samplers_seq_config.clear();
+    pimpl->context.reset();
+    pimpl->threadpools.reset();
+}
+
+bool common_init_result::recreate_context(common_params & params, int64_t * t_warmup_us) {
+    GGML_ASSERT(pimpl->model);
+    free_context();
+    // the fit of the first load changed only its own copy of the parameters: the context parameters come from params
+    if (!init_context(params, common_context_params_to_llama(params))) {
+        return false;
+    }
+    return common_init_post_context(this, params, t_warmup_us);
 }
 
 common_init_result::~common_init_result() = default;
@@ -1793,11 +1841,16 @@ struct ggml_threadpool_params ggml_threadpool_params_from_cpu_params(const commo
 }
 
 common_threadpools::~common_threadpools() {
-    if (!free_fn) {
-        return;
+    reset();
+}
+
+void common_threadpools::reset() {
+    if (free_fn) {
+        free_fn(threadpool);
+        free_fn(threadpool_batch);
     }
-    free_fn(threadpool);
-    free_fn(threadpool_batch);
+    threadpool       = nullptr;
+    threadpool_batch = nullptr;
 }
 
 void common_threadpools::init(llama_context * ctx, const common_params & params) {

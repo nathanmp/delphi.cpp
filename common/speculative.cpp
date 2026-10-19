@@ -3050,11 +3050,36 @@ common_speculative_init_result::common_speculative_init_result(
     llama_context * ctx_tgt) :
     pimpl(new impl{}) {
     const bool has_draft = params.speculative.has_dft();
+
+    if (has_draft) {
+        const std::string model_path = params.speculative.draft.mparams.path;
+        LOG_INF("%s: loading draft model '%s'\n", __func__, model_path.c_str());
+
+        // a draft head can leave out the embeddings and lm head and use the target's
+        auto mparams = common_model_params_to_llama(params);
+        llama_model * model_dft = llama_model_load_from_file(params.model.path.c_str(), mparams);
+        if (model_dft == NULL) {
+            LOG_ERR("%s: failed to load draft model, '%s'\n", __func__, model_path.c_str());
+            return;
+        }
+
+        pimpl->model.reset(model_dft);
+    }
+
+    create_context(params, model_tgt, ctx_tgt);
+}
+
+// the draft or MTP context on the model that is loaded (the draft model, or the target model for MTP)
+bool common_speculative_init_result::create_context(common_params & params, llama_model * model_tgt, llama_context * ctx_tgt) {
+    const bool has_draft = params.speculative.has_dft();
     const bool spec_mtp = std::find(params.speculative.types.begin(),
                                     params.speculative.types.end(),
                                     COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
 
-    auto mparams = common_model_params_to_llama(params);
+    if (!has_draft && !spec_mtp) {
+        return true;
+    }
+
     auto cparams = common_context_params_to_llama(params);
 
     if (spec_mtp) {
@@ -3069,42 +3094,29 @@ common_speculative_init_result::common_speculative_init_result(
     cparams.n_rs_seq  = 0;
     cparams.ctx_other = ctx_tgt;
 
-    std::string model_path;
-    if (has_draft) {
-        model_path = params.speculative.draft.mparams.path;
-        LOG_INF("%s: loading draft model '%s'\n", __func__, model_path.c_str());
-
-        // a draft head can leave out the embeddings and lm head and use the target's
-        llama_model * model_dft = llama_model_load_from_file(params.model.path.c_str(), mparams);
-        if (model_dft == NULL) {
-            LOG_ERR("%s: failed to load draft model, '%s'\n", __func__, model_path.c_str());
-            return;
-        }
-
-        pimpl->model.reset(model_dft);
-
-        llama_context * ctx_dft = llama_init_from_model(model_dft, cparams);
-        if (ctx_dft == nullptr) {
-            LOG_ERR("%s: failed to create MTP context\n", __func__);
-            return;
-        }
-
-        pimpl->context.reset(ctx_dft);
-        pimpl->threadpools.init(ctx_dft, params);
-    } else if (spec_mtp) {
-        model_path = params.model.path;
-
-        LOG_INF("%s: creating MTP draft context against the target model '%s'\n", __func__, model_path.c_str());
-
-        llama_context * ctx_dft = llama_init_from_model(model_tgt, cparams);
-        if (ctx_dft == nullptr) {
-            LOG_ERR("%s: failed to create MTP context\n", __func__);
-            return;
-        }
-
-        pimpl->context.reset(ctx_dft);
-        pimpl->threadpools.init(ctx_dft, params);
+    if (!has_draft) {
+        LOG_INF("%s: creating MTP draft context against the target model '%s'\n", __func__, params.model.path.c_str());
     }
+
+    llama_context * ctx_dft = llama_init_from_model(has_draft ? pimpl->model.get() : model_tgt, cparams);
+    if (ctx_dft == nullptr) {
+        LOG_ERR("%s: failed to create MTP context\n", __func__);
+        return false;
+    }
+
+    pimpl->context.reset(ctx_dft);
+    pimpl->threadpools.init(ctx_dft, params);
+    return true;
+}
+
+void common_speculative_init_result::free_context() {
+    pimpl->context.reset();
+    pimpl->threadpools.reset();
+}
+
+bool common_speculative_init_result::recreate_context(common_params & params, llama_model * model_tgt, llama_context * ctx_tgt) {
+    free_context();
+    return create_context(params, model_tgt, ctx_tgt);
 }
 
 common_speculative_init_result::~common_speculative_init_result() = default;

@@ -129,6 +129,10 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
 // throws std::invalid_argument
 void common_params_apply_spec_args(common_params & params, llama_example ex, const std::vector<std::string> & args);
 
+// the context options of a running server (-c, -b, -ub, -ctk, -ctv, -fa, threads, CPU masks, draft -ubd and threads): used
+// by POST /tune/context, which creates the context again
+void common_params_apply_ctx_args(common_params & params, llama_example ex, const std::vector<std::string> & args);
+
 // load all backends and print the list of available (non-CPU) devices to stdout
 void common_print_available_devices();
 
