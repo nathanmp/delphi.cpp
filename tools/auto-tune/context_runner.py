@@ -38,6 +38,8 @@ def payload(command, env, defaults, active_env):
            for flag, (field, convert) in FIELDS.items() if field in defaults or K.option_value(command, flag) is not None}
     out['env'] = {name: env.get(name) for name in set(active_env) | set(env)
                   if K.ENV_RELOAD.get(name, 'process') == 'context' and active_env.get(name) != env.get(name)}
+    if out.get('flash_attn') in ('enabled', 'disabled'):
+        out['flash_attn'] = 'on' if out['flash_attn'] == 'enabled' else 'off'
     return out
 
 
@@ -147,8 +149,10 @@ class ContextRunner:
                 raise M.LaunchFailed('context endpoint disappeared; subsequent points use full launches') from error
             # GET succeeds only after restoration. A dead or unavailable server must be launched again.
             restored = self.request()
-            previous = payload(*self.active, self.defaults, self.active[1])
-            if (any(restored.get(k) != v for k, v in previous.items() if k != 'env')
+            (directory / 'context-restored.json').write_text(json.dumps(restored, indent=2) + '\n')
+            previous = getattr(self, 'current_state', self.defaults)
+            fields = {field for field, _ in FIELDS.values()}
+            if (any(restored.get(k) != v for k, v in previous.items() if k in fields)
                     or restored.get('env', {}) != getattr(self, 'current_state', {}).get('env', {})):
                 self.close()
                 raise M.LaunchFailed('the context hook did not restore the previous parameters') from error

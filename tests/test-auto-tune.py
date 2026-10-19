@@ -613,6 +613,20 @@ class ContextSearch(unittest.TestCase):
             self.assertEqual(runner.active, (BASE, {}))
             self.assertEqual(runner.stats['recreates'], 1)
 
+    def test_restoration_compares_hook_names_and_requests_use_cli_names(self):
+        with tempfile.TemporaryDirectory() as d:
+            runner = ContextRunner(cfg(d), P.ServerArm('a', BASE, ('client',)), None)
+            runner.active = (BASE, {})
+            runner.defaults = {**payload(BASE, {}, {}, {}), 'flash_attn': 'enabled'}
+            runner.current_state = runner.defaults
+            restored = dict(runner.defaults)
+            error = urllib.error.HTTPError('http://server/tune/context', 400, 'invalid batch', {}, io.BytesIO(b'invalid batch'))
+            with patch.object(runner, 'request', side_effect=[error, restored]):
+                with self.assertRaises(ContextRejected):
+                    runner._recreate(K.set_option(BASE, '-ub', '0'), {}, Path(d))
+            self.assertEqual(payload(K.remove_option(BASE, '-fa'), {}, runner.defaults, {})['flash_attn'], 'on')
+            self.assertTrue((Path(d) / 'context-restored.json').exists())
+
     def test_return_to_an_omitted_flag_does_not_reuse_a_resumed_explicit_default(self):
         with tempfile.TemporaryDirectory() as d:
             runner = ContextRunner(cfg(d), P.ServerArm('a', BASE, ('client',)), None)
