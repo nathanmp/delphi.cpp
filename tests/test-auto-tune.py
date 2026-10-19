@@ -323,6 +323,24 @@ class PlacementPolicy(unittest.TestCase):
             self.assertEqual(plan['runtime_overhead_mib']['ROCm0'], 164)
             self.assertEqual(plan['extra_mib']['ROCm0'], 164)
 
+    def test_split_refinement_moves_past_a_layer_plateau(self):
+        with tempfile.TemporaryDirectory() as d:
+            c = cfg(d, devices={'ROCm0': {'min_free_mib': 100}, 'ROCm1': {'fill': 'min', 'min_free_mib': 100}})
+            command = K.remove_option(BASE, '--spec-type')
+            facts = {'architecture': 'dense', 'experts': 0, 'expert_layers': [], 'layers': 10, 'nextn': 0,
+                     'mtp_mib': 0, 'model_mib': 1300, 'files': []}
+            def probe(command, label):
+                if label == 'full':
+                    model = 650
+                else:
+                    ratio = float(K.option_value(command, '-ts').split(',')[0])
+                    model = 810 if ratio > 700 else 650
+                return {**self.rows(model), 'ROCm1': self.rows(1300-model)['ROCm0']}
+            with patch('placement.model_info', return_value=facts):
+                plan = PL.prepare(c, command, {}, {'ROCm0': 'a', 'ROCm1': 'b'}, {'a': (0, 1000), 'b': (0, 1000)}, None, probe)
+            self.assertLessEqual(sum(plan['candidates'][0]['projected']['ROCm0'].values()), 900)
+            self.assertGreaterEqual(plan['split_reserve_mib']['ROCm0'], 130)
+
     def test_failed_reference_can_use_verified_policy(self):
         with tempfile.TemporaryDirectory() as d:
             c = cfg(d, knobs={'only': ['--no-repack'], 'include': [], 'exclude': ['--no-repack'], 'levels': {}})

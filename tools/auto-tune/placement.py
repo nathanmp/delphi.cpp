@@ -303,7 +303,8 @@ def prepare(cfg, command, env, pci_map, state, cpu, probe=None, observed=None):
             options = candidates(command, env, devices, full, dense, info, extra)
     # Layer boundaries round a byte ratio. Measure the derived split before paying for a full model load.
     corrections = {}
-    for attempt in range(3):
+    previous_models = {}
+    for attempt in range(4):
         first = options[0]
         if first['name'] != 'fits' or len(devices) < 2:
             break
@@ -313,11 +314,16 @@ def prepare(cfg, command, env, pci_map, state, cpu, probe=None, observed=None):
         overflow = {name: value for name, value in overflow.items() if value > 0}
         if not overflow:
             break
-        if attempt == 2:
+        if attempt == 3:
             first['warnings'].append('the split estimate still exceeds a device budget; fresh-load verification can reject it')
             break
         for name, value in overflow.items():
-            corrections[name] = corrections.get(name, 0) + value + 1
+            step = value + 1
+            if previous_models.get(name) == projected[name]['model']:
+                # Small changes can stay on the same layer boundary. Move one average layer on that plateau.
+                step = max(step, sum(full[d.name]['model'] for d in devices) / max(1, info['layers'] - info.get('nextn', 0)))
+            corrections[name] = corrections.get(name, 0) + step
+        previous_models = {name: row['model'] for name, row in projected.items()}
         options = candidates(command, env, devices, full, dense, info,
                              {name: extra.get(name, 0) + corrections.get(name, 0) for name in set(extra) | set(corrections)})
     for option in options:
