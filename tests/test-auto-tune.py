@@ -323,6 +323,25 @@ class PlacementPolicy(unittest.TestCase):
             self.assertEqual(plan['runtime_overhead_mib']['ROCm0'], 164)
             self.assertEqual(plan['extra_mib']['ROCm0'], 164)
 
+    def test_auto_cache_margin_covers_buffers_after_first_decode(self):
+        with tempfile.TemporaryDirectory() as d:
+            c = cfg(d, devices={'ROCm0': {'min_free_mib': 100}})
+            command = (*K.remove_option(BASE, '--spec-type'), '-cmoe')
+            facts = {'architecture': 'moe', 'experts': 8, 'expert_layers': list(range(20)), 'layers': 20, 'nextn': 0,
+                     'mtp_mib': 0, 'model_mib': 2100, 'files': []}
+            observed = {'command': command, 'env': {'LLAMA_MOE_CACHE_AUTO_MARGIN_MIB': '100'},
+                        'metrics': {'vram': {'a': {'used_mib': 950, 'min_free_mib': 50}}}}
+            def probe(command, label):
+                return self.rows(2000 if label == 'full' else 100)
+            with patch('placement.model_info', return_value=facts):
+                plan = PL.prepare(c, command, {}, {'ROCm0': 'a'}, {'a': (0, 1000)}, None, probe, observed)
+                self.assertEqual(plan['cache_margin_mib'], 214)
+                self.assertEqual(plan['candidates'][0]['env']['LLAMA_MOE_CACHE_AUTO_MARGIN_MIB'], '214')
+                observed['env']['LLAMA_MOE_CACHE_AUTO_MARGIN_MIB'] = '214'
+                observed['metrics']['vram']['a']['min_free_mib'] = 150
+                plan = PL.prepare(c, command, {}, {'ROCm0': 'a'}, {'a': (0, 1000)}, None, probe, observed)
+                self.assertEqual(plan['cache_margin_mib'], 214)
+
     def test_split_refinement_moves_past_a_layer_plateau(self):
         with tempfile.TemporaryDirectory() as d:
             c = cfg(d, devices={'ROCm0': {'min_free_mib': 100}, 'ROCm1': {'fill': 'min', 'min_free_mib': 100}})

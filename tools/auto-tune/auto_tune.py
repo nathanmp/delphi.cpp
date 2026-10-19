@@ -238,6 +238,18 @@ class Tuner:
             placement_options = self.state['placement']['candidates']
         if self.cpu_budget:
             self.state['cpu_budget'] = self.cpu_budget.summary()
+
+        def apply_feedback(cmd, e, metrics):
+            nonlocal placement_options
+            if not self.placement_feedback:
+                return
+            self.log('placement: calibrate the dry run against the verified reference footprint')
+            started = time.time()
+            self.state['placement'] = self.placement_feedback(cmd, e, metrics)
+            placement_options = self.state['placement']['candidates']
+            stage = self.state['stages']['placement']
+            stage['wall_s'] += time.time() - started
+            stage['dry_runs'] += len(self.state['placement']['dry_runs'])
         if self.cfg["warmup_launch"]:
             try:
                 self.evaluate(command, env, "warmup", phase="warmup", cached=False)
@@ -249,6 +261,8 @@ class Tuner:
             raise TuneError("the budget does not cover the base launch") from None
         if base_row["status"] != "ok":
             self.state['reference_failure'] = base_row.get('error') or base_row['status']
+            if base_row.get('metrics'):
+                apply_feedback(command, env, base_row['metrics'])
             for option in placement_options:
                 try:
                     row = self.evaluate(option['command'], option['env'], 'placement ' + option['name'])
@@ -262,14 +276,7 @@ class Tuner:
                 raise TuneError(f"no placement loaded within the constraints: {self.state['reference_failure']}")
         reference = base_row["metrics"]
         self.state["base"] = base_row["key"]
-        if self.placement_feedback:
-            self.log('placement: calibrate the dry run against the verified reference footprint')
-            started = time.time()
-            self.state['placement'] = self.placement_feedback(command, base_row['metrics'])
-            placement_options = self.state['placement']['candidates']
-            stage = self.state['stages']['placement']
-            stage['wall_s'] += time.time() - started
-            stage['dry_runs'] += len(self.state['placement']['dry_runs'])
+        apply_feedback(command, env, base_row['metrics'])
         incumbent = {"command": command, "env": env, "row": base_row, "score": 1.0}
         for option in placement_options:
             step = {'knob': 'placement', 'candidate': option['name']}
@@ -440,9 +447,9 @@ def make_tuner(cfg: Mapping[str, Any], log: Callable[[str], None] = print) -> Tu
     def placement_factory():
         return placement.prepare(cfg, command, env, pci_map, M.vram_state(), cpu)
 
-    def placement_feedback(observed_command, metrics):
+    def placement_feedback(observed_command, observed_env, metrics):
         return placement.prepare(cfg, command, env, pci_map, M.vram_state(), cpu,
-                                 observed={'command': observed_command, 'metrics': metrics})
+                                 observed={'command': observed_command, 'env': observed_env, 'metrics': metrics})
 
     run_identity = {**identity(cfg, arm, command), 'cpu_budget': cpu.summary(), 'devices': cfg['devices'],
                     'clock_mode': cfg['clock_mode']}

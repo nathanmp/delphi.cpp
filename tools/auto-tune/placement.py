@@ -281,6 +281,21 @@ def prepare(cfg, command, env, pci_map, state, cpu, probe=None, observed=None):
     if K.option_value(command, '--mmproj') and not cfg['placement']['reserve_mib']:
         raise TuneError('mmproj needs placement.reserve_mib from a server memory report; the fit CLI cannot measure it')
     calibration = {}
+    cache_margin = None
+    host_observation = observed and any(flag in observed['command'] for flag in ('-cmoe', '--cpu-moe', '--n-cpu-moe', '-ncmoe'))
+    if host_observation:
+        # Auto tiers leave the margin at the first decode. Later prompt graphs can allocate more buffers.
+        observed_env = observed.get('env', {})
+        cache_margin = int(observed_env.get('LLAMA_MOE_CACHE_AUTO_MARGIN_MIB', '1536'))
+        deficit = 0
+        for d in devices:
+            peak = observed['metrics'].get('vram', {}).get(pci_map[d.name])
+            if peak:
+                deficit = max(deficit, d.margin_mib - peak['min_free_mib'])
+                if d.max_used_mib is not None:
+                    deficit = max(deficit, peak['used_mib'] - d.max_used_mib)
+        if deficit > 0:
+            cache_margin += math.ceil(deficit) + 64
     if observed and not any(flag in observed['command'] for flag in ('-cmoe', '--cpu-moe', '--n-cpu-moe', '-ncmoe')):
         projected = measure(observed['command'], 'reference')
         for d in devices:
@@ -327,6 +342,8 @@ def prepare(cfg, command, env, pci_map, state, cpu, probe=None, observed=None):
         options = candidates(command, env, devices, full, dense, info,
                              {name: extra.get(name, 0) + corrections.get(name, 0) for name in set(extra) | set(corrections)})
     for option in options:
+        if cache_margin is not None and option['name'] in ('host-experts', 'cpu-expert-layers'):
+            option['env']['LLAMA_MOE_CACHE_AUTO_MARGIN_MIB'] = str(max(cache_margin, int(option['env']['LLAMA_MOE_CACHE_AUTO_MARGIN_MIB'])))
         if 'draft-mtp' in spec:
             option['warnings'].append('MTP scratch memory is a conservative estimate; verify the fresh launch')
         if draft_estimate:
@@ -335,6 +352,6 @@ def prepare(cfg, command, env, pci_map, state, cpu, probe=None, observed=None):
             option['warnings'].append('check mmproj load order: auto cache sizing must run after mmproj allocation')
     result = {'devices': [asdict(d) for d in devices], 'model': info, 'full': full, 'dense': dense,
               'extra_mib': extra, 'runtime_overhead_mib': calibration, 'draft_estimate': draft_estimate,
-              'split_reserve_mib': corrections, 'dry_runs': commands, 'candidates': options}
+              'cache_margin_mib': cache_margin, 'split_reserve_mib': corrections, 'dry_runs': commands, 'candidates': options}
     (out / 'plan.json').write_text(json.dumps(result, indent=2) + '\n')
     return result
