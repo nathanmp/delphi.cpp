@@ -263,16 +263,17 @@ class Tuner:
 
     def request_points(self, row):
         """Calculate request policies from one context's measurements; these spend no launches."""
-        from speculation import Policy
+        from speculation import Policy, validated_estimates
         spec = row.get('metrics', {}).get('speculation', {})
         if row.get('status') != 'ok' or spec.get('status') != 'ok':
             return []
         result = []
         started = time.monotonic()
         # Every request policy has the same prefill. The fastest decode dominates the others for all positive decode weights.
-        for candidate in spec['candidates'][:1]:
+        for candidate in validated_estimates(spec, row['metrics']['decode_t_s'])[:1]:
             command = Policy(**candidate['policy']).command(row['command'])
-            metrics = {**row['metrics'], 'decode_t_s': candidate['decode_t_s'], 'decode_source': 'replay-estimate',
+            metrics = {**row['metrics'], 'decode_t_s': candidate['decode_t_s'],
+                       'decode_source': candidate.get('decode_source', 'replay-estimate'),
                        'speculation_policy': candidate['policy'], 'speculation_parent': row['key']}
             # The cost repeats measure different real-text prompts at the same deterministic acceptance.
             costs = candidate['repeat_decode_t_s']

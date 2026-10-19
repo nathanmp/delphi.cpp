@@ -131,11 +131,11 @@ def correlate(trace, rows):
 
 def costs(trace, requests, windows, settle=3, minimum=3):
     """Full logical cycles include checkpoint replay and server overhead; draft spans include ingest."""
-    plain = [w for w in windows if w['width'] == 1]
+    plain = [w for w in windows if w['width'] == 1 and not w.get('observed_empty_draft')]
     table = cost_table(trace, plain, settle, minimum) if plain else {'widths': {}, 'by_prompt': {}}
     by_width, by_prompt = {}, {}
     for w in windows:
-        if w['width'] == 1:
+        if w in plain:
             continue
         rows = requests.get(w['request_id'], [])
         correlate(trace, rows)

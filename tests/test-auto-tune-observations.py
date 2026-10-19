@@ -4,12 +4,14 @@ import copy
 import json
 from pathlib import Path
 import sys
+import tempfile
 import unittest
-from unittest.mock import Mock
+import urllib.error
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools/auto-tune'))
 import observations as O
-from speculation import SpecError
+from speculation import SpecError, Policy, replay, validated_estimates
 from context_runner import ContextRunner, process_key
 from config import DEFAULTS, _merge
 
@@ -133,6 +135,42 @@ class Observations(unittest.TestCase):
         with self.assertRaises(SpecError):
             O.costs(trace(raw), requests, [w], settle=1, minimum=3)
 
+    def test_empty_draft_cost_keeps_the_confidence_cut_step(self):
+        raw = records()
+        for r in raw:
+            if r['kind'] == 'draft':
+                r.update(draft_tokens=[], draft_probabilities=[], selected=False)
+            elif r['kind'] == 'target':
+                r['batch_tokens'] = 1
+            else:
+                r.update(draft_tokens=[], accepted_tokens=[99], accepted_length=0)
+        requests = parse(raw)
+        window = {'width': 1, 'prompt': 0, 'request_id': 10, 'start_ns': 0,
+                  'end_ns': 100_000_000_000, 'observed_empty_draft': True}
+        table = O.costs(trace(raw), requests, [window], settle=1, minimum=3)
+        self.assertEqual(table['widths']['1']['draft_ms'], 4)
+        self.assertEqual(table['widths']['1']['cycle_ms'], 20)
+
+    def test_replay_uses_the_servers_float_threshold(self):
+        widths = {str(w): {'cycle_ms': 10, 'draft_ms': 0} for w in range(1, 4)}
+        result = replay([{'passes': [{'n': 2, 'acc': 2, 'p': [.800000011920929, .9]}]}],
+                        Policy(2, p_min=.80000002), widths)
+        self.assertEqual(result['output_tokens'], 3)
+
+    def test_measured_validation_overrules_a_wrong_replay_ranking(self):
+        def measured(policy, speeds):
+            return {'policy': policy, 'samples': [{'repeat': i, 'timings': {'predicted_per_second': value}}
+                                                 for i, value in enumerate(speeds)]}
+        a, b = {'n_max': 4}, {'n_max': 2}
+        spec = {'candidates': [{'policy': a, 'decode_t_s': 200}, {'policy': b, 'decode_t_s': 150}],
+                'validation': {'repetitions': 3, 'launch': measured(None, [50, 51, 49]),
+                               'policies': [measured(a, [40, 40, 40]), measured(b, [60, 60, 60])]}}
+        candidates = validated_estimates(spec, reference_t_s=100)
+        self.assertEqual(candidates[0]['policy'], b)
+        self.assertEqual(candidates[0]['decode_source'], 'matched-validation-estimate')
+        self.assertAlmostEqual(candidates[0]['decode_t_s'], 120)
+        self.assertAlmostEqual(candidates[1]['decode_t_s'], 80)
+
     def test_snapshot_rejects_either_drop_counter_and_io_failure(self):
         shot = {'ok': True, 'cumulative': True, 'event_count': 10, 'event_capacity': 100, 'dropped_event_count': 0,
                 'speculative': {'enabled': True, 'ok': True, 'failed': False, 'dropped': 0}}
@@ -146,6 +184,34 @@ class Observations(unittest.TestCase):
 
 
 class RetainedSnapshots(unittest.TestCase):
+    def test_endpoint_404_falls_back_but_snapshot_failure_does_not(self):
+        import measure as M
+        for status in (404, 500):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as directory:
+                cfg = _merge(DEFAULTS, {'speculation': {'enabled': True}})
+                cmd = ('server', '--spec-type', 'draft-mtp')
+                runner = ContextRunner(cfg, M.P.ServerArm('test', cmd, ('client',)), None, log=lambda _: None)
+                error = urllib.error.HTTPError('http://server/tune/snapshot', status, 'unavailable', {}, None)
+                try:
+                    with patch('context_runner.subprocess.run', return_value=Mock(stdout='--tune-endpoints', stderr='')), \
+                            patch('context_runner.subprocess.Popen') as process, patch('context_runner.M.vram_state', return_value={}), \
+                            patch.object(M.P, '_version', return_value='test'), patch.object(M.P, '_wait_for_server'), \
+                            patch.object(M.P, '_stop_server'), patch.object(runner, 'request', side_effect=[{}, error]):
+                        process.return_value.pid = 123
+                        if status == 404:
+                            runner._start(cmd, {}, Path(directory))
+                            self.assertIs(runner.snapshot_supported, False)
+                            self.assertTrue(runner.supported)
+                            self.assertIn('DELPHI_SPEC_PLOG', process.call_args.kwargs['env'])
+                            runner.close()
+                        else:
+                            with self.assertRaises(urllib.error.HTTPError):
+                                runner._start(cmd, {}, Path(directory))
+                            self.assertIsNone(runner.process)
+                finally:
+                    runner.process = None
+                    runner.close()
+
     def runner(self):
         cfg = _merge(DEFAULTS, {'speculation': {'enabled': True}})
         r = ContextRunner(cfg, Mock(port=18081), None)

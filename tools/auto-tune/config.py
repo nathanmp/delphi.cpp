@@ -34,7 +34,7 @@ DEFAULTS: dict[str, Any] = {
     "placement": {"reserve_mib": {}},  # extra device buffers not measured by llama-fit-params (for example mmproj)
     "context_search": {"reps": 3, "screen_threshold": 8},  # full workload repeats per context point
     "speculation": {"enabled": False, "text": None, "prompt_tokens": 128, "prompts": 3, "osl": 64,
-                    "max_draft": 6, "settle_cycles": 3, "min_cycles": 3, "trace_max_events": 8388608,
+                    "max_draft": 6, "settle_cycles": 3, "min_cycles": 3, "trace_max_events": 33554432,
                     "validation_reps": 3, "validation_candidates": 2},
     "class_order": ["fit", "precision", "accept", "speed"],  # the order in which the knob classes are searched
 }

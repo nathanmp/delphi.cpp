@@ -172,11 +172,12 @@ class Collector:
             for width in widths:
                 n = width - 1
                 args = ([*Policy(n).args(), '--spec-synth-rates', ','.join(['1'] * (n - 1) + ['0'])]
-                        if n else ['--spec-type', 'none'])
+                        if n else [*Policy(1, p_min=1).args(), '--spec-synth-rates', '0'])
                 self.configure(args)
-                self.completion(prompts[0])  # Warm the new graph width; never use synthetic output as quality evidence.
+                for prompt in prompts:
+                    self.completion(prompt)
                 for i, prompt in enumerate(prompts):
-                    self.completion(prompt, window={'width': width, 'prompt': i})
+                    self.completion(prompt, window={'width': width, 'prompt': i, 'observed_empty_draft': n == 0})
             captured = self.configure([*Policy(self.cap).args(), '--spec-draft-sampling', 'greedy'])
             if captured['adaptive'] != 'off' or captured['p_min'] != 0 or captured['n_max'] != self.cap:
                 raise SpecError('server did not apply the uncensored capture policy')
@@ -211,12 +212,12 @@ class Collector:
 
     def validate(self, prompts, source, table):
         """Independent normal-acceptance requests on the same workload; report both pass and full decode rates."""
-        selected = [Policy(self.cap)]
+        selected = [None, Policy(self.cap)]
         for candidate in self.result['candidates']:
             policy = Policy(**candidate['policy'])
             if policy not in selected:
                 selected.append(policy)
-            if len(selected) >= 1 + self.cfg['validation_candidates']:
+            if len(selected) >= 2 + self.cfg['validation_candidates']:
                 break
         pending = []
         for rep in range(self.cfg['validation_reps']):
@@ -224,40 +225,49 @@ class Collector:
             if rep % 2:
                 order.reverse()
             for policy in order:
-                self.configure([*policy.args(), '--spec-draft-sampling', 'greedy'])
+                self.configure([*policy.args(), '--spec-draft-sampling', 'greedy'] if policy else [])
                 self.completion(prompts[0])
                 for i, prompt in enumerate(prompts):
                     response = self.completion(prompt)
                     if not response.get('tokens') or response['tokens'] != source[i].get('tokens'):
                         raise SpecError('normal-acceptance validation changed the greedy token sequence')
-                    pending.append({'policy': asdict(policy), 'repeat': rep, 'prompt': i,
+                    pending.append({'policy': asdict(policy) if policy else None, 'repeat': rep, 'prompt': i,
                                     'request_id': response.get('speculative_request_id'), 'timings': response['timings']})
         inputs, trace = self.live_inputs()
-        results = []
+        results, launch = [], None
         for policy in selected:
             samples = []
             for item in pending:
-                if item['policy'] != asdict(policy):
+                if item['policy'] != (asdict(policy) if policy else None):
                     continue
                 rows = inputs.get(item['request_id'], [])
                 O.correlate(trace, rows)
                 rows = [r for r in rows[self.cfg['settle_cycles']:] if 'cycle_ms' in r]
                 if len(rows) < self.cfg['min_cycles']:
                     raise SpecError('too few settled normal-acceptance validation cycles')
-                prediction = replay([self.requests[item['prompt']]], policy, table['by_prompt'][str(item['prompt'])])
+                prediction = replay([self.requests[item['prompt']]], policy, table['by_prompt'][str(item['prompt'])]) if policy else None
                 actual = O.rate(rows)
-                samples.append({**item, 'aligned_decode_t_s': actual, 'prediction_t_s': prediction['decode_t_s'],
-                                'error_fraction': prediction['decode_t_s'] / actual - 1,
+                widths = table['by_prompt'][str(item['prompt'])]
+                # Holding the observed acceptance/boundaries fixed isolates timing-model error from clipping error.
+                modeled_ms = (sum(widths[str(r['n'] + 1)]['cycle_ms'] - widths[str(r['n'] + 1)]['draft_ms']
+                                  + widths[str(r['draft']['attempted_steps'] + 1)]['draft_ms'] for r in rows) if policy else None)
+                samples.append({**item, 'aligned_decode_t_s': actual, 'prediction_t_s': prediction['decode_t_s'] if prediction else None,
+                                'error_fraction': prediction['decode_t_s'] / actual - 1 if prediction else None,
+                                'cost_model_error_fraction': sum(r['cycle_ms'] for r in rows) / modeled_ms - 1 if modeled_ms else None,
+                                'predicted_accepted_per_pass': prediction['accepted_per_pass'] if prediction else None,
                                 'accepted_per_pass': statistics.mean(r['acc'] for r in rows),
                                 'passes': len(rows), 'tokens_identical': True})
-            predicted = statistics.median(s['prediction_t_s'] for s in samples)
             actual = statistics.median(s['aligned_decode_t_s'] for s in samples)
-            results.append({'policy': asdict(policy), 'prediction_t_s': predicted, 'aligned_decode_t_s': actual,
-                            'decode_t_s': statistics.median(s['timings']['predicted_per_second'] for s in samples),
-                            'error_fraction': predicted / actual - 1, 'samples': samples})
+            result = {'policy': asdict(policy) if policy else None, 'aligned_decode_t_s': actual,
+                      'decode_t_s': statistics.median(s['timings']['predicted_per_second'] for s in samples), 'samples': samples}
+            if policy:
+                predicted = statistics.median(s['prediction_t_s'] for s in samples)
+                results.append({**result, 'prediction_t_s': predicted, 'error_fraction': predicted / actual - 1})
+            else:
+                launch = result
         self.result['validation'] = {'schema': 'delphi.auto-tune/replay-validation/1', 'normal_acceptance': True,
                                      'same_workload': True, 'fresh_requests': True, 'fresh_process': False,
-                                     'policies': results, 'repetitions': self.cfg['validation_reps'],
+                                     'policies': results, 'launch': launch, 'repetitions': self.cfg['validation_reps'],
                                      'note': 'Matched-workload diagnostics; deployment recommendations still require fresh-process confirmation.'}
         self.save('validation.json', self.result['validation'])
 

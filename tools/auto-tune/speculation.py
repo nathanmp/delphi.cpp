@@ -5,6 +5,7 @@ import itertools
 import json
 import math
 import statistics
+import struct
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -158,6 +159,7 @@ def replay(requests, policy, widths):
     """Empirical pass replay. Clipping changes future pass boundaries, so this is a prediction, not a token replay."""
     tokens, elapsed, accepted_total, passes = 0, 0.0, 0, 0
     depths = {}
+    threshold = struct.unpack('<f', struct.pack('<f', policy.p_min))[0]
     for request in requests:
         bucket = Bucket(policy)
         for row in request['passes']:
@@ -166,7 +168,7 @@ def replay(requests, policy, widths):
             depth = bucket.depth if policy.adaptive == 'bucket' else policy.n_max
             n = depth
             for i, p in enumerate(row['p'][:depth]):
-                if p < policy.p_min:
+                if p < threshold:
                     n = i
                     break
             # The low-confidence step ran before its token was cut. n_min can then discard the whole draft.
@@ -254,6 +256,28 @@ def rank(requests, candidates, table):
                             precision,
                             'Cost/conf controllers require live timing, shadow tokens or calibration and are not replayed.',
                             'Settled width medians omit graph rebuild and depth-switch costs.']}
+
+
+def validated_estimates(spec, reference_t_s):
+    """Use measured policy gains on the matched workload to estimate recipe rates for fresh confirmation."""
+    validation = spec.get('validation', {})
+    launch = validation.get('launch')
+    if not launch:
+        return spec['candidates']
+    results = []
+    for measured in validation['policies']:
+        predicted = next((c for c in spec['candidates'] if c['policy'] == measured['policy']), None)
+        if not predicted:
+            continue
+        gains = []
+        for rep in range(validation['repetitions']):
+            def median_rate(row):
+                return statistics.median(s['timings']['predicted_per_second'] for s in row['samples'] if s['repeat'] == rep)
+            gains.append(median_rate(measured) / median_rate(launch))
+        results.append({**predicted, 'decode_t_s': reference_t_s * statistics.median(gains),
+                        'repeat_decode_t_s': [reference_t_s * gain for gain in gains],
+                        'decode_source': 'matched-validation-estimate', 'validated_gain': statistics.median(gains)})
+    return sorted(results, key=lambda r: r['decode_t_s'], reverse=True)
 
 
 def main():
