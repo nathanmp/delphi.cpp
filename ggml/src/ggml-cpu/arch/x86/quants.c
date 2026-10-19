@@ -501,9 +501,101 @@ void quantize_row_q8_1(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, i
 #endif
 }
 
-// placeholder implementation for Apple targets
-void quantize_row_q8_K(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
-    quantize_row_q8_K_ref(x, y, k);
+// Adapted from Strata q8k_quant_avx2, commit 296b59d2f73c8f04a805df29c2fa97655adace78.
+// MIT License
+//
+// Copyright (c) 2026 Niko1221 and the Strata contributors
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+void quantize_row_q8_K(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+#if defined(__AVX2__)
+    assert(k % QK_K == 0);
+    const int64_t nb = k / QK_K;
+    block_q8_K * GGML_RESTRICT y = vy;
+    const __m256 sign_bit = _mm256_set1_ps(-0.0f);
+    const __m256 magic = _mm256_set1_ps(12582912.f);
+    const __m256i mantissa = _mm256_set1_epi32(0x007fffff);
+    const __m256i offset = _mm256_set1_epi32(0x00400000);
+    const __m256i max_value = _mm256_set1_epi32(127);
+    const __m256i perm = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+
+    for (int64_t i = 0; i < nb; ++i, x += QK_K) {
+        __m256 max_abs = _mm256_setzero_ps();
+        for (int j = 0; j < QK_K; j += 8) {
+            max_abs = _mm256_max_ps(_mm256_andnot_ps(sign_bit, _mm256_loadu_ps(x + j)), max_abs);
+        }
+        __m128 max4 = _mm_max_ps(_mm256_castps256_ps128(max_abs), _mm256_extractf128_ps(max_abs, 1));
+        max4 = _mm_max_ps(max4, _mm_movehl_ps(max4, max4));
+        max4 = _mm_max_ss(max4, _mm_movehdup_ps(max4));
+        const float amax = _mm_cvtss_f32(max4);
+        if (!amax) {
+            y[i].d = 0;
+            memset(y[i].qs, 0, QK_K);
+            // The reference leaves bsums unchanged for zero blocks.
+            continue;
+        }
+
+        // The first value with the largest magnitude supplies the sign, including ties across lanes.
+        float max = 0.0f;
+        const __m256 va = _mm256_set1_ps(amax);
+        for (int j = 0; j < QK_K; j += 8) {
+            const int mask = _mm256_movemask_ps(_mm256_cmp_ps(_mm256_andnot_ps(sign_bit, _mm256_loadu_ps(x + j)), va, _CMP_EQ_OQ));
+            if (mask) {
+                int lane = 0;
+                while (!((mask >> lane) & 1)) {
+                    ++lane;
+                }
+                max = x[j + lane];
+                break;
+            }
+        }
+        const float iscale = -127.f / max;
+        const __m256 mul = _mm256_set1_ps(iscale);
+        for (int j = 0; j < QK_K; j += 32) {
+            __m256i v[4];
+            for (int q = 0; q < 4; ++q) {
+                __m256 p = _mm256_mul_ps(mul, _mm256_loadu_ps(x + j + 8*q));
+                // nearest_int rounds the product before the magic add. FMA changes half-way cases.
+#if defined(__GNUC__) || defined(__clang__)
+                __asm__("" : "+x"(p));
+#else
+                const volatile __m256 rounded_product = p;
+                p = rounded_product;
+#endif
+                const __m256 t = _mm256_add_ps(p, magic);
+                v[q] = _mm256_min_epi32(_mm256_sub_epi32(_mm256_and_si256(_mm256_castps_si256(t), mantissa), offset), max_value);
+                // Match the reference's int8_t store before computing the sums.
+                v[q] = _mm256_srai_epi32(_mm256_slli_epi32(v[q], 24), 24);
+            }
+            for (int q = 0; q < 2; ++q) {
+                y[i].bsums[j/16 + q] = hsum_i32_8(_mm256_add_epi32(v[2*q], v[2*q + 1]));
+            }
+            const __m256i p16a = _mm256_packs_epi32(v[0], v[1]);
+            const __m256i p16b = _mm256_packs_epi32(v[2], v[3]);
+            const __m256i p8 = _mm256_permutevar8x32_epi32(_mm256_packs_epi16(p16a, p16b), perm);
+            _mm256_storeu_si256((__m256i *) (y[i].qs + j), p8);
+        }
+        y[i].d = 1 / iscale;
+    }
+#else
+    quantize_row_q8_K_ref(x, vy, k);
+#endif
 }
 
 //===================================== Dot products =================================

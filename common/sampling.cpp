@@ -12,6 +12,7 @@
 #include <climits>
 #include <cmath>
 #include <cstring>
+#include <random>
 #include <unordered_map>
 #include <vector>
 
@@ -121,10 +122,16 @@ struct common_sampler {
 
     llama_token_data_array cur_p;
 
+    // for rejection sampling; independent of the draft, or the target distribution is not preserved
+    std::mt19937 rng;
+
     void reset() {
         prev.clear();
 
         llama_sampler_reset(chain);
+
+        // as at init: the rejection draws repeat with the chain, so a reused sampler matches a new one
+        rng.seed(llama_sampler_get_seed(chain) ^ 0x9e3779b9u);
     }
 
     void set_logits(struct llama_context * ctx, int idx) {
@@ -432,6 +439,8 @@ struct common_sampler * common_sampler_init(
         /* .prev    = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
         /* .cur     = */ {},
         /* .cur_p   = */ {},
+        // mix it, the chain and the draft are seeded from this one too
+        /* .rng     = */ std::mt19937(llama_sampler_get_seed(chain) ^ 0x9e3779b9u),
     };
 
     return result;
@@ -506,6 +515,44 @@ void common_sampler_reset(struct common_sampler * gsmpl) {
     gsmpl->reset();
 }
 
+bool common_sampler_params_reusable(const common_params_sampling & a, const common_params_sampling & b) {
+    // no grammar sampler and no reasoning budget sampler (the conditions of common_sampler_init); without a grammar the
+    // triggers, the lazy flag and the preserved tokens of a chat template have no effect on the chain
+    auto plain = [](const common_params_sampling & p) {
+        const bool rbudget = !p.reasoning_budget_start.empty() && !p.reasoning_budget_end.empty() &&
+                             (p.grammar_lazy || p.reasoning_budget_tokens >= 0 || p.reasoning_control);
+        return common_grammar_value(p.grammar).empty() && !rbudget;
+    };
+    auto bias_eq = [](const std::vector<llama_logit_bias> & x, const std::vector<llama_logit_bias> & y) {
+        if (x.size() != y.size()) {
+            return false;
+        }
+        for (size_t i = 0; i < x.size(); ++i) {
+            if (x[i].token != y[i].token || x[i].bias != y[i].bias) {
+                return false;
+            }
+        }
+        return true;
+    };
+    return plain(a) && plain(b) &&
+           a.print()              == b.print() &&
+           a.seed                 == b.seed &&
+           a.n_prev               == b.n_prev &&
+           a.n_probs              == b.n_probs &&
+           a.min_keep             == b.min_keep &&
+           a.dynatemp_range       == b.dynatemp_range &&
+           a.dynatemp_exponent    == b.dynatemp_exponent &&
+           a.ignore_eos           == b.ignore_eos &&
+           a.no_perf              == b.no_perf &&
+           a.user_sampling_config == b.user_sampling_config &&
+           a.backend_sampling     == b.backend_sampling &&
+           a.samplers             == b.samplers &&
+           a.dry_sequence_breakers == b.dry_sequence_breakers &&
+           a.generation_prompt    == b.generation_prompt &&
+           bias_eq(a.logit_bias, b.logit_bias) &&
+           bias_eq(a.logit_bias_eog, b.logit_bias_eog);
+}
+
 struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
     return new common_sampler {
         /* .params  = */ gsmpl->params,
@@ -515,6 +562,7 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .prev    = */ gsmpl->prev,
         /* .cur     = */ gsmpl->cur,
         /* .cur_p   = */ gsmpl->cur_p,
+        /* .rng     = */ gsmpl->rng,
     };
 }
 
@@ -535,6 +583,7 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     dst->cur        = src->cur;
     dst->cur_p      = src->cur_p;
     dst->cur_p.data = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
+    dst->rng        = src->rng;
     dst->t_total_us = src->t_total_us;
 }
 
@@ -692,6 +741,124 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
         if (draft[i] != id) {
             break;
         }
+    }
+
+    if (i == draft.size()) {
+        const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+
+        common_sampler_accept(gsmpl, id, true);
+
+        result.push_back(id);
+    }
+
+    return result;
+}
+
+static float prob_of(const llama_token_data * data, size_t n, llama_token id) {
+    for (size_t k = 0; k < n; ++k) {
+        if (data[k].id == id) {
+            return data[k].p;
+        }
+    }
+    return 0.0f;
+}
+
+// Accept a drafted token with probability min(1, p/q), else draw from norm(max(0, p - q)).
+// Preserves the target distribution exactly, and accepts more often than matching does when the
+// draft samples instead of taking its argmax.
+std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q, bool grammar_first) {
+    GGML_ASSERT(idxs.size()    == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
+    GGML_ASSERT(draft_q.size() == draft.size() && "draft_q must have one entry per draft token");
+
+    std::vector<llama_token> result;
+    result.reserve(idxs.size());
+
+    // draws come from the sampler's own stream, so they stay independent of what was drafted
+    std::uniform_real_distribution<float> uni(0.0f, 1.0f);
+
+    std::vector<llama_token_data> residual;
+
+    std::vector<llama_token_data> cand; // candidate array masked by the grammar, if there is one
+
+    size_t i = 0;
+    for (; i < draft.size(); i++) {
+        // leaves the target distribution in the candidate array
+        const llama_token id_tgt = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+
+        const auto * cur_p = common_sampler_get_candidates(gsmpl, true);
+        const auto & q     = draft_q[i];
+
+        const bool masked = !grammar_first && grammar_should_apply(gsmpl);
+        if (masked) {
+            cand.assign(cur_p->data, cur_p->data + cur_p->size);
+            llama_token_data_array arr = { cand.data(), cand.size(), -1, false };
+            llama_sampler_apply(gsmpl->grmr, &arr);
+        }
+
+        // a candidate the grammar rejects carries no probability, whatever the target thinks
+        auto p_raw = [&](size_t k) {
+            return masked && cand[k].logit == -INFINITY ? 0.0f : cur_p->data[k].p;
+        };
+
+        // masking drops probability mass, so rescale what is left or the residual is over-weighted
+        float p_sum = 0.0f;
+        if (masked) {
+            for (size_t k = 0; k < cur_p->size; ++k) {
+                p_sum += p_raw(k);
+            }
+        }
+
+        const float p_norm = masked && p_sum > 0.0f ? 1.0f/p_sum : 1.0f;
+
+        auto p_of = [&](size_t k) {
+            return p_raw(k)*p_norm;
+        };
+
+        // q_x is never 0 for a token the draft produced, but guard the divide
+        const float q_x = prob_of(q.data(), q.size(), draft[i]);
+
+        float p_x = 0.0f;
+        for (size_t k = 0; k < cur_p->size; ++k) {
+            if (cur_p->data[k].id == draft[i]) {
+                p_x = p_of(k);
+                break;
+            }
+        }
+
+        if (q_x > 0.0f && (p_x >= q_x || uni(gsmpl->rng) < p_x / q_x)) {
+            common_sampler_accept(gsmpl, draft[i], true);
+            result.push_back(draft[i]);
+            continue;
+        }
+
+        // rejected: tokens outside q's support keep all of p
+        residual.clear();
+        float sum = 0.0f;
+        for (size_t k = 0; k < cur_p->size; ++k) {
+            const float r = p_of(k) - prob_of(q.data(), q.size(), cur_p->data[k].id);
+            if (r > 0.0f) {
+                residual.push_back({ cur_p->data[k].id, 0.0f, r });
+                sum += r;
+            }
+        }
+
+        llama_token id = id_tgt;
+        if (sum > 0.0f) {
+            float u = uni(gsmpl->rng) * sum;
+            id = residual.back().id;
+            for (const auto & e : residual) {
+                u -= e.p;
+                if (u <= 0.0f) {
+                    id = e.id;
+                    break;
+                }
+            }
+        }
+
+        common_sampler_accept(gsmpl, id, true);
+        result.push_back(id);
+
+        break;
     }
 
     if (i == draft.size()) {

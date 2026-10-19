@@ -6,6 +6,7 @@
 #include "llama-context.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cmath>
 #include <cstring>
@@ -1250,12 +1251,42 @@ const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
     return v_cells[seq_to_stream[seq_id]];
 }
 
+static std::atomic<uint32_t> kv_n_pad_reserved{0};
+// largest batch (tokens) that uses the reserved step
+static constexpr size_t kv_n_pad_reserve_max_tokens = 64;
+
+void llama_kv_cache_n_pad_reserve(uint32_t n_pad) {
+    if (n_pad % 256 != 0) {
+        LLAMA_LOG_WARN("%s: %u is not a multiple of 256, ignored\n", __func__, n_pad);
+        return;
+    }
+    uint32_t cur = kv_n_pad_reserved.load();
+    while (n_pad > cur && !kv_n_pad_reserved.compare_exchange_weak(cur, n_pad)) {
+    }
+}
+
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     uint32_t result = 0;
 
     // pad the n_kv value so that the graph remains constant across batches and can be reused
     // note: this also helps some backends with performance (f.ex https://github.com/ggml-org/llama.cpp/pull/16812#issuecomment-3455112220)
-    const uint32_t n_pad_cur = std::max(n_pad, 256u);
+    // LLAMA_KV_N_PAD (multiple of 256) or llama_kv_cache_n_pad_reserve(): a larger step makes the KV view grow less often,
+    // so the graphs of idle batch widths (e.g. speculative verify widths) stay reusable longer, at the cost of more masked
+    // cells. The variable wins over the reservation, so LLAMA_KV_N_PAD=256 restores the upstream step.
+    static const uint32_t n_pad_env = [] {
+        const char * env = getenv("LLAMA_KV_N_PAD");
+        const long   v   = env ? atol(env) : 0;
+        if (env && (v < 256 || v % 256 != 0)) {
+            LLAMA_LOG_WARN("%s: LLAMA_KV_N_PAD=%s is not a multiple of 256, ignored\n", __func__, env);
+            return 256u;
+        }
+        return v > 0 ? (uint32_t) v : 0u;
+    }();
+    // The reservation is for small batches only (draft and verify widths). Prompt ubatches change the view at every ubatch
+    // anyway, and on a pipelined layer split (Qwen on 3 ROCm GPUs) the large step cost 40 % of the prefill speed.
+    const bool small_batch = !sinfo.empty() && !sinfo.idxs[0].empty() && sinfo.idxs[0].size() <= kv_n_pad_reserve_max_tokens;
+    const uint32_t n_pad_rsv = small_batch ? kv_n_pad_reserved.load(std::memory_order_relaxed) : 0u;
+    const uint32_t n_pad_cur = std::max(n_pad, n_pad_env > 0 ? n_pad_env : std::max(256u, n_pad_rsv));
 
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const auto & cells = v_cells[sinfo.strm[s]];

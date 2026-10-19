@@ -4,6 +4,8 @@
 #include "server-ckpt.h"
 #include "server-ckpt-spill.h"
 #include "server-turn.h"
+#include "server-tune.h"
+#include "kld.h"
 #include "server-common.h"
 #include "server-http.h"
 #include "server-task.h"
@@ -11,6 +13,7 @@
 #include "server-schema.h"
 #include "server-stream.h"
 
+#include "arg.h"
 #include "build-info.h"
 #include "common.h"
 #include "fit.h"
@@ -72,6 +75,31 @@ static common_speculative_output_limits server_output_limits(const common_params
 
     result.total   = std::max<int32_t>(1, result.total);
     result.per_seq = std::max<int32_t>(1, result.per_seq);
+    return result;
+}
+
+// a checkpoint restore dropped tokens the target had accepted - re-accept them rather than verify again
+static std::vector<llama_token> server_accept_replay(
+        common_sampler * smpl,
+        llama_context * ctx,
+        const std::vector<int32_t> & idxs,
+        const llama_tokens & draft) {
+    GGML_ASSERT(idxs.size() == draft.size() + 1);
+
+    std::vector<llama_token> result;
+    result.reserve(idxs.size());
+
+    for (size_t i = 0; i < draft.size(); ++i) {
+        // the token is discarded - the call is what advances the sampler over this position
+        common_sampler_sample(smpl, ctx, idxs[i]);
+        common_sampler_accept(smpl, draft[i], true);
+        result.push_back(draft[i]);
+    }
+
+    const llama_token id = common_sampler_sample(smpl, ctx, idxs[draft.size()]);
+    common_sampler_accept(smpl, id, true);
+    result.push_back(id);
+
     return result;
 }
 
@@ -162,13 +190,19 @@ struct server_batch {
     }
 
     ~server_batch() {
+        free();
+    }
+
+    void free() {
         if (batch.pos != nullptr) {
             clear();
             llama_batch_free(batch);
+            batch.pos = nullptr;
         }
     }
 
     void init(int32_t n_tokens_alloc, int32_t n_embd) {
+        free(); // the context is made again by POST /tune/context
         this->n_tokens_alloc = n_tokens_alloc;
         this->n_embd = n_embd;
         batch = llama_batch_init(n_tokens_alloc, 0, 1);
@@ -275,6 +309,9 @@ struct server_slot {
     common_speculative * spec;
 
     llama_tokens spec_draft;
+
+    // draft candidates per token in spec_draft; only draft-simple and draft-mtp fill it
+    std::vector<std::vector<llama_token_data>> spec_draft_q;
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
@@ -383,6 +420,7 @@ struct server_slot {
     json json_schema;
 
     common_sampler_ptr smpl;
+    common_params_sampling smpl_params; // parameters smpl was created from (before common_sampler_init adjusted them)
 
     llama_token sampled; // in speculative mode, this is the last accepted token
 
@@ -434,7 +472,8 @@ struct server_slot {
 
         n_predict_max = -1;
 
-        llama_set_sampler(ctx_tgt, id, nullptr);
+        // the sampler stays attached: a next request with equal parameters reuses it and the graphs built with it
+        // (see launch_slot_with_task); a different one replaces or detaches it before it is freed
 
         // clear alora start
         alora_invocation_start = -1;
@@ -506,6 +545,11 @@ struct server_slot {
 
     bool can_speculate() const {
         return !!spec;
+    }
+
+    // at temp 0 both p and q are point masses, so rejection is the same as sample-and-match
+    bool use_spec_rejection() const {
+        return task && task->params.sampling.temp > 0.0f;
     }
 
     void add_token(const completion_token_output & token) {
@@ -948,6 +992,12 @@ private:
 
     common_speculative_init_result_ptr spec_init;
 
+    // POST /speculative: the launch configuration, its draft limit (the output buffers are sized for it) and the
+    // calibrated verify times of the cost-aware draft depth
+    common_params_speculative spec_params_launch;
+    int32_t                   spec_n_max_launch = 0;
+    std::vector<double>       spec_t_verify;
+
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
 
@@ -997,6 +1047,14 @@ private:
 
     int64_t t_last_load_progress_ms = 0;
 
+    int32_t tune_outputs = 0;     // outputs per ubatch that a tune request asked for at least (POST /tune/kld batches)
+    int64_t t_tune_warmup_us = 0; // the warmup of the last context that load_model() made
+
+    // POST /tune/context: a request waits for the running slots, and new tasks wait behind it
+    bool                         tune_pending = false;
+    std::unique_ptr<server_task> tune_task;
+    std::map<std::string, std::string> tune_env; // the environment that requests set (for GET /tune/context)
+
     // do the slots make context checkpoints at all
     bool ckpt_used() const {
         return params_base.n_ctx_checkpoints > 0 && (
@@ -1008,6 +1066,31 @@ private:
     // checkpoints at the ends of chat messages are made only where the slots make checkpoints at all
     int32_t ckpt_turn_step() const {
         return params_base.use_jinja && ckpt_used() ? params_base.ckpt_turn_step : 0;
+    }
+
+    // delphi: free everything that the context owns, the model stays (POST /tune/context); load_model(.., true) follows
+    void destroy_context() {
+        ckpt_async_sync();
+        if (ctx_tgt) {
+            llama_synchronize(ctx_tgt);
+        }
+        vram.free();
+        ckpt_spill.shutdown();
+
+        spec.reset();
+        slots.clear();
+        prompt_cache.reset();
+        batch.free();
+        spec_t_verify.clear();
+
+        if (spec_init) {
+            spec_init->free_context();
+        }
+        ctx_dft = nullptr;
+        if (llama_init) {
+            llama_init->free_context();
+        }
+        ctx_tgt = nullptr;
     }
 
     void destroy() {
@@ -1082,7 +1165,9 @@ private:
 
     // load the model and initialize llama_context
     // this may also be called to resume from sleeping state
-    bool load_model(common_params & params) {
+    // delphi: ctx_only keeps the model (and the draft model and the multimodal projector) and makes the contexts, the
+    // slots and the speculative state again, see destroy_context()
+    bool load_model(common_params & params, bool ctx_only = false) {
         load_progress_data load_progress_text  (this, "text_model");
         load_progress_data load_progress_mmproj(this, "mmproj_model");
         load_progress_data load_progress_spec  (this, "spec_model");
@@ -1091,7 +1176,7 @@ private:
 
         params_base = params;
         const auto output_limits = server_output_limits(params_base);
-        params_base.n_outputs_max = output_limits.total;
+        params_base.n_outputs_max = std::max<int32_t>(output_limits.total, tune_outputs);
         params_base.n_outputs_max_per_seq = output_limits.per_seq;
 
         const bool has_mmproj = !params.mmproj.path.empty();
@@ -1140,7 +1225,7 @@ private:
         }
 
         // optionally get the memory usage of mmproj
-        if (has_mmproj && params_base.fit_params) {
+        if (has_mmproj && params_base.fit_params && !ctx_only) {
             int64_t t_start = ggml_time_us();
             auto mmproj_mem = mtmd_get_memory_usage(mmproj_path.c_str(), mparams);
             int64_t t_elapsed = ggml_time_us() - t_start;
@@ -1175,7 +1260,14 @@ private:
             params_base.load_progress_callback_user_data = &load_progress_text;
         }
 
-        llama_init = common_init_from_params(params_base);
+        if (ctx_only) {
+            GGML_ASSERT(llama_init && llama_init->model());
+            if (!llama_init->recreate_context(params_base, &t_tune_warmup_us)) {
+                llama_init->free_context();
+            }
+        } else {
+            llama_init = common_init_from_params(params_base);
+        }
 
         model_tgt = llama_init->model();
         ctx_tgt   = llama_init->context();
@@ -1208,7 +1300,11 @@ private:
                 params_dft.load_progress_callback           = load_progress_callback;
                 params_dft.load_progress_callback_user_data = &load_progress_spec;
 
-                spec_init = common_speculative_init_from_params(params_dft, model_tgt, ctx_tgt);
+                if (ctx_only && spec_init) {
+                    spec_init->recreate_context(params_dft, model_tgt, ctx_tgt);
+                } else {
+                    spec_init = common_speculative_init_from_params(params_dft, model_tgt, ctx_tgt);
+                }
                 model_dft = spec_init->model();
                 ctx_dft   = spec_init->context();
 
@@ -1229,7 +1325,7 @@ private:
             load_progress_callback(1.0f, &load_progress_spec);
         }
 
-        if (has_mmproj) {
+        if (has_mmproj && !ctx_only) {
             if (callback_state) {
                 callback_state(SERVER_STATE_LOADING, {{"stage", "mmproj_model"}});
             }
@@ -1363,6 +1459,10 @@ private:
             return false;
         }
 
+        spec_params_launch = params_base.speculative;
+        spec_n_max_launch  = common_speculative_n_max(&params_base.speculative);
+        spec_calibrate();
+
         for (int i = 0; i < params_base.n_parallel; i++) {
             server_slot & slot = slots[i];
 
@@ -1380,6 +1480,7 @@ private:
 
             slot.callback_on_release = [this](int id_slot) {
                 queue_tasks.pop_deferred_task(id_slot);
+                tune_resume();
             };
 
             slot.callback_on_reset = [this](const server_slot & slot) {
@@ -1482,8 +1583,11 @@ private:
         params = params_base;
 
         if (!is_resume) {
-            const bool ok = init();
+            const bool ok = ctx_only ? true : init();
             if (ok) {
+                if (ctx_only) {
+                    init_vram();
+                }
                 // after the draft or MTP context and the slots hold their memory
                 llama_expert_cache_auto(ctx_tgt);
             }
@@ -1495,6 +1599,25 @@ private:
         }
 
         return true;
+    }
+
+    void init_vram() {
+        vram.init(ctx_tgt, ctx_dft, params_base.devices, model_name, [this]() { queue_tasks.wake(); }, [this]() {
+            // before the KV cache is freed: idle slots go to the host prompt cache (if any) and start empty
+            ckpt_async_sync();
+            for (auto & slot : slots) {
+                if (slot.is_processing() || slot.prompt.tokens.size() == 0) {
+                    continue;
+                }
+                if (prompt_cache) {
+                    slot.prompt_save(*prompt_cache);
+                }
+                slot.prompt_clear();
+            }
+            if (prompt_cache) {
+                prompt_cache->update();
+            }
+        });
     }
 
     // unlike load_model(), this is only called once during initialization
@@ -1517,22 +1640,7 @@ private:
         queue_tasks.on_idle_tick([this]() {
             vram.idle_tick();
         });
-        vram.init(ctx_tgt, ctx_dft, params_base.devices, model_name, [this]() { queue_tasks.wake(); }, [this]() {
-            // before the KV cache is freed: idle slots go to the host prompt cache (if any) and start empty
-            ckpt_async_sync();
-            for (auto & slot : slots) {
-                if (slot.is_processing() || slot.prompt.tokens.size() == 0) {
-                    continue;
-                }
-                if (prompt_cache) {
-                    slot.prompt_save(*prompt_cache);
-                }
-                slot.prompt_clear();
-            }
-            if (prompt_cache) {
-                prompt_cache->update();
-            }
-        });
+        init_vram();
 
         metrics.init();
 
@@ -1900,7 +2008,15 @@ private:
         // initialize samplers
         if (task.need_sampling()) {
             try {
-                slot.smpl.reset(common_sampler_init(model_tgt, task.params.sampling));
+                if (slot.smpl && common_sampler_params_reusable(slot.smpl_params, task.params.sampling)) {
+                    // no grammar or reasoning budget, so common_sampler_init() would not change backend_sampling either
+                    common_sampler_reset(slot.smpl.get());
+                } else {
+                    common_params_sampling params_in = task.params.sampling;
+                    llama_set_sampler(ctx_tgt, slot.id, nullptr); // the old object is freed next
+                    slot.smpl.reset(common_sampler_init(model_tgt, task.params.sampling));
+                    slot.smpl_params = std::move(params_in);
+                }
             } catch (std::exception & e) {
                 std::string err_msg = std::string("Failed to initialize samplers: ") + e.what();
                 send_error(task, err_msg, ERROR_TYPE_INVALID_REQUEST);
@@ -1931,6 +2047,7 @@ private:
                 slot.spec_synth_rng.seed(seed);
             }
         } else {
+            llama_set_sampler(ctx_tgt, slot.id, nullptr);
             slot.smpl.reset();
         }
 
@@ -2428,7 +2545,8 @@ private:
     // A full slot drops this checkpoint. With --ctx-checkpoints-spill-dir the data goes to the writer thread first, which takes it
     // out of the checkpoint. The caller has synced the async copy of the checkpoint.
     void ckpt_spill_put(server_slot & slot, common_prompt_checkpoint & ckpt) {
-        if (!ckpt_spill.enabled() || ckpt.empty()) {
+        // a prompt with media has no plain token list to key the file with
+        if (!ckpt_spill.enabled() || ckpt.empty() || slot.prompt.tokens.has_mtmd) {
             return;
         }
 
@@ -2455,7 +2573,7 @@ private:
     // and reads it into out. A file is usable under the rule of the search in memory, and if the prompt of the slot still starts with
     // the tokens that it was made for.
     bool ckpt_spill_load(server_slot & slot, llama_pos pos_next, llama_pos pos_min_thold, int64_t n_ram, common_prompt_checkpoint & out) {
-        if (!ckpt_spill.enabled()) {
+        if (!ckpt_spill.enabled() || slot.prompt.tokens.has_mtmd) {
             return false;
         }
 
@@ -2639,6 +2757,12 @@ private:
                     }
 
                     const int id_task = task.id;
+
+                    if (tune_pending) {
+                        // POST /tune/context waits for the running slots: no new work until it is done
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
 
                     server_slot * slot = get_available_slot(task);
 
@@ -2967,9 +3091,394 @@ private:
                     res->id = task.id;
                     queue_results.send(std::move(res));
                 } break;
+            case SERVER_TASK_TYPE_GET_SPEC:
+                {
+                    auto res = std::make_unique<server_task_result_spec>();
+                    res->id   = task.id;
+                    res->data = spec_to_json();
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_TUNE_GET:
+                {
+                    auto res = std::make_unique<server_task_result_tune>();
+                    res->id   = task.id;
+                    res->data = params_base.endpoint_tune ? server_tune_state(params_base, n_ctx, tune_env)
+                                                          : json { { "error", "not enabled" } };
+                    if (params_base.endpoint_tune) {
+                        res->data["n_outputs_max"] = tune_outputs;
+                    }
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_TUNE_SET:
+                {
+                    if (!params_base.endpoint_tune) {
+                        send_error(task, "the tune endpoints are off (--tune-endpoints)", ERROR_TYPE_NOT_SUPPORTED);
+                        break;
+                    }
+                    if (sleeping) {
+                        send_error(task, "the server sleeps", ERROR_TYPE_UNAVAILABLE);
+                        break;
+                    }
+                    if (any_slot_processing()) {
+                        // wait until every slot is idle; new tasks wait behind this one (see tune_resume())
+                        tune_pending = true;
+                        if (tune_task) {
+                            queue_tasks.defer(std::move(task));
+                        } else {
+                            tune_task = std::make_unique<server_task>(std::move(task));
+                        }
+                        break;
+                    }
+                    tune_context(task);
+                    tune_pending = false;
+                    queue_tasks.pop_deferred_all();
+                } break;
+            case SERVER_TASK_TYPE_TUNE_KLD:
+                {
+                    if (!params_base.endpoint_tune) {
+                        send_error(task, "the tune endpoints are off (--tune-endpoints)", ERROR_TYPE_NOT_SUPPORTED);
+                        break;
+                    }
+                    if (sleeping || !ctx_tgt) {
+                        send_error(task, "the server sleeps", ERROR_TYPE_UNAVAILABLE);
+                        break;
+                    }
+                    if (any_slot_processing() || tune_pending) {
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
+                    tune_kld(task);
+                } break;
+            case SERVER_TASK_TYPE_SET_SPEC:
+                {
+                    const bool busy = std::any_of(slots.begin(), slots.end(), [](const server_slot & slot) {
+                        return slot.is_processing();
+                    });
+                    if (busy) {
+                        // the speculative state is shared by the slots: wait until all of them are idle
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
+                    std::string err;
+                    if (!spec_reconfigure(task.spec_args, task.spec_calibrate, err)) {
+                        send_error(task, err, ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    auto res = std::make_unique<server_task_result_spec>();
+                    res->id   = task.id;
+                    res->data = spec_to_json();
+                    queue_results.send(std::move(res));
+                } break;
         }
 
         return true;
+    }
+
+    bool any_slot_processing() const {
+        return std::any_of(slots.begin(), slots.end(), [](const server_slot & slot) {
+            return slot.is_processing();
+        });
+    }
+
+    // POST /tune/kld: the text is the one of the base file; runs here, on the main loop, while every slot is idle
+    void tune_kld(server_task & task) {
+        const json & body = task.tune_body;
+        if (!body.is_object() || !body.contains("base_file") || !body.at("base_file").is_string()) {
+            send_error(task, "base_file is required", ERROR_TYPE_INVALID_REQUEST);
+            return;
+        }
+        const std::string base_file = body.at("base_file").get<std::string>();
+        int n_batch = 4;
+        if (body.contains("batch")) {
+            n_batch = body.at("batch").get<int>();
+        }
+        if (n_batch < 1) {
+            send_error(task, "batch must be at least 1", ERROR_TYPE_INVALID_REQUEST);
+            return;
+        }
+        if (body.contains("n_ctx") && body.at("n_ctx").get<int>() != 0) {
+            // the base file fixes the chunk size; a different value is a mistake of the caller
+            std::ifstream in(base_file, std::ios::binary);
+            char magic[8];
+            uint32_t n_ctx_file = 0;
+            if (in.read(magic, 8) && in.read((char *) &n_ctx_file, sizeof(n_ctx_file)) &&
+                (int) n_ctx_file != body.at("n_ctx").get<int>()) {
+                send_error(task, "n_ctx does not match the base file (" + std::to_string(n_ctx_file) + ")", ERROR_TYPE_INVALID_REQUEST);
+                return;
+            }
+        }
+        const int64_t t_start = ggml_time_us();
+        const int n_out_lim = params_base.n_outputs_max > 0 ? params_base.n_outputs_max : params_base.n_batch;
+        if (n_batch > n_out_lim) {
+            send_error(task, "batch " + std::to_string(n_batch) + " is above the output limit of the context (" +
+                       std::to_string(n_out_lim) + "); POST /tune/context with n_outputs_max >= batch first",
+                       ERROR_TYPE_INVALID_REQUEST);
+            return;
+        }
+        llama_kld_stats st;
+        llama_kld_compute(ctx_tgt, base_file, n_batch, st);
+        for (auto & slot : slots) {
+            slot.prompt_clear();
+        }
+        if (!st.ok) {
+            send_error(task, "kld: " + (st.error.empty() ? std::string("failed") : st.error), ERROR_TYPE_SERVER);
+            return;
+        }
+        auto res = std::make_unique<server_task_result_tune>();
+        res->id   = task.id;
+        res->data = json {
+            { "ok",               true },
+            { "kld",              st.kld },
+            { "kld_se",           st.kld_se },
+            { "ppl",              st.ppl },
+            { "ppl_se",           st.ppl_se },
+            { "ppl_base",         st.ppl_base },
+            { "log_ppl_ratio",    st.log_ppl_ratio },
+            { "log_ppl_ratio_se", st.log_ppl_ratio_se },
+            { "same_top",         st.same_top },
+            { "same_top_se",      st.same_top_se },
+            { "p_diff_rms",       st.p_diff_rms },
+            { "tokens",           (int64_t) st.count },
+            { "chunks",           st.n_chunk },
+            { "n_ctx",            st.n_ctx },
+            { "batch",            n_batch },
+            { "ms",               (ggml_time_us() - t_start) / 1000 },
+        };
+        queue_results.send(std::move(res));
+    }
+
+    // POST /tune/context: when the last slot is idle, run the request that waited for it
+    void tune_resume() {
+        if (tune_task && !any_slot_processing()) {
+            queue_tasks.post(std::move(*tune_task), true);
+            tune_task.reset();
+        }
+    }
+
+    // POST /tune/context: make the contexts again with new parameters, on the same weights. The slots are idle.
+    // On failure the old parameters come back; if that fails too, the process exits (the tuner records a crash).
+    void tune_context(server_task & task) {
+        server_tune_request req;
+        std::string err;
+        if (!server_tune_parse(task.tune_body, req, err)) {
+            send_error(task, err, ERROR_TYPE_INVALID_REQUEST);
+            return;
+        }
+        common_params params_new;
+        if (!server_tune_apply(params_base, n_ctx, req, params_new, err)) {
+            send_error(task, err, ERROR_TYPE_INVALID_REQUEST);
+            return;
+        }
+
+        SRV_INF("tune: making the context again: ubatch %d, batch %d, ctx %d, threads %d/%d, %zu env, %zu spec args\n",
+                params_new.n_ubatch, params_new.n_batch, params_new.n_ctx, params_new.cpuparams.n_threads,
+                params_new.cpuparams_batch.n_threads, req.env.size(), req.spec_args.size());
+
+        const common_params params_old = params_base;
+        const int32_t       n_ctx_old  = n_ctx;
+        const auto          tune_env_old = tune_env;
+        const int32_t       tune_outputs_old = tune_outputs;
+
+        const int64_t t_start = ggml_time_us();
+        if (req.n_outputs_max >= 0) {
+            tune_outputs = req.n_outputs_max;
+        }
+        auto env_prev = server_tune_env_set(req.env);
+        for (const auto & [name, val] : req.env) {
+            if (val) {
+                tune_env[name] = *val;
+            } else {
+                tune_env.erase(name);
+            }
+        }
+
+        destroy_context();
+        t_tune_warmup_us = 0;
+        bool ok = false;
+        try {
+            common_params p = params_new;
+            ok = load_model(p, true);
+        } catch (const std::exception & e) {
+            SRV_ERR("tune: the new context failed: %s\n", e.what());
+        }
+        if (!ok) {
+            SRV_ERR("%s", "tune: the new context failed, going back to the old parameters\n");
+            server_tune_env_restore(env_prev);
+            tune_env = tune_env_old;
+            tune_outputs = tune_outputs_old;
+            destroy_context();
+            bool ok_old = false;
+            try {
+                common_params p = params_old;
+                ok_old = load_model(p, true);
+            } catch (const std::exception & e) {
+                SRV_ERR("tune: the old context failed: %s\n", e.what());
+            }
+            if (!ok_old) {
+                SRV_ERR("%s", "tune: the old context cannot be made again, exiting\n");
+                fflush(nullptr);
+                _exit(1);
+            }
+            n_ctx = n_ctx_old;
+            send_error(task, "the new context could not be made (out of memory?); the old parameters are active", ERROR_TYPE_SERVER);
+            return;
+        }
+
+        const int64_t t_total = ggml_time_us() - t_start;
+        auto res = std::make_unique<server_task_result_tune>();
+        res->id   = task.id;
+        res->data = server_tune_state(params_base, n_ctx, tune_env);
+        res->data["n_outputs_max"] = tune_outputs;
+        res->data["ok"]        = true;
+        res->data["load_ms"]   = (t_total - t_tune_warmup_us) / 1000.0;
+        res->data["warmup_ms"] = t_tune_warmup_us / 1000.0;
+        queue_results.send(std::move(res));
+        SRV_INF("tune: done in %.1f s (warmup %.1f s)\n", t_total / 1e6, t_tune_warmup_us / 1e6);
+    }
+
+    // measure the verify time by rows for the cost-aware draft depth; the slots must be idle
+    void spec_calibrate(bool force = false) {
+        const int32_t n_width = common_speculative_cost_width(spec.get());
+        if (n_width <= 0) {
+            return;
+        }
+        if (force || (int32_t) spec_t_verify.size() <= n_width) {
+            std::vector<double> t = common_speculative_calibrate(ctx_tgt, slots.empty() ? 0 : slots[0].id,
+                                                                 std::min(n_width, std::max(1, spec_n_max_launch + 1)));
+            if (!t.empty()) {
+                spec_t_verify = std::move(t);
+            }
+        }
+        common_speculative_set_verify_times(spec.get(), spec_t_verify);
+    }
+
+    // replace the speculative state with the launch configuration plus args; the models, the contexts and the draft
+    // context stay; the slots must be idle (their cached prompts are dropped: the draft state of a prompt belongs to
+    // the old configuration)
+    bool spec_reconfigure(const std::vector<std::string> & args, bool calibrate, std::string & err) {
+        if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+            err = "speculative decoding is not supported by this context";
+            return false;
+        }
+
+        common_params params = params_base;
+        params.speculative = spec_params_launch;
+        try {
+            common_params_apply_spec_args(params, LLAMA_EXAMPLE_SERVER, args);
+            common_speculative_params_resolve(params.speculative);
+        } catch (const std::exception & e) {
+            err = e.what();
+            return false;
+        }
+
+        auto & sp = params.speculative;
+        const bool draft_type = std::any_of(sp.types.begin(), sp.types.end(), [](common_speculative_type t) {
+            return t == COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 ||
+                   t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP    || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH ||
+                   t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+        });
+        if (draft_type && ctx_dft == nullptr) {
+            err = "a draft-model type needs the draft context of the launch (start the server with it)";
+            return false;
+        }
+        const int32_t n_max = common_speculative_n_max(&sp);
+        if (n_max > spec_n_max_launch) {
+            err = string_format("the largest draft (%d) exceeds that of the launch (%d), which sized the output buffers",
+                                n_max, spec_n_max_launch);
+            return false;
+        }
+        sp.draft.ctx_tgt = ctx_tgt;
+        sp.draft.ctx_dft = ctx_dft;
+
+        for (auto & slot : slots) {
+            slot.prompt_clear();
+            slot.spec_ckpt.clear();
+            slot.n_accepted_per_pos.clear();
+        }
+        if (prompt_cache) {
+            prompt_cache->states.clear();
+        }
+
+        // the old state goes first: both would register the same draft context for the asynchronous ingest
+        // (init enables the target's feature hand-off again when the new state ingests asynchronously)
+        spec.reset();
+        llama_set_feature_handoff(ctx_tgt, false);
+        try {
+            spec.reset(common_speculative_init(sp, params_base.n_parallel));
+        } catch (const std::exception & e) {
+            err = e.what();
+        }
+        if (!err.empty()) {
+            spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
+        } else {
+            params_base.speculative = sp;
+        }
+        for (auto & slot : slots) {
+            slot.spec = spec.get();
+        }
+        if (!err.empty()) {
+            return false;
+        }
+
+        spec_calibrate(calibrate);
+
+        SRV_INF("speculative decoding reconfigured: types = %s, n_max = %d, adaptive = %s\n",
+                common_speculative_type_name_str(sp.types).c_str(), n_max,
+                !sp.draft.adaptive ? "off" : sp.draft.adaptive_mode == COMMON_SPECULATIVE_ADAPTIVE_COST ? "cost" :
+                    sp.draft.adaptive_mode == COMMON_SPECULATIVE_ADAPTIVE_CONF ? "conf" : "bucket");
+        return true;
+    }
+
+    json spec_to_json() const {
+        const auto & sp = params_base.speculative;
+        json impls = json::array();
+        for (const auto & info : common_speculative_get_info(spec.get())) {
+            json j = {
+                {"type",             info.type},
+                {"n_max",            info.n_max},
+                {"adaptive",         info.adaptive},
+                {"n_min_adaptive",   info.n_min_adaptive},
+                {"n_gen_drafts",     info.n_gen_drafts},
+                {"n_acc_drafts",     info.n_acc_drafts},
+                {"n_gen_tokens",     info.n_gen_tokens},
+                {"n_acc_tokens",     info.n_acc_tokens},
+                {"n_verify",         info.n_call_accept},
+                {"acc_rate_per_pos", info.acc_rate_per_pos},
+                {"depth",            info.depth},
+            };
+            if (info.adaptive == "cost") {
+                j["cost"] = {
+                    {"t_verify_ms", info.t_verify_ms},
+                    {"t_round_ms",  info.t_round_ms},
+                    {"n_round",     info.n_round},
+                    {"t_step_ms",   info.t_step_ms},
+                    {"t_switch_ms", info.t_switch_ms},
+                    {"accept_rate", info.accept_rate},
+                };
+            }
+            if (info.adaptive == "conf") {
+                j["conf"] = {
+                    {"t_verify_ms", info.t_verify_ms},
+                    {"t_step_ms",   info.t_step_ms},
+                    {"rate",        info.conf_rate},
+                    {"cal",         info.conf_cal},
+                    {"trials",      info.conf_trials},
+                };
+            }
+            impls.push_back(std::move(j));
+        }
+        return json {
+            {"types",         common_speculative_type_name_str(sp.types)},
+            {"n_max",         common_speculative_n_max(&sp)},
+            {"n_max_launch",  spec_n_max_launch},
+            {"adaptive",      !sp.draft.adaptive ? "off" : sp.draft.adaptive_mode == COMMON_SPECULATIVE_ADAPTIVE_COST ? "cost" :
+                    sp.draft.adaptive_mode == COMMON_SPECULATIVE_ADAPTIVE_CONF ? "conf" : "bucket"},
+            {"p_min",         sp.draft.p_min},
+            {"draft_sampling", sp.draft.probabilistic ? "probabilistic" : "greedy"},
+            {"draft_context", ctx_dft != nullptr},
+            {"n_graph_built", {{"target", ctx_tgt ? llama_graph_n_built(ctx_tgt) : 0}, {"draft", ctx_dft ? llama_graph_n_built(ctx_dft) : 0}}},
+            {"impls",         impls},
+        };
     }
 
     void iterate(std::vector<server_slot> & slots, std::function<void(server_slot &)> callback) {
@@ -3264,6 +3773,9 @@ private:
                 if (n_draft_max > 0) {
                     GGML_ASSERT(slot.can_speculate());
 
+                    // stale candidates: a replay never reads them, a new draft refills them
+                    slot.spec_draft_q.clear();
+
                     if (!slot.spec_draft.empty()) {
                         // we have a previous (partial) draft to reuse
                         if (use_ckpt_tgt) {
@@ -3283,6 +3795,8 @@ private:
 
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
 
+                        const bool spec_reject = slot.use_spec_rejection();
+
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
                             /* .drafting = */ true,
                             /* .n_max    = */ n_draft_max,
@@ -3290,6 +3804,9 @@ private:
                             /* .id_last  = */ slot.sampled,
                             /* .prompt   = */ &slot.spec_prompt,
                             /* .result   = */ &slot.spec_draft,
+                            /* .result_q = */ spec_reject ? &slot.spec_draft_q : nullptr,
+                            /* .temp     = */ slot.task->params.sampling.temp,
+                            /* .seed     = */ slot.task->params.sampling.seed,
                         };
 
                         drafting.push_back(&slot);
@@ -4230,12 +4747,25 @@ private:
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
+                GGML_ASSERT(slot.spec_draft_q.empty() || (slot.spec_draft_q.size() == slot.spec_draft.size()));
                 const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
-                auto accepted = synth_probs.empty()
-                    ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft)
-                    : server_sample_and_accept_synth(
+
+                // drafters that fill no distribution fall back here
+                const bool use_rejection = slot.use_spec_rejection() && !slot.spec_draft_q.empty();
+
+                std::vector<llama_token> accepted;
+                if (!synth_probs.empty()) {
+                    // synthetic acceptance replaces verification entirely, so it comes first
+                    accepted = server_sample_and_accept_synth(
                             slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
                             synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
+                } else if (slot.spec_is_replay && slot.use_spec_rejection()) {
+                    accepted = server_accept_replay(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                } else if (use_rejection) {
+                    accepted = common_sampler_sample_and_accept_n_rejection(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, slot.spec_draft_q);
+                } else {
+                    accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                }
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
@@ -4281,7 +4811,7 @@ private:
                     SLT_INF(slot, "accepted %2zu/%2zu draft tokens\n", accepted.size() - 1, n_draft);
                 }
 
-                common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
+                common_speculative_accept(spec.get(), slot.id, accepted.size() - 1, accepted.back());
 
                 common_spec_ledger_span(COMMON_SPEC_LEDGER_ACCEPT, t_accept, (uint32_t) n_draft, (uint32_t) (accepted.size() - 1));
                 if (common_spec_ledger_on()) {
@@ -4644,7 +5174,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         std::vector<server_turn_boundary> turn_bounds;
         if (inputs.size() == 1 && prompt.is_string() && files.empty() && params.ckpt_turn_step > 0) {
             turn_bounds = server_turn_boundaries(data, ctx_server.vocab, prompt.get<std::string>(),
-                                                 inputs[0].get_tokens(), params.ckpt_turn_step);
+                                                 inputs[0].get_text_tokens(), params.ckpt_turn_step);
             SRV_DBG("turn checkpoint boundaries: %zu\n", turn_bounds.size());
         }
 
@@ -5594,6 +6124,94 @@ void server_routes::init_routes() {
         GGML_ASSERT(dynamic_cast<server_task_result_get_lora*>(result.get()) != nullptr);
         res->ok(result->to_json());
         return res;
+    };
+
+    this->get_speculative = [this](const server_http_req & req) {
+        auto res = create_response();
+        auto & rd = res->rd;
+        {
+            server_task task(SERVER_TASK_TYPE_GET_SPEC);
+            task.id = rd.get_new_id();
+            rd.post_task(std::move(task));
+        }
+        auto result = rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+        res->ok(result->to_json());
+        return res;
+    };
+
+    // body: {"args": ["--spec-draft-n-max", "5", ...], "calibrate": false}; the args apply over the launch
+    // configuration (an empty list restores it); waits until every slot is idle
+    this->post_speculative = [this](const server_http_req & req) {
+        auto res = create_response();
+        const json body = json::parse(req.body);
+        if (!body.is_object()) {
+            res->error(format_error_response("Request body must be an object", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        std::vector<std::string> args;
+        for (const auto & a : body.value("args", json::array())) {
+            args.push_back(a.is_string() ? a.get<std::string>() : a.dump());
+        }
+
+        auto & rd = res->rd;
+        {
+            server_task task(SERVER_TASK_TYPE_SET_SPEC);
+            task.id             = rd.get_new_id();
+            task.spec_args      = std::move(args);
+            task.spec_calibrate = body.value("calibrate", false);
+            rd.post_task(std::move(task));
+        }
+        auto result = rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+        res->ok(result->to_json());
+        return res;
+    };
+
+    // delphi: auto-tuner hooks (--tune-endpoints), see server-tune.h
+    auto tune_request = [this](server_task_type type, const json & body, const server_http_req & req) {
+        auto res = create_response();
+        auto & rd = res->rd;
+        {
+            server_task task(type);
+            task.id        = rd.get_new_id();
+            task.tune_body = body;
+            rd.post_task(std::move(task));
+        }
+        auto result = rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+        res->ok(result->to_json());
+        return res;
+    };
+    this->get_tune_context = [tune_request](const server_http_req & req) {
+        return tune_request(SERVER_TASK_TYPE_TUNE_GET, json::object(), req);
+    };
+    this->post_tune_context = [tune_request](const server_http_req & req) {
+        return tune_request(SERVER_TASK_TYPE_TUNE_SET, json::parse(req.body), req);
+    };
+    this->post_tune_kld = [tune_request](const server_http_req & req) {
+        return tune_request(SERVER_TASK_TYPE_TUNE_KLD, json::parse(req.body), req);
     };
 
     this->post_lora_adapters = [this](const server_http_req & req) {

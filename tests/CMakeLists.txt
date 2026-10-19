@@ -118,6 +118,7 @@ endfunction()
 
 llama_build_and_test(test-quant-rules.cpp)
 llama_build_and_test(test-speculative-adaptive.cpp)
+llama_build_and_test(test-speculative-cost.cpp)
 
 if (LLAMA_BUILD_TOOLS)
     llama_build_and_test(test-quant-damage.cpp)
@@ -328,6 +329,7 @@ llama_build(test-backend-ops.cpp)
 
 # Grouped routed-MoE schedule: host builder, device builders and grouped reference execution.
 llama_build_and_test(test-moe-schedule.cpp)
+llama_build_and_test(test-moe-prefill.cpp)
 llama_build_and_test(test-offload-cost.cpp)
 
 # Logits of a model over a mixed prefill/decode sequence, saved or compared with another run (needs a model: build only).
@@ -374,6 +376,8 @@ if (NOT GGML_BACKEND_DL)
     # these tests use the backends directly and cannot be built with dynamic loading
     llama_build_and_test(test-barrier.cpp)
     llama_build_and_test(test-quantize-fns.cpp)
+    llama_build_and_test(test-quantize-q8-k.cpp LABEL "quant")
+    target_include_directories(test-quantize-q8-k PRIVATE ../ggml/src)
     llama_build_and_test(test-row-meta.cpp)
     llama_build_and_test(test-quantize-perf.cpp)
     llama_build_and_test(test-rope.cpp)

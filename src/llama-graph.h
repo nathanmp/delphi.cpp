@@ -959,6 +959,9 @@ public:
     // return true if the graph was updated and can be reused
     bool can_reuse(const llm_graph_params & params);
 
+    // diagnostic: why can_reuse() fails ("params" or the type of the first input that refuses), nullptr if it does not
+    std::string reuse_fail_reason(const llm_graph_params & params);
+
     // the graph was built for parameters of the same topology; its inputs may no longer match them
     bool same_topology(const llm_graph_params & params) const { return this->params.allow_reuse(params); }
 
@@ -1176,7 +1179,9 @@ struct llm_graph_context {
              ggml_tensor * up_exps_s = nullptr,
              ggml_tensor * gate_exps_s = nullptr,
              ggml_tensor * down_exps_s = nullptr,
-             ggml_tensor * selected_experts_in = nullptr) const;
+             ggml_tensor * selected_experts_in = nullptr,
+             ggml_tensor * post_exp_norm = nullptr,
+                   float   post_exp_norm_eps = 1e-5f) const;
 
     ggml_tensor * build_moe_ffn(
              ggml_tensor * cur,
@@ -1202,7 +1207,9 @@ struct llm_graph_context {
              ggml_tensor * up_exps_s = nullptr,
              ggml_tensor * gate_exps_s = nullptr,
              ggml_tensor * down_exps_s = nullptr,
-             ggml_tensor * selected_experts_in = nullptr) const;
+             ggml_tensor * selected_experts_in = nullptr,
+             ggml_tensor * post_exp_norm = nullptr,
+                   float   post_exp_norm_eps = 1e-5f) const;
 
     // routed experts with hot experts in the GPU expert cache (LLAMA_MOE_CACHE_MIB), see build_moe_ffn;
     // limit > 0: clipped SwiGLU (ggml_swiglu_clamp)

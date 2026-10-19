@@ -2,6 +2,7 @@
 
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -26,6 +27,14 @@ struct llama_expert_cache {
     // Most rows of a batch that runs the cache graph. LLAMA_MOE_CACHE_PROMPT_ROWS raises it above max_rows, so that prompt
     // batches the CPU runs (below GGML_SCHED_STAGE_MIN_TOKENS) also run their hot experts on the GPU beside the CPU part.
     int64_t graph_rows() const { return std::max(max_rows, prompt_rows); }
+    bool prefill_enabled(int64_t rows) const { return rows >= prefill_min_rows && rows <= prefill_max_rows; }
+    bool prefill_staging(int64_t rows, int il) const;
+    ggml_tensor * prefill_bank(int il, int p) const;
+    ggml_tensor * prefill_route(int il) const;
+    // The plan starts selected uploads. The second CPU op waits, or preserves a split boundary for the submission worker.
+    ggml_tensor * build_prefill_ready(ggml_context * ctx, ggml_tensor * plan, int il);
+    bool prefill_overlap() const;
+    static bool prefill_worker_ready(const ggml_cgraph * graph, bool ask, void * userdata);
     // run-time tiers; each adds a partial expert pass per layer to the graph
     static constexpr int max_tiers = 8;
 
@@ -42,7 +51,8 @@ struct llama_expert_cache {
         int64_t rows = 0;
     };
 
-    static std::unique_ptr<llama_expert_cache> create(const llama_model & model, const std::vector<ggml_backend_ptr> & backends);
+    static std::unique_ptr<llama_expert_cache> create(const llama_model & model, const std::vector<ggml_backend_ptr> & backends,
+            bool allow_prefill_overlap);
     // LLAMA_MOE_CACHE_MIB unset or "auto" (and no LLAMA_MOE_CACHE_SHARED): the cache is on when the model allows it, and its
     // tiers are sized from the free memory of the GPUs at the first decode (llama_context::expert_cache_auto). An unsupported
     // model then gets no cache instead of an error.
@@ -84,6 +94,10 @@ struct llama_expert_cache {
     ggml_tensor * build_cold_ids(ggml_context * ctx, ggml_tensor * ids, int il);
     // CPU op: records the routed ids (I32 [top_k, n_tokens]) of a batch that does not use the arena. Null if not recorded.
     ggml_tensor * build_record(ggml_context * ctx, ggml_tensor * ids, int il);
+    // CPU op: the sum over the expert slots of experts (F32 [n_embd, top_k, n_tokens]) times weights (F32 [1, top_k, n_tokens]),
+    // F32 [n_embd, n_tokens]. The same sums in the same order as ggml_mul and a chain of ggml_add, in one op (one thread barrier
+    // instead of top_k)
+    static ggml_tensor * build_weighted_sum(ggml_context * ctx, ggml_tensor * experts, ggml_tensor * weights);
 
     // Call before each decoded batch while no graph is running. True at the first small batch after a prompt (or after a tier
     // was added): then the caller synchronizes, reclaims lent staging slots from every scheduler, and calls refresh(). Other
@@ -129,6 +143,15 @@ private:
     void forget(const tier & t) const;
     static void op_cold_ids(ggml_tensor * dst, int ith, int nth, void * userdata);
     static void op_record(ggml_tensor * dst, int ith, int nth, void * userdata);
+    static void op_prefill_plan(ggml_tensor * dst, int ith, int nth, void * userdata);
+    static void op_prefill_ready(ggml_tensor * dst, int ith, int nth, void * userdata);
+    static void op_weighted_sum(ggml_tensor * dst, int ith, int nth, void * userdata);
+
+    struct prefill_share;
+    std::unique_ptr<prefill_share> prefill;
+    int64_t prefill_min_rows = 512; // LLAMA_MOE_PREFILL_MIN_ROWS
+    int64_t prefill_max_rows = 0; // LLAMA_MOE_PREFILL_SHARE, LLAMA_MOE_PREFILL_MAX_ROWS
+    void init_prefill(uint32_t min_reuse, bool gpu_only, bool allow_overlap);
 
     const llama_model * model = nullptr;
     ggml_backend_t gpu = nullptr;

@@ -2,6 +2,9 @@
 #include "llama-model.h"
 #include "llama-impl.h"
 #include "ggml-alloc.h"
+#include "ggml-cpuset.h"
+#include "ggml-stage-copy.h"
+#include "llama-moe-prefill.h"
 
 #include <algorithm>
 #include <array>
@@ -16,11 +19,276 @@
 #include <mutex>
 #include <thread>
 #include <tuple>
+#include <limits>
 
 #ifdef __linux__
 #include <pthread.h>
 #include <sched.h>
 #endif
+
+static std::vector<int> local_cpus(ggml_backend_dev_t dev);
+static void pin_thread(const std::vector<int> & cpus);
+
+struct llama_expert_cache::prefill_share {
+    static constexpr int n_bounce = 4;
+    ggml_backend_t gpu = nullptr;
+    ggml_backend_ptr copy;
+    ggml_context_ptr ctx;
+    ggml_backend_buffer_ptr buffer, host;
+    std::vector<std::array<ggml_tensor *, 3>> banks;
+    std::vector<ggml_tensor *> routes;
+    std::vector<size_t> capacity;
+    uint32_t min_reuse = 1;
+    bool gpu_only = false;
+    bool overlap = false;
+    size_t stride = 0;
+    size_t ids_offset = 0, host_size = 0;
+    void (*upload)(ggml_backend_t, void *, const void *, size_t, ggml_backend_event_t) = nullptr;
+    size_t (*pack_unit)(ggml_backend_t, const ggml_tensor *) = nullptr;
+    ggml_backend_stage_pack_host_t pack_host = nullptr;
+    void (*upload_packed)(ggml_backend_t, const ggml_tensor *, void *, size_t, const void *, size_t, bool,
+                         ggml_backend_event_t, ggml_backend_event_t) = nullptr;
+    void (*prepare)(ggml_backend_t, ggml_tensor *) = nullptr;
+    void (*forget)(ggml_backend_t, const ggml_tensor *) = nullptr;
+    ggml_backend_event_t done[n_bounce] = {};
+    bool recorded[n_bounce] = {};
+    ggml_backend_event_t route_done = nullptr;
+    bool route_recorded = false;
+    ggml_tensor * route = nullptr;
+    size_t route_bytes = 0;
+    uint64_t current_cpu_groups = 0;
+    int next = 0, last = -1;
+    ggml_backend_sched_stage_copier copier;
+    std::thread worker;
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool stop = false, queued = false;
+    struct slab { const ggml_tensor * src; ggml_tensor * bank; int expert, slot; };
+    std::vector<slab> slabs;
+    int64_t copy_us = 0, wait_us = 0;
+    uint64_t bytes = 0, batches = 0, cpu_groups = 0, gpu_groups = 0;
+    FILE * trace = nullptr;
+
+    void run(const std::vector<int> & cpus) {
+        pin_thread(cpus);
+        for (;;) {
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                cv.wait(lock, [&] { return stop || queued; });
+                if (stop) { return; }
+            }
+            last = -1;
+            for (const auto & s : slabs) {
+                const int b = next;
+                next = (next + 1) % n_bounce;
+                // DMA is the last reader of these pinned bytes. The record is issued before the next reuse.
+                if (recorded[b]) { ggml_backend_event_synchronize(done[b]); }
+                void * dst = static_cast<char *>(ggml_backend_buffer_get_base(host.get())) + b * stride;
+                const void * src = static_cast<const char *>(s.src->data) + s.expert * s.src->nb[2];
+                const bool packed = pack_host && upload_packed && pack_unit && pack_unit(copy.get(), s.bank) > 0;
+                const int64_t start = ggml_time_us();
+                copier.run(dst, src, s.src->nb[2], packed ? pack_host : nullptr, s.bank);
+                copy_us += ggml_time_us() - start;
+                if (packed) {
+                    upload_packed(copy.get(), s.bank, s.bank->data, s.slot * s.bank->nb[2], dst, s.bank->nb[2],
+                            true, nullptr, done[b]);
+                } else {
+                    upload(copy.get(), static_cast<char *>(s.bank->data) + s.slot * s.bank->nb[2], dst, s.bank->nb[2], done[b]);
+                }
+                recorded[b] = true;
+                last = b;
+            }
+            if (overlap) {
+                // One stream orders all bank uploads and the route table. Publish only after its event record exists.
+                const void * ids = static_cast<char *>(ggml_backend_buffer_get_base(host.get())) + ids_offset;
+                upload(copy.get(), route->data, ids, route_bytes, route_done);
+                route_recorded = true;
+            }
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                queued = false;
+            }
+            cv.notify_all();
+        }
+    }
+
+    void wait() {
+        const int64_t start = ggml_time_us();
+        std::unique_lock<std::mutex> lock(mutex);
+        cv.wait(lock, [&] { return !queued; });
+        wait_us += ggml_time_us() - start;
+    }
+
+    ~prefill_share() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stop = true;
+        }
+        cv.notify_all();
+        if (worker.joinable()) { worker.join(); }
+        if (gpu && buffer) { ggml_backend_synchronize(gpu); }
+        for (int b = 0; b < n_bounce; ++b) {
+            if (recorded[b]) { ggml_backend_event_synchronize(done[b]); }
+            ggml_backend_event_free(done[b]);
+        }
+        if (route_recorded) { ggml_backend_event_synchronize(route_done); }
+        ggml_backend_event_free(route_done);
+        if (forget) { for (auto & group : banks) { for (auto * bank : group) { if (bank) { forget(gpu, bank); } } } }
+        if (trace) { fclose(trace); }
+        if (batches) {
+            LLAMA_LOG_WARN("moe-prefill: %llu batches, %llu CPU groups, %llu transient groups, %.3f GiB uploaded; copy/pack %.1f ms, issue wait %.1f ms\n",
+                    (unsigned long long) batches, (unsigned long long) cpu_groups, (unsigned long long) gpu_groups,
+                    bytes / double(1ULL << 30), copy_us / 1000.0, wait_us / 1000.0);
+        }
+    }
+};
+
+void llama_expert_cache::init_prefill(uint32_t min_reuse, bool gpu_only, bool allow_overlap) {
+    if (min_reuse == std::numeric_limits<uint32_t>::max()) { return; }
+    auto s = std::make_unique<prefill_share>();
+    s->gpu = gpu;
+    s->min_reuse = min_reuse;
+    s->gpu_only = gpu_only;
+    // Overlap is on by default; set LLAMA_MOE_PREFILL_OVERLAP=0 to disable it.
+    const char * overlap_env = getenv("LLAMA_MOE_PREFILL_OVERLAP");
+    const bool requested = allow_overlap && (!overlap_env || atoi(overlap_env) != 0);
+    // The GPU endpoint has no cold CPU work to overlap. Keep its original readiness and submission path.
+    s->overlap = requested && !gpu_only;
+    const auto dev = ggml_backend_get_device(gpu);
+    const auto reg = ggml_backend_dev_backend_reg(dev);
+    ggml_backend_dev_props props = {};
+    ggml_backend_dev_get_props(dev, &props);
+    s->upload = (decltype(s->upload)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_stage_upload");
+    if (!s->upload || !props.caps.events || !props.caps.host_buffer) {
+        LLAMA_LOG_WARN("moe-prefill: staging unavailable on %s; cold experts stay on CPU\n", ggml_backend_name(gpu));
+        return;
+    }
+    s->pack_unit = (decltype(s->pack_unit)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_stage_pack_unit");
+    s->pack_host = (decltype(s->pack_host)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_stage_pack_host");
+    s->upload_packed = (decltype(s->upload_packed)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_stage_upload_packed");
+    s->prepare = (decltype(s->prepare)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_stage_prepare");
+    s->forget = (decltype(s->forget)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_moe_int4_forget_inside");
+    auto env_int = [](const char * name, int64_t fallback) { const char * e = getenv(name); return e ? std::max<int64_t>(0, atoll(e)) : fallback; };
+    const size_t budget = size_t(env_int("LLAMA_MOE_PREFILL_MIB", 1536)) << 20;
+    const size_t slots = std::min<size_t>(n_expert, env_int("LLAMA_MOE_PREFILL_SLOTS", 64));
+    const size_t n_groups = group_types.size();
+    s->ctx.reset(ggml_init({(12 * n_groups + layers.size()) * ggml_tensor_overhead(), nullptr, true}));
+    s->banks.resize(n_groups, {});
+    s->capacity.resize(n_groups, 0);
+    for (size_t g = 0; g < n_groups; ++g) {
+        const size_t n = std::min(slots, budget / n_groups / group_bytes[g]);
+        // Keep the expert dimension explicit instead of allocating a matrix-shaped singleton bank.
+        if (n < 2) { continue; }
+        // The GPU endpoint must fit any route. Reject it before graph construction so its fallback is the complete CPU graph.
+        if (gpu_only && n < size_t(n_expert)) { continue; }
+        bool supported = true;
+        std::array<ggml_tensor *, 3> banks;
+        for (int p = 0; p < 3; ++p) {
+            banks[p] = ggml_new_tensor_3d(s->ctx.get(), group_types[g][p], shape[p]->ne[0], shape[p]->ne[1], n);
+            ggml_set_name(banks[p], ("moe_prefill_" + std::to_string(g) + "_" + std::to_string(p)).c_str());
+            auto * x = ggml_new_tensor_3d(s->ctx.get(), GGML_TYPE_F32, banks[p]->ne[0], 1, 1);
+            auto * ids = ggml_new_tensor_2d(s->ctx.get(), GGML_TYPE_I32, 1, 1);
+            supported &= ggml_backend_supports_op(gpu, ggml_mul_mat_id_partial(s->ctx.get(), banks[p], x, ids));
+        }
+        if (supported) { s->banks[g] = banks; s->capacity[g] = n; }
+    }
+    // Probe tensors share the metadata context but have no data consumers. Allocate only the banks.
+    size_t allocated = 0;
+    const auto buft = ggml_backend_get_default_buffer_type(gpu);
+    const size_t alignment = ggml_backend_buft_get_alignment(buft);
+    for (auto & banks : s->banks) {
+        for (auto * bank : banks) { if (bank) { allocated += ggml_backend_buft_get_alloc_size(buft, bank) + alignment; } }
+    }
+    if (!allocated) { LLAMA_LOG_WARN("moe-prefill: no supported bank fits the budget; cold experts stay on CPU\n"); return; }
+    size_t ids_bytes = 0;
+    s->routes.resize(layers.size(), nullptr);
+    for (const auto & l : layers) {
+        if (!l.owner || !s->capacity[l.group]) { continue; }
+        auto * ids = ggml_new_tensor_2d(s->ctx.get(), GGML_TYPE_I32, model->hparams.n_expert_used(l.il), prefill_max_rows);
+        s->routes[l.il] = ids;
+        allocated += ggml_backend_buft_get_alloc_size(buft, ids) + alignment;
+        ids_bytes = std::max(ids_bytes, ggml_nbytes(ids));
+    }
+    s->buffer.reset(ggml_backend_buft_alloc_buffer(ggml_backend_get_default_buffer_type(gpu), allocated));
+    s->stride = max_slab();
+    s->ids_offset = (prefill_share::n_bounce * s->stride + 63) & ~size_t(63);
+    s->host_size = s->ids_offset + ids_bytes;
+    auto cpus = local_cpus(dev);
+    std::thread([&] {
+        pin_thread(cpus);
+        s->host.reset(ggml_backend_buft_alloc_buffer(ggml_backend_dev_host_buffer_type(dev), s->host_size));
+        if (s->host) { memset(ggml_backend_buffer_get_base(s->host.get()), 0, s->host_size); }
+    }).join();
+    s->copy.reset(ggml_backend_dev_init(dev, nullptr));
+    if (!s->buffer || !s->host || !s->copy) {
+        LLAMA_LOG_WARN("moe-prefill: scratch allocation failed; cold experts stay on CPU\n");
+        return;
+    }
+    ggml_backend_buffer_set_usage(s->buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    ggml_backend_buffer_clear(s->buffer.get(), 0);
+    auto alloc = ggml_tallocr_new(s->buffer.get());
+    for (auto & banks : s->banks) { for (auto * bank : banks) { if (bank) { GGML_ASSERT(ggml_tallocr_alloc(&alloc, bank) == GGML_STATUS_SUCCESS); } } }
+    for (auto * ids : s->routes) { if (ids) { GGML_ASSERT(ggml_tallocr_alloc(&alloc, ids) == GGML_STATUS_SUCCESS); } }
+    for (int b = 0; b < prefill_share::n_bounce; ++b) {
+        s->done[b] = ggml_backend_event_new(dev);
+        if (!s->done[b]) { LLAMA_LOG_WARN("moe-prefill: cannot allocate events; cold experts stay on CPU\n"); return; }
+    }
+    if (s->overlap) {
+        s->route_done = ggml_backend_event_new(dev);
+        if (!s->route_done) { LLAMA_LOG_WARN("moe-prefill: cannot allocate route event; cold experts stay on CPU\n"); return; }
+    }
+    if (const char * path = getenv("LLAMA_MOE_PREFILL_TRACE"); path && *path) {
+        s->trace = fopen(path, "a");
+        if (!s->trace) { throw std::runtime_error("cannot open LLAMA_MOE_PREFILL_TRACE"); }
+        if (ftell(s->trace) == 0) { fprintf(s->trace, "layer,rows,resident,cpu,gpu,cpu_uses,gpu_uses,bytes,capacity_rejected\n"); }
+    }
+    s->copier.start(std::max<int64_t>(1, env_int("LLAMA_MOE_PREFILL_THREADS", 8)), cpus, pin_thread);
+    auto * worker = s.get();
+    s->worker = std::thread([worker, cpus] { worker->run(cpus); });
+    LLAMA_LOG_WARN("moe-prefill: reuse >= %u%s, %lld-row limit, up to %zu slots per type group, %.1f MiB on %s, %.1f MiB pinned\n",
+            min_reuse, gpu_only ? " (GPU endpoint; CPU fallback if full)" : "", (long long) prefill_max_rows, slots,
+            ggml_backend_buffer_get_size(s->buffer.get()) / 1048576.0, ggml_backend_name(gpu), s->host_size / 1048576.0);
+    prefill = std::move(s);
+}
+
+ggml_tensor * llama_expert_cache::prefill_bank(int il, int p) const {
+    return prefill && layer(il) ? prefill->banks[layers[il].group][p] : nullptr;
+}
+
+bool llama_expert_cache::prefill_staging(int64_t rows, int il) const {
+    return prefill_enabled(rows) && prefill_bank(il, 0);
+}
+
+bool llama_expert_cache::prefill_overlap() const {
+    return prefill && prefill->overlap;
+}
+
+bool llama_expert_cache::prefill_worker_ready(const ggml_cgraph * graph, bool ask, void * userdata) {
+    auto & c = *static_cast<llama_expert_cache *>(userdata);
+    auto & s = *c.prefill;
+    auto * view = const_cast<ggml_cgraph *>(graph);
+    for (int i = 0; i < ggml_graph_n_nodes(view); ++i) {
+        const auto * node = ggml_graph_node(view, i);
+        if (node->op != GGML_OP_MUL_MAT_ID) { continue; }
+        for (size_t g = 0; g < s.banks.size(); ++g) {
+            if (!s.banks[g][0] || node->src[0] != s.banks[g][0]) { continue; }
+            if (ask) { return s.current_cpu_groups > 0; }
+            s.wait();
+            // queued=false publishes the final record. Independent GPU compute streams must see banks and IDs ready.
+            GGML_ASSERT(s.route_recorded);
+            GGML_ASSERT(node->src[2] == s.route || node->src[2]->view_src == s.route);
+            ggml_backend_event_wait(s.gpu, s.route_done);
+            if (s.prepare && s.last >= 0) { for (auto * bank : s.banks[g]) { s.prepare(s.gpu, bank); } }
+            ggml_backend_synchronize(s.gpu);
+            return true;
+        }
+    }
+    return false;
+}
+
+ggml_tensor * llama_expert_cache::prefill_route(int il) const {
+    return prefill ? prefill->routes[il] : nullptr;
+}
 
 // gate, up and down slabs may differ in size (types per projection and group); buffers that hold slabs of any bank use the
 // largest as their stride
@@ -121,14 +389,16 @@ bool llama_expert_cache::auto_requested() {
 }
 
 std::unique_ptr<llama_expert_cache> llama_expert_cache::create(
-        const llama_model & model, const std::vector<ggml_backend_ptr> & backends) {
+        const llama_model & model, const std::vector<ggml_backend_ptr> & backends, bool allow_prefill_overlap) {
     // LLAMA_MOE_CACHE_SHARED=1: a cache without a static tier, for tiers leased at run time (VRAM sharing)
     const char * budget_env = getenv("LLAMA_MOE_CACHE_MIB");
     const char * shared_env = getenv("LLAMA_MOE_CACHE_SHARED");
     const bool auto_size = auto_requested();
     const long long budget_mib = budget_env && !auto_size ? atoll(budget_env) : 0;
     const bool shared = shared_env && atoi(shared_env) != 0;
-    if (budget_mib <= 0 && !shared && !auto_size) { return nullptr; }
+    const char * share_env = getenv("LLAMA_MOE_PREFILL_SHARE");
+    const bool sharing = share_env && *share_env && strcmp(share_env, "0") != 0;
+    if (budget_mib <= 0 && !shared && !auto_size && !sharing) { return nullptr; }
     if (model.hparams.no_alloc) { return nullptr; }
     auto result = std::unique_ptr<llama_expert_cache>(new llama_expert_cache);
     result->model = &model;
@@ -240,6 +510,27 @@ std::unique_ptr<llama_expert_cache> llama_expert_cache::create(
         c.forget_inside = (decltype(c.forget_inside)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_moe_int4_forget_inside");
     }
 
+    if (sharing) {
+        uint32_t reuse = 1;
+        const bool gpu_only = strcmp(share_env, "gpu") == 0;
+        if (strcmp(share_env, "cpu") == 0) {
+            reuse = std::numeric_limits<uint32_t>::max();
+        } else if (!gpu_only) {
+            char * end = nullptr;
+            const long v = strtol(share_env, &end, 10);
+            if (*end || v <= 0 || v >= std::numeric_limits<uint32_t>::max()) {
+                throw std::runtime_error("LLAMA_MOE_PREFILL_SHARE requires 0, cpu, gpu, or a positive reuse threshold");
+            }
+            reuse = v;
+        }
+        const char * max_env = getenv("LLAMA_MOE_PREFILL_MAX_ROWS");
+        const char * min_env = getenv("LLAMA_MOE_PREFILL_MIN_ROWS");
+        c.prefill_min_rows = std::max<int64_t>(max_rows + 1, min_env ? atoll(min_env) : 512);
+        c.prefill_max_rows = std::max<int64_t>(max_rows, max_env ? atoll(max_env) : 2047);
+        if (c.prefill_min_rows > c.prefill_max_rows) { throw std::runtime_error("moe-prefill minimum rows exceeds maximum rows"); }
+        c.init_prefill(reuse, gpu_only, allow_prefill_overlap);
+    }
+
     std::string desc;
     for (size_t g = 0; g < c.group_types.size(); ++g) {
         desc += format("%s%s/%s/%s x %lld layers", g ? ", " : "", ggml_type_name(c.group_types[g][0]), ggml_type_name(c.group_types[g][1]),
@@ -247,7 +538,7 @@ std::unique_ptr<llama_expert_cache> llama_expert_cache::create(
     }
     if (budget_mib <= 0) {
         LLAMA_LOG_WARN("%s: no static tier (%s); %s; window %lld rows, prompts %s, hysteresis %.2f, decode-time refresh every %lld small batches (up to %lld experts)\n", __func__,
-                auto_size ? "auto: tiers at the first decode" : "LLAMA_MOE_CACHE_SHARED", desc.c_str(), (long long) c.window,
+                auto_size ? "auto: tiers at the first decode" : sharing ? "prefill only" : "LLAMA_MOE_CACHE_SHARED", desc.c_str(), (long long) c.window,
                 c.record_prompts ? "on" : "off", c.hysteresis, (long long) c.every, (long long) c.max_async);
         return result;
     }
@@ -411,6 +702,7 @@ struct llama_expert_cache::async_refresh {
 };
 
 llama_expert_cache::~llama_expert_cache() {
+    prefill.reset();
     async.reset();
     if (dump) { fclose(dump); }
     if (n_refresh) {
@@ -540,7 +832,117 @@ void llama_expert_cache::op_record(ggml_tensor * dst, int ith, int nth, void * u
 ggml_tensor * llama_expert_cache::build_cold_ids(ggml_context * ctx, ggml_tensor * ids, int il) {
     GGML_ASSERT(ids->type == GGML_TYPE_F32 && layer(il));
     ggml_tensor * args[] = { ids };
+    if (prefill_staging(ids->ne[1], il)) {
+        return ggml_custom_4d(ctx, GGML_TYPE_I32, ids->ne[0], ids->ne[1], 2, 1, args, 1, op_prefill_plan, 1, &layers[il]);
+    }
     return ggml_custom_4d(ctx, GGML_TYPE_I32, ids->ne[0], ids->ne[1], 1, 1, args, 1, op_cold_ids, 1, &layers[il]);
+}
+
+void llama_expert_cache::op_prefill_plan(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    if (ith != 0) { return; }
+    op_cold_ids(dst, ith, nth, userdata);
+    auto & l = *static_cast<entry *>(userdata);
+    auto & c = *l.owner;
+    auto & s = *c.prefill;
+    const auto * ids = dst->src[0];
+    std::vector<uint32_t> count(l.cold.size(), 0);
+    for (int64_t r = 0; r < ids->ne[1]; ++r) {
+        for (int64_t k = 0; k < ids->ne[0]; ++k) {
+            count[(int32_t) *reinterpret_cast<const float *>((const char *) ids->data + r * ids->nb[1] + k * ids->nb[0])]++;
+        }
+    }
+    const auto plan = llama_moe_prefill_partition(count, l.cold, s.min_reuse, s.capacity[l.group], s.gpu_only);
+    uint64_t resident = 0, cpu = 0, cpu_uses = 0, gpu_uses = 0, bytes = 0;
+    for (size_t e = 0; e < count.size(); ++e) {
+        if (!count[e]) { continue; }
+        if (l.cold[e] < 0) { resident++; }
+        else if (plan.slots[e] < 0) { cpu++; cpu_uses += count[e]; }
+        else { gpu_uses += count[e]; }
+    }
+    for (int64_t r = 0; r < ids->ne[1]; ++r) {
+        for (int64_t k = 0; k < ids->ne[0]; ++k) {
+            const int32_t e = (int32_t) *reinterpret_cast<const float *>((const char *) ids->data + r * ids->nb[1] + k * ids->nb[0]);
+            const int32_t slot = plan.slots[e];
+            auto * cpu_id = reinterpret_cast<int32_t *>((char *) dst->data + r * dst->nb[1] + k * dst->nb[0]);
+            if (slot >= 0) { *cpu_id = -1; }
+            *reinterpret_cast<int32_t *>((char *) cpu_id + dst->nb[2]) = slot;
+        }
+    }
+    s.wait();
+    // Stable banks are shared by layers of the same type group. Finish every old compute reader before an upload rewrites them.
+    ggml_backend_synchronize(c.gpu);
+    {
+        std::lock_guard<std::mutex> lock(s.mutex);
+        s.current_cpu_groups = cpu;
+        if (s.overlap) {
+            s.route = s.routes[l.il];
+            s.route_bytes = dst->nb[2];
+            GGML_ASSERT(s.route_bytes <= s.host_size - s.ids_offset);
+            void * host_ids = static_cast<char *>(ggml_backend_buffer_get_base(s.host.get())) + s.ids_offset;
+            memcpy(host_ids, static_cast<const char *>(dst->data) + dst->nb[2], s.route_bytes);
+        }
+        s.slabs.clear();
+        const auto & layer = c.model->layers[l.il];
+        const ggml_tensor * weights[] = {layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps};
+        for (size_t slot = 0; slot < plan.experts.size(); ++slot) {
+            for (int p = 0; p < 3; ++p) {
+                s.slabs.push_back({weights[p], s.banks[l.group][p], plan.experts[slot], (int) slot});
+                bytes += weights[p]->nb[2];
+            }
+        }
+        s.queued = true;
+    }
+    s.cv.notify_all();
+    s.bytes += bytes;
+    s.batches++;
+    s.cpu_groups += cpu;
+    s.gpu_groups += plan.experts.size();
+    if (s.trace && !c.warmup) {
+        fprintf(s.trace, "%d,%lld,%llu,%llu,%zu,%llu,%llu,%llu,%d\n", l.il, (long long) ids->ne[1],
+                (unsigned long long) resident, (unsigned long long) cpu, plan.experts.size(), (unsigned long long) cpu_uses,
+                (unsigned long long) gpu_uses, (unsigned long long) bytes, plan.capacity_rejected);
+        fflush(s.trace);
+    }
+}
+
+void llama_expert_cache::op_prefill_ready(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    GGML_UNUSED(nth);
+    if (ith != 0) { return; }
+    auto & l = *static_cast<entry *>(userdata);
+    auto & s = *l.owner->prefill;
+    if (s.overlap) {
+        // Retain the CPU split boundary, but let the transient GPU consumer's worker perform the wait.
+        if (s.current_cpu_groups == 0) {
+            // There is no CPU work to hide. Keep readiness here and submit the GPU FFN on the caller.
+            s.wait();
+            ggml_backend_event_wait(s.gpu, s.route_done);
+            if (s.prepare && s.last >= 0) { for (auto * bank : s.banks[l.group]) { s.prepare(s.gpu, bank); } }
+            ggml_backend_synchronize(s.gpu);
+        }
+        *static_cast<int32_t *>(dst->data) = 0;
+        return;
+    }
+    s.wait();
+    const auto * plan = dst->src[0];
+    const size_t bytes = plan->nb[2];
+    GGML_ASSERT(plan->ne[0] == s.routes[l.il]->ne[0] && bytes <= s.host_size - s.ids_offset);
+    char * host_ids = static_cast<char *>(ggml_backend_buffer_get_base(s.host.get())) + s.ids_offset;
+    // The next plan synchronizes the compute stream before these pinned bytes can change again.
+    memcpy(host_ids, static_cast<const char *>(plan->data) + plan->nb[2], bytes);
+    ggml_backend_tensor_set_async(s.gpu, s.routes[l.il], host_ids, 0, bytes);
+    // A wait must not refer to an event that the upload worker has not yet recorded.
+    if (s.last >= 0) {
+        ggml_backend_event_wait(s.gpu, s.done[s.last]);
+        if (s.prepare) { for (auto * bank : s.banks[l.group]) { s.prepare(s.gpu, bank); } }
+    }
+    // The route table is an external graph input. Complete its update before a backend can start independent compute streams.
+    ggml_backend_synchronize(s.gpu);
+    *static_cast<int32_t *>(dst->data) = 0;
+}
+
+ggml_tensor * llama_expert_cache::build_prefill_ready(ggml_context * ctx, ggml_tensor * plan, int il) {
+    ggml_tensor * args[] = {plan};
+    return ggml_custom_4d(ctx, GGML_TYPE_I32, 1, 1, 1, 1, args, 1, op_prefill_ready, 1, &layers[il]);
 }
 
 ggml_tensor * llama_expert_cache::build_record(ggml_context * ctx, ggml_tensor * ids, int il) {
@@ -548,6 +950,34 @@ ggml_tensor * llama_expert_cache::build_record(ggml_context * ctx, ggml_tensor *
     GGML_ASSERT(ids->type == GGML_TYPE_I32 && ids->ne[2] == 1 && ids->ne[3] == 1);
     ggml_tensor * args[] = { ids };
     return ggml_custom_4d(ctx, GGML_TYPE_I32, 1, 1, 1, 1, args, 1, op_record, 1, &layers[il]);
+}
+
+void llama_expert_cache::op_weighted_sum(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    GGML_UNUSED(userdata);
+    const ggml_tensor * x = dst->src[0];
+    const ggml_tensor * w = dst->src[1];
+    const int64_t n = x->ne[0], k = x->ne[1], rows = x->ne[2];
+    const int64_t per = (n + nth - 1) / nth;
+    const int64_t i0 = std::min(n, ith * per), i1 = std::min(n, i0 + per);
+    for (int64_t r = 0; r < rows; ++r) {
+        float * out = reinterpret_cast<float *>((char *) dst->data + r * dst->nb[1]);
+        for (int64_t j = 0; j < k; ++j) {
+            const float wj = *reinterpret_cast<const float *>((const char *) w->data + j * w->nb[1] + r * w->nb[2]);
+            const float * xj = reinterpret_cast<const float *>((const char *) x->data + j * x->nb[1] + r * x->nb[2]);
+            if (j == 0) {
+                for (int64_t i = i0; i < i1; ++i) { out[i] = xj[i] * wj; }
+            } else {
+                for (int64_t i = i0; i < i1; ++i) { out[i] += xj[i] * wj; }
+            }
+        }
+    }
+}
+
+ggml_tensor * llama_expert_cache::build_weighted_sum(ggml_context * ctx, ggml_tensor * experts, ggml_tensor * weights) {
+    GGML_ASSERT(experts->type == GGML_TYPE_F32 && weights->type == GGML_TYPE_F32 && experts->nb[0] == sizeof(float));
+    GGML_ASSERT(weights->ne[0] == 1 && weights->ne[1] == experts->ne[1] && weights->ne[2] == experts->ne[2]);
+    ggml_tensor * args[] = { experts, weights };
+    return ggml_custom_4d(ctx, GGML_TYPE_F32, experts->ne[0], experts->ne[2], 1, 1, args, 2, op_weighted_sum, GGML_N_TASKS_MAX, nullptr);
 }
 
 bool llama_expert_cache::needs_refresh(int64_t n_tokens, bool is_warmup) {
@@ -705,12 +1135,19 @@ static std::vector<int> local_cpus(ggml_backend_dev_t dev) {
     return cpus;
 }
 
+// The thread stays inside the allowed CPUs (ggml-cpuset.h): the CPUs of the list that are allowed, else all allowed CPUs.
 static void pin_thread(const std::vector<int> & cpus) {
 #ifdef __linux__
-    if (cpus.empty()) { return; }
+    std::vector<int> allowed(cpus);
+    allowed.resize(ggml_cpuset_filter(allowed.data(), (int) allowed.size()));
+    if (allowed.empty()) {
+        allowed.resize(CPU_SETSIZE);
+        allowed.resize(ggml_cpuset_list(allowed.data(), (int) allowed.size()));
+    }
+    if (allowed.empty()) { return; }
     cpu_set_t set;
     CPU_ZERO(&set);
-    for (int c : cpus) { CPU_SET(c, &set); }
+    for (int c : allowed) { CPU_SET(c, &set); }
     pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
 #else
     GGML_UNUSED(cpus);
@@ -739,8 +1176,8 @@ void llama_expert_cache::upload(const std::vector<upload_job> & jobs) {
         }
         return;
     }
-    static const int per_half = [] { const char * e = getenv("LLAMA_MOE_CACHE_REFILL_SLABS"); return e ? std::max(1, atoi(e)) : 32; }();
-    static const char * env_threads = getenv("LLAMA_MOE_CACHE_REFILL_THREADS");
+    const int per_half = [] { const char * e = getenv("LLAMA_MOE_CACHE_REFILL_SLABS"); return e ? std::max(1, atoi(e)) : 32; }();
+    const char * env_threads = getenv("LLAMA_MOE_CACHE_REFILL_THREADS");
     // Two options for --numa tensors (experts in CPU_NUMA buffers), off by default; for NPS4 set both (MiMo V2.6 Flash, NPS4:
     // refresh 210 -> ~150 ms per prompt; NPS1 is bound by the PCIe upload and not measured with them).
     // The pinned staging buffer next to the GPU is one node's memory, which at NPS4 is one quadrant: its 2 channels take all
@@ -748,9 +1185,9 @@ void llama_expert_cache::upload(const std::vector<upload_job> & jobs) {
     // An expert stores its rows node by node, in node order. With LLAMA_MOE_CACHE_REFILL_NUMA=1, thread t copies part t of
     // each slab and runs on the node that holds that part (at least 2 threads per node), so that it reads local memory. By
     // default all threads run next to the GPU.
-    static const std::vector<std::vector<int>> node_cpus = numa_node_cpus();
-    static const bool stage_interleave = [] { const char * e = getenv("LLAMA_MOE_CACHE_REFILL_INTERLEAVE"); return e && atoi(e) != 0; }();
-    static const bool pin_nodes = [] { const char * e = getenv("LLAMA_MOE_CACHE_REFILL_NUMA"); return e && atoi(e) != 0; }();
+    const std::vector<std::vector<int>> node_cpus = numa_node_cpus();
+    const bool stage_interleave = [] { const char * e = getenv("LLAMA_MOE_CACHE_REFILL_INTERLEAVE"); return e && atoi(e) != 0; }();
+    const bool pin_nodes = [] { const char * e = getenv("LLAMA_MOE_CACHE_REFILL_NUMA"); return e && atoi(e) != 0; }();
     const ggml_tensor * src0 = model->layers[jobs[0].il].ffn_gate_exps;
     const int n_nodes = (int) node_cpus.size();
     const bool numa = n_nodes > 1 && src0->buffer && strcmp(ggml_backend_buffer_name(src0->buffer), "CPU_NUMA") == 0;
@@ -778,10 +1215,23 @@ void llama_expert_cache::upload(const std::vector<upload_job> & jobs) {
     char * host = static_cast<char *>(ggml_backend_buffer_get_base(pinned.get()));
     for (const auto & [backend, slabs] : by_backend) {
         ggml_backend_dev_t dev = ggml_backend_get_device(backend);
-        ggml_context_ptr sctx(ggml_init({ggml_tensor_overhead(), nullptr, true}));
-        ggml_tensor * scratch = ggml_new_tensor_1d(sctx.get(), GGML_TYPE_I8, 2 * per_half * bytes);
-        ggml_backend_buffer_ptr sbuf(ggml_backend_alloc_ctx_tensors_from_buft(sctx.get(), ggml_backend_get_default_buffer_type(backend)));
+        // Fewer slabs per batch when the device has no room for the full scratch (its free memory is the auto cache margin, which
+        // the compute buffers of a long prompt can use up): a slower refill, not a failed decode.
+        int half_n = per_half;
+        ggml_context_ptr sctx;
+        ggml_tensor * scratch = nullptr;
+        ggml_backend_buffer_ptr sbuf;
+        for (; half_n >= 1 && !sbuf; half_n /= 2) {
+            sctx.reset(ggml_init({ggml_tensor_overhead(), nullptr, true}));
+            scratch = ggml_new_tensor_1d(sctx.get(), GGML_TYPE_I8, 2 * half_n * bytes);
+            sbuf.reset(ggml_backend_alloc_ctx_tensors_from_buft(sctx.get(), ggml_backend_get_default_buffer_type(backend)));
+            if (sbuf) { break; }
+        }
         if (!sbuf) { throw std::runtime_error("expert-cache: cannot allocate refill scratch"); }
+        if (half_n < per_half) {
+            LLAMA_LOG_WARN("expert-cache: refill scratch on %s: %d of %d slabs per batch, the memory for more is not available\n",
+                    ggml_backend_name(backend), half_n, per_half);
+        }
         ggml_backend_event_t ev[2] = { ggml_backend_event_new(dev), ggml_backend_event_new(dev) };
 
         // workers copy batch `batch` when it changes; each takes an interleaved share of every slab
@@ -819,7 +1269,7 @@ void llama_expert_cache::upload(const std::vector<upload_job> & jobs) {
                 }
             });
         }
-        const size_t n_batches = (slabs.size() + per_half - 1) / per_half;
+        const size_t n_batches = (slabs.size() + half_n - 1) / half_n;
         for (size_t b = 0; b < n_batches; ++b) {
             const int half = b % 2;
             int64_t t = ggml_time_us();
@@ -828,9 +1278,9 @@ void llama_expert_cache::upload(const std::vector<upload_job> & jobs) {
             t = ggml_time_us();
             {
                 std::lock_guard<std::mutex> lock(mutex);
-                first = b * per_half;
-                n = std::min<size_t>(per_half, slabs.size() - first);
-                dst = host + half * per_half * bytes;
+                first = b * half_n;
+                n = std::min<size_t>(half_n, slabs.size() - first);
+                dst = host + half * half_n * bytes;
                 done = 0;
                 batch = b;
             }
@@ -840,10 +1290,10 @@ void llama_expert_cache::upload(const std::vector<upload_job> & jobs) {
                 cv_done.wait(lock, [&] { return done == n_threads; });
             }
             upload_copy_us += ggml_time_us() - t;
-            ggml_backend_tensor_set_async(backend, scratch, dst, half * per_half * bytes, n * bytes);
+            ggml_backend_tensor_set_async(backend, scratch, dst, half * half_n * bytes, n * bytes);
             for (size_t i = 0; i < n; ++i) {
                 const auto & x = slabs[first + i];
-                set_expert(backend, x.bank, x.slot, static_cast<const char *>(scratch->data) + (half * per_half + i) * bytes);
+                set_expert(backend, x.bank, x.slot, static_cast<const char *>(scratch->data) + (half * half_n + i) * bytes);
             }
             ggml_backend_event_record(ev[half], backend);
         }

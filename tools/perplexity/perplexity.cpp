@@ -2,6 +2,7 @@
 #include "common.h"
 #include "fit.h"
 #include "hotswap.h"
+#include "kld.h"
 #include "log.h"
 #include "llama.h"
 
@@ -1697,8 +1698,9 @@ static void multiple_choice_score(llama_context * ctx, const common_params & par
     LOG_INF("\n");
 }
 
-static void kl_divergence(llama_context * ctx, const common_params & params, bool * success = nullptr) {
+static void kl_divergence(llama_context * ctx, const common_params & params, bool * success = nullptr, llama_kld_stats * stats = nullptr) {
     if (success) { *success = false; }
+    auto fail = [&] (const std::string & msg) { if (stats) { stats->error = msg; } };
     const llama_model * model = llama_get_model(ctx);
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
@@ -1709,6 +1711,7 @@ static void kl_divergence(llama_context * ctx, const common_params & params, boo
     std::ifstream in(params.logits_file.c_str(), std::ios::binary);
     if (!in) {
         LOG_ERR("%s: failed to open %s\n", __func__, params.logits_file.c_str());
+        fail("cannot open base file");
         return;
     }
     {
@@ -1716,6 +1719,7 @@ static void kl_divergence(llama_context * ctx, const common_params & params, boo
         in.read(check, 8);
         if (in.fail() || strncmp("_logits_", check, 8) != 0) {
             LOG_ERR("%s: %s does not look like a file containing log-probabilities\n", __func__, params.logits_file.c_str());
+            fail("not a base file");
             return;
         }
     }
@@ -1725,6 +1729,10 @@ static void kl_divergence(llama_context * ctx, const common_params & params, boo
     if (n_ctx > llama_n_ctx(ctx)) {
         LOG_ERR("%s: %s has been computed with %u, while the current context is %d. Increase it with -c and retry\n",
                 __func__, params.logits_file.c_str(), n_ctx, params.n_ctx);
+        if (stats) {
+            fail("base file n_ctx " + std::to_string(n_ctx) + " is above the context size " + std::to_string(llama_n_ctx(ctx)));
+            return;
+        }
     }
 
     int n_vocab;
@@ -1737,6 +1745,10 @@ static void kl_divergence(llama_context * ctx, const common_params & params, boo
     }
     if (n_vocab != llama_vocab_n_tokens(vocab)) {
         LOG_ERR("%s: inconsistent vocabulary (%d vs %d)\n", __func__, n_vocab, llama_vocab_n_tokens(vocab));
+        if (stats) {
+            fail("inconsistent vocabulary");
+            return;
+        }
     }
 
     std::vector<llama_token> tokens(size_t(n_ctx) * n_chunk);
@@ -1839,6 +1851,7 @@ static void kl_divergence(llama_context * ctx, const common_params & params, boo
 
             if (llama_decode(ctx, batch)) {
                 LOG_ERR("%s : failed to decode\n", __func__);
+                fail("decode failed");
                 llama_batch_free(batch);
                 return;
             }
@@ -1913,7 +1926,10 @@ static void kl_divergence(llama_context * ctx, const common_params & params, boo
     llama_batch_free(batch);
     LOG("\n");
 
-    if (kld.count < 100) return; // we do not wish to do statistics on so few values
+    if (kld.count < 100) { // we do not wish to do statistics on so few values
+        fail("fewer than 100 evaluated tokens");
+        return;
+    }
 
     // LLAMA_KLD_TOKENS_FILE: write the per-token KL divergence (float32, in chunk order) for paired comparisons
     if (const char * path = std::getenv("LLAMA_KLD_TOKENS_FILE")) {
@@ -1930,6 +1946,36 @@ static void kl_divergence(llama_context * ctx, const common_params & params, boo
     std::sort(p_diff_values.begin(), p_diff_values.end());
 
     if (success) { *success = std::isfinite(kld.sum_kld) && std::isfinite(kld.sum_nll) && std::isfinite(kld.sum_nll_base); }
+    if (stats) {
+        const auto mu = [&] (double sum, double sum2, size_t count) {
+            if (count < 1) { return std::make_pair(0., 0.); }
+            const double f = sum/count;
+            double df = sum2/count - f*f;
+            df = df > 0 && count > 10 ? sqrt(df/(count-1)) : 0.;
+            return std::make_pair(f, df);
+        };
+        const auto lp  = mu(kld.sum_nll, kld.sum_nll2, kld.count);
+        const auto lpb = mu(kld.sum_nll_base, kld.sum_nll_base2, kld.count);
+        double cov = 0.0;
+        if (kld.count >= 10) {
+            cov = (kld.sum_nll_nll_base/kld.count - (kld.sum_nll/kld.count)*(kld.sum_nll_base/kld.count)) / (kld.count - 1);
+        }
+        const auto kl = mu(kld.sum_kld, kld.sum_kld2, kld.count);
+        const auto pd = mu(kld.sum_p_diff2, kld.sum_p_diff4, kld.count);
+        const double top = 1.*kld.n_same_top/kld.count;
+        stats->n_chunk = n_chunk;
+        stats->n_ctx   = (int) n_ctx;
+        stats->count   = kld.count;
+        stats->kld = kl.first; stats->kld_se = kl.second;
+        stats->ppl = exp(lp.first); stats->ppl_se = stats->ppl*lp.second;
+        stats->ppl_base = exp(lpb.first);
+        stats->log_ppl_ratio = lp.first - lpb.first;
+        stats->log_ppl_ratio_se = sqrt(std::max(0.0, lp.second*lp.second + lpb.second*lpb.second - 2.0*cov));
+        stats->same_top = top; stats->same_top_se = sqrt(top*(1 - top)/(kld.count - 1));
+        stats->p_diff_rms = sqrt(pd.first);
+        stats->ok = std::isfinite(kld.sum_kld) && std::isfinite(kld.sum_nll) && std::isfinite(kld.sum_nll_base);
+        if (!stats->ok) { stats->error = "non-finite statistics"; }
+    }
     LOG("====== Perplexity statistics ======\n");
 
     auto log_ppl = mean_and_uncertainty(kld.sum_nll, kld.sum_nll2, kld.count);
@@ -2241,4 +2287,15 @@ int llama_perplexity(int argc, char ** argv) {
     llama_backend_free();
 
     return 0;
+}
+
+bool llama_kld_compute(llama_context * ctx, const std::string & base_file, int n_batch, llama_kld_stats & stats) {
+    stats = llama_kld_stats();
+    common_params params;
+    params.logits_file = base_file;
+    params.n_batch     = n_batch;
+    params.n_ctx       = (int) llama_n_ctx(ctx);
+    bool success = false;
+    kl_divergence(ctx, params, &success, &stats);
+    return stats.ok;
 }

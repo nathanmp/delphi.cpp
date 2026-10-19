@@ -1274,6 +1274,112 @@ static utf8_argv make_utf8_argv() {
 }
 #endif
 
+// speculative options that a running server can change: they only configure common_speculative_init(), not the
+// models or the contexts
+static bool common_arg_is_spec_runtime(const std::string & arg) {
+    static const std::set<std::string> names = {
+        "--spec-type",
+        "--spec-draft-n-max", "--draft", "--draft-n", "--draft-max",
+        "--spec-draft-n-min", "--draft-min", "--draft-n-min",
+        "--spec-draft-p-min", "--draft-p-min",
+        "--spec-draft-p-split", "--draft-p-split",
+        "--spec-draft-adaptive", "--no-spec-draft-adaptive", "--spec-draft-adaptive-mode",
+        "--spec-draft-n-min-adaptive", "--spec-draft-n-start", "--spec-draft-sampling",
+        "--spec-synth-len", "--spec-synth-rates",
+    };
+    return names.count(arg) > 0 || arg.rfind("--spec-ngram-", 0) == 0;
+}
+
+// apply the options of args to params; only those that allowed() accepts
+static void common_params_apply_runtime_args(common_params & params, llama_example ex, const std::vector<std::string> & args,
+        bool (*allowed)(const common_arg &, const std::string &)) {
+    common_params scratch;
+    auto ctx_arg = common_params_parser_init(scratch, ex);
+
+    std::unordered_map<std::string, std::pair<common_arg *, bool>> arg_to_options;
+    for (auto & opt : ctx_arg.options) {
+        for (const auto & arg : opt.args) {
+            arg_to_options[arg] = {&opt, true};
+        }
+        for (const auto & arg : opt.args_neg) {
+            arg_to_options[arg] = {&opt, false};
+        }
+    }
+
+    bool types_cleared = false;
+    for (size_t i = 0; i < args.size(); i++) {
+        std::string arg = args[i];
+        if (arg.rfind("--", 0) == 0) {
+            std::replace(arg.begin(), arg.end(), '_', '-');
+        }
+        auto it = arg_to_options.find(arg);
+        if (it == arg_to_options.end() || !allowed(*it->second.first, arg)) {
+            throw std::invalid_argument(string_format("argument %s cannot be changed at run time", arg.c_str()));
+        }
+        const common_arg & opt = *it->second.first;
+        const bool is_positive = it->second.second;
+
+        if (arg == "--spec-type" && !types_cleared) {
+            // the handler appends: the first --spec-type replaces the types
+            params.speculative.types.clear();
+            types_cleared = true;
+        }
+
+        try {
+            if (opt.handler_void) {
+                opt.handler_void(params);
+                continue;
+            }
+            if (opt.handler_bool) {
+                opt.handler_bool(params, is_positive);
+                continue;
+            }
+            if (i + 1 >= args.size()) {
+                throw std::invalid_argument("expected value for argument");
+            }
+            const std::string val = args[++i];
+            if (opt.handler_int) {
+                opt.handler_int(params, std::stoi(val));
+            } else if (opt.handler_string) {
+                opt.handler_string(params, val);
+            } else {
+                throw std::invalid_argument("unsupported argument");
+            }
+        } catch (const std::exception & e) {
+            throw std::invalid_argument(string_format("error while handling argument %s: %s", arg.c_str(), e.what()));
+        }
+    }
+}
+
+void common_params_apply_spec_args(common_params & params, llama_example ex, const std::vector<std::string> & args) {
+    common_params_apply_runtime_args(params, ex, args, [](const common_arg & opt, const std::string & arg) {
+        return opt.is_spec && common_arg_is_spec_runtime(arg);
+    });
+}
+
+// delphi: the context options that POST /tune/context changes by creating the context again
+static bool common_arg_is_ctx_runtime(const std::string & arg) {
+    static const std::set<std::string> names = {
+        "-c", "--ctx-size", "-b", "--batch-size", "-ub", "--ubatch-size",
+        "-ctk", "--cache-type-k", "-ctv", "--cache-type-v", "-fa", "--flash-attn",
+        "-t", "--threads", "-tb", "--threads-batch",
+        "-C", "--cpu-mask", "-Cr", "--cpu-range", "-Cb", "--cpu-mask-batch", "-Crb", "--cpu-range-batch",
+        "--spec-draft-ubatch-size", "-ubd",
+        "-td", "--spec-draft-threads", "-tbd", "--spec-draft-threads-batch",
+    };
+    return names.count(arg) > 0;
+}
+
+void common_params_apply_ctx_args(common_params & params, llama_example ex, const std::vector<std::string> & args) {
+    common_params_apply_runtime_args(params, ex, args, [](const common_arg &, const std::string & arg) {
+        return common_arg_is_ctx_runtime(arg);
+    });
+    postprocess_cpu_params(params.cpuparams,       nullptr);
+    postprocess_cpu_params(params.cpuparams_batch, &params.cpuparams);
+    postprocess_cpu_params(params.speculative.draft.cpuparams,       &params.cpuparams);
+    postprocess_cpu_params(params.speculative.draft.cpuparams_batch, &params.cpuparams_batch);
+}
+
 bool common_params_parse(int argc, char ** argv, common_params & params, llama_example ex, void(*print_usage)(int, char **)) {
 #ifdef _WIN32
     auto utf8 = make_utf8_argv();
@@ -1304,6 +1410,7 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
             exit(0);
         }
         params.lr.init();
+        common_speculative_params_resolve(params.speculative);
     } catch (const std::invalid_argument & ex) {
         fprintf(stderr, "%s\n", ex.what());
         ctx_arg.params = params_org;
@@ -3648,6 +3755,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_ENDPOINT_PROPS"));
     add_opt(common_arg(
+        {"--tune-endpoints"},
+        "enable the auto-tuner endpoints POST/GET /tune/context and POST /tune/kld (default: disabled)",
+        [](common_params & params) {
+            params.endpoint_tune = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_TUNE_ENDPOINTS"));
+    add_opt(common_arg(
         {"--slots"},
         {"--no-slots"},
         string_format("expose slots monitoring endpoint (default: %s)", params.endpoint_slots ? "enabled" : "disabled"),
@@ -4183,12 +4297,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
 
     add_opt(common_arg(
         {"--spec-draft-n-max"}, "N",
-        string_format("number of tokens to draft for speculative decoding (default: %d)", params.speculative.draft.n_max),
+        string_format("number of tokens to draft for speculative decoding (default: %d; %d for the default conf mode of draft-mtp)", params.speculative.draft.n_max, COMMON_SPECULATIVE_CONF_N_MAX_DEFAULT),
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("invalid value");
             }
-            params.speculative.draft.n_max = value;
+            params.speculative.draft.n_max      = value;
+            params.speculative.draft.n_max_set  = true;
+            params.speculative.draft.n_max_auto = false;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX"));
     add_opt(common_arg(
@@ -4210,16 +4326,39 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MIN"));
     add_opt(common_arg(
-        {"--spec-draft-adaptive"},
+        {"--spec-draft-adaptive"}, {"--no-spec-draft-adaptive"},
         "adapt the draft depth of a draft model (draft-simple, eagle3, dflash, dspark, draft-mtp) to its acceptance, "
-        "between --spec-draft-n-min-adaptive and --spec-draft-n-max (default: off)",
-        [](common_params & params) {
-            params.speculative.draft.adaptive = true;
+        "between --spec-draft-n-min-adaptive and --spec-draft-n-max (default: on in the conf mode for draft-mtp without synthetic "
+        "acceptance, else off; --no-spec-draft-adaptive gives the fixed depth --spec-draft-n-max)",
+        [](common_params & params, bool value) {
+            params.speculative.draft.adaptive     = value;
+            params.speculative.draft.adaptive_set = true;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_ADAPTIVE"));
     add_opt(common_arg(
+        {"--spec-draft-adaptive-mode"}, "{bucket,cost,conf}",
+        "controller of --spec-draft-adaptive (implies it): bucket follows the acceptance alone; cost chooses the depth "
+        "with the most expected tokens per second from the acceptance per position, the measured round time per "
+        "draft length and the measured cost of a change of depth; conf stops each draft at the step whose calibrated "
+        "confidence no longer pays for its verify row, up to --spec-draft-n-max (draft-mtp only; default: conf for draft-mtp, else bucket)",
+        [](common_params & params, const std::string & value) {
+            if (value == "bucket") {
+                params.speculative.draft.adaptive_mode = COMMON_SPECULATIVE_ADAPTIVE_BUCKET;
+            } else if (value == "cost") {
+                params.speculative.draft.adaptive_mode = COMMON_SPECULATIVE_ADAPTIVE_COST;
+            } else if (value == "conf") {
+                params.speculative.draft.adaptive_mode = COMMON_SPECULATIVE_ADAPTIVE_CONF;
+            } else {
+                throw std::invalid_argument("invalid value");
+            }
+            params.speculative.draft.adaptive          = true;
+            params.speculative.draft.adaptive_set      = true;
+            params.speculative.draft.adaptive_mode_set = true;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_ADAPTIVE_MODE"));
+    add_opt(common_arg(
         {"--spec-draft-n-min-adaptive"}, "N",
-        string_format("lowest draft depth of --spec-draft-adaptive (default: %d)", params.speculative.draft.n_min_adaptive),
+        "lowest draft depth of --spec-draft-adaptive (default: 3 for the bucket mode, 1 for the cost mode)",
         [](common_params & params, int value) {
             if (value < 1) {
                 throw std::invalid_argument("--spec-draft-n-min-adaptive must be at least 1");
@@ -4229,7 +4368,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MIN_ADAPTIVE"));
     add_opt(common_arg(
         {"--spec-draft-n-start"}, "N",
-        "draft depth of --spec-draft-adaptive at the start of a generation (default: 0 = n_max - 3, at least the floor)",
+        "draft depth of --spec-draft-adaptive at the start of a generation (default: 0 = n_max - 3 for the bucket mode; for the cost mode the best depth for the acceptance of the earlier requests, 3 for the first; at least the floor)",
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("invalid value");
@@ -4293,6 +4432,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.backend_sampling = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_BACKEND_SAMPLING"));
+    add_opt(common_arg(
+        {"--spec-draft-sampling"}, "{greedy,probabilistic}",
+        string_format("how the draft is sampled: greedy takes its argmax, probabilistic samples it and has "
+                      "the target verify by rejection sampling (default: %s)",
+                      params.speculative.draft.probabilistic ? "probabilistic" : "greedy"),
+        [](common_params & params, const std::string & value) {
+            if (value == "greedy") {
+                params.speculative.draft.probabilistic = false;
+            } else if (value == "probabilistic") {
+                params.speculative.draft.probabilistic = true;
+            } else {
+                throw std::invalid_argument("invalid value, must be one of: greedy, probabilistic");
+            }
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_SAMPLING"));
     add_opt(common_arg(
         {"--spec-draft-device", "-devd", "--device-draft"}, "<dev1,dev2,..>",
         "comma-separated list of devices to use for offloading the draft model (none = don't offload, default: follows --device)\n"

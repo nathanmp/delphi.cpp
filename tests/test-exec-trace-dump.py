@@ -206,6 +206,39 @@ class TestExecTraceDump(unittest.TestCase):
         self.assertEqual(epochs[7]["placement"], "inconsistent")
         self.assertIsNone(epochs[7]["placement_uncertainty_ns"])
 
+    def test_gpu_timing_placement_uses_completion_wait(self):
+        resolved = 1 << 8
+        device_event = 2 << 16
+        graph_launch = 2
+        scheduler_synchronize = 4
+
+        def gpu_span(backend_id, enqueue_ns, duration_ns, epoch_id):
+            return event(exec_trace_dump.K_GPU_TIMING, enqueue_ns, backend_id=backend_id, device_id=backend_id,
+                         flags=graph_launch | resolved | device_event, args=(enqueue_ns + 10_000, 0, duration_ns, epoch_id << 32))
+
+        def epoch(backend_id, enqueue_ns, complete_ns, epoch_id):
+            return event(exec_trace_dump.K_GPU_TIMING_EPOCH, enqueue_ns, backend_id=backend_id, device_id=backend_id,
+                         flags=device_event, args=(complete_ns, epoch_id, 1, 1))
+
+        def wait(backend_id, start_ns, end_ns):
+            return event(exec_trace_dump.K_BACKEND_WAIT, start_ns, end_ns, backend_id=backend_id, flags=scheduler_synchronize)
+
+        # A layer split: the host queues both devices at once, then blocks on each in turn. Device 2 waits for device 1.
+        # A third epoch completes in a wait that returns at once, so its device finished before that wait started.
+        events = [
+            gpu_span(1, 1_000_000, 7_000_000, 1), gpu_span(2, 1_500_000, 7_000_000, 2), gpu_span(3, 20_000_000, 100_000, 3),
+            epoch(1, 1_000_000, 8_100_000, 1), wait(1, 2_000_000, 8_110_000),
+            epoch(2, 1_500_000, 15_200_000, 2), wait(2, 8_110_000, 15_210_000),
+            epoch(3, 20_000_000, 30_000_500, 3), wait(3, 30_000_000, 30_001_000),
+        ]
+        spans, epochs = exec_trace_dump.gpu_timing_model(events)
+        self.assertEqual([epochs[i]["anchor"] for i in (1, 2, 3)], ["completion", "completion", "enqueue"])
+        self.assertEqual((spans[0]["device_start_ns"], spans[0]["device_end_ns"]), (1_100_000, 8_100_000))
+        self.assertEqual((spans[1]["device_start_ns"], spans[1]["device_end_ns"]), (8_200_000, 15_200_000))
+        self.assertEqual(epochs[2]["placement_uncertainty_ns"], exec_trace_dump.GPU_TIMING_BLOCKED_WAIT_NS)
+        self.assertEqual(spans[2]["device_start_ns"], 20_000_000)
+        self.assertEqual(epochs[3]["anchor_upper_ns"], 29_900_000)
+
 
 if __name__ == "__main__":
     unittest.main()

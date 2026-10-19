@@ -1,4 +1,5 @@
 #include "llama-graph.h"
+#include <typeinfo>
 #include "llama-expert-cache.h"
 
 #include "llama-impl.h"
@@ -1553,6 +1554,45 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
     return res;
 }
 
+std::string llm_graph_result::reuse_fail_reason(const llm_graph_params & params) {
+    if (!this->params.allow_reuse(params)) {
+        const auto & a = this->params;
+        const auto & b = params;
+        if (a.ubatch.n_tokens != b.ubatch.n_tokens || a.ubatch.n_seqs != b.ubatch.n_seqs) {
+            return "params:ubatch";
+        }
+        if (a.n_outputs != b.n_outputs) {
+            return "params:n_outputs";
+        }
+        if (!llm_graph_params::samplers_equal(a.samplers, b.samplers)) {
+            return "params:samplers";
+        }
+        if (a.samplers.size() > 0 && (!a.ubatch.data || !b.ubatch.data)) {
+            return "params:ubatch_data";
+        }
+        if (a.samplers.size() > 0) {
+            for (uint32_t i = 0; i < a.ubatch.n_tokens; ++i) {
+                if (a.ubatch.output[i] != b.ubatch.output[i] || a.ubatch.seq_id[i][0] != b.ubatch.seq_id[i][0]) {
+                    return "params:outputs";
+                }
+            }
+        }
+        if (a.share_gen != b.share_gen) {
+            return "params:share_gen";
+        }
+        if (a.samplers_gen != b.samplers_gen) {
+            return "params:samplers_gen";
+        }
+        return "params:other";
+    }
+    for (auto & input : inputs) {
+        if (!input->can_reuse(params)) {
+            return typeid(*input).name();
+        }
+    }
+    return "";
+}
+
 llm_graph_input_i * llm_graph_result::add_input(llm_graph_input_ptr input) {
     inputs.emplace_back(std::move(input));
     return inputs.back().get();
@@ -2085,7 +2125,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
          ggml_tensor * down_exps_s,
-         ggml_tensor * selected_experts_in) const {
+         ggml_tensor * selected_experts_in,
+         ggml_tensor * post_exp_norm,
+               float   post_exp_norm_eps) const {
     return build_moe_ffn(
         cur,
         gate_inp,  /* gate_inp_b  */ nullptr,
@@ -2106,7 +2148,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         up_exps_s,
         gate_exps_s,
         down_exps_s,
-        selected_experts_in
+        selected_experts_in,
+        post_exp_norm,
+        post_exp_norm_eps
     );
 }
 
@@ -2134,7 +2178,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
          ggml_tensor * down_exps_s,
-         ggml_tensor * selected_experts_in) const {
+         ggml_tensor * selected_experts_in,
+         ggml_tensor * post_exp_norm,
+               float   post_exp_norm_eps) const {
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
@@ -2288,7 +2334,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     const bool  clamp_arch  = arch == LLM_ARCH_MAPLE || arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK41 ||
             arch == LLM_ARCH_GLM5NEXT || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0) || arch == LLM_ARCH_HY_V4;
     const float swiglu_lim  = il >= 0 ? hparams.swiglu_clamp_exp[il] : 0.0f;
-    if (expert_cache && expert_cache->active() && ubatch.n_tokens <= expert_cache->graph_rows() && expert_cache->layer(il) &&
+    if (expert_cache && ((expert_cache->active() && ubatch.n_tokens <= expert_cache->graph_rows()) ||
+            expert_cache->prefill_enabled(ubatch.n_tokens)) && expert_cache->layer(il) &&
             type_op == LLM_FFN_SILU && !weight_before_ffn && !gate_up_exps &&
             !up_exps_s && !gate_exps_s && !down_exps_s && !up_exps_b && !gate_exps_b && !down_exps_b &&
             (loras == nullptr || loras->empty()) && (swiglu_lim <= 1e-6f || clamp_arch)) {
@@ -2466,6 +2513,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(experts, "ffn_moe_down_biased", il);
     }
 
+    // an expert output can be scaled by a norm weight, then normalized, before the router weights apply
+    if (post_exp_norm) {
+        experts = ggml_mul(ctx0, experts, post_exp_norm);
+        experts = ggml_rms_norm(ctx0, experts, post_exp_norm_eps);
+        cb(experts, "ffn_moe_post_exp_norm", il);
+    }
+
     if (!weight_before_ffn) {
         experts = ggml_mul(ctx0, experts, weights);
         cb(experts, "ffn_moe_weighted", il);
@@ -2550,11 +2604,16 @@ ggml_tensor * llm_graph_context::build_moe_ffn_cache(
     // backend fuses into its batch kernels, and the CPU part sends [n_embd, n_tokens] instead of every expert slot. The CPU
     // then needs the routing weights, so the packet carries them.
     const bool prompt = ids->ne[1] > llama_expert_cache::max_rows;
+    // delphi: in decode the CPU part also reduces its expert slots with the routing weights, so that [n_embd, n_tokens] crosses
+    // back instead of every slot (480 KiB to 80 KiB per DeepSeek V4 layer at 4 tokens). Each GPU part then reduces on its own,
+    // and the sum adds the parts in another order. LLAMA_MOE_CACHE_CPU_REDUCE=0 merges the slots on the layer GPU as before
+    static const bool cpu_reduce_env = [] { const char * e = getenv("LLAMA_MOE_CACHE_CPU_REDUCE"); return e == nullptr || atoi(e) != 0; }();
+    const bool cpu_reduce = prompt || cpu_reduce_env;
     auto * fids = ggml_cast(ctx0, flat, GGML_TYPE_F32);
     name(fids, "packet_ids", false);
     auto * packet = ggml_concat(ctx0, ggml_reshape_1d(ctx0, ggml_cont(ctx0, cur), nx), fids, 0);
     name(packet, "packet_src", false);
-    if (any_remote || prompt) {
+    if (any_remote || cpu_reduce) {
         auto * w = ggml_is_contiguous(weights) ? weights : ggml_cont(ctx0, weights);
         packet = ggml_concat(ctx0, packet, ggml_reshape_1d(ctx0, w, ggml_nelements(w)), 0);
         name(packet, "packet_src", false);
@@ -2564,6 +2623,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn_cache(
     auto * cx = ggml_view_3d(ctx0, input, cur->ne[0], 1, cur->ne[2], cur->ne[0] * sizeof(float), cur->ne[0] * sizeof(float), 0);
     auto * ci = expert_cache->build_cold_ids(ctx0,
             ggml_view_2d(ctx0, input, ids->ne[0], ids->ne[1], ids->ne[0] * sizeof(float), nx * sizeof(float)), il);
+    auto * plan = ci;
+    const bool sharing = expert_cache->prefill_staging(ids->ne[1], il);
+    if (sharing) {
+        name(plan, "prefill_plan", true);
+        // The first plane is still read by the CPU FFN after the ready callback has consumed the second plane.
+        ggml_set_output(plan);
+        ci = ggml_view_2d(ctx0, plan, ids->ne[0], ids->ne[1], plan->nb[1], 0);
+    }
     name(cx, "input", true); name(ci, "ids", true);
     ggml_build_forward_expand(gf, cx);
     ggml_build_forward_expand(gf, ci);
@@ -2625,7 +2692,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn_cache(
         const int tier = t;
         const labeler label = [&, tier](ggml_tensor * x, const char * l) { name_tier(x, tier, l); };
         auto * d = part(cur, hot, expert_cache->bank(t, il, 0), expert_cache->bank(t, il, 1), expert_cache->bank(t, il, 2), label);
-        (prompt ? remote : local).push_back(prompt ? reduce(d, weights, label) : d);
+        (cpu_reduce ? remote : local).push_back(cpu_reduce ? reduce(d, weights, label) : d);
     }
     for (int t = 0; t < expert_cache->n_tiers(); ++t) {
         auto * map = expert_cache->hot_ids(t, il);
@@ -2638,13 +2705,34 @@ ggml_tensor * llm_graph_context::build_moe_ffn_cache(
         auto * d = part(remote_input(t).x, hot, expert_cache->bank(t, il, 0), expert_cache->bank(t, il, 1), expert_cache->bank(t, il, 2), label);
         remote.push_back(reduce(d, remote_input(t).weights, label));
     }
+    if (sharing) {
+        // The CPU callback separates resident and transient splits. In overlap mode, the transient submission worker waits
+        // for readiness while this thread runs the cold CPU FFN; otherwise the callback waits as in S1.
+        auto * ready = expert_cache->build_prefill_ready(ctx0, plan, il);
+        name(ready, "prefill_ready", true);
+        ggml_build_forward_expand(gf, ready);
+        auto * bank_ids = expert_cache->prefill_route(il);
+        auto * route = ggml_view_2d(ctx0, bank_ids, ids->ne[0], ids->ne[1], bank_ids->nb[1], 0);
+        name(route, "prefill_ids", false);
+        const labeler label = [&](ggml_tensor * x, const char * l) {
+            name(x, (std::string("prefill_") + l).c_str(), false);
+        };
+        auto * d = part(cur, route, expert_cache->prefill_bank(il, 0), expert_cache->prefill_bank(il, 1),
+                expert_cache->prefill_bank(il, 2), label);
+        remote.push_back(reduce(d, weights, label));
+    }
     auto * experts = part(cx, ci, gate, up, down, [&](ggml_tensor * x, const char * l) { name(x, l, true); });
     ggml_tensor * out = nullptr;
-    if (prompt) {
+    if (cpu_reduce) {
         auto * cw = ggml_view_3d(ctx0, input, weights->ne[0], weights->ne[1], weights->ne[2], weights->ne[0] * sizeof(float),
                 weights->ne[0] * weights->ne[1] * sizeof(float), (nx + ni) * sizeof(float));
         name(cw, "weights", true);
-        out = reduce(experts, cw, [&](ggml_tensor * x, const char * l) { name(x, l, true); });
+        if (prompt) {
+            out = reduce(experts, cw, [&](ggml_tensor * x, const char * l) { name(x, l, true); });
+        } else {
+            out = llama_expert_cache::build_weighted_sum(ctx0, experts, cw);
+            name(out, "sum", true);
+        }
     } else {
         // Merge the per-expert outputs on the GPU (the first local tier first, as before tiers existed).
         for (auto * d : local) {
@@ -2656,6 +2744,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn_cache(
     for (auto * r : remote) {
         out = ggml_add(ctx0, out, r);
         name(out, "remote", false);
+        ggml_build_forward_expand(gf, out);
+    }
+    if (expert_cache->prefill_enabled(ids->ne[1]) && remote.empty()) {
+        // Keep the following dense operations on the same device in the CPU endpoint, including an empty resident set.
+        out = ggml_dup(ctx0, out);
+        name(out, "prefill_merge", false);
         ggml_build_forward_expand(gf, out);
     }
     return out;

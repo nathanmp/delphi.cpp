@@ -48,7 +48,12 @@ The run metadata records `gpu_timing`, `gpu_timing_event_capacity`, and the star
 
 ## Placement on the host clock
 
-The decoder places device intervals on the host clock without a clock-rate model. All spans of an epoch share one device anchor, the start event of the first span. The host reads its clock before it records each start and end event, so the device reaches the event after that sample. The device completes each end event before completion is known. These constraints bound the anchor. The decoder uses the lower bound as the placement and reports the width of the bound as the placement uncertainty. An epoch whose bounds cannot all hold is reported as `inconsistent`.
+The decoder places device intervals on the host clock without a clock-rate model. All spans of an epoch share one device anchor, the start event of the first span. The host reads its clock before it records each start and end event, so the device reaches the event after that sample. The device completes each end event before completion is known. These constraints bound the anchor. The host span around the synchronize that gave the completion time narrows the bound:
+
+- If that synchronize blocked for 50 us or more, the device was busy when it started and finished at most 50 us before it returned. The decoder uses the upper bound as the placement (`anchor=completion`). This is the normal case for a layer split: the host queues every device, then waits for each in turn.
+- If it returned at once, the device finished before it started. The decoder lowers the upper bound to that point and uses the lower bound as the placement (`anchor=enqueue`), as it does when no synchronize gave the completion time.
+
+The width of the remaining bound is the placement uncertainty. An epoch whose bounds cannot all hold is reported as `inconsistent`.
 
 ## Clock and metadata
 

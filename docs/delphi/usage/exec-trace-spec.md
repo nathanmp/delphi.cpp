@@ -8,7 +8,7 @@
 
 `llama_decode` can return before the device work ends, so host time in the call is not the cost of an execution. The tool therefore measures one speculative cycle (the draft executions of a verify pass plus the pass) from the start of one verify pass to the next. It also gives the device busy time per cycle, the share of the cycle when every device is idle (host-side work such as sampling and draft control, or waits), and the CPU compute per cycle.
 
-Device spans are placed at the earliest start the host clock allows. With a layer split the host submits every stage of a verify pass before the first one ends, so a later stage can start up to the whole pass later than placed. When the median placement uncertainty is more than 5% of the cycle, the tool does not report the any-device time and the idle share. It gives the sum of the device busy times instead, which is the critical path when the devices run one after another.
+Device spans are placed on the host clock as `exec-trace-record.md` describes. With a layer split the host submits every stage of a verify pass before the first one ends and then waits for each stage, so each stage is placed at the synchronize that completed it. When the median placement uncertainty is more than 5% of the cycle (for example when no synchronize blocked), the tool does not report the any-device time and the idle share. It gives the sum of the device busy times instead, which is the critical path when the devices run one after another.
 
 ## Synopsis
 
@@ -25,7 +25,7 @@ python3 tools/exec-trace/exec-trace-spec.py TRACE [--top N] [--node-regex REGEX]
 
 ## Recording
 
-Device times need GPU timing. Record with `GGML_EXEC_TRACE=<file>` and `GGML_EXEC_TRACE_GPU_TIMING=submit` for production timing, or `=op` with graphs and fusion disabled (`GGML_CUDA_DISABLE_GRAPHS=1`, `GGML_HIP_DISABLE_GRAPHS=1`, `GGML_CUDA_DISABLE_FUSION=1`, `GGML_CPU_DISABLE_FUSION=1`) to rank operations. Operation-mode times are inflated by the missing graphs and fusion: use them to compare operations, not to measure throughput. CPU operations are listed when the trace has CPU node timing.
+Device times need GPU timing. Record with `GGML_EXEC_TRACE=<file>` and `GGML_EXEC_TRACE_GPU_TIMING=submit` for production timing, or `=op` with graphs and fusion disabled (`GGML_CUDA_DISABLE_GRAPHS=1`, `GGML_HIP_DISABLE_GRAPHS=1`, `GGML_CUDA_DISABLE_FUSION=1`, `GGML_CPU_DISABLE_FUSION=1`) to rank operations. Operation-mode times are inflated by the missing graphs and fusion: use them to compare operations, not to measure throughput. On NVIDIA, the fused INT4 FFN of `Q4_G128` routed experts stays on with fusion disabled; the trace shows it as one `MUL_MAT_ID` operation. CPU operations are listed when the trace has CPU node timing.
 
 Acceptance is not in the trace. The server reports `draft_n` and `draft_n_accepted` in each response's `timings`. Divide the accepted tokens by the number of verify passes the tool reports for `--accepted-per-verify`. A synthetic acceptance arm (`--spec-synth-rates 1,1,1,0`) accepts a fixed number per pass.
 

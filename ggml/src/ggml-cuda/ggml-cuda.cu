@@ -36,6 +36,7 @@
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
+#include "ggml-cuda/mmid-partial.cuh"
 #include "ggml-cuda/mmvq-q8-tc.cuh"
 #include "ggml-cuda/moe-devsort.cuh"
 #include "ggml-cuda/moe-schedule.cuh"
@@ -2442,7 +2443,12 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
     if (ggml_mul_mat_id_is_partial(dst)) {
-        // only the MMQ path skips the out-of-range ids of a partial MUL_MAT_ID (see supports_op)
+        // the MMQ path and, for small batches, the MMVQ path skip the out-of-range ids of a partial MUL_MAT_ID (see supports_op)
+        if (ggml_cuda_mul_mat_id_partial_mmvq(ctx, src0, src1, ids, dst)) {
+            ggml_exec_trace_dispatch(dst->op, GGML_EXEC_TRACE_DISPATCH_GPU_MMVQ,
+                    GGML_EXEC_TRACE_DISPATCH_VARIANT_DEFAULT, cc, (uint32_t) dst->ne[2]);
+            return;
+        }
         ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
         return;
     }
@@ -3202,9 +3208,9 @@ static uint64_t ggml_cuda_graph_get_topo_key(const ggml_cgraph * cgraph) {
 
 // When the KV cache view grows by a padding step, only the attention nodes of a graph change shape, and every
 // such graph gets a new key. The new graph can take over the executable of the previous size through
-// cudaGraphExecUpdate instead of instantiating its own: with HIP an instantiation costs about 1 ms, and tensor
-// split steps about 50 graphs per device at once. Graphs that differ in more than half of the node shapes
-// (another batch size) are left alone, since those usually stay in use.
+// cudaGraphExecUpdate instead of instantiating its own (tensor split steps about 50 graphs per device at once).
+// Graphs that differ in more than half of the node shapes (another batch size) are left alone, since those
+// usually stay in use.
 static ggml_cuda_graph * ggml_cuda_graph_find_sibling(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, ggml_cuda_graph * self) {
     if (self->topo_key == 0) {
         self->topo_key = ggml_cuda_graph_get_topo_key(cgraph);
@@ -3281,8 +3287,33 @@ static bool ggml_cuda_graph_update_required(
     return res;
 }
 
+// With HIP, hipGraphExecUpdate grows about with the square of the node count (gfx1201: 0.7 ms at 150 nodes,
+// 6 ms at 500, 25 ms at 1000) and hipGraphInstantiate about linearly (1.2, 2.4, 4.7 ms). Decode graphs have
+// 450-2600 nodes, so a large graph is instantiated again instead of updated, and does not take over the
+// executable of a sibling.
+static bool ggml_cuda_graph_prefer_instantiate(int n_nodes) {
+#if defined(GGML_USE_HIP)
+    return n_nodes > 256;
+#else
+    GGML_UNUSED(n_nodes);
+    return false;
+#endif // defined(GGML_USE_HIP)
+}
+
 static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, uint64_t graph_key) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+
+    if (ggml_cuda_graph_prefer_instantiate(graph->num_nodes)) {
+        // the last launch of the executable can still run on the stream; HIP does not document a deferred destruction
+        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+        CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
+        graph->instance = nullptr;
+        CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+        graph->trace_id = ggml_exec_trace_next_gpu_graph_id();
+        ggml_exec_trace_gpu_graph(GGML_EXEC_TRACE_GPU_GRAPH_UPDATE, graph->trace_id, graph->num_nodes,
+                GGML_EXEC_TRACE_GPU_GRAPH_REASON_UPDATE_REINSTANTIATED);
+        return;
+    }
 
 #if CUDART_VERSION >= 12000
     cudaGraphExecUpdateResultInfo result_info;
@@ -3740,8 +3771,7 @@ struct ggml_cuda_moe_weighted_reduction_match {
 static bool ggml_cuda_match_moe_weighted_reduction(
         const ggml_cgraph * cgraph,
         int node_idx,
-        ggml_cuda_moe_weighted_reduction_match & match,
-        bool allow_single_token = false) {
+        ggml_cuda_moe_weighted_reduction_match & match) {
     const ggml_tensor * first = cgraph->nodes[node_idx];
     if (first->op != GGML_OP_MUL || first->type != GGML_TYPE_F32 || !ggml_is_contiguous(first)) {
         return false;
@@ -3802,11 +3832,12 @@ static bool ggml_cuda_match_moe_weighted_reduction(
 
     const int n_expert_used = (int) weighted->ne[1];
     const int64_t n_tokens = weighted->ne[2] * weighted->ne[3];
-    // For single-token decode, launching one reduction kernel is slower than the
-    // existing chain of vector operations. Keep the fusion for multi-token
-    // prefill and speculative verification batches.
+    // The fused kernel is not bit-identical to the unfused MUL/ADD chain: the kernel's accumulate can contract to an
+    // FMA, while the chain rounds each product and each sum. GGML_SPEC_INVARIANT therefore keeps widths 1-8 unfused so
+    // that a verify batch matches a 1-token decode. Outside that mode the fusion runs at 1 token too: one kernel
+    // replaces the MUL + (k-1) ADD chain and its intermediate global-memory traffic.
     if (n_expert_used < 2 || n_expert_used > MOE_WEIGHTED_REDUCTION_MAX_EXPERTS ||
-            (n_tokens <= 1 && !allow_single_token) || ggml_cuda_spec_inv(n_tokens)) {
+            n_tokens < 1 || ggml_cuda_spec_inv(n_tokens)) {
         return false;
     }
 
@@ -3898,7 +3929,7 @@ static bool ggml_cuda_match_moe_down_reduction(
     }
 
     ggml_cuda_moe_weighted_reduction_match reduction;
-    if (!ggml_cuda_match_moe_weighted_reduction(cgraph, node_idx + 1, reduction, true) ||
+    if (!ggml_cuda_match_moe_weighted_reduction(cgraph, node_idx + 1, reduction) ||
             reduction.experts != mmid || reduction.expert_scale != nullptr) {
         return false;
     }
@@ -3925,6 +3956,17 @@ static bool ggml_cuda_match_moe_down_reduction(
     match.dst = reduction.dst;
     match.node_count = node_count;
     return true;
+}
+
+// delphi: GGML_CUDA_DISABLE_FUSION does not disable the INT4 FFN region on NVIDIA. Packed weights have no unfused kernel there:
+// ggml_cuda_mul_mat_id converts all experts of the tensor to Q4_0 in the pool (1.3 GiB per op on GLM), which is slow, and the
+// pool keeps it. HIP runs packed weights per node with the direct G128 kernel, so there the switch disables the region too.
+static constexpr bool ggml_cuda_moe_int4_ffn_ignores_disable_fusion() {
+#ifdef GGML_HIP_MOE_INT4_AVAILABLE
+    return false;
+#else
+    return true;
+#endif
 }
 
 // delphi: one complete routed FFN for the INT4 path (moe-int4-decode.cuh): the gate and up MUL_MAT_ID in either order, the
@@ -3972,7 +4014,7 @@ static bool ggml_cuda_match_moe_int4_ffn(
 #endif
 
     ggml_cuda_moe_weighted_reduction_match reduction;
-    if (!ggml_cuda_match_moe_weighted_reduction(cgraph, node_idx + 4, reduction, true) || reduction.experts != down ||
+    if (!ggml_cuda_match_moe_weighted_reduction(cgraph, node_idx + 4, reduction) || reduction.experts != down ||
             reduction.expert_scale != nullptr) {
         return false;
     }
@@ -4382,15 +4424,51 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+// delphi: sibling MUL_MATs (ggml_cuda_mul_mat_vec_q_siblings). GGML_CUDA_FUSE_SIBLING_MM=0 turns them off.
+static bool ggml_cuda_sibling_mm_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_CUDA_FUSE_SIBLING_MM");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return enabled;
+}
+
+// Whether ggml_cuda_mul_mat sends this quantized MUL_MAT to the plain MMVQ kernel.
+static bool ggml_cuda_mul_mat_takes_mmvq(const ggml_tensor * mm, const int cc) {
+    const ggml_tensor * src0 = mm->src[0];
+    const ggml_tensor * src1 = mm->src[1];
+    if (mm->op != GGML_OP_MUL_MAT || src0->buffer == nullptr || !ggml_is_quantized(src0->type) ||
+        src1->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32 ||
+        ggml_get_op_params_i32(mm, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
+        return false;
+    }
+    if (ggml_cuda_mmvq_q8_smallk_supported(src0, src1, mm, cc) || ggml_cuda_mmvq_q8_tc_supported(src0, src1, mm, cc)) {
+        return false;
+    }
+    return ggml_cuda_should_use_mmvq(src0->type, cc, src1->ne[1], src0->ne[1]);
+}
+
+// Sorts mm[0..n) by weight address and returns whether they can run as one MMVQ launch.
+static bool ggml_cuda_sibling_mm_group(ggml_tensor ** mm, const int n, const int cc) {
+    for (int k = 0; k < n; ++k) {
+        if (!ggml_cuda_mul_mat_takes_mmvq(mm[k], cc)) {
+            return false;
+        }
+    }
+    std::sort(mm, mm + n, [](const ggml_tensor * a, const ggml_tensor * b) {
+        return (const char *) a->src[0]->data < (const char *) b->src[0]->data;
+    });
+    return ggml_cuda_mul_mat_vec_q_siblings_supported(mm, n);
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
-    if (disable_fusion) {
+    ggml_tensor * node = cgraph->nodes[i];
+    if (disable_fusion && (node->op != GGML_OP_MUL_MAT_ID || !ggml_cuda_moe_int4_ffn_ignores_disable_fusion())) {
         return 0;
     }
-
-    ggml_tensor * node = cgraph->nodes[i];
 
     const auto trace_fused_mul_mat = [&](int node_index, ggml_op op, enum ggml_exec_trace_dispatch_impl implementation) {
         if (!ggml_exec_trace_observing()) {
@@ -4433,6 +4511,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             }
 #endif
         }
+    }
+
+    if (disable_fusion) {
+        return 0;
     }
 
     if (node->op == GGML_OP_MUL_MAT_ID) {
@@ -5248,6 +5330,29 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // delphi: sibling MUL_MATs, put next to each other by ggml_backend_cuda_graph_optimize
+    if (node->op == GGML_OP_MUL_MAT && ggml_cuda_sibling_mm_enabled()) {
+        const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+        int n = 1;
+        while (n < GGML_CUDA_MMVQ_MAX_SIBLINGS && i + n < cgraph->n_nodes && cgraph->nodes[i + n]->op == GGML_OP_MUL_MAT &&
+               cgraph->nodes[i + n]->src[1] == node->src[1] && (cgraph->nodes[i + n]->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+            ++n;
+        }
+        for (; n >= 2; --n) {
+            ggml_tensor * mm[GGML_CUDA_MMVQ_MAX_SIBLINGS] = {};
+            for (int k = 0; k < n; ++k) {
+                mm[k] = cgraph->nodes[i + k];
+            }
+            if (ggml_cuda_sibling_mm_group(mm, n, cc)) {
+                for (int k = 0; k < n; ++k) {
+                    trace_fused_mul_mat(i + k, GGML_OP_MUL_MAT, GGML_EXEC_TRACE_DISPATCH_GPU_MMVQ);
+                }
+                ggml_cuda_mul_mat_vec_q_siblings(*cuda_ctx, mm, n);
+                return n - 1;
+            }
+        }
+    }
+
     return 0;
 }
 
@@ -5512,7 +5617,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             cuda_ctx->graph_topo_no_lend.insert(graph->topo_key);
             graph->instance_lent = false;
         }
-        ggml_cuda_graph * sibling = graph->instance == nullptr ? ggml_cuda_graph_find_sibling(cuda_ctx, cgraph, graph) : nullptr;
+        ggml_cuda_graph * sibling = graph->instance == nullptr && !ggml_cuda_graph_prefer_instantiate(cgraph->n_nodes) ?
+            ggml_cuda_graph_find_sibling(cuda_ctx, cgraph, graph) : nullptr;
         if (sibling != nullptr) {
             // cuda_graph_update_required is set whenever there is no instance, so the executable is updated below
             graph->instance    = sibling->instance;
@@ -5522,7 +5628,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 graph->trace_id = ggml_exec_trace_next_gpu_graph_id();
             }
         }
-        if (graph->instance == nullptr) { // Create executable graph from captured graph.
+        const bool instantiated = graph->instance == nullptr;
+        if (instantiated) { // Create executable graph from captured graph.
             const int64_t prefill_inst_t0 = prefill_timelog ? ggml_time_us() : 0;
             CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
             if (prefill_timelog) {
@@ -5534,8 +5641,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 graph->trace_id = ggml_exec_trace_next_gpu_graph_id();
             }
         }
-        if (cuda_graph_update_required) { // Update graph executable
-            ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
+        if (cuda_graph_update_required) {
+            // an executable instantiated just now already matches the captured graph: an update would only
+            // repeat the work (with HIP, at the cost of several instantiations)
+            if (!instantiated) {
+                ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
+            }
         } else {
             ggml_exec_trace_dispatch_replay(graph->trace_dispatches.data(), graph->trace_dispatches.size());
         }
@@ -5741,7 +5852,45 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
-    if (!disable_fusion) {
+
+    // delphi: move the later sibling MUL_MATs (same src1, weights back to back) right after the first, ggml_cuda_try_fuse
+    // then runs them as one launch. Safe: a MUL_MAT needs only its weights and the src1 the first one already needs.
+    if (!disable_fusion && ggml_cuda_sibling_mm_enabled()) {
+        const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            ggml_tensor * a = cgraph->nodes[i];
+            if (a->op != GGML_OP_MUL_MAT || !ggml_cuda_mul_mat_takes_mmvq(a, cc)) {
+                continue;
+            }
+            ggml_tensor * group[GGML_CUDA_MMVQ_MAX_SIBLINGS] = { a };
+            int           idx[GGML_CUDA_MMVQ_MAX_SIBLINGS]   = { i };
+            int           n        = 1;
+            for (int j = i + 1; j < cgraph->n_nodes && n < GGML_CUDA_MMVQ_MAX_SIBLINGS; ++j) {
+                ggml_tensor * b = cgraph->nodes[j];
+                if (b->op != GGML_OP_MUL_MAT || b->src[1] != a->src[1]) {
+                    continue;
+                }
+                ggml_tensor * test[GGML_CUDA_MMVQ_MAX_SIBLINGS];
+                std::copy(group, group + GGML_CUDA_MMVQ_MAX_SIBLINGS, test);
+                test[n] = b;
+                if (ggml_cuda_sibling_mm_group(test, n + 1, cc)) {
+                    group[n] = b;
+                    idx[n]   = j;
+                    ++n;
+                }
+            }
+            for (int k = 1; k < n; ++k) {
+                // idx[k] grows with k, so moving one member does not shift the later ones
+                for (int j = idx[k]; j > i + k; --j) {
+                    cgraph->nodes[j] = cgraph->nodes[j - 1];
+                }
+                cgraph->nodes[i + k] = group[k];
+            }
+            i += n - 1;
+        }
+    }
+
+    if (!disable_fusion || ggml_cuda_moe_int4_ffn_ignores_disable_fusion()) {
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT_ID) {
                 ggml_cuda_moe_int4_ffn ffn;
@@ -5753,6 +5902,12 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                     i += ffn_nodes - 1;
                     continue;
                 }
+            }
+            if (disable_fusion) {
+                continue;
+            }
+
+            if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT_ID) {
                 ggml_cuda_moe_down_reduction_match match;
                 if (ggml_cuda_match_moe_down_reduction(cgraph, i, match)) {
                     params->add_alloc_dep(

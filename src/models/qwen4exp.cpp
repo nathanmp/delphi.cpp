@@ -240,14 +240,15 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         const int64_t conv_dim   = key_dim * 2 + value_dim;
 
         // two HC modules per layer: before the token mixer, before the MoE
+        // inject right after down: both read the same input, so the CUDA backend can run them as one launch
         layer.hc_attn_norm   = create_tensor(tn(LLM_TENSOR_HC_ATTN_NORM,   "weight", il), { n_embd, hc }, TENSOR_ALLOW_RESHAPE | flags);
         layer.hc_attn_down   = create_tensor(tn(LLM_TENSOR_HC_ATTN_DOWN,   "weight", il), { hc_dim, hc_lr }, flags);
-        layer.hc_attn_up     = create_tensor(tn(LLM_TENSOR_HC_ATTN_UP,     "weight", il), { hc_lr, hc_dim }, flags);
         layer.hc_attn_inject = create_tensor(tn(LLM_TENSOR_HC_ATTN_INJECT, "weight", il), { hc_dim, hc }, flags);
+        layer.hc_attn_up     = create_tensor(tn(LLM_TENSOR_HC_ATTN_UP,     "weight", il), { hc_lr, hc_dim }, flags);
         layer.hc_ffn_norm    = create_tensor(tn(LLM_TENSOR_HC_FFN_NORM,    "weight", il), { n_embd, hc }, TENSOR_ALLOW_RESHAPE | flags);
         layer.hc_ffn_down    = create_tensor(tn(LLM_TENSOR_HC_FFN_DOWN,    "weight", il), { hc_dim, hc_lr }, flags);
-        layer.hc_ffn_up      = create_tensor(tn(LLM_TENSOR_HC_FFN_UP,      "weight", il), { hc_lr, hc_dim }, flags);
         layer.hc_ffn_inject  = create_tensor(tn(LLM_TENSOR_HC_FFN_INJECT,  "weight", il), { hc_dim, hc }, flags);
+        layer.hc_ffn_up      = create_tensor(tn(LLM_TENSOR_HC_FFN_UP,      "weight", il), { hc_lr, hc_dim }, flags);
 
         if (!hparams.is_recr(il)) {
             // full attention: wq holds [q|gate] interleaved per head
@@ -263,13 +264,14 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
             layer.index_q_norm = create_tensor(tn(LLM_TENSOR_INDEXER_Q_NORM, "weight", il), { idx_dim }, flags);
             layer.index_k_norm = create_tensor(tn(LLM_TENSOR_INDEXER_K_NORM, "weight", il), { idx_dim }, flags);
         } else {
+            // the four projections of the input back to back, so the CUDA backend can run them as one launch
             layer.wqkv       = create_tensor(tn(LLM_TENSOR_ATTN_QKV,   "weight", il), { n_embd, key_dim * 2 + value_dim }, flags);
             layer.wqkv_gate  = create_tensor(tn(LLM_TENSOR_ATTN_GATE,  "weight", il), { n_embd, value_dim }, flags);
+            layer.ssm_beta   = create_tensor(tn(LLM_TENSOR_SSM_BETA,   "weight", il), { n_embd, n_v_heads }, flags);
+            layer.ssm_alpha  = create_tensor(tn(LLM_TENSOR_SSM_ALPHA,  "weight", il), { n_embd, n_v_heads }, flags);
             layer.ssm_conv1d = create_tensor(tn(LLM_TENSOR_SSM_CONV1D, "weight", il), { hparams.ssm_d_conv, conv_dim }, flags);
             layer.ssm_dt     = create_tensor(tn(LLM_TENSOR_SSM_DT,     "bias",   il), { hparams.ssm_dt_rank }, flags);
             layer.ssm_a      = create_tensor(tn(LLM_TENSOR_SSM_A_NOSCAN,         il), { hparams.ssm_dt_rank }, flags);
-            layer.ssm_beta   = create_tensor(tn(LLM_TENSOR_SSM_BETA,   "weight", il), { n_embd, n_v_heads }, flags);
-            layer.ssm_alpha  = create_tensor(tn(LLM_TENSOR_SSM_ALPHA,  "weight", il), { n_embd, n_v_heads }, flags);
             layer.ssm_norm   = create_tensor(tn(LLM_TENSOR_SSM_NORM,   "weight", il), { head_v_dim }, flags);
             layer.ssm_out    = create_tensor(tn(LLM_TENSOR_SSM_OUT,    "weight", il), { value_dim, n_embd }, flags);
         }
@@ -563,7 +565,6 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     graph(model, params, no_build_t{}) {
     GGML_ASSERT(hparams.n_layer_nextn > 0 && "QWEN4EXP MTP requires n_layer_nextn > 0");
     GGML_ASSERT(hparams.n_layer_nextn == 1 && "QWEN4EXP MTP currently only supports a single MTP block");
-    GGML_ASSERT(ubatch.token && "QWEN4EXP MTP requires token input");
 
     const int64_t hc     = hparams.dsv4_hc_mult;
     const int64_t hc_dim = hc * n_embd;
@@ -585,7 +586,8 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
     ggml_set_input(inp->tokens);
 
-    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hc_dim, n_tokens);
+    // media rows: the batch row width (n_embd_inp), as in build_inp_embd
+    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_inp(), n_tokens);
     ggml_set_input(inp->embd);
 
     inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hc_dim, n_tokens);
@@ -596,7 +598,10 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     if (tok_embd_w == nullptr) {
         tok_embd_w = qwen4exp_shared_model(cparams, model, "token_embd.weight").tok_embd;
     }
-    ggml_tensor * tok_embd   = ggml_get_rows(ctx0, tok_embd_w, inp->tokens);
+    // media positions arrive as embeddings (ref: ggml-org/llama.cpp#30397); their rows can be wider than n_embd (deepstack
+    // features after the main embedding), and the head reads only the main embedding, like the trunk input
+    ggml_tensor * tok_embd   = ubatch.token ? ggml_get_rows(ctx0, tok_embd_w, inp->tokens) :
+                                              ggml_view_2d(ctx0, inp->embd, n_embd, n_tokens, inp->embd->nb[1], 0);
     cb(tok_embd, "mtp_tok_embd", il);
 
     ggml_tensor * h_state = ggml_reshape_3d(ctx0, inp->h, n_embd, hc, n_tokens);
