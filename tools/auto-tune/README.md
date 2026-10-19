@@ -2,11 +2,11 @@
 
 `auto_tune.py` finds better launch flags and environment knobs for one model on a fixed set of devices. It starts from a `tools/bottlenecks` recipe arm, changes one registered knob at a time, keeps a change when it beats the current best by the noise margin, and then confirms the best config against the arm with interleaved runs (best, base, best). It never changes a deployment; it writes a report and `best.json`.
 
-Status: V1 milestone 2. Loop 1 searches placement and process-time knobs. For each launch candidate, loop 2 searches context knobs through feature-detected `/tune/context`; a 404 uses full launches within the same budget. Request-policy tuning and precision gates are later milestones. M2 keeps the recipe's speculative policy and precision levels fixed, even when `kld.limit` is set.
+Status: V1 milestone 3, with server limitations below. Loop 1 searches placement and process-time knobs. For each launch candidate, loop 2 searches context knobs through feature-detected `/tune/context`; a 404 uses full launches within the same budget. Opt-in loop 3 calculates MTP request policies from acceptance logs and pass costs. Precision gates are a later milestone and precision levels stay fixed, even when `kld.limit` is set.
 
 Each context point uses three full workload repeats (`context_search.reps`, at least two). A complete repeat contains the recipe's decode client and every weighted prefill length. After each repeat, racing can stop a losing point if its log score is below the incumbent by more than three standard deviations of the incumbent's repeat scores (with `noise_margin` as the minimum gap). Partial points cannot win or be exported. Context points use wall time but no launch slots; three fresh launches stay reserved for confirmation. Server and recipe warmup stay enabled, and prompt caching is disabled.
 
-Context search uses coordinate descent, with batch x auto-cache margin searched jointly while cache precision stays fixed. Explicit NUMA overrides are process knobs and each gets its own thread search. More than eight surviving context knobs trigger two randomized finite-domain Morris screening trajectories; the batch/cache and thread coordinates remain eligible for refinement. The target, batch and following draft thread counts stay inside the CPU budget; custom levels outside it and the prohibited count 64 are removed. Per-launch traces currently use the fresh-launch fallback so trace windows do not mix contexts.
+Context search uses coordinate descent, with batch x auto-cache margin searched jointly while cache precision stays fixed. Explicit NUMA overrides are process knobs and each gets its own thread search. More than eight surviving context knobs trigger two randomized finite-domain Morris screening trajectories; the batch/cache and thread coordinates remain eligible for refinement. The target, batch and following draft thread counts stay inside the CPU budget; custom levels outside it and the prohibited count 64 are removed. Per-launch traces use the fresh-launch fallback. Loop 3 also needs that fallback because the server flushes its trace only at process exit.
 
 ## Commands
 
@@ -36,6 +36,7 @@ python3 tools/auto-tune/auto_tune.py report tune.json   # rewrite report.md from
   "prefill": {"text": "/path/real-text.txt", "lengths": {"300": 2, "2048": 1}, "reps": 3},
   "decode": {"osl": 256},
   "context_search": {"reps": 3, "screen_threshold": 8},
+  "speculation": {"enabled": false, "max_draft": 6, "osl": 64, "prompts": 3},
   "context": 32768,
   "kld": {"limit": 0.02, "text": "/path/eval.txt", "chunks": 8, "ctx": 512, "batch": 4},
   "devices": {"ROCm2": {"min_free_mib": 2048}, "ROCm0": {"max_used_mib": 16384}},
@@ -62,6 +63,7 @@ python3 tools/auto-tune/auto_tune.py report tune.json   # rewrite report.md from
 | `clock_mode` | the forced performance level that every used amdgpu card must have at the start; `null` skips the check |
 | `budget` | at most `max_launches` full launches and `max_hours`; re-creates use time only, and 3 launches stay reserved for confirmation |
 | `context_search` | full workload repeats per context point, and the knob count above which screening runs |
+| `speculation` | opt-in MTP replay; see below for measurements and current server requirements |
 | `knobs` | `only` limits the registry, `include` adds opt-in knobs, `exclude` removes knobs, `levels` replaces the levels of a knob |
 | `class_order` | the search order of the knob classes; the budget can end the search before the last ones |
 | `noise_margin` | a change must beat the current best score by this fraction |
@@ -80,7 +82,7 @@ score = product over the metrics of (metric / base metric) ^ weight. The metrics
 | --- | --- | --- |
 | fit | `-ub`, `-b`, `-ubd`, staging slots, cache margin | score; a level that does not load is a recorded failure |
 | speed | `-t`, staging threshold, cache prompt rows and refresh interval | score |
-| accept | draft n-max, adaptive depth, adaptive floor | score (real acceptance in the decode client) |
+| accept | draft n-max/n-min/p-min, adaptive depth and floor | MTP replay estimates, then fresh real-acceptance confirmation |
 | precision | KV type, GPU expert cache, `-sm tensor` (opt-in), indexer split (opt-in) | KLD gate, then score |
 
 A knob is offered only where it applies (for example staging knobs only with `GGML_SCHED_STAGE=1`, draft batch knobs only with `--spec-type`). Threads start at physical cores less two per GPU and can move up to the physical-core budget or `max_threads`. Unknown env knobs require a process launch. Context requests contain the complete target settings and env changes, including unsets, so rejected points and returning to an earlier point cannot leave stale settings behind. The server restores a rejected context; the tuner records it as infeasible and continues. Transport failures close the owned server and require a new launch.
@@ -90,3 +92,24 @@ A knob is offered only where it applies (for example staging knobs only with `GG
 `output/` holds `results.jsonl`, `journal.jsonl`, `state.json`, `report.md`, `best.json`, the launch artifacts and the `llama-perplexity` logs. The reference logits are in `/dev/shm` during the run and are deleted at its end.
 
 The report gives the recommendation (the confirmed best, or the base when the confirm did not hold the gain) with a paste-ready command and environment, the best measured config for decode shares 0, 0.25, 0.5, 0.75 and 1 of the weight (single runs), and every measurement with TTFT and prompt t/s per length, acceptance, KLD and VRAM use.
+
+## Speculative replay (loop 3)
+
+Set `speculation.enabled: true` to collect MTP acceptance and T(w) at each context point. The existing `DELPHI_SPEC_PLOG` hook is reused. One process measures every width through `POST /speculative`; replaying policies adds no launches or context re-creates. Because the trace is written at process exit, this mode currently uses a fresh process for each loop-2 point. It is opt-in until a live trace-flush hook is available. Launch/time limits and the confirmation reserve still apply.
+
+`speculation.text` defaults to `prefill.text`. Defaults are three distinct real-text prompts of 128 tokens, 64 output tokens, a maximum draft of 6 (clipped to the launch output capacity), three initial cycles omitted per request, and at least three measured cycles per width/request. `trace_max_events` defaults to 8388608; a truncated trace or dropped events rejects the point. The width order is shuffled with a fixed seed. Server and recipe warmup stay enabled. Each width uses fixed synthetic acceptance; its generated output is invalid and is never quality evidence. T(w) is the median verify-to-verify host wall interval within a request, including draft work and synchronization. Device times are not added. A confidence cut also pays for the discarded draft step; n_min can discard the whole draft.
+
+The capture uses greedy MTP, fixed maximum depth, p_min=0, n_min=0, and normal acceptance. Separate requests supply boundaries absent from the log. Short final passes are omitted. Replay clips the accepted prefix and simulates fixed or bucket depth, with bucket state reset for every request. Candidate domains come from the request knobs in the registry and respect `only`, `exclude`, and `levels`. Cost/conf controllers are not replayed: they need timing, shadow-token or calibration state that the current log does not contain. The best decode policy for a context also dominates the other policies at every positive decode weight because their prefill measurements are identical.
+
+These are empirical pass estimates. Shorter drafts change future pass boundaries, the log rounds probabilities to four decimals, and settled T(w) omits graph rebuild/depth-switch costs. The log does not contain tokens, so this cannot be an exact token replay. Predicted rows are labeled `replay-estimate`; `best.json` requires fresh normal-acceptance confirmation before it can recommend them. The original policy is restored after synthetic collection, including on errors, before the recipe's real client and prefill measurements run.
+
+DSpark and other implementations have no per-pass probability log. Their normal measurements continue with an explicit unavailable reason, and their request policy stays fixed. The report requests a shared log with request/sequence/pass IDs, tokens, full-precision probabilities, accepted length and checkpoint-replay markers, plus a live trace-flush hook. No C++ changes are made by this milestone.
+
+Artifacts include `source.json` (point identity and tokenized prompts), request settings and restoration, one raw acceptance JSONL per prompt, `capture.json`, synthetic request windows, `loop3.trace`, `pass-cost.json`, the existing host execution summary, and `replay.json`. Capture and cost files carry the same point identity. Recalculate policies without a server:
+
+```bash
+python3 tools/auto-tune/speculation.py /path/capture.json /path/pass-cost.json \
+  --policy '{"n_max":4,"p_min":0.5}' \
+  --policy '{"n_max":4,"adaptive":"bucket","n_min_adaptive":1}' \
+  --output /tmp/replay.json
+```

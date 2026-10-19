@@ -90,7 +90,8 @@ class Tuner:
                              "trace": cfg["trace"], "env": cfg["env"]}
         if context_runner:
             self.measure_spec['context_search'] = cfg['context_search']
-            self.measure_spec['version'] = 2
+            self.measure_spec['speculation'] = cfg['speculation']
+            self.measure_spec['version'] = 3
         self.kld_spec = {k: v for k, v in cfg["kld"].items() if k != "limit"}
         self.max_threads = min(cpu_budget.cores, cfg['max_threads'] or cpu_budget.cores) if cpu_budget else cfg["max_threads"] or max(1, physical_cores() - 8)
         self.fresh_launch_s = []
@@ -259,6 +260,37 @@ class Tuner:
         return self.store.add({**record, "status": status, "metrics": metrics, "error": "; ".join(problems) or None})
 
     # search
+
+    def request_points(self, row):
+        """Calculate request policies from one context's measurements; these spend no launches."""
+        from speculation import Policy
+        spec = row.get('metrics', {}).get('speculation', {})
+        if row.get('status') != 'ok' or spec.get('status') != 'ok':
+            return []
+        result = []
+        started = time.monotonic()
+        # Every request policy has the same prefill. The fastest decode dominates the others for all positive decode weights.
+        for candidate in spec['candidates'][:1]:
+            command = Policy(**candidate['policy']).command(row['command'])
+            metrics = {**row['metrics'], 'decode_t_s': candidate['decode_t_s'], 'decode_source': 'replay-estimate',
+                       'speculation_policy': candidate['policy'], 'speculation_parent': row['key']}
+            # The cost repeats measure different real-text prompts at the same deterministic acceptance.
+            costs = candidate['repeat_decode_t_s']
+            metrics['samples'] = [{**s, 'decode_t_s': costs[i % len(costs)]} for i, s in enumerate(metrics.get('samples', []))]
+            metrics.pop('speculation', None)
+            metrics['draft_n'] = metrics['draft_n_accepted'] = None
+            key = digest({'parent': row['key'], 'policy': candidate['policy']})
+            record = self.store.find(key, 'launch', 'search')
+            if record is None:
+                record = self.store.add({'key': key, 'kind': 'launch', 'phase': 'search', 'operation': 'replay', 'status': 'ok',
+                                         'name': row['name'] + ' request ' + json.dumps(candidate['policy'], sort_keys=True),
+                                         'command': list(command), 'env': row['env'], 'changes': self.changes(command, row['env']),
+                                         'metrics': metrics, 'parent': row['key']})
+            result.append(record)
+        stage = self.state.setdefault('stages', {}).setdefault('request', {'launches': 0, 'policies': 0, 'wall_s': 0.0})
+        stage['policies'] += len(spec['candidates'])
+        stage['wall_s'] += time.monotonic() - started
+        return result
 
     def run(self) -> dict[str, Any]:
         try:
@@ -556,8 +588,11 @@ def plan_text(tuner: Tuner) -> str:
     budget = cfg["budget"]
     if tuner.context_runner:
         lines += [f"Context points use {cfg['context_search']['reps']} complete workload repeats; stop below the incumbent by >3x repeat noise.",
-                  "Context/request precision changes stay fixed until the KLD milestone; fresh launches confirm the final candidate.",
+                  "Precision changes stay fixed until the KLD milestone; fresh launches confirm the final candidate.",
                   "The launch estimate excludes context points and their nesting; without hooks each point needs a launch."]
+        if cfg['speculation']['enabled']:
+            lines += ['Loop 3: MTP probability capture, synthetic T(w), then fixed/bucket replay; fresh normal acceptance confirms predictions.',
+                      'No live trace flush hook: MTP loop-2 points use fresh launches in this opt-in mode; DSpark needs a per-pass log.']
     lines += ["", f"launches at most (KLD runs count as launches): {launches}; budget {budget['max_launches']} launches, {budget['max_hours']} h"]
     if launches > budget["max_launches"]:
         lines.append("the budget ends the search early: the knobs at the end of the list are then not tested")

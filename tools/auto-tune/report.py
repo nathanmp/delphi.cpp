@@ -106,7 +106,7 @@ def write(cfg: Mapping[str, Any], state: Mapping[str, Any], store: Store, out: P
             continue
         m = record.get("metrics") or {}
         s = S.score(m, reference, weights) if record["status"] == "ok" and record.get("phase") != "warmup" else None
-        note = (record.get("error") or "").replace("|", "/")[:160]
+        note = (record.get("error") or m.get('decode_source') or "").replace("|", "/")[:160]
         lines.append(f"| {record['name']} | {record['status']} | {_f(s, '{:.3f}')} | {_f(m.get('decode_t_s'))} | {_acceptance(m)} | "
                      + " | ".join(_prefill_cells(m, lengths)) + f" | {_f(record.get('kld'), '{:.4f}')} | {_vram(m)} | {note} |")
 
@@ -117,7 +117,7 @@ def write(cfg: Mapping[str, Any], state: Mapping[str, Any], store: Store, out: P
         lines += ["", f"Skipped (no longer applied after an earlier change): {', '.join(skipped)}."]
     placement = state.get('placement')
     if placement:
-        lines += ['', '## Placement verification', '', 'Context tuning uses feature-detected hooks; request tuning and precision gates are later milestones.', '']
+        lines += ['', '## Placement verification', '', 'Context tuning uses feature-detected hooks. Precision gates are a later milestone.', '']
         for candidate in placement['candidates']:
             lines.append(f"- {candidate['name']}: " + '; '.join(candidate['warnings'] or ['no planning warnings']))
         for row in store.records:
@@ -128,6 +128,18 @@ def write(cfg: Mapping[str, Any], state: Mapping[str, Any], store: Store, out: P
     lines += ['', 'Stages: ' + json.dumps(state.get('stages', {}))]
     if 'context_hooks' in state:
         lines += ['', f"Context hooks: {state['context_hooks']}. Context repeats stop early when the score is worse by more than three times incumbent repeat noise."]
+    spec_rows = [r for r in by_key.values() if r.get('metrics', {}).get('speculation')]
+    if spec_rows:
+        lines += ['', '## Speculative replay', '',
+                  'Replay rows are throughput estimates from empirical acceptance passes and measured T(w). Synthetic output is performance-only. Recommendations require fresh normal-acceptance confirmation.',
+                  'The MTP log has four-decimal probabilities and no tokens or request IDs. Requests are captured separately. Clipping changes future pass boundaries; cost/conf controllers and depth-switch costs are not replayed.',
+                  'Request a shared per-pass server log for DSpark/other speculators, with request/sequence/pass IDs, tokens, full-precision probabilities, accepted length, and checkpoint-replay markers. A live execution-trace flush hook is also needed to keep loop-2 contexts resident during T(w) collection.', '']
+        for row in spec_rows:
+            spec = row['metrics']['speculation']
+            if spec.get('status') != 'ok':
+                lines.append(f"- {row['name']}: unavailable: {spec.get('reason')}")
+            else:
+                lines.append(f"- {row['name']}: cap {spec['cap']}, {spec['requests']} measured requests, {len(spec['candidates'])} replay policies, {spec['wall_s']:.1f} s; artifacts: {spec['path']}. {spec['trace_fallback']}")
     (out / "report.md").write_text("\n".join(lines) + "\n")
     (out / "best.json").write_text(json.dumps({"command": list(command), "env": recommended["env"], 'cpu_budget': cpu_budget,
                                                "changes": recommended.get("changes") or {}, "confirm": confirm}, indent=2) + "\n")

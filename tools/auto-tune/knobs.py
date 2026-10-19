@@ -205,6 +205,8 @@ REGISTRY: tuple[Knob, ...] = (
     Knob("LLAMA_MOE_CACHE_EVERY", "speed", "env", ("LLAMA_MOE_CACHE_EVERY",), (4, 8, 16), "small batches between cache refreshes", requires=_cache, unset="8"),
     # accept
     Knob("--spec-draft-n-max", "accept", "option", ("--spec-draft-n-max",), (2, 3, 4, 5, 6), "largest draft", requires=_speculative),
+    Knob("--spec-draft-n-min", "accept", "option", ("--spec-draft-n-min",), (0, 1, 2), "discard drafts below this length", requires=_speculative, unset="0"),
+    Knob("--spec-draft-p-min", "accept", "option", ("--spec-draft-p-min",), (0, 0.5, 0.8), "draft confidence cutoff", requires=_speculative, unset="0"),
     Knob("--spec-draft-adaptive", "accept", "switch", ("--spec-draft-adaptive",), (OFF, ON), "adaptive draft depth", requires=_speculative),
     Knob("--spec-draft-n-min-adaptive", "accept", "option", ("--spec-draft-n-min-adaptive",), (1, 2), "smallest adaptive draft", requires=_adaptive),
     # precision

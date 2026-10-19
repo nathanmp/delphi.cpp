@@ -61,14 +61,18 @@ class ContextRunner:
         self.stats = {'launches': 0, 'recreates': 0, 'launch_wall_s': 0.0, 'recreate_wall_s': 0.0, 'measurement_wall_s': 0.0}
         self.url = f'http://127.0.0.1:{arm.port}'
 
-    def request(self, body=None):
+    def spec_enabled(self, command):
+        from spec_runner import unavailable
+        return self.cfg['speculation']['enabled'] and unavailable(command) is None
+
+    def request(self, body=None, *, path='/tune/context'):
         data = json.dumps(body).encode() if body is not None else None
-        req = urllib.request.Request(self.url + '/tune/context', data=data, headers={'Content-Type': 'application/json'})
+        req = urllib.request.Request(self.url + path, data=data, headers={'Content-Type': 'application/json'})
         with urllib.request.urlopen(req, timeout=self.arm.request_timeout_s) as response:
             return json.loads(response.read())
 
     def operation(self, command, env):
-        if self.cfg['trace'] or self.supported is False or self.process is None or self.process.poll() is not None:
+        if self.cfg['trace'] or self.spec_enabled(command) or self.supported is False or self.process is None or self.process.poll() is not None:
             return 'launch'
         # A resumed search can first load an explicit level. Its GET value is not the CLI default of an omitted flag.
         if any(K.option_value(command, flag) is None and K.option_value(self.launch_command, flag) is not None for flag in FIELDS):
@@ -104,6 +108,16 @@ class ContextRunner:
             values = {'port': str(self.arm.port), 'url': self.url, 'artifact_dir': str(directory), 'output': str(directory / 'client.json')}
             # Context measurements cannot use a trace spanning other contexts. Traced runs use the fresh-launch path.
             full_env.update(M.P._trace_env(directory / 'unused.trace', 'off', 0, 0))
+            if self.spec_enabled(command):
+                self.trace_path = directory / 'loop3.trace'
+                self.plog_path = directory / 'mtp-probabilities.jsonl'
+                # The log appends and opens its path once per process. Never append to a previous attempt.
+                self.plog_path.unlink(missing_ok=True)
+                for key in list(full_env):
+                    if key.startswith('GGML_EXEC_TRACE'):
+                        del full_env[key]
+                full_env.update(GGML_EXEC_TRACE=str(self.trace_path), GGML_EXEC_TRACE_MAX_EVENTS=str(self.cfg['speculation']['trace_max_events']),
+                                DELPHI_SPEC_PLOG=str(self.plog_path))
             self.process = subprocess.Popen(M.P._render(cmd, values), cwd=M.ROOT, env=full_env, text=True, stdout=stdout, stderr=stderr)
             (directory / 'launch.json').write_text(json.dumps({'command': list(cmd), 'env': dict(env), 'pid': self.process.pid,
                 'binary_version': M.P._version(command[0], env), 'models': M.P._model_identity(self.arm.model_paths)}, indent=2) + '\n')
@@ -202,7 +216,7 @@ class ContextRunner:
         samples = []
         started = time.monotonic()
         with self.cpu.affinity() if self.cpu else contextlib.nullcontext():
-            if self.cfg['trace']:
+            if self.cfg['trace'] and not self.spec_enabled(command):
                 # Keep trace windows and fresh-launch validation identical to M0.
                 self.close()
                 self.stats['launches'] += 1
@@ -221,6 +235,28 @@ class ContextRunner:
                     self._client(self.arm.warmup_command, env, values, directory, 'warmup')
                 with M.VramSampler() as vram:
                     vram.baseline = self.baseline
+                    collector = None
+                    spec_status = None
+                    if self.spec_enabled(command):
+                        from spec_runner import Collector
+                        from speculation import Unavailable
+                        collector = Collector(self, command, env, directory, continue_measure)
+                        try:
+                            collector.collect()
+                        except Unavailable as error:
+                            collector = None
+                            spec_status = {'status': 'unavailable', 'reason': str(error)}
+                        except urllib.error.HTTPError as error:
+                            if error.code != 404:
+                                raise
+                            collector = None
+                            spec_status = {'status': 'unavailable', 'reason': '/speculative is absent (404); request the server control hook.'}
+                        # Collection restores the launch policy. Warm it again after the synthetic widths.
+                        if self.arm.warmup_command:
+                            self._client(self.arm.warmup_command, env, values, directory, 'restored-warmup')
+                    elif self.cfg['speculation']['enabled']:
+                        from spec_runner import unavailable
+                        spec_status = {'status': 'unavailable', 'reason': unavailable(command)}
                     for rep in range(self.cfg['context_search']['reps']):
                         rep_dir = directory / f'repeat-{rep + 1}'
                         rep_dir.mkdir(exist_ok=True)
@@ -242,6 +278,11 @@ class ContextRunner:
                     if self.audit.violations or not self.audit.samples:
                         raise M.LaunchFailed('CPU budget audit failed: ' + str(result['cpu_budget']))
                 result['placement_warnings'] = self.warnings(offsets)
+                if collector:
+                    self.close()
+                    result['speculation'] = collector.finish()
+                elif spec_status:
+                    result['speculation'] = spec_status
                 (directory / 'metrics.json').write_text(json.dumps(result, indent=2) + '\n')
                 if not self.supported:
                     self.close()

@@ -26,6 +26,8 @@ import placement as PL
 from measure import vram_violations, P, CpuSampler
 from verify_client import verify
 from context_runner import ContextRunner, ContextRejected, process_key, payload
+import speculation as SP
+from spec_runner import Collector, unavailable
 
 BASE = ("llama-server", "-m", "model.gguf", "-c", "8192", "-b", "2048", "-ub", "512", "-fa", "on", "-t", "32",
         "--spec-type", "draft-mtp", "--spec-draft-n-max", "4", "--device", "ROCm0,ROCm1")
@@ -693,6 +695,170 @@ class ContextSearch(unittest.TestCase):
             state = t.run()
             self.assertTrue(state['screening'])
             self.assertIn('-ub', state['screening'][0]['effects_log'])
+
+
+class Speculation(unittest.TestCase):
+    def widths(self):
+        return {str(n + 1): {'cycle_ms': 10.0 + n * 2, 'draft_ms': n * 1.0, 'verify_ms': 5.0, 'cycles': 10} for n in range(7)}
+
+    def corpus(self):
+        return [SP.read_plog('\n'.join(json.dumps({'n': 4, 'acc': a, 'p': [.95, .7, .4, .3]}) for a in (4, 2, 0)), 4)]
+
+    def test_log_validation_and_censored_boundaries(self):
+        parsed = SP.read_plog('{"n":4,"acc":2,"p":[0.9,0.8,0.7,0.6]}\n{"n":1,"acc":0,"p":[0.8]}\n', 4)
+        self.assertEqual(len(parsed['passes']), 1)
+        self.assertEqual(parsed['boundary_passes_omitted'], 1)
+        for text in ('{"n":4,"acc":5,"p":[1,1,1,1]}', '{"n":4,"acc":2,"p":[1,1,1]}',
+                     '{"n":4,"acc":2,"p":[1,1,1,NaN]}', '{"n":4,"acc":2,"p":[1,1,1,true]}',
+                     '{"n":0,"acc":0,"p":[]}', '{"n":4', '[]', '{"n":4,"acc":2,"p":[1,1,1,1,1]}'):
+            with self.subTest(text=text), self.assertRaises(SP.SpecError):
+                SP.read_plog(text, 4)
+
+    def test_clipping_uses_accepted_plus_one_and_complete_pass_cost(self):
+        result = SP.replay(self.corpus(), SP.Policy(2), self.widths())
+        self.assertEqual(result['output_tokens'], 7)
+        self.assertEqual(result['wall_ms'], 42)
+        self.assertAlmostEqual(result['decode_t_s'], 1000 * 7 / 42)
+        self.assertTrue(result['estimate'])
+
+    def test_probability_cut_pays_for_the_discarded_step_and_minimum(self):
+        result = SP.replay(self.corpus(), SP.Policy(4, p_min=.8), self.widths())
+        self.assertEqual(result['output_tokens'], 5)
+        self.assertEqual(result['wall_ms'], 39)  # width 2 at 12 ms plus one cut step at 1 ms
+        result = SP.replay(self.corpus(), SP.Policy(4, n_min=2, p_min=.8), self.widths())
+        self.assertEqual(result['output_tokens'], 3)
+        self.assertEqual(result['wall_ms'], 36)  # width 1 at 10 ms plus both attempted steps
+
+    def test_missing_costs_and_extrapolation_cannot_win(self):
+        with self.assertRaises(SP.SpecError):
+            SP.replay(self.corpus(), SP.Policy(5), self.widths())
+        table = self.widths()
+        del table['2']
+        ranked = SP.rank(self.corpus(), [SP.Policy(4, p_min=.8)], {'widths': table, 'by_prompt': {'0': table}})
+        self.assertFalse(ranked['candidates'])
+        self.assertTrue(ranked['skipped'])
+
+    def test_bucket_drop_climb_and_request_reset(self):
+        policy = SP.Policy(6, adaptive='bucket', n_start=3)
+        bucket = SP.Bucket(policy)
+        for _ in range(20):
+            bucket.update(0)
+        self.assertEqual((bucket.depth, bucket.credit), (2, 26))
+        bucket = SP.Bucket(policy)
+        for _ in range(16):
+            bucket.update(3)
+        self.assertEqual((bucket.depth, bucket.credit), (4, 60))
+        for _ in range(500):
+            bucket.update(0)
+        self.assertEqual((bucket.depth, bucket.credit), (1, 0))
+        rows = {'passes': [{'n': 6, 'acc': 0, 'p': [1] * 6}] * 20}
+        result = SP.replay([rows, rows], policy, self.widths())
+        self.assertEqual(result['depths'], {'3': 40})
+        with self.assertRaises(SP.SpecError):
+            SP.Policy(4, adaptive='conf')
+
+    def test_policy_command_overrides_both_adaptive_switches(self):
+        source = (*BASE, '--spec-draft-adaptive', '--spec-draft-adaptive-mode', 'conf')
+        fixed = SP.Policy(2).command(source)
+        self.assertIn('--no-spec-draft-adaptive', fixed)
+        self.assertNotIn('--spec-draft-adaptive', fixed)
+        self.assertIsNone(K.option_value(fixed, '--spec-draft-adaptive-mode'))
+        adaptive = SP.Policy(4, adaptive='bucket').command(fixed)
+        self.assertNotIn('--no-spec-draft-adaptive', adaptive)
+        self.assertEqual(K.option_value(adaptive, '--spec-draft-adaptive-mode'), 'bucket')
+
+    def test_domains_respect_registry_capacity_and_unsupported_controller(self):
+        c = cfg('unused', knobs={'only': ['--spec-draft-n-max'], 'levels': {'--spec-draft-n-max': [2, 4, 8]}})
+        candidates = SP.policies(BASE, {}, c, 4)
+        self.assertEqual([p.n_max for p in candidates], [2, 4])
+        self.assertFalse(SP.policies(BASE, {}, c, 4, {'adaptive': 'conf'}))
+        c['knobs']['only'].append('--spec-draft-adaptive')
+        candidates = SP.policies(BASE, {}, c, 4, {'adaptive': 'conf'})
+        self.assertEqual({p.adaptive for p in candidates}, {'off', 'bucket'})
+        c['knobs']['only'] = ['-ub']
+        self.assertFalse(SP.policies(BASE, {}, c, 4))
+        self.assertIn('DSpark', unavailable(K.set_option(BASE, '--spec-type', 'draft-dspark')))
+
+    def trace(self):
+        events = []
+        def execution(i, phase, tokens, start, end):
+            events.extend([{'kind': 2, 'execution_id': i, 'timestamp_ns': int(start * 1e6), 'flags': phase << 8, 'args': [tokens]},
+                           {'kind': 3, 'execution_id': i, 'timestamp_ns': int(end * 1e6), 'flags': phase << 8, 'args': [tokens]}])
+        for request, offset in enumerate((0, 1000)):
+            for i in range(8):
+                start = offset + i * 20
+                execution(request * 100 + i * 2, 2, 3, start, start + 5)
+                execution(request * 100 + i * 2 + 1, 3, 1, start + 10, start + 14)
+        return {'flags': 0, 'events': sorted(events, key=lambda e: e['timestamp_ns']), 'trace_stats': {}}
+
+    def test_cost_windows_omit_warmup_and_do_not_bridge_requests(self):
+        windows = [{'width': 3, 'prompt': i, 'start_ns': i * 1000_000_000, 'end_ns': (i * 1000 + 160) * 1_000_000} for i in range(2)]
+        table = SP.cost_table(self.trace(), windows, settle=3, minimum=3)
+        self.assertEqual(table['widths']['3']['cycles'], 8)
+        self.assertEqual(table['widths']['3']['cycle_ms'], 20)
+        self.assertEqual(table['widths']['3']['draft_ms'], 4)
+        self.assertEqual(set(table['by_prompt']), {'0', '1'})
+        trace = self.trace()
+        trace['flags'] = 1
+        with self.assertRaises(SP.SpecError):
+            SP.cost_table(trace, windows)
+        trace['flags'] = 0
+        trace['trace_stats']['dropped_event_count'] = 1
+        with self.assertRaises(SP.SpecError):
+            SP.cost_table(trace, windows)
+        with self.assertRaises(SP.SpecError):
+            SP.cost_table(self.trace(), windows, settle=6, minimum=3)
+
+    def test_trace_filter_keeps_integrity_and_default_reader_behavior(self):
+        with tempfile.TemporaryDirectory() as d:
+            T = P.TRACE_SPEC.T
+            path = Path(d) / 'trace'
+            events = []
+            for kind in (T.K_RUN_METADATA, T.K_EXECUTION_BEGIN, T.K_EXECUTION_END):
+                events.append(T.EVENT.pack(1, 2, 0, 0, 0, 3, 0, 0, 0, kind, 2 << 8, 0, 0, 0, 0))
+            header_size = T.HEADER.size + T.HEADER_V3_STATS.size
+            path.write_bytes(T.HEADER.pack(b'GEXECTR', 5, header_size, T.EVENT.size, 0, 0, 3, 0, 0)
+                             + T.HEADER_V3_STATS.pack(10, 3, 1, 0, 0) + b''.join(events))
+            self.assertEqual(len(T.read_trace(path)['events']), 3)
+            selected = T.read_trace(path, kinds={T.K_EXECUTION_BEGIN, T.K_EXECUTION_END})
+            self.assertEqual(len(selected['events']), 2)
+            self.assertEqual(selected['trace_stats']['dropped_event_count'], 1)
+
+    def test_collector_restores_launch_policy_on_measurement_error(self):
+        with tempfile.TemporaryDirectory() as d:
+            c = cfg(d, speculation={'enabled': True, 'text': str(Path(d) / 'text')})
+            Path(c['speculation']['text']).write_text('some text')
+            info = {'types': 'draft-mtp', 'draft_sampling': 'greedy', 'draft_context': True, 'n_max_launch': 4,
+                    'n_max': 4, 'adaptive': 'off', 'p_min': 0}
+            runner = Mock(cfg=c, url='url', arm=Mock(request_timeout_s=10), plog_path=Path(d) / 'plog')
+            runner.request.side_effect = [info, {'total_slots': 1}, info, info]
+            collector = Collector(runner, BASE, {}, Path(d), lambda: True)
+            with patch('spec_runner.post', return_value={'tokens': list(range(1000))}), patch.object(collector, 'completion', side_effect=SP.SpecError('failed')):
+                with self.assertRaisesRegex(SP.SpecError, 'failed'):
+                    collector.collect()
+            self.assertEqual(runner.request.call_args, unittest.mock.call({'args': [], 'calibrate': False}, path='/speculative'))
+            self.assertTrue((Path(d) / 'restored.json').exists())
+
+    def test_replay_points_cost_no_launch_and_need_real_confirmation(self):
+        with tempfile.TemporaryDirectory() as d:
+            t, runner, fresh = ContextSearch().tuner(d, knobs={'only': ['--spec-draft-n-max']})
+            original = runner.measure
+            def measure(*args):
+                metrics = original(*args)
+                metrics['speculation'] = {'status': 'ok', 'candidates': [{'policy': asdict(SP.Policy(5)), 'decode_t_s': 100,
+                                                                        'repeat_decode_t_s': [99, 101]}]}
+                return metrics
+            from dataclasses import asdict
+            runner.measure = measure
+            state = t.run()
+            records = [r for r in t.store.records if r.get('operation') == 'replay']
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]['metrics']['decode_source'], 'replay-estimate')
+            self.assertEqual(state['budget']['launches'], 4)
+            self.assertEqual(state['stages']['request']['launches'], 0)
+            self.assertEqual(fresh, ['confirm-1 best', 'confirm-2 base', 'confirm-3 best'])
+            # The real fake client sees only a small gain, not the predicted 2x.
+            self.assertLess(state['confirm']['gain'], 1.1)
 
 
 if __name__ == "__main__":

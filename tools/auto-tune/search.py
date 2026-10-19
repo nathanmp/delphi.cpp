@@ -25,7 +25,15 @@ class NestedSearch:
         point = {'command': tuple(command), 'env': dict(env), 'row': row, 'score': value}
         if self.better(point, self.best):
             self.best = point
+        self.requests(point)
         return point
+
+    def requests(self, point):
+        for row in self.t.request_points(point['row']):
+            value = S.score(row['metrics'], self.reference, self.t.weights)
+            candidate = {'command': tuple(row['command']), 'env': row['env'], 'row': row, 'score': value}
+            if self.better(candidate, self.best):
+                self.best = candidate
 
     def better(self, candidate, incumbent):
         return candidate['score'] is not None and candidate['score'] > incumbent['score'] * (1 + self.t.cfg['noise_margin'])
@@ -114,6 +122,7 @@ class NestedSearch:
         return incumbent
 
     def run(self, incumbent, placements):
+        self.requests(incumbent)
         best = self.refine(incumbent)
         # Each placement gets its own context search, including placements whose starting point loses.
         for option in placements:

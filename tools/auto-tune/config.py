@@ -33,6 +33,8 @@ DEFAULTS: dict[str, Any] = {
     "max_cores": None,  # at most this many physical cores from the caller's affinity
     "placement": {"reserve_mib": {}},  # extra device buffers not measured by llama-fit-params (for example mmproj)
     "context_search": {"reps": 3, "screen_threshold": 8},  # full workload repeats per context point
+    "speculation": {"enabled": False, "text": None, "prompt_tokens": 128, "prompts": 3, "osl": 64,
+                    "max_draft": 6, "settle_cycles": 3, "min_cycles": 3, "trace_max_events": 8388608},  # MTP replay; traces currently require a fresh process per point
     "class_order": ["fit", "precision", "accept", "speed"],  # the order in which the knob classes are searched
 }
 
@@ -76,6 +78,7 @@ def load_config(path: Path) -> dict[str, Any]:
         cfg[key] = resolve(cfg[key])
     cfg["prefill"]["text"] = resolve(cfg["prefill"]["text"])
     cfg["kld"]["text"] = resolve(cfg["kld"]["text"])
+    cfg["speculation"]["text"] = resolve(cfg["speculation"]["text"]) or cfg["prefill"]["text"]
     if not cfg["arm"]:
         raise TuneError("arm is required")
     if not cfg["output"]:
@@ -100,6 +103,17 @@ def load_config(path: Path) -> dict[str, Any]:
         value = cfg["context_search"][name]
         if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
             raise TuneError(f"context_search.{name} must be an integer >= {minimum}")
+    spec = cfg['speculation']
+    if set(spec) - set(DEFAULTS['speculation']) or type(spec['enabled']) is not bool:
+        raise TuneError('speculation takes the documented keys and a boolean enabled')
+    for name in ('prompt_tokens', 'prompts', 'osl', 'max_draft', 'min_cycles', 'settle_cycles', 'trace_max_events'):
+        minimum = 0 if name == 'settle_cycles' else 1
+        if type(spec[name]) is not int or spec[name] < minimum:
+            raise TuneError(f'speculation.{name} must be an integer >= {minimum}')
+    if spec['enabled'] and (not spec['text'] or cfg['weights'].get('decode', 0) <= 0):
+        raise TuneError('speculation needs text and a positive decode weight')
+    if spec['enabled'] and spec['osl'] < (spec['settle_cycles'] + spec['min_cycles'] + 2) * spec['max_draft']:
+        raise TuneError('speculation.osl is too short for settled cycles at max_draft')
     for name, value in cfg["placement"]["reserve_mib"].items():
         if not isinstance(value, (int, float)) or value < 0:
             raise TuneError(f"placement.reserve_mib.{name} must be non-negative")
