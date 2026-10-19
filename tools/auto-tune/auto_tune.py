@@ -68,7 +68,8 @@ class Tuner:
     def __init__(self, cfg: Mapping[str, Any], base_command: Sequence[str], base_env: Mapping[str, str], identity: Mapping[str, Any],
                  launcher: Callable[..., dict[str, Any]], kld_runner: Callable[..., float | None] | None,
                  vram_check: Callable[[Mapping[str, Any], Sequence[str]], list[str]] = lambda metrics, command: [],
-                 budget: Budget | None = None, log: Callable[[str], None] = print) -> None:
+                 budget: Budget | None = None, log: Callable[[str], None] = print, *, launch_only: bool = False,
+                 placement_factory=None, cpu_budget=None) -> None:
         self.cfg = cfg
         self.base = (tuple(base_command), dict(base_env))
         self.identity = dict(identity)
@@ -78,12 +79,15 @@ class Tuner:
         self.store = Store(Path(cfg["output"]))
         self.budget = budget or Budget(cfg["budget"]["max_launches"], cfg["budget"]["max_hours"])
         self.log = log
+        self.launch_only = launch_only
+        self.placement_factory = placement_factory
+        self.cpu_budget = cpu_budget
         self.weights = S.metric_weights(cfg["weights"], cfg["prefill"]["lengths"])
         self.measure_spec = {"prefill": cfg["prefill"] if cfg["weights"].get("prefill", 0) > 0 else None,
                              "osl": cfg["decode"]["osl"] if cfg["weights"].get("decode", 0) > 0 else 16,
                              "trace": cfg["trace"], "env": cfg["env"]}
         self.kld_spec = {k: v for k, v in cfg["kld"].items() if k != "limit"}
-        self.max_threads = cfg["max_threads"] or max(1, physical_cores() - 8)
+        self.max_threads = cpu_budget.threads(len((K.option_value(base_command, '--device') or '').split(',')), cfg['max_threads']) if cpu_budget else cfg["max_threads"] or max(1, physical_cores() - 8)
         self.state: dict[str, Any] = {"steps": [], "untested": [], "confirm": None}
         self.logits_ready: set[str] = set()  # reference logits written by this process (they live in /dev/shm for one run)
 
@@ -103,6 +107,13 @@ class Tuner:
             a, b = knob.current(base.command, base.env), knob.current(ctx.command, ctx.env)
             if a != b:
                 out[knob.name] = [a, b]
+        for name in ('--device', '-ts', '-ngl', '--n-cpu-moe', '--numa'):
+            a, b = K.option_value(base.command, name), K.option_value(ctx.command, name)
+            if a != b:
+                out[name] = [a, b]
+        for name in ('-cmoe',):
+            if (name in base.command) != (name in ctx.command):
+                out[name] = [K.ON if name in base.command else K.OFF, K.ON if name in ctx.command else K.OFF]
         return out
 
     def selected(self) -> list[tuple[K.Knob, list[str]]]:
@@ -110,6 +121,8 @@ class Tuner:
         chosen = K.select(self.context(*self.base), only=k["only"], include=k["include"], exclude=k["exclude"], levels=k["levels"])
         if self.cfg["kld"]["limit"] is None:
             chosen = [(knob, levels) for knob, levels in chosen if knob.cls != "precision"]
+        if self.launch_only:
+            chosen = [(knob, levels) for knob, levels in chosen if knob.reload == 'process']
         order = {name: i for i, name in enumerate(self.cfg.get("class_order") or ("fit", "precision", "accept", "speed"))}
         return sorted(chosen, key=lambda item: order[item[0].cls])
 
@@ -215,6 +228,15 @@ class Tuner:
 
     def run(self) -> dict[str, Any]:
         command, env = self.base
+        placement_options = []
+        if self.placement_factory:
+            self.log('placement: dry runs at the context floor')
+            started = time.time()
+            self.state['placement'] = self.placement_factory()
+            self.state['stages'] = {'placement': {'dry_runs': len(self.state['placement']['dry_runs']), 'wall_s': time.time() - started}}
+            placement_options = self.state['placement']['candidates']
+        if self.cpu_budget:
+            self.state['cpu_budget'] = self.cpu_budget.summary()
         if self.cfg["warmup_launch"]:
             try:
                 self.evaluate(command, env, "warmup", phase="warmup", cached=False)
@@ -225,10 +247,34 @@ class Tuner:
         except BudgetExhausted:
             raise TuneError("the budget does not cover the base launch") from None
         if base_row["status"] != "ok":
-            raise TuneError(f"the base config did not measure: {base_row.get('error') or base_row['status']}")
+            self.state['reference_failure'] = base_row.get('error') or base_row['status']
+            for option in placement_options:
+                try:
+                    row = self.evaluate(option['command'], option['env'], 'placement ' + option['name'])
+                except BudgetExhausted:
+                    break
+                if row['status'] == 'ok':
+                    command, env, base_row = tuple(option['command']), option['env'], row
+                    self.base = (command, env)
+                    break
+            if base_row['status'] != 'ok':
+                raise TuneError(f"no placement loaded within the constraints: {self.state['reference_failure']}")
         reference = base_row["metrics"]
         self.state["base"] = base_row["key"]
         incumbent = {"command": command, "env": env, "row": base_row, "score": 1.0}
+        for option in placement_options:
+            step = {'knob': 'placement', 'candidate': option['name']}
+            try:
+                row = self.evaluate(option['command'], option['env'], 'placement ' + option['name'], reserve=CONFIRM_LAUNCHES)
+            except BudgetExhausted:
+                self.state['untested'].append('placement ' + option['name'])
+                continue
+            value = S.score(row['metrics'], reference, self.weights) if row['status'] == 'ok' else None
+            step.update(key=row['key'], status=row['status'], score=value)
+            if value is not None and value > incumbent['score'] * (1 + self.cfg['noise_margin']):
+                incumbent = {'command': tuple(option['command']), 'env': option['env'], 'row': row, 'score': value}
+                step['kept'] = option['name']
+            self.state['steps'].append(step)
         selected = self.selected()
         index = 0
         for position, (knob, levels) in enumerate(selected):
@@ -264,6 +310,8 @@ class Tuner:
         self.state["confirm"] = self.confirm(incumbent)
         self.state["budget"] = {"launches": self.budget.used, "max_launches": self.budget.max_launches,
                                 "hours": (time.time() - self.budget.started) / 3600.0, "max_hours": self.budget.max_s / 3600.0}
+        self.state.setdefault('stages', {})['launch'] = {'launches': self.budget.used, 'recreates': 0,
+                                                       'wall_s': sum(self.budget.durations)}
         return self.state
 
     def confirm(self, incumbent: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -285,7 +333,7 @@ class Tuner:
         best, base = mean_metrics(runs["best"]), mean_metrics(runs["base"])
         gain = S.score(best, base, self.weights)
         return {"complete": len(runs["best"]) == 2, "gain": gain, "best": best, "base": base,
-                "kept": gain is not None and gain > 1.0 + self.cfg["noise_margin"]}
+                "kept": len(runs['best']) == 2 and gain is not None and gain > 1.0 + self.cfg["noise_margin"]}
 
 
 def mean_metrics(items: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
@@ -311,7 +359,18 @@ def base_launch(cfg: Mapping[str, Any]):
     if not isinstance(arm, P.ServerArm):
         raise TuneError("the auto-tuner needs a server arm")
     command = set_option(arm.server_command, "-c", str(cfg["context"]))
-    return arm, command, dict(arm.env)
+    # Canonicalize aliases used by the placement and CPU policy before replacing their values.
+    aliases = {'--ctx-size': '-c', '--threads': '-t', '--threads-batch': '-tb', '--tensor-split': '-ts',
+               '--n-gpu-layers': '-ngl', '-dev': '--device', '--cpu-moe': '-cmoe', '-ncmoe': '--n-cpu-moe',
+               '--override-tensor': '-ot', '--load-mode': '-lm', '-nr': '--no-repack', '-fit': '--fit', '-fitt': '--fit-target'}
+    for old, new in aliases.items():
+        if old in ('--cpu-moe', '-nr'):
+            command = tuple(new if item == old else item for item in command)
+        elif K.option_value(command, old) is not None:
+            value = K.option_value(command, old)
+            command = K.set_option(K.remove_option(command, old), new, value)
+    command = K.set_option(command, '-c', str(cfg['context']))
+    return arm, command, {**arm.env, **cfg['env']}
 
 
 def identity(cfg: Mapping[str, Any], arm, command: Sequence[str]) -> dict[str, Any]:
@@ -323,25 +382,41 @@ def identity(cfg: Mapping[str, Any], arm, command: Sequence[str]) -> dict[str, A
 
 def make_tuner(cfg: Mapping[str, Any], log: Callable[[str], None] = print) -> Tuner:
     import measure as M
+    from cpu import CpuBudget
+    import placement
     arm, command, env = base_launch(cfg)
+    cpu = CpuBudget.resolve(cfg['cpus'], cfg['max_cores'])
+    command = cpu.apply(command, len(M.used_devices(command)), cfg['max_threads'])
+    command = K.set_option(command, '-fa', 'on') if not (K.option_value(command, '-fa') or K.option_value(command, '--flash-attn')) else command
     out = Path(cfg["output"])
-    pci_map = M.device_pci_map(cfg["env"])
-    problems = M.clock_problems(command, pci_map, cfg["clock_mode"])
+    pci_map = M.device_pci_map(env)
+    clock_command = K.set_option(command, '--device', ','.join(set(cfg['devices']) | set(M.used_devices(command))))
+    problems = M.clock_problems(clock_command, pci_map, cfg["clock_mode"])
     if problems:
         raise TuneError("GPU clock mode: " + "; ".join(problems))
     shm = Path("/dev/shm") / f"auto-tune-{digest(cfg['output'])}"
 
     def launcher(cmd, e, name):
-        return M.launch(cfg, arm, cmd, e, name.replace(" ", "_").replace("=", "-"), out / "artifacts")
+        with cpu.affinity():
+            return M.launch(cfg, arm, cmd, e, name.replace(" ", "_").replace("=", "-"), out / "artifacts", cpu_budget=cpu)
 
     def kld_runner(cmd, e, key, compare):
         shm.mkdir(exist_ok=True)
-        return M.kld(cfg, cmd, e, shm / f"{key}.kld", out / "kld" / f"{digest([cmd, e])}.log", compare=compare)
+        with cpu.affinity():
+            return M.kld(cfg, cmd, e, shm / f"{key}.kld", out / "kld" / f"{digest([cmd, e])}.log", compare=compare)
 
     def vram_check(metrics, cmd):
-        return M.vram_violations(metrics.get("vram", {}), cfg["devices"], pci_map)
+        caps = {d.name: {'min_free_mib': d.margin_mib, **({'max_used_mib': d.max_used_mib} if d.max_used_mib is not None else {})}
+                for d in placement.devices_from_state(command, cfg['devices'], pci_map, M.vram_state(), int(env.get('LLAMA_MOE_CACHE_AUTO_MARGIN_MIB', '1536')))}
+        return M.vram_violations(metrics.get("vram", {}), caps, pci_map)
 
-    tuner = Tuner(cfg, command, env, identity(cfg, arm, command), launcher, kld_runner, vram_check, log=log)
+    def placement_factory():
+        return placement.prepare(cfg, command, env, pci_map, M.vram_state(), cpu)
+
+    run_identity = {**identity(cfg, arm, command), 'cpu_budget': cpu.summary(), 'devices': cfg['devices'],
+                    'clock_mode': cfg['clock_mode']}
+    tuner = Tuner(cfg, command, env, run_identity, launcher, kld_runner, vram_check, log=log,
+                  launch_only=True, placement_factory=placement_factory, cpu_budget=cpu)
     tuner.shm = shm
     return tuner
 
@@ -351,6 +426,9 @@ def plan_text(tuner: Tuner) -> str:
     lines = [f"base: {cfg['recipe']} arm {cfg['arm']}", "command: " + " ".join(tuner.base[0]),
              "env: " + " ".join(f"{k}={v}" for k, v in sorted(tuner.base[1].items())), "", "knobs (current level first):"]
     selected = tuner.selected()
+    if tuner.cpu_budget:
+        lines += ['CPU budget: ' + json.dumps(tuner.cpu_budget.summary()),
+                  'loop 1 only: placement dry runs and fresh-load verification run with the run command']
     launches = (1 if cfg["warmup_launch"] else 0) + 1 + CONFIRM_LAUNCHES
     precision = 0
     for knob, levels in selected:
@@ -379,9 +457,16 @@ def main() -> int:
     parser.add_argument("config", type=Path)
     parser.add_argument("--max-launches", type=int, help="override budget.max_launches")
     parser.add_argument("--max-hours", type=float, help="override budget.max_hours")
+    cpu_options = parser.add_mutually_exclusive_group()
+    cpu_options.add_argument('--cpus', help='use exactly this Linux CPU list')
+    cpu_options.add_argument('--max-cores', type=int, help='use at most this many physical cores')
     args = parser.parse_args()
     try:
         cfg = load_config(args.config)
+        if args.cpus is not None:
+            cfg.update(cpus=args.cpus, max_cores=None)
+        if args.max_cores is not None:
+            cfg.update(max_cores=args.max_cores, cpus=None)
         if args.max_launches is not None:
             cfg["budget"]["max_launches"] = args.max_launches
         if args.max_hours is not None:
@@ -398,7 +483,9 @@ def main() -> int:
             print(plan_text(tuner))
             return 0
         try:
-            state = tuner.run()
+            from measure import benchmark_locks
+            with benchmark_locks(tuner.base[0], cfg['devices']):
+                state = tuner.run()
         finally:
             shm = getattr(tuner, "shm", None)
             if shm is not None and shm.is_dir():

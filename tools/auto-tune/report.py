@@ -80,6 +80,12 @@ def write(cfg: Mapping[str, Any], state: Mapping[str, Any], store: Store, out: P
     if recommended.get("kld"):
         lines.append(f"KLD against the exact-precision levels: {recommended['kld']:.4f}.")
     command = remove_option(recommended["command"], "--port")
+    cpu_budget = state.get('cpu_budget')
+    if cpu_budget:
+        command = ('taskset', '--cpu-list', cpu_budget['cpus'], *command)
+        lines += ['', f"CPU budget: {cpu_budget['cpus']} ({cpu_budget['physical_cores']} physical cores, NUMA nodes {cpu_budget['numa_nodes']})."]
+    if state.get('reference_failure'):
+        lines += ['', 'The recipe reference was infeasible. The first verified policy candidate is the reference: ' + state['reference_failure']]
     lines += ["", "```", " ".join(shlex.quote(item) for item in command), "```", "", "Environment:", "", "```"]
     lines += [f"{k}={shlex.quote(str(v))}" for k, v in sorted(recommended["env"].items())] or ["(none)"]
     lines.append("```")
@@ -109,6 +115,17 @@ def write(cfg: Mapping[str, Any], state: Mapping[str, Any], store: Store, out: P
     skipped = [step["knob"] for step in state.get("steps", ()) if step.get("skipped")]
     if skipped:
         lines += ["", f"Skipped (no longer applied after an earlier change): {', '.join(skipped)}."]
+    placement = state.get('placement')
+    if placement:
+        lines += ['', '## Placement verification', '', 'Loop 1 only. Context and request tuning are later milestones.', '']
+        for candidate in placement['candidates']:
+            lines.append(f"- {candidate['name']}: " + '; '.join(candidate['warnings'] or ['no planning warnings']))
+        for row in store.records:
+            if row.get('kind') == 'launch' and row.get('status') == 'ok':
+                metrics = row.get('metrics', {})
+                lines.append(f"- {row['name']}: context {metrics.get('verified_context', '?')}, CPU audit {metrics.get('cpu_budget', {})}")
+                lines.extend('- ' + warning for warning in metrics.get('placement_warnings', []))
+        lines += ['', 'Stages: ' + json.dumps(state.get('stages', {}))]
     (out / "report.md").write_text("\n".join(lines) + "\n")
-    (out / "best.json").write_text(json.dumps({"command": recommended["command"], "env": recommended["env"],
+    (out / "best.json").write_text(json.dumps({"command": list(command), "env": recommended["env"], 'cpu_budget': cpu_budget,
                                                "changes": recommended.get("changes") or {}, "confirm": confirm}, indent=2) + "\n")

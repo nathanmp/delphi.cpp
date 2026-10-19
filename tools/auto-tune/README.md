@@ -2,17 +2,21 @@
 
 `auto_tune.py` finds better launch flags and environment knobs for one model on a fixed set of devices. It starts from a `tools/bottlenecks` recipe arm, changes one registered knob at a time, keeps a change when it beats the current best by the noise margin, and then confirms the best config against the arm with interleaved runs (best, base, best). It never changes a deployment; it writes a report and `best.json`.
 
-Status: milestone 0 (registry, objective, runner, results store, coordinate search, confirm, report). Screening (Morris) and orthogonal arrays, the acceptance replay for speculative settings and the pass-cost model are later milestones.
+Status: V1 milestone 1. The command searches loop 1 only: placement and process-time knobs. M0 scoring, results, coordinate search and fresh-launch confirmation are reused. Context and request tuning are later milestones.
 
 ## Commands
 
 ```bash
-python3 tools/auto-tune/auto_tune.py plan   tune.json   # knobs, levels and launch count; loads nothing
-flock -x /tmp/delphi-rocm.lock python3 tools/auto-tune/auto_tune.py run tune.json [--max-launches N] [--max-hours H]
+python3 tools/auto-tune/auto_tune.py plan   tune.json --max-cores 48  # loads nothing
+python3 tools/auto-tune/auto_tune.py run tune.json --cpus 0-23,32-55 [--max-launches N] [--max-hours H]
 python3 tools/auto-tune/auto_tune.py report tune.json   # rewrite report.md from the stored results
 ```
 
-`run` resumes: measurements already in `results.jsonl` with the same binary, model, command, env and measurement settings are reused. A launch that started but never ended (the machine went down) is recorded as `crashed` and is not tried again; delete `journal.jsonl` to retry it. Run one tuner at a time and take the benchmark lock, as for any measurement.
+`run` takes the representative and device benchmark locks itself; do not wrap it in `flock`. No builds or other model runs may compete with it. Give exactly one CPU budget in the file or on the command line: `cpus` uses the exact logical CPU list, and `max_cores` selects at most that many physical cores from the process affinity, balanced across NUMA nodes. The server inherits this affinity, its target/draft masks are restricted to it, and every observed server thread is audited. `best.json` includes the `taskset` command needed to enforce the same budget.
+
+`run` resumes: measurements already in `results.jsonl` with the same binary, model, command, env and measurement settings are reused. A launch that started but never ended (the machine went down) is recorded as `crashed` and is not tried again; delete `journal.jsonl` to retry it.
+
+`devices` is ordered by priority. Each device takes `fill: "fill"` (use available memory) or `fill: "min"` (only the overflow), plus the existing memory caps. The default margin is 1536 MiB; ROCm2 defaults to 2048 MiB. `placement/plan.json` records no-allocation fit measurements, extra draft/MTP reservations and candidates. The runner verifies candidates with fresh profiler launches at the context floor. Host experts use auto cache tiers, sized after context and draft allocation. The auto cache has one margin for all devices, so protecting a `min` device can leave space unused on `fill` devices. MTP scratch memory is a conservative estimate because the fit CLI cannot measure its context. A GPU mmproj needs `placement.reserve_mib: {"DEVICE": MiB}` from a server memory report; check that it loads before auto cache sizing.
 
 ## Configuration
 

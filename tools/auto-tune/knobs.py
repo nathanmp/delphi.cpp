@@ -11,11 +11,14 @@ knobs that are worth tuning; debug, trace and A/B off-switches are not in it. Cl
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import json
+from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
 CLASSES = ("fit", "speed", "accept", "precision")
 OFF = "off"
 ON = "on"
+ENV_RELOAD = json.loads((Path(__file__).parent / "env-reload.json").read_text())
 
 
 @dataclass(frozen=True)
@@ -45,6 +48,16 @@ class Knob:
     exact: str | None = None  # precision knobs: the level without precision loss
     default: bool = True  # False: only tuned when the config includes it (opt-in)
     unset: str | None = None  # the value of an env knob or an option that is not set (its built-in default)
+
+    @property
+    def reload(self) -> str:
+        if self.kind == "env":
+            return ENV_RELOAD.get(self.name, "process")
+        if self.cls == "accept":
+            return "request"
+        if self.name in ("-lm", "--no-repack"):
+            return "process"
+        return "context"
 
     def applies(self, ctx: Context) -> bool:
         return self.requires(ctx)
@@ -156,6 +169,8 @@ def _threads(ctx: Context) -> list[int]:
 
 
 REGISTRY: tuple[Knob, ...] = (
+    Knob("-lm", "fit", "option", ("-lm",), ("mmap", "mmap+mlock"), "weight load mode", default=False, unset="auto"),
+    Knob("--no-repack", "speed", "switch", ("--no-repack",), (OFF, ON), "disable CPU weight repacking", default=False),
     # fit
     Knob("-ub", "fit", "option", ("-ub",), (256, 512, 1024, 2048, 4096), "physical batch; -b is raised to it if lower"),
     Knob("-b", "fit", "option", ("-b",), (2048, 4096, 8192, 10240), "logical batch", requires=lambda c: c.option("-ub") is not None),

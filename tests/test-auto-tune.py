@@ -4,6 +4,8 @@ import json
 import sys
 import tempfile
 import unittest
+import os
+import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -14,6 +16,9 @@ from auto_tune import Budget, Tuner, plan_text
 from config import DEFAULTS, _merge
 from report import write
 from store import Store
+from cpu import CpuBudget, parse_list
+import placement as PL
+from measure import vram_violations
 
 BASE = ("llama-server", "-m", "model.gguf", "-c", "8192", "-b", "2048", "-ub", "512", "-fa", "on", "-t", "32",
         "--spec-type", "draft-mtp", "--spec-draft-n-max", "4", "--device", "ROCm0,ROCm1")
@@ -91,6 +96,144 @@ class Score(unittest.TestCase):
         shorter = {"decode_t_s": 50.0, "prefill": {"300": {"ttft_s": 0.15}}}
         self.assertAlmostEqual(S.score(shorter, ref, w), 2.0 ** 0.3)  # TTFT: smaller is better
         self.assertIsNone(S.score({"decode_t_s": 50.0}, ref, w))
+
+
+class CpuPolicy(unittest.TestCase):
+    facts = {i: (i // 4, i % 4, i // 4) for i in range(8)} | {8: (0, 0, 0)}
+
+    def test_exact_list_and_smt(self):
+        budget = CpuBudget.resolve('0-3,8', facts=self.facts)
+        self.assertEqual(budget.cpus, (0, 1, 2, 3, 8))
+        self.assertEqual(budget.cores, 4)
+        self.assertEqual(budget.nodes, (0,))
+        with self.assertRaises(RuntimeError):
+            CpuBudget.resolve('0-9', facts=self.facts)
+        for value in ('3-1', '-1', '1,,2', '1-2-3'):
+            with self.assertRaises(RuntimeError):
+                parse_list(value)
+
+    def test_core_limit_is_balanced_and_uses_no_smt_sibling(self):
+        budget = CpuBudget.resolve(max_cores=4, facts=self.facts)
+        self.assertEqual(budget.cpus, (0, 1, 4, 5))
+        self.assertEqual(budget.threads(1), 2)
+        self.assertEqual(len(CpuBudget.resolve(max_cores=100, facts=self.facts).cpus), 8)
+        with self.assertRaises(RuntimeError):
+            CpuBudget.resolve('0', 2, self.facts)
+
+    def test_command_replaces_all_masks_and_thread_counts(self):
+        budget = CpuBudget.resolve('0-1,4-5', facts=self.facts)
+        command = (*BASE, '--threads', '64', '--cpu-range', '0-63', '--cpu-mask-batch', 'ffff',
+                   '--spec-draft-cpu-range', '0-63', '--spec-draft-threads', '64')
+        command = budget.apply(command, 1)
+        self.assertEqual(K.option_value(command, '-t'), '2')
+        self.assertEqual(K.option_value(command, '-tb'), '2')
+        self.assertEqual(K.option_value(command, '--spec-draft-threads'), '2')
+        self.assertEqual(int(K.option_value(command, '--cpu-mask'), 16), 0x33)
+        self.assertNotIn('--cpu-range', command)
+        self.assertNotIn('--threads', command)
+        one_node = CpuBudget.resolve('0-3', facts=self.facts)
+        self.assertIsNone(K.option_value(one_node.apply(BASE, 1), '--numa'))
+        self.assertEqual(K.option_value(command, '--numa'), 'tensors')
+        self.assertEqual(K.option_value(budget.apply((*BASE, '--numa', 'numactl'), 1), '--numa'), 'numactl')
+
+    def test_affinity_is_inherited_and_restored(self):
+        original = os.sched_getaffinity(0)
+        cpus = tuple(sorted(original)[:2])
+        budget = CpuBudget(cpus, len(cpus), (0,))
+        with budget.affinity():
+            result = subprocess.check_output([sys.executable, '-c', 'import os; print(sorted(os.sched_getaffinity(0)))'], text=True)
+            self.assertEqual(json.loads(result), list(cpus))
+        self.assertEqual(os.sched_getaffinity(0), original)
+
+
+class PlacementPolicy(unittest.TestCase):
+    def rows(self, model, context=50, compute=50):
+        return {'ROCm0': {'model': model, 'context': context, 'compute': compute},
+                'Host': {'model': 10000, 'context': 0, 'compute': 0}}
+
+    def options(self, full=500, dense=100, experts=8, free=1000):
+        info = {'experts': experts, 'expert_layers': list(range(20))}
+        return PL.candidates(BASE, {}, [PL.Device('ROCm0', free, 100)], self.rows(full), self.rows(dense), info)
+
+    def test_fits(self):
+        option = self.options()[0]
+        self.assertEqual(option['name'], 'fits')
+        self.assertEqual(K.option_value(option['command'], '-ngl'), '999')
+        self.assertNotIn('-cmoe', option['command'])
+        self.assertEqual(option['env']['LLAMA_MOE_CACHE_MIB'], '0')
+
+    def test_dense_fits_moe(self):
+        option = self.options(full=2000)[0]
+        self.assertEqual(option['name'], 'host-experts')
+        self.assertIn('-cmoe', option['command'])
+        self.assertEqual(option['env']['LLAMA_MOE_CACHE_MIB'], 'auto')
+        self.assertEqual(option['env']['GGML_SCHED_STAGE_MIN_TOKENS'], '1024')
+
+    def test_dense_fits_dense_and_poor_fit(self):
+        option = self.options(full=2000, dense=2000, experts=0)[0]
+        self.assertEqual(option['name'], 'dense-partial')
+        self.assertIsNone(K.option_value(option['command'], '-ngl'))
+        option = self.options(full=2000, dense=1000)[0]
+        self.assertEqual(option['name'], 'poor-fit')
+        self.assertTrue(option['warnings'])
+
+    def test_small_cpu_expert_fraction(self):
+        options = self.options(full=900, dense=100)
+        self.assertEqual([o['name'] for o in options], ['host-experts', 'cpu-expert-layers'])
+        self.assertNotIn('-cmoe', options[1]['command'])
+        self.assertEqual(K.option_value(options[1]['command'], '--n-cpu-moe'), '3')
+        self.assertEqual(len(self.options(full=2000)), 1)
+
+    def test_fill_rules_and_per_device_buffers(self):
+        devices = [PL.Device('ROCm2', 1000, 100, 'min'), PL.Device('ROCm0', 1000, 100), PL.Device('ROCm3', 1000, 100)]
+        full = {d.name: {'model': 600, 'context': 50, 'compute': 50} for d in devices}
+        full['Host'] = {'model': 10000, 'context': 0, 'compute': 0}
+        options = PL.candidates(BASE, {}, devices, full, full, {'experts': 0}, {'ROCm3': 100})
+        split = [float(n) for n in K.option_value(options[0]['command'], '-ts').split(',')]
+        self.assertEqual(split, [300, 800, 700])
+        self.assertEqual(K.option_value(options[0]['command'], '--device'), 'ROCm2,ROCm0,ROCm3')
+
+    def test_display_margin_caps_and_free_memory(self):
+        devices = PL.devices_from_state(('--device', 'ROCm0,ROCm2'), {'ROCm2': {'fill': 'min'}, 'ROCm0': {'max_used_mib': 4000}},
+                                       {'ROCm0': 'a', 'ROCm2': 'b'}, {'a': (2000, 10000), 'b': (3000, 10000)})
+        self.assertEqual([d.name for d in devices], ['ROCm2', 'ROCm0'])
+        self.assertEqual(devices[0].margin_mib, 2048)
+        self.assertEqual(devices[1].capacity, 4000)
+        self.assertTrue(vram_violations({'b': {'min_free_mib': 2000}}, {'ROCm2': {'min_free_mib': 2048}}, {'ROCm2': 'b'}))
+
+    def test_fit_parser_and_server_only_options(self):
+        rows = PL.parse_fit('ROCm0 123 45 67 \nHost 890 0 4\n')
+        self.assertEqual(rows['ROCm0']['compute'], 67)
+        with self.assertRaises(RuntimeError):
+            PL.parse_fit('')
+        cmd = PL.fit_command((*BASE, '--spec-draft-model', 'draft.gguf', '--parallel', '1'))
+        self.assertNotIn('--spec-type', cmd)
+        self.assertNotIn('--spec-draft-model', cmd)
+        self.assertIn('--fit-print', cmd)
+
+    def test_loop_one_uses_reload_table(self):
+        with tempfile.TemporaryDirectory() as d:
+            c = cfg(d, knobs={'only': ['-ub', '-t', '--spec-draft-n-max', '--no-repack'], 'include': [], 'exclude': [], 'levels': {}})
+            t = Tuner(c, BASE, {}, {}, lambda *a: {}, None, launch_only=True)
+            self.assertEqual([k.name for k, _ in t.selected()], ['--no-repack'])
+            self.assertEqual(K.BY_NAME['-ub'].reload, 'context')
+            self.assertEqual(K.BY_NAME['--spec-draft-n-max'].reload, 'request')
+
+    def test_failed_reference_can_use_verified_policy(self):
+        with tempfile.TemporaryDirectory() as d:
+            c = cfg(d, knobs={'only': ['--no-repack'], 'include': [], 'exclude': ['--no-repack'], 'levels': {}})
+            def launch(command, env, name):
+                if K.option_value(command, '-ts') is None:
+                    raise RuntimeError('out of memory')
+                return fake_metrics(command, env)
+            candidate = {'name': 'fits', 'command': K.set_option(BASE, '-ts', '1,1'), 'env': {}, 'warnings': []}
+            t = Tuner(c, BASE, {}, {}, launch, None, launch_only=True,
+                      placement_factory=lambda: {'dry_runs': [], 'candidates': [candidate]}, log=lambda s: None)
+            state = t.run()
+            self.assertIn('reference_failure', state)
+            self.assertEqual(t.store.find(state['base'], 'launch')['status'], 'ok')
+            write(c, state, t.store, Path(d))
+            self.assertIn('reference was infeasible', (Path(d) / 'report.md').read_text())
 
 
 class Search(unittest.TestCase):

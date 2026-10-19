@@ -29,6 +29,9 @@ DEFAULTS: dict[str, Any] = {
     "warmup_launch": True,  # one unscored launch first (page cache, compile caches)
     "trace": False,  # record the execution trace of every launch (slower; needed for pass-cost analysis)
     "max_threads": None,  # default: physical cores - 8
+    "cpus": None,  # exact Linux CPU list, for example 0-23,32-55
+    "max_cores": None,  # at most this many physical cores from the caller's affinity
+    "placement": {"reserve_mib": {}},  # extra device buffers not measured by llama-fit-params (for example mmproj)
     "class_order": ["fit", "precision", "accept", "speed"],  # the order in which the knob classes are searched
 }
 
@@ -81,8 +84,20 @@ def load_config(path: Path) -> dict[str, Any]:
     if set(cfg["weights"]) - {"prefill", "decode"}:
         raise TuneError("weights takes prefill and decode")
     for name, cap in cfg["devices"].items():
-        if set(cap) - {"min_free_mib", "max_used_mib"}:
-            raise TuneError(f"devices.{name}: takes min_free_mib and max_used_mib")
+        if set(cap) - {"min_free_mib", "max_used_mib", "fill"}:
+            raise TuneError(f"devices.{name}: takes fill, min_free_mib and max_used_mib")
+        if cap.get("fill", "fill") not in ("fill", "min"):
+            raise TuneError(f"devices.{name}.fill must be fill or min")
+        for key in ("min_free_mib", "max_used_mib"):
+            if key in cap and (not isinstance(cap[key], (int, float)) or cap[key] < 0):
+                raise TuneError(f"devices.{name}.{key} must be non-negative")
+    if cfg["context"] < 1:
+        raise TuneError("context must be positive")
+    if cfg["max_threads"] is not None and cfg["max_threads"] < 1:
+        raise TuneError("max_threads must be positive")
+    for name, value in cfg["placement"]["reserve_mib"].items():
+        if not isinstance(value, (int, float)) or value < 0:
+            raise TuneError(f"placement.reserve_mib.{name} must be non-negative")
     cfg["prefill"]["lengths"] = {str(int(k)): float(v) for k, v in cfg["prefill"]["lengths"].items()}
     cfg["config_path"] = str(path)
     return cfg

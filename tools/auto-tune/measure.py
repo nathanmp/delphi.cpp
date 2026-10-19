@@ -3,6 +3,8 @@ KLD of its precision settings (llama-perplexity)."""
 from __future__ import annotations
 
 import json
+import contextlib
+import fcntl
 import os
 import re
 import shutil
@@ -20,6 +22,8 @@ if str(ROOT) not in sys.path:
 from tools.bottlenecks import profile as P  # noqa: E402
 
 from knobs import option_value, set_option  # noqa: E402
+from cpu import parse_list  # noqa: E402
+from config import TuneError  # noqa: E402
 
 PREFILL_CLIENT = Path(__file__).resolve().parent / "prefill_client.py"
 DRM = Path("/sys/class/drm")
@@ -58,8 +62,79 @@ print(json.dumps(out))
 """
 
 
-class LaunchFailed(RuntimeError):
+class LaunchFailed(TuneError):
     pass
+
+
+@contextlib.contextmanager
+def benchmark_locks(command, devices):
+    names = set(devices) | set(used_devices(command))
+    names.update((option_value(command, '--spec-draft-device') or '').split(','))
+    locks = ['/tmp/delphi-representative.lock']
+    if any(n.startswith('ROCm') for n in names):
+        locks.append('/tmp/delphi-rocm.lock')
+    if any(n.startswith('CUDA') for n in names):
+        locks.append('/tmp/delphi-cuda.lock')
+    with contextlib.ExitStack() as stack:
+        for path in locks:
+            handle = stack.enter_context(open(path, 'a'))
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise LaunchFailed(f'benchmark lock is busy: {path}; run the tuner without an outer flock') from None
+        yield
+
+
+class CpuSampler:
+    """Audit the affinity of every observed server thread, including helper and draft threads."""
+    def __init__(self, command, budget):
+        self.binary = Path(command[0]).resolve()
+        self.allowed = set(budget.cpus)
+        self.children = Path(f'/proc/{os.getpid()}/task/{threading.get_native_id()}/children')
+        self.samples = 0
+        self.max_threads = 0
+        self.violations = set()
+        self.stop = threading.Event()
+
+    def sample(self):
+        try:
+            children = self.children.read_text().split()
+        except OSError:
+            return
+        for pid in children:
+            process = Path('/proc') / pid
+            try:
+                if (process / 'exe').resolve() != self.binary:
+                    continue
+                threads = list((process / 'task').iterdir())
+                self.max_threads = max(self.max_threads, len(threads))
+                for thread in threads:
+                    try:
+                        status = dict(line.split(':', 1) for line in (thread / 'status').read_text().splitlines() if ':' in line)
+                        mask = parse_list(status['Cpus_allowed_list'].strip())
+                    except (OSError, KeyError):
+                        continue
+                    self.samples += 1
+                    if not mask <= self.allowed:
+                        self.violations.add(f'{pid}/{thread.name}: CPUs outside the budget {sorted(mask - self.allowed)}')
+            except OSError:
+                continue
+
+    def loop(self):
+        while not self.stop.wait(0.1):
+            self.sample()
+
+    def __enter__(self):
+        self.thread = threading.Thread(target=self.loop, name='cpu-budget-audit', daemon=True)
+        self.thread.start()
+        return self
+
+    def __exit__(self, *args):
+        self.stop.set()
+        self.thread.join()
+
+    def summary(self):
+        return {'thread_samples': self.samples, 'max_threads': self.max_threads, 'violations': sorted(self.violations)}
 
 
 def short_pci(value: str) -> str:
@@ -187,7 +262,7 @@ def _client(base: Sequence[str], osl: int) -> tuple[str, ...]:
 
 
 def launch(cfg: Mapping[str, Any], base_arm: P.ServerArm, command: Sequence[str], env: Mapping[str, str], name: str,
-           artifacts: Path) -> dict[str, Any]:
+           artifacts: Path, cpu_budget=None) -> dict[str, Any]:
     """One server launch: the decode client, then the prefill lengths. Returns metrics; raises LaunchFailed."""
     prefill = cfg["prefill"]
     measures = ()
@@ -203,7 +278,8 @@ def launch(cfg: Mapping[str, Any], base_arm: P.ServerArm, command: Sequence[str]
                   trace_prefill_min_tokens=0, trace_prefill_target_tokens=0)
     recipe = P.Recipe(name="auto-tune", description="auto-tuner launch", arms=(arm,))
     started = time.time()
-    with VramSampler() as vram:
+    audit = CpuSampler(command, cpu_budget) if cpu_budget else None
+    with VramSampler() as vram, audit if audit else contextlib.nullcontext():
         try:
             result = P.run_recipe(recipe, artifacts, environment=cfg["env"], gpu_sample_interval_s=0)
         except (P.ProfileError, subprocess.TimeoutExpired, OSError, ValueError) as error:
@@ -219,6 +295,17 @@ def launch(cfg: Mapping[str, Any], base_arm: P.ServerArm, command: Sequence[str]
         "vram": vram.summary(),
         "wall_s": time.time() - started,
     }
+    if audit:
+        metrics['cpu_budget'] = audit.summary()
+        if audit.violations or not audit.samples:
+            raise LaunchFailed('CPU budget audit failed: ' + ('; '.join(sorted(audit.violations)) or 'no server threads observed'))
+        log = (artifacts / name / 'server.stderr.log').read_text(errors='replace')
+        contexts = [int(n) for n in re.findall(r'\bn_ctx_per_seq\s*=\s*(\d+)', log)]
+        if not contexts or min(contexts) < cfg['context']:
+            raise LaunchFailed(f'context floor {cfg["context"]} not verified: {contexts}')
+        metrics['verified_context'] = min(contexts)
+        metrics['placement_warnings'] = [line.strip() for line in log.splitlines()
+                                         if re.search(r'expert cache auto:.*no tier|staging.*(?:disabled|fail)|failed.*staging', line, re.I)]
     for extra in item["extra_measurements"]:
         m = extra["metrics"]
         metrics["prefill"][str(m["target_tokens"])] = {"ttft_s": m.get("latency_s"), "t_s": m.get("prompt_t_s"), "prompt_ms": m.get("prompt_ms")}
