@@ -131,6 +131,7 @@ class ContextRunner:
                                 DELPHI_SPEC_PLOG=str(self.plog_path), DELPHI_SPEC_TRACE=str(self.observation_path))
             self.process = subprocess.Popen(M.P._render(cmd, values), cwd=M.ROOT, env=full_env, text=True, stdout=stdout, stderr=stderr)
             (directory / 'launch.json').write_text(json.dumps({'command': list(cmd), 'env': dict(env), 'pid': self.process.pid,
+                'diagnostic_env': {k: v for k, v in full_env.items() if k.startswith(('GGML_EXEC_TRACE', 'DELPHI_SPEC_'))},
                 'binary_version': M.P._version(command[0], env), 'models': M.P._model_identity(self.arm.model_paths)}, indent=2) + '\n')
             M.P._wait_for_server(self.url, self.process, self.arm.ready_timeout_s)
             self.signature = process_key(command, env)

@@ -159,7 +159,7 @@ class Observations(unittest.TestCase):
 
     def test_measured_validation_overrules_a_wrong_replay_ranking(self):
         def measured(policy, speeds):
-            return {'policy': policy, 'samples': [{'repeat': i, 'timings': {'predicted_per_second': value}}
+            return {'policy': policy, 'tokens_identical': True, 'samples': [{'repeat': i, 'timings': {'predicted_per_second': value}}
                                                  for i, value in enumerate(speeds)]}
         a, b = {'n_max': 4}, {'n_max': 2}
         spec = {'candidates': [{'policy': a, 'decode_t_s': 200}, {'policy': b, 'decode_t_s': 150}],
@@ -170,6 +170,10 @@ class Observations(unittest.TestCase):
         self.assertEqual(candidates[0]['decode_source'], 'matched-validation-estimate')
         self.assertAlmostEqual(candidates[0]['decode_t_s'], 120)
         self.assertAlmostEqual(candidates[1]['decode_t_s'], 80)
+        spec['validation']['policies'][1]['tokens_identical'] = False
+        self.assertEqual(validated_estimates(spec, 100)[0]['policy'], a)
+        spec['validation']['launch']['tokens_identical'] = False
+        self.assertEqual(validated_estimates(spec, 100), [])
 
     def test_snapshot_rejects_either_drop_counter_and_io_failure(self):
         shot = {'ok': True, 'cumulative': True, 'event_count': 10, 'event_capacity': 100, 'dropped_event_count': 0,

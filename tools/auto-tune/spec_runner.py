@@ -34,6 +34,8 @@ class Collector:
         self.continue_measure = continue_measure
         self.windows, self.requests, self.operations = [], [], []
         launch = directory / 'launch.json'
+        if not launch.exists() and isinstance(getattr(runner, 'trace_path', None), Path):
+            launch = runner.trace_path.parent / 'launch.json'
         self.launch = json.loads(launch.read_text()) if launch.exists() else {}
         self.point = digest([command, env, runner.cfg['speculation'], self.launch, time.time_ns()])
         self.started = time.monotonic()
@@ -221,23 +223,30 @@ class Collector:
             if len(selected) >= 2 + self.cfg['validation_candidates']:
                 break
         pending = []
+        mismatches = []
         for rep in range(self.cfg['validation_reps']):
             order = list(selected)
             if rep % 2:
                 order.reverse()
             for policy in order:
                 self.configure([*policy.args(), '--spec-draft-sampling', 'greedy'] if policy else [])
-                self.completion(prompts[0])
+                for prompt in prompts:
+                    self.completion(prompt)
                 for i, prompt in enumerate(prompts):
                     response = self.completion(prompt)
-                    if not response.get('tokens') or response['tokens'] != source[i].get('tokens'):
-                        self.save('validation-token-mismatch.json', {'policy': asdict(policy) if policy else None,
-                                  'repeat': rep, 'prompt': i, 'source': source[i], 'response': response})
-                        raise SpecError('normal-acceptance validation changed the greedy token sequence')
+                    if not response.get('tokens'):
+                        raise SpecError('normal-acceptance validation response has no token IDs')
+                    matches_capture = response['tokens'] == source[i].get('tokens')
+                    if not matches_capture:
+                        mismatches.append({'policy': asdict(policy) if policy else None,
+                                           'repeat': rep, 'prompt': i, 'source': source[i], 'response': response})
+                        self.save('validation-token-mismatch.json', mismatches)
                     pending.append({'policy': asdict(policy) if policy else None, 'repeat': rep, 'prompt': i,
-                                    'request_id': response.get('speculative_request_id'), 'timings': response['timings']})
+                                    'request_id': response.get('speculative_request_id'), 'timings': response['timings'],
+                                    'tokens': response['tokens'], 'tokens_match_capture': matches_capture})
         inputs, trace = self.live_inputs()
         results, launch = [], None
+        launch_tokens = {s['prompt']: s['tokens'] for s in pending if s['policy'] is None and s['repeat'] == 0}
         for policy in selected:
             samples = []
             for item in pending:
@@ -259,10 +268,11 @@ class Collector:
                                 'cost_model_error_fraction': sum(r['cycle_ms'] for r in rows) / modeled_ms - 1 if modeled_ms else None,
                                 'predicted_accepted_per_pass': prediction['accepted_per_pass'] if prediction else None,
                                 'accepted_per_pass': statistics.mean(r['acc'] for r in rows),
-                                'passes': len(rows), 'tokens_identical': True})
+                                'passes': len(rows), 'tokens_identical': item['tokens'] == launch_tokens[item['prompt']]})
             actual = statistics.median(s['aligned_decode_t_s'] for s in samples)
             result = {'policy': asdict(policy) if policy else None, 'aligned_decode_t_s': actual,
-                      'decode_t_s': statistics.median(s['timings']['predicted_per_second'] for s in samples), 'samples': samples}
+                      'decode_t_s': statistics.median(s['timings']['predicted_per_second'] for s in samples),
+                      'tokens_identical': all(s['tokens_identical'] for s in samples), 'samples': samples}
             if policy:
                 predicted = statistics.median(s['prediction_t_s'] for s in samples)
                 results.append({**result, 'prediction_t_s': predicted, 'error_fraction': predicted / actual - 1})

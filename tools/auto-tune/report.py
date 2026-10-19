@@ -160,6 +160,8 @@ def write(cfg: Mapping[str, Any], state: Mapping[str, Any], store: Store, out: P
                                  f"replay {check['prediction_t_s']:.2f}, settled actual {check['aligned_decode_t_s']:.2f} t/s "
                                  f"({100 * check['error_fraction']:+.1f}% error{timing}); full decode {check['decode_t_s']:.2f} t/s. "
                                  'Fresh requests on the resident process; fresh-process deployment confirmation is separate.')
+                    if check.get('tokens_identical') is False:
+                        lines.append('  Excluded from recommendations: greedy output differs from the matched launch policy. See validation-token-mismatch.json.')
     (out / "report.md").write_text("\n".join(lines) + "\n")
     (out / "best.json").write_text(json.dumps({"command": list(command), "env": recommended["env"], 'cpu_budget': cpu_budget,
                                                "changes": recommended.get("changes") or {}, "confirm": confirm}, indent=2) + "\n")

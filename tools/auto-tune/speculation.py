@@ -264,8 +264,12 @@ def validated_estimates(spec, reference_t_s):
     launch = validation.get('launch')
     if not launch:
         return spec['candidates']
+    if launch.get('tokens_identical') is not True:
+        return []
     results = []
     for measured in validation['policies']:
+        if measured.get('tokens_identical') is not True:
+            continue
         predicted = next((c for c in spec['candidates'] if c['policy'] == measured['policy']), None)
         if not predicted:
             continue
