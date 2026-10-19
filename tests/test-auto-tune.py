@@ -8,6 +8,8 @@ import os
 import subprocess
 import urllib.error
 import io
+import contextlib
+from unittest.mock import Mock
 from unittest.mock import patch
 from pathlib import Path
 
@@ -595,6 +597,51 @@ class ContextSearch(unittest.TestCase):
                     runner._recreate(K.set_option(BASE, '-ub', '4096'), {}, Path(d))
             self.assertEqual(runner.active, (BASE, {}))
             self.assertEqual(runner.stats['recreates'], 1)
+
+    def test_return_to_an_omitted_flag_does_not_reuse_a_resumed_explicit_default(self):
+        with tempfile.TemporaryDirectory() as d:
+            runner = ContextRunner(cfg(d), P.ServerArm('a', BASE, ('client',)), None)
+            explicit = K.set_option(BASE, '-ubd', '512')
+            runner.process = Mock()
+            runner.process.poll.return_value = None
+            runner.signature = process_key(explicit, {})
+            runner.launch_command = explicit
+            runner.supported = True
+            self.assertEqual(runner.operation(BASE, {}), 'launch')
+            runner.launch_command = BASE
+            self.assertEqual(runner.operation(explicit, {}), 'context')
+
+    def test_live_measurement_races_after_one_repeat_and_404_uses_new_processes(self):
+        with tempfile.TemporaryDirectory() as d:
+            c = cfg(d, weights={'decode': 1, 'prefill': 0})
+            runner = ContextRunner(c, P.ServerArm('a', BASE, ('client',)), None)
+            incumbent = S.aggregate([{'decode_t_s': v, 'prefill': {}} for v in [99, 100, 101]])
+            sampler = Mock()
+            sampler.baseline = {}
+            sampler.summary.return_value = {}
+            def start(*args):
+                runner.supported = False  # GET returned 404 at startup
+                runner.baseline = {}
+            with patch.object(runner, '_start', side_effect=start), patch.object(runner, '_measure', return_value={'decode_t_s': 50, 'prefill': {}}) as measured, \
+                 patch('context_runner.M.VramSampler', return_value=contextlib.nullcontext(sampler)), patch.object(runner, 'close') as closed:
+                result = runner.measure(BASE, {}, 'slow', incumbent)
+                self.assertEqual(measured.call_count, 1)
+                self.assertTrue(result['racing']['stopped'])
+                self.assertFalse(result['measurement_complete'])
+                self.assertTrue(closed.called)
+                self.assertEqual(runner.operation(BASE, {}), 'launch')
+
+    def test_context_aliases_and_disabled_numa(self):
+        with tempfile.TemporaryDirectory() as d:
+            command = (*BASE, '--ubatch-size', '2048', '--batch-size', '8192', '--spec-draft-ubatch-size', '128')
+            arm = P.ServerArm('a', command, ('client',))
+            with patch('measure.P.load_recipe', return_value=P.Recipe('test', '', (arm,))):
+                _, normalized, _ = base_launch(cfg(d))
+            self.assertNotIn('--ubatch-size', normalized)
+            self.assertEqual(K.option_value(normalized, '-ub'), '2048')
+            self.assertEqual(K.option_value(normalized, '-ubd'), '128')
+            command, _ = K.BY_NAME['--numa'].apply((*BASE, '--numa', 'tensors'), {}, 'disabled')
+            self.assertNotIn('--numa', command)
 
     def test_screening_runs_only_above_threshold(self):
         with tempfile.TemporaryDirectory() as d:

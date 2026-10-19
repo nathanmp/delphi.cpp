@@ -68,6 +68,9 @@ class ContextRunner:
     def operation(self, command, env):
         if self.cfg['trace'] or self.supported is False or self.process is None or self.process.poll() is not None:
             return 'launch'
+        # A resumed search can first load an explicit level. Its GET value is not the CLI default of an omitted flag.
+        if any(K.option_value(command, flag) is None and K.option_value(self.launch_command, flag) is not None for flag in FIELDS):
+            return 'launch'
         return 'context' if self.signature == process_key(command, env) else 'launch'
 
     def close(self):
@@ -102,6 +105,7 @@ class ContextRunner:
             (directory / 'launch.json').write_text(json.dumps({'command': list(cmd), 'env': dict(env), 'pid': self.process.pid}, indent=2) + '\n')
             M.P._wait_for_server(self.url, self.process, self.arm.ready_timeout_s)
             self.signature = process_key(command, env)
+            self.launch_command = tuple(command)
             self.active = (tuple(command), dict(env))
             try:
                 self.defaults = self.request()
