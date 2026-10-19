@@ -8,6 +8,7 @@ import fcntl
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -94,6 +95,7 @@ class CpuSampler:
         self.samples = 0
         self.max_threads = 0
         self.violations = set()
+        self.stopped = set()
         self.stop = threading.Event()
 
     def sample(self):
@@ -117,6 +119,12 @@ class CpuSampler:
                     self.samples += 1
                     if not mask <= self.allowed:
                         self.violations.add(f'{pid}/{thread.name}: CPUs outside the budget {sorted(mask - self.allowed)}')
+                        if pid not in self.stopped:
+                            try:
+                                os.kill(int(pid), signal.SIGINT)
+                                self.stopped.add(pid)
+                            except ProcessLookupError:
+                                pass
             except OSError:
                 continue
 
@@ -287,6 +295,8 @@ def launch(cfg: Mapping[str, Any], base_arm: P.ServerArm, command: Sequence[str]
         try:
             result = P.run_recipe(recipe, artifacts, environment=cfg["env"], gpu_sample_interval_s=0)
         except (P.ProfileError, subprocess.TimeoutExpired, OSError, ValueError) as error:
+            if audit and audit.violations:
+                raise LaunchFailed('CPU budget audit failed: ' + '; '.join(sorted(audit.violations))) from error
             raise LaunchFailed(f"{error}; {stderr_tail(artifacts / name)}") from error
     item = result["arms"][0]
     decode = item["metrics"]

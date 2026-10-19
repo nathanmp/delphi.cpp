@@ -68,7 +68,6 @@ def model_info(path):
     mtp_bytes = 0
     total_bytes = 0
     expert_layers = set()
-    layer_bytes = {}
     for index, p in enumerate(paths):
         part = reader if index == 0 else GGUFReader(p)
         for tensor in part.tensors:
@@ -78,13 +77,9 @@ def model_info(path):
                 mtp_bytes += tensor.n_bytes
             elif match and re.search(r'\.ffn_(?:gate|up|down|gate_up)_(?:ch)?exps\.', tensor.name):
                 expert_layers.add(int(match[1]))
-            if match and not any(s in tensor.name for s in ('engram_embd', 'per_layer_token_embd')):
-                il = int(match[1])
-                layer_bytes[il] = layer_bytes.get(il, 0) + tensor.n_bytes
     return {'architecture': arch, 'experts': int(field(f'{arch}.expert_count', 0)), 'layers': layers,
             'expert_layers': sorted(expert_layers), 'mtp_mib': mtp_bytes / MiB, 'nextn': nextn,
-            'files': [str(p) for p in paths], 'model_mib': total_bytes / MiB,
-            'max_layer_mib': max(layer_bytes.values(), default=0) / MiB}
+            'files': [str(p) for p in paths], 'model_mib': total_bytes / MiB}
 
 
 # Spec and HTTP options are server-only. The standalone fit tool does not fit an extra draft model.
@@ -248,11 +243,13 @@ def prepare(cfg, command, env, pci_map, state, cpu, probe=None):
     dense = measure((*cmd, '-cmoe'), 'dense') if info['experts'] else full
     extra = dict(cfg['placement']['reserve_mib'])
     spec = K.option_value(command, '--spec-type') or ''
+    mtp_reserve = 0
     if 'draft-mtp' in spec:
         # The fit CLI cannot create an MTP context. Reserve its weights and a conservative scratch-buffer bound.
-        device = devices[-1].name
-        extra[device] = extra.get(device, 0) + info['mtp_mib'] + max(r['compute'] for n, r in full.items() if n != 'Host')
-        extra[device] += sum(r['context'] for n, r in full.items() if n != 'Host') * max(1, info['nextn']) / max(1, info['layers'])
+        mtp_device = devices[-1].name
+        mtp_reserve = info['mtp_mib'] + max(r['compute'] for n, r in full.items() if n != 'Host')
+        mtp_reserve += sum(r['context'] for n, r in full.items() if n != 'Host') * max(1, info['nextn']) / max(1, info['layers'])
+        extra[mtp_device] = extra.get(mtp_device, 0) + mtp_reserve
     draft = K.option_value(command, '--spec-draft-model')
     draft_estimate = None
     if draft:
@@ -284,6 +281,15 @@ def prepare(cfg, command, env, pci_map, state, cpu, probe=None):
     if K.option_value(command, '--mmproj') and not cfg['placement']['reserve_mib']:
         raise TuneError('mmproj needs placement.reserve_mib from a server memory report; the fit CLI cannot measure it')
     options = candidates(command, env, devices, full, dense, info, extra)
+    if mtp_reserve:
+        for _ in range(len(devices)):
+            last = K.option_value(options[0]['command'], '--device').split(',')[-1]
+            if last == mtp_device:
+                break
+            extra[mtp_device] -= mtp_reserve
+            extra[last] = extra.get(last, 0) + mtp_reserve
+            mtp_device = last
+            options = candidates(command, env, devices, full, dense, info, extra)
     # Layer boundaries round a byte ratio. Measure the derived split before paying for a full model load.
     corrections = {}
     for attempt in range(3):
@@ -300,7 +306,7 @@ def prepare(cfg, command, env, pci_map, state, cpu, probe=None):
             first['warnings'].append('the split estimate still exceeds a device budget; fresh-load verification can reject it')
             break
         for name, value in overflow.items():
-            corrections[name] = corrections.get(name, 0) + value + info.get('max_layer_mib', 0)
+            corrections[name] = corrections.get(name, 0) + value + 1
         options = candidates(command, env, devices, full, dense, info,
                              {name: extra.get(name, 0) + corrections.get(name, 0) for name in set(extra) | set(corrections)})
     for option in options:

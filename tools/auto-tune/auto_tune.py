@@ -384,7 +384,9 @@ def base_launch(cfg: Mapping[str, Any]):
         draft_devices = K.option_value(command, '--spec-draft-device')
         if draft_devices and not set(draft_devices.split(',')) <= set(requested):
             raise TuneError('the draft devices must be included in the device budget')
-    return arm, command, {**arm.env, **cfg['env']}
+    inherited = {name: value for name, value in os.environ.items()
+                 if name.startswith(('GGML_', 'LLAMA_')) or name in ('HIP_VISIBLE_DEVICES', 'ROCR_VISIBLE_DEVICES', 'CUDA_VISIBLE_DEVICES')}
+    return arm, command, {**inherited, **arm.env, **cfg['env']}
 
 
 def identity(cfg: Mapping[str, Any], arm, command: Sequence[str]) -> dict[str, Any]:
@@ -400,6 +402,8 @@ def make_tuner(cfg: Mapping[str, Any], log: Callable[[str], None] = print) -> Tu
     import placement
     arm, command, env = base_launch(cfg)
     cpu = CpuBudget.resolve(cfg['cpus'], cfg['max_cores'])
+    # ROCr otherwise starts helper threads on all CPUs, even under taskset.
+    env['HSA_OVERRIDE_CPU_AFFINITY_DEBUG'] = '0'
     command = cpu.apply(command, len(M.used_devices(command)), cfg['max_threads'])
     command = K.set_option(command, '-fa', 'on') if not (K.option_value(command, '-fa') or K.option_value(command, '--flash-attn')) else command
     out = Path(cfg["output"])
@@ -444,6 +448,8 @@ def plan_text(tuner: Tuner) -> str:
         lines += ['CPU budget: ' + json.dumps(tuner.cpu_budget.summary()),
                   'loop 1 only: placement dry runs and fresh-load verification run with the run command']
     launches = (1 if cfg["warmup_launch"] else 0) + 1 + CONFIRM_LAUNCHES
+    if tuner.launch_only:
+        launches += 2
     precision = 0
     for knob, levels in selected:
         lines.append(f"  {knob.cls:9s} {knob.name:34s} {' '.join(levels)}")
@@ -452,10 +458,12 @@ def plan_text(tuner: Tuner) -> str:
             precision += sum(1 for level in levels if level != knob.exact)
     if precision:
         launches += precision + 1
-    skipped = [k.name for k in K.REGISTRY if k.cls == "precision" and cfg["kld"]["limit"] is None and k.applies(tuner.context(*tuner.base))]
+    skipped = [k.name for k in K.REGISTRY if k.cls == "precision" and cfg["kld"]["limit"] is None and k.applies(tuner.context(*tuner.base))
+               and (not tuner.launch_only or k.reload == 'process')]
     if skipped:
         lines.append(f"  not tuned without kld.limit: {', '.join(skipped)}")
-    optin = [k.name for k in K.REGISTRY if not k.default and k.applies(tuner.context(*tuner.base)) and k.name not in cfg["knobs"]["include"]]
+    optin = [k.name for k in K.REGISTRY if not k.default and k.applies(tuner.context(*tuner.base)) and k.name not in cfg["knobs"]["include"]
+             and (not tuner.launch_only or k.reload == 'process')]
     if optin:
         lines.append(f"  opt-in knobs that apply (add to knobs.include): {', '.join(optin)}")
     budget = cfg["budget"]

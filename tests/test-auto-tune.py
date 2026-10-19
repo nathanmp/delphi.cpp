@@ -276,6 +276,40 @@ class PlacementPolicy(unittest.TestCase):
             self.assertEqual(plan['candidates'][0]['name'], 'host-experts')
             self.assertIsNotNone(plan['draft_estimate'])
 
+    def test_mtp_reservation_follows_last_active_device(self):
+        with tempfile.TemporaryDirectory() as d:
+            c = cfg(d, devices={'ROCm0': {'min_free_mib': 100}, 'ROCm1': {'fill': 'min', 'min_free_mib': 100}})
+            facts = {'architecture': 'qwen4exp', 'experts': 0, 'expert_layers': [], 'layers': 10, 'nextn': 1,
+                     'mtp_mib': 50, 'model_mib': 450, 'files': []}
+            full = {**self.rows(200), 'ROCm1': self.rows(200)['ROCm0']}
+            def probe(command, label):
+                return full if label == 'full' else self.rows(400)
+            with patch('placement.model_info', return_value=facts):
+                plan = PL.prepare(c, BASE, {}, {'ROCm0': 'a', 'ROCm1': 'b'}, {'a': (0, 1000), 'b': (0, 1000)}, None, probe)
+            self.assertEqual(K.option_value(plan['candidates'][0]['command'], '--device'), 'ROCm0')
+            self.assertGreater(plan['extra_mib']['ROCm0'], 0)
+            self.assertEqual(plan['extra_mib']['ROCm1'], 0)
+
+    def test_split_rounding_is_checked_before_a_load(self):
+        with tempfile.TemporaryDirectory() as d:
+            c = cfg(d, devices={'ROCm0': {'min_free_mib': 100}, 'ROCm1': {'fill': 'min', 'min_free_mib': 100}})
+            command = K.remove_option(BASE, '--spec-type')
+            facts = {'architecture': 'dense', 'experts': 0, 'expert_layers': [], 'layers': 10, 'nextn': 0,
+                     'mtp_mib': 0, 'model_mib': 1300, 'files': []}
+            labels = []
+            def probe(command, label):
+                labels.append(label)
+                if label == 'full':
+                    return {**self.rows(650), 'ROCm1': self.rows(650)['ROCm0']}
+                if label == 'split-0':
+                    return {**self.rows(950), 'ROCm1': self.rows(350)['ROCm0']}
+                return {**self.rows(649), 'ROCm1': self.rows(651)['ROCm0']}
+            with patch('placement.model_info', return_value=facts):
+                plan = PL.prepare(c, command, {}, {'ROCm0': 'a', 'ROCm1': 'b'}, {'a': (0, 1000), 'b': (0, 1000)}, None, probe)
+            self.assertEqual(labels, ['full', 'split-0', 'split-1'])
+            self.assertEqual(plan['split_reserve_mib']['ROCm0'], 151)
+            self.assertIn('projected', plan['candidates'][0])
+
     def test_failed_reference_can_use_verified_policy(self):
         with tempfile.TemporaryDirectory() as d:
             c = cfg(d, knobs={'only': ['--no-repack'], 'include': [], 'exclude': ['--no-repack'], 'levels': {}})
