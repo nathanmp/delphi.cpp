@@ -304,6 +304,9 @@ class ContextRunner:
                 result['placement_warnings'] = self.warnings(offsets)
                 if collector:
                     if self.snapshot_supported:
+                        from observations import snapshot_ok
+                        self.snapshot_state = snapshot_ok(self.request({}, path='/tune/snapshot'))
+                        (directory / 'snapshot-final.json').write_text(json.dumps(self.snapshot_state, indent=2) + '\n')
                         self.point_events = max(self.point_events, self.snapshot_state['event_count'] - events_before)
                     else:
                         self.close()

@@ -184,6 +184,7 @@ class Collector:
             for prompt in prompts:
                 self.completion(prompt)
             source = [self.completion(prompt) for prompt in prompts]
+            self.save('source-responses.json', source)
             inputs, trace = self.live_inputs()
             for i, response in enumerate(source):
                 request_id = response.get('speculative_request_id')
@@ -230,6 +231,8 @@ class Collector:
                 for i, prompt in enumerate(prompts):
                     response = self.completion(prompt)
                     if not response.get('tokens') or response['tokens'] != source[i].get('tokens'):
+                        self.save('validation-token-mismatch.json', {'policy': asdict(policy) if policy else None,
+                                  'repeat': rep, 'prompt': i, 'source': source[i], 'response': response})
                         raise SpecError('normal-acceptance validation changed the greedy token sequence')
                     pending.append({'policy': asdict(policy) if policy else None, 'repeat': rep, 'prompt': i,
                                     'request_id': response.get('speculative_request_id'), 'timings': response['timings']})

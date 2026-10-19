@@ -149,10 +149,16 @@ def write(cfg: Mapping[str, Any], state: Mapping[str, Any], store: Store, out: P
                                  f"({min(observed):.2f}-{max(observed):.2f}); prediction difference {100 * (prediction / actual - 1):+.1f}%. "
                                  'Short captures include startup/boundary costs. This is diagnostic; prediction accuracy still needs fresh real-acceptance validation.')
                 validation = spec.get('validation', {})
+                if validation.get('launch'):
+                    lines.append(f"  Matched launch-policy decode: {validation['launch']['decode_t_s']:.2f} t/s. "
+                                 'Measured policy gains select the candidate for fresh-process recipe confirmation.')
                 for check in validation.get('policies', []):
+                    cost_errors = [s['cost_model_error_fraction'] for s in check['samples']
+                                   if s.get('cost_model_error_fraction') is not None]
+                    timing = f"; timing-model error {100 * statistics.median(cost_errors):+.1f}%" if cost_errors else ''
                     lines.append(f"  Matched normal-acceptance check {json.dumps(check['policy'], sort_keys=True)}: "
                                  f"replay {check['prediction_t_s']:.2f}, settled actual {check['aligned_decode_t_s']:.2f} t/s "
-                                 f"({100 * check['error_fraction']:+.1f}% error); full decode {check['decode_t_s']:.2f} t/s. "
+                                 f"({100 * check['error_fraction']:+.1f}% error{timing}); full decode {check['decode_t_s']:.2f} t/s. "
                                  'Fresh requests on the resident process; fresh-process deployment confirmation is separate.')
     (out / "report.md").write_text("\n".join(lines) + "\n")
     (out / "best.json").write_text(json.dumps({"command": list(command), "env": recommended["env"], 'cpu_budget': cpu_budget,
