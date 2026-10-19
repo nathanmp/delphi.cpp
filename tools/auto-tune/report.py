@@ -132,6 +132,7 @@ def write(cfg: Mapping[str, Any], state: Mapping[str, Any], store: Store, out: P
     spec_rows = [r for r in by_key.values() if r.get('metrics', {}).get('speculation')]
     if spec_rows:
         lines += ['', '## Speculative replay', '',
+                  f"Acceptance capture: raw {cfg['speculation']['prompt_tokens']}-token text prompts, {cfg['speculation']['osl']} output tokens, fixed maximum draft depth, adaptation off, p_min=0 and n_min=0. The measurements table uses the recipe client with {cfg['decode']['osl']} output tokens and the recipe policy.",
                   'Replay rows are throughput estimates from empirical acceptance passes and measured T(w). Synthetic output is performance-only. Recommendations require fresh normal-acceptance confirmation.',
                   'The MTP log has four-decimal probabilities and no tokens or request IDs. Requests are captured separately. Clipping changes future pass boundaries; cost/conf controllers and depth-switch costs are not replayed.',
                   'Request a shared per-pass server log for DSpark/other speculators, with request/sequence/pass IDs, tokens, full-precision probabilities, accepted length, attempted draft steps, checkpoint-replay markers, and pass timing or trace correlation. A live execution-trace flush hook is also needed to keep loop-2 contexts resident during T(w) collection.', '']
@@ -145,7 +146,7 @@ def write(cfg: Mapping[str, Any], state: Mapping[str, Any], store: Store, out: P
                 prediction = spec.get('capture_prediction', {}).get('decode_t_s')
                 if observed and prediction:
                     actual = statistics.median(observed)
-                    lines.append(f"  Source-policy check: replay {prediction:.2f} t/s; short real captures {actual:.2f} t/s median "
+                    lines.append(f"  Fixed-depth capture check: replay {prediction:.2f} t/s; short real captures {actual:.2f} t/s median "
                                  f"({min(observed):.2f}-{max(observed):.2f}); prediction difference {100 * (prediction / actual - 1):+.1f}%. "
                                  'Short captures include startup/boundary costs. This is diagnostic; prediction accuracy still needs fresh real-acceptance validation.')
     (out / "report.md").write_text("\n".join(lines) + "\n")
