@@ -289,6 +289,11 @@ def measurement_arm(cfg, base_arm, command, env, name, cpu_budget=None):
                   trace_prefill_min_tokens=0, trace_prefill_target_tokens=0)
 
 
+def placement_warnings(log):
+    return [line.strip() for line in log.splitlines()
+            if re.search(r'expert cache auto:.*no tier|staging.*(?:disabled|fail)|failed.*staging', line, re.I)]
+
+
 def launch(cfg: Mapping[str, Any], base_arm: P.ServerArm, command: Sequence[str], env: Mapping[str, str], name: str,
            artifacts: Path, cpu_budget=None) -> dict[str, Any]:
     """One server launch: the decode client, then the prefill lengths. Returns metrics; raises LaunchFailed."""
@@ -320,8 +325,7 @@ def launch(cfg: Mapping[str, Any], base_arm: P.ServerArm, command: Sequence[str]
             raise LaunchFailed('CPU budget audit failed: ' + ('; '.join(sorted(audit.violations)) or 'no server threads observed'))
         metrics.update(json.loads((artifacts / name / 'verification.json').read_text()))
         log = '\n'.join((artifacts / name / f'server.{stream}.log').read_text(errors='replace') for stream in ('stdout', 'stderr'))
-        metrics['placement_warnings'] = [line.strip() for line in log.splitlines()
-                                         if re.search(r'expert cache auto:.*no tier|staging.*(?:disabled|fail)|failed.*staging', line, re.I)]
+        metrics['placement_warnings'] = placement_warnings(log)
     for extra in item["extra_measurements"]:
         m = extra["metrics"]
         metrics["prefill"][str(m["target_tokens"])] = {"ttft_s": m.get("latency_s"), "t_s": m.get("prompt_t_s"), "prompt_ms": m.get("prompt_ms")}

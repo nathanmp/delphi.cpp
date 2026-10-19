@@ -99,6 +99,7 @@ class ContextRunner:
             self.baseline = M.vram_state()
             stdout = self.handles.enter_context((directory / 'server.stdout.log').open('w'))
             stderr = self.handles.enter_context((directory / 'server.stderr.log').open('w'))
+            self.server_logs = [directory / f'server.{stream}.log' for stream in ('stdout', 'stderr')]
             self.audit = self.handles.enter_context(M.CpuSampler(command, self.cpu)) if self.cpu else None
             values = {'port': str(self.arm.port), 'url': self.url, 'artifact_dir': str(directory), 'output': str(directory / 'client.json')}
             # Context measurements cannot use a trace spanning other contexts. Traced runs use the fresh-launch path.
@@ -167,6 +168,14 @@ class ContextRunner:
         if completed.returncode:
             raise M.LaunchFailed(f'{name} failed ({completed.returncode}); see {directory}')
 
+    def warnings(self, offsets):
+        chunks = []
+        for path in getattr(self, 'server_logs', []):
+            with path.open('rb') as handle:
+                handle.seek(offsets.get(path, 0))
+                chunks.append(handle.read().decode(errors='replace'))
+        return M.placement_warnings('\n'.join(chunks))
+
     def _measure(self, command, env, directory):
         arm = M.measurement_arm(self.cfg, self.arm, command, env, 'context', self.cpu)
         values = {'url': self.url, 'port': str(arm.port), 'output': str(directory / 'client.json'), 'artifact_dir': str(directory)}
@@ -202,6 +211,7 @@ class ContextRunner:
                 finally:
                     self.stats['launch_wall_s'] += time.monotonic() - started
             try:
+                offsets = {p: p.stat().st_size for p in getattr(self, 'server_logs', [])} if self.operation(command, env) == 'context' else {}
                 if self.operation(command, env) == 'launch':
                     self._start(command, env, directory)
                 else:
@@ -231,7 +241,7 @@ class ContextRunner:
                     result['cpu_budget'] = self.audit.summary()
                     if self.audit.violations or not self.audit.samples:
                         raise M.LaunchFailed('CPU budget audit failed: ' + str(result['cpu_budget']))
-                result['placement_warnings'] = []
+                result['placement_warnings'] = self.warnings(offsets)
                 (directory / 'metrics.json').write_text(json.dumps(result, indent=2) + '\n')
                 if not self.supported:
                     self.close()

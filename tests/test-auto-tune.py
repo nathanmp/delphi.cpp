@@ -675,6 +675,17 @@ class ContextSearch(unittest.TestCase):
             selected = K.select(K.Context(command, {'LLAMA_ARG_NUMA': 'tensors'}, 48, 48), only=['--numa'])
             self.assertEqual(selected, [])
 
+    def test_retained_contexts_keep_new_staging_warnings(self):
+        with tempfile.TemporaryDirectory() as d:
+            runner = ContextRunner(cfg(d), P.ServerArm('a', BASE, ('client',)), None)
+            log = Path(d) / 'server.stderr.log'
+            log.write_text('staging disabled in the old context\n')
+            offsets = {log: log.stat().st_size}
+            with log.open('a') as handle:
+                handle.write('expert cache auto: no tier on ROCm0\nnormal message\n')
+            runner.server_logs = [log]
+            self.assertEqual(runner.warnings(offsets), ['expert cache auto: no tier on ROCm0'])
+
     def test_screening_runs_only_above_threshold(self):
         with tempfile.TemporaryDirectory() as d:
             t, runner, _ = self.tuner(d, context_search={'screen_threshold': 1},
