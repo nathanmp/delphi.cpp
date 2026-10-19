@@ -14,10 +14,12 @@ from prefill_client import post
 from speculation import Policy, SpecError, Unavailable, cost_table, policies, rank, read_plog, replay
 
 
-def unavailable(command):
+def unavailable(command, env=None):
     if K.option_value(command, '--spec-type') != 'draft-mtp':
         return 'Per-pass probability logging is available only for draft-mtp; request a shared server log for DSpark and other speculators.'
-    if K.option_value(command, '--spec-synth-rates') or K.option_value(command, '--spec-synth-len'):
+    env = env or {}
+    if (K.option_value(command, '--spec-synth-rates') or K.option_value(command, '--spec-synth-len')
+            or env.get('LLAMA_ARG_SPEC_SYNTH_RATES') or env.get('LLAMA_ARG_SPEC_SYNTH_LEN')):
         return 'The reference must use real acceptance.'
     return None
 
@@ -82,8 +84,8 @@ class Collector:
         self.save('source.json', {'point': self.point, 'launch': self.launch, 'speculative': info, 'capture_policy': asdict(Policy(self.cap)),
                                  'command': list(self.command), 'env': self.env, 'prompt_tokens': prompts})
         try:
-            # Empty synth rates and -1 restore normal acceptance even if the launch had an environment override.
-            clean = ['--spec-synth-rates', '', '--spec-synth-len', '-1', '--spec-draft-sampling', 'greedy']
+            # Each update starts from the real-acceptance launch defaults. The CLI rejects an explicit synth-len=-1.
+            clean = ['--spec-draft-sampling', 'greedy']
             captured = self.configure([*Policy(self.cap).args(), *clean])
             if captured['adaptive'] != 'off' or captured['p_min'] != 0 or captured['n_max'] != self.cap:
                 raise SpecError('server did not apply the uncensored capture policy')
@@ -105,7 +107,7 @@ class Collector:
             for width in widths:
                 n = width - 1
                 args = ([*Policy(n).args(), '--spec-synth-rates', ','.join(['1'] * (n - 1) + ['0'])]
-                        if n else ['--spec-type', 'none', '--spec-synth-rates', '', '--spec-synth-len', '-1'])
+                        if n else ['--spec-type', 'none'])
                 state = self.configure(args)
                 if n and (state['n_max'] != n or state['adaptive'] != 'off'):
                     raise SpecError('server did not apply the fixed synthetic width')

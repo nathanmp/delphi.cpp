@@ -887,6 +887,8 @@ class Speculation(unittest.TestCase):
             self.assertEqual({w['width'] for w in collector.windows}, {1, 2, 3})
             self.assertGreater(collector.collection_wall_s, 0)
             self.assertEqual(json.loads((Path(d) / 'restored.json').read_text()), info)
+            self.assertTrue(all('--spec-synth-len' not in call.args[0]['args'] for call in runner.request.call_args_list if call.args))
+            self.assertIn('real acceptance', unavailable(BASE, {'LLAMA_ARG_SPEC_SYNTH_RATES': '1,0'}))
 
     def test_loop_three_budget_failure_restores_policy(self):
         with tempfile.TemporaryDirectory() as d:
