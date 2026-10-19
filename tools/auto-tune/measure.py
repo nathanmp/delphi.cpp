@@ -273,7 +273,11 @@ def launch(cfg: Mapping[str, Any], base_arm: P.ServerArm, command: Sequence[str]
                                                       "--output", "{output}"), "prefill")
             for i, length in enumerate(prefill["lengths"]))
     osl = cfg["decode"]["osl"] if cfg["weights"].get("decode", 0) > 0 else 16
-    arm = replace(base_arm, name=name, server_command=tuple(command), env=dict(env), client_command=_client(base_arm.client_command, osl),
+    client = _client(base_arm.client_command, osl)
+    if cpu_budget:
+        client = (sys.executable, str(Path(__file__).parent / 'verify_client.py'), '--url', '{url}', '--floor', str(cfg['context']),
+                  '--output', '{artifact_dir}/verification.json', '--', *client)
+    arm = replace(base_arm, name=name, server_command=tuple(command), env=dict(env), client_command=client,
                   extra_measurements=measures, trace_mode="submit" if cfg["trace"] else "off",
                   trace_prefill_min_tokens=0, trace_prefill_target_tokens=0)
     recipe = P.Recipe(name="auto-tune", description="auto-tuner launch", arms=(arm,))
@@ -299,11 +303,8 @@ def launch(cfg: Mapping[str, Any], base_arm: P.ServerArm, command: Sequence[str]
         metrics['cpu_budget'] = audit.summary()
         if audit.violations or not audit.samples:
             raise LaunchFailed('CPU budget audit failed: ' + ('; '.join(sorted(audit.violations)) or 'no server threads observed'))
-        log = (artifacts / name / 'server.stderr.log').read_text(errors='replace')
-        contexts = [int(n) for n in re.findall(r'\bn_ctx_per_seq\s*=\s*(\d+)', log)]
-        if not contexts or min(contexts) < cfg['context']:
-            raise LaunchFailed(f'context floor {cfg["context"]} not verified: {contexts}')
-        metrics['verified_context'] = min(contexts)
+        metrics.update(json.loads((artifacts / name / 'verification.json').read_text()))
+        log = '\n'.join((artifacts / name / f'server.{stream}.log').read_text(errors='replace') for stream in ('stdout', 'stderr'))
         metrics['placement_warnings'] = [line.strip() for line in log.splitlines()
                                          if re.search(r'expert cache auto:.*no tier|staging.*(?:disabled|fail)|failed.*staging', line, re.I)]
     for extra in item["extra_measurements"]:

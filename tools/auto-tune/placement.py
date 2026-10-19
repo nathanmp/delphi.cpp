@@ -2,12 +2,12 @@
 from __future__ import annotations
 
 import math
+import json
 import re
 import subprocess
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Mapping
 
 from config import TuneError
 import knobs as K
@@ -66,18 +66,25 @@ def model_info(path):
             raise TuneError('split GGUF needs a numbered shard path')
         paths = [Path(f'{match[1]}-{i:05d}-of-{count:05d}.gguf') for i in range(1, count + 1)]
     mtp_bytes = 0
+    total_bytes = 0
     expert_layers = set()
+    layer_bytes = {}
     for index, p in enumerate(paths):
         part = reader if index == 0 else GGUFReader(p)
         for tensor in part.tensors:
+            total_bytes += tensor.n_bytes
             match = re.match(r'blk\.(\d+)\.', tensor.name)
             if match and nextn and int(match[1]) >= layers - nextn:
                 mtp_bytes += tensor.n_bytes
             elif match and re.search(r'\.ffn_(?:gate|up|down|gate_up)_(?:ch)?exps\.', tensor.name):
                 expert_layers.add(int(match[1]))
+            if match and not any(s in tensor.name for s in ('engram_embd', 'per_layer_token_embd')):
+                il = int(match[1])
+                layer_bytes[il] = layer_bytes.get(il, 0) + tensor.n_bytes
     return {'architecture': arch, 'experts': int(field(f'{arch}.expert_count', 0)), 'layers': layers,
             'expert_layers': sorted(expert_layers), 'mtp_mib': mtp_bytes / MiB, 'nextn': nextn,
-            'files': [str(p) for p in paths]}
+            'files': [str(p) for p in paths], 'model_mib': total_bytes / MiB,
+            'max_layer_mib': max(layer_bytes.values(), default=0) / MiB}
 
 
 # Spec and HTTP options are server-only. The standalone fit tool does not fit an extra draft model.
@@ -145,7 +152,8 @@ def candidates(command, env, devices, full, dense, info, extra=None):
     model_mib = sum(full[d.name]['model'] for d in devices)
     dense_mib = sum(dense[d.name]['model'] for d in devices)
     full_alloc, deficit = distribute(model_mib, capacities, devices)
-    dense_alloc, dense_deficit = distribute(dense_mib, capacities, devices)
+    dense_capacities = {d.name: d.capacity - dense[d.name]['context'] - dense[d.name]['compute'] - extra.get(d.name, 0) for d in devices}
+    dense_alloc, dense_deficit = distribute(dense_mib, dense_capacities, devices)
     cmd = strip_placement(command)
     warnings = []
     if env.get('GGML_SCHED_STAGE_REGISTER') == '1':
@@ -180,7 +188,7 @@ def candidates(command, env, devices, full, dense, info, extra=None):
         # Auto sizing reads one margin for all GPUs, after KV, compute and draft allocation.
         # Use the strictest device bound; a min device is not allowed an extra cache tier.
         margins = [max(d.margin_mib, d.free_mib - d.max_used_mib if d.max_used_mib is not None else 0) for d in active]
-        margins += [max(0, d.free_mib - allocation[d.name] - full[d.name]['context'] - full[d.name]['compute'] - extra.get(d.name, 0))
+        margins += [max(0, d.free_mib - allocation[d.name] - dense[d.name]['context'] - dense[d.name]['compute'] - extra.get(d.name, 0))
                     for d in active if d.fill == 'min']
         e['LLAMA_MOE_CACHE_AUTO_MARGIN_MIB'] = str(math.ceil(max(margins)))
         e.setdefault('GGML_SCHED_STAGE', '1')
@@ -246,6 +254,7 @@ def prepare(cfg, command, env, pci_map, state, cpu, probe=None):
         extra[device] = extra.get(device, 0) + info['mtp_mib'] + max(r['compute'] for n, r in full.items() if n != 'Host')
         extra[device] += sum(r['context'] for n, r in full.items() if n != 'Host') * max(1, info['nextn']) / max(1, info['layers'])
     draft = K.option_value(command, '--spec-draft-model')
+    draft_estimate = None
     if draft:
         dcmd = K.set_option(strip_placement(command), '-m', draft)
         dcmd = K.remove_option(dcmd, '--model')
@@ -255,18 +264,53 @@ def prepare(cfg, command, env, pci_map, state, cpu, probe=None):
         dcmd = K.set_option(dcmd, '-ub', K.option_value(command, '-ubd') or '512')
         # Target-only lazy embedding overrides do not describe the draft model.
         dcmd = K.remove_option(K.remove_option(dcmd, '-ot'), '--override-tensor')
-        for name, row in measure(dcmd, 'draft').items():
+        draft_info = model_info(draft)
+        if draft_info['architecture'] in ('dflash', 'eagle3', 'gemma4-assistant'):
+            # These contexts require ctx_other, which the standalone fit CLI cannot supply.
+            draft_devices = K.option_value(dcmd, '--device').split(',')
+            if len(draft_devices) != 1:
+                raise TuneError('coupled draft estimation currently needs one draft device')
+            device = draft_devices[0]
+            draft_rows = {device: {'model': draft_info['model_mib'],
+                                  'context': sum(r['context'] for n, r in dense.items() if n != 'Host'),
+                                  'compute': max(r['compute'] for n, r in dense.items() if n != 'Host')}}
+            draft_estimate = {'architecture': draft_info['architecture'], 'memory': draft_rows,
+                              'reason': 'the draft context requires a loaded target; reserve its weights and a target-buffer bound'}
+        else:
+            draft_rows = measure(dcmd, 'draft')
+        for name, row in draft_rows.items():
             if name != 'Host':
                 extra[name] = extra.get(name, 0) + sum(row.values())
     if K.option_value(command, '--mmproj') and not cfg['placement']['reserve_mib']:
         raise TuneError('mmproj needs placement.reserve_mib from a server memory report; the fit CLI cannot measure it')
     options = candidates(command, env, devices, full, dense, info, extra)
+    # Layer boundaries round a byte ratio. Measure the derived split before paying for a full model load.
+    corrections = {}
+    for attempt in range(3):
+        first = options[0]
+        if first['name'] != 'fits' or len(devices) < 2:
+            break
+        projected = measure(first['command'], f'split-{attempt}')
+        first['projected'] = projected
+        overflow = {d.name: sum(projected.get(d.name, {}).values()) + extra.get(d.name, 0) - d.capacity for d in devices}
+        overflow = {name: value for name, value in overflow.items() if value > 0}
+        if not overflow:
+            break
+        if attempt == 2:
+            first['warnings'].append('the split estimate still exceeds a device budget; fresh-load verification can reject it')
+            break
+        for name, value in overflow.items():
+            corrections[name] = corrections.get(name, 0) + value + info.get('max_layer_mib', 0)
+        options = candidates(command, env, devices, full, dense, info,
+                             {name: extra.get(name, 0) + corrections.get(name, 0) for name in set(extra) | set(corrections)})
     for option in options:
         if 'draft-mtp' in spec:
             option['warnings'].append('MTP scratch memory is a conservative estimate; verify the fresh launch')
+        if draft_estimate:
+            option['warnings'].append('coupled draft buffers use a conservative target-buffer estimate; verify the fresh launch')
         if K.option_value(command, '--mmproj'):
             option['warnings'].append('check mmproj load order: auto cache sizing must run after mmproj allocation')
     result = {'devices': [asdict(d) for d in devices], 'model': info, 'full': full, 'dense': dense,
-              'extra_mib': extra, 'dry_runs': commands, 'candidates': options}
-    (out / 'plan.json').write_text(__import__('json').dumps(result, indent=2) + '\n')
+              'extra_mib': extra, 'draft_estimate': draft_estimate, 'split_reserve_mib': corrections, 'dry_runs': commands, 'candidates': options}
+    (out / 'plan.json').write_text(json.dumps(result, indent=2) + '\n')
     return result

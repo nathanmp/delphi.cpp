@@ -6,19 +6,21 @@ import tempfile
 import unittest
 import os
 import subprocess
+from unittest.mock import patch
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools/auto-tune"))
 import knobs as K
 import score as S
-from auto_tune import Budget, Tuner, plan_text
+from auto_tune import Budget, Tuner, plan_text, base_launch
 from config import DEFAULTS, _merge
 from report import write
 from store import Store
 from cpu import CpuBudget, parse_list
 import placement as PL
-from measure import vram_violations
+from measure import vram_violations, P, CpuSampler
+from verify_client import verify
 
 BASE = ("llama-server", "-m", "model.gguf", "-c", "8192", "-b", "2048", "-ub", "512", "-fa", "on", "-t", "32",
         "--spec-type", "draft-mtp", "--spec-draft-n-max", "4", "--device", "ROCm0,ROCm1")
@@ -145,6 +147,26 @@ class CpuPolicy(unittest.TestCase):
             self.assertEqual(json.loads(result), list(cpus))
         self.assertEqual(os.sched_getaffinity(0), original)
 
+    def test_audit_observes_child_threads(self):
+        cpus = tuple(sorted(os.sched_getaffinity(0))[:2])
+        budget = CpuBudget(cpus, len(cpus), (0,))
+        audit = CpuSampler((sys.executable,), budget)
+        with budget.affinity():
+            child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(10)'])
+        try:
+            audit.sample()
+            self.assertGreater(audit.samples, 0)
+            self.assertFalse(audit.violations)
+        finally:
+            child.terminate()
+            child.wait()
+
+    def test_context_floor_uses_server_props(self):
+        self.assertEqual(verify({'default_generation_settings': {'n_ctx': 8192}}, 8192)['verified_context'], 8192)
+        for props in ({}, {'default_generation_settings': {'n_ctx': 4096}}):
+            with self.assertRaises(ValueError):
+                verify(props, 8192)
+
 
 class PlacementPolicy(unittest.TestCase):
     def rows(self, model, context=50, compute=50):
@@ -218,6 +240,41 @@ class PlacementPolicy(unittest.TestCase):
             self.assertEqual([k.name for k, _ in t.selected()], ['--no-repack'])
             self.assertEqual(K.BY_NAME['-ub'].reload, 'context')
             self.assertEqual(K.BY_NAME['--spec-draft-n-max'].reload, 'request')
+        command = (*BASE, '--numa', 'tensors', '-cmoe')
+        self.assertEqual(K.BY_NAME['GGML_CPU_NUMA_CHUNKS'].reload, 'process')
+        self.assertIn('GGML_CPU_NUMA_CHUNKS', dict((k.name, v) for k, v in K.select(ctx(command))))
+
+    def test_requested_devices_reorder_reference_ratios(self):
+        with tempfile.TemporaryDirectory() as d:
+            arm = P.ServerArm('a', (*BASE, '-ts', '2,1'), ('client',))
+            recipe = P.Recipe('test', '', (arm,))
+            with patch('measure.P.load_recipe', return_value=recipe):
+                c = cfg(d, devices={'ROCm1': {}, 'ROCm0': {}})
+                _, command, _ = base_launch(c)
+                self.assertEqual(K.option_value(command, '--device'), 'ROCm1,ROCm0')
+                self.assertEqual(K.option_value(command, '-ts'), '1,2')
+                c['devices'] = {'ROCm1': {}}
+                _, command, _ = base_launch(c)
+                self.assertEqual(K.option_value(command, '--device'), 'ROCm1')
+                self.assertIsNone(K.option_value(command, '-ts'))
+
+    def test_coupled_draft_reserves_weights_and_buffers_without_fit(self):
+        with tempfile.TemporaryDirectory() as d:
+            c = cfg(d, devices={'ROCm0': {'min_free_mib': 100}})
+            command = K.set_option(K.set_option(BASE, '--spec-type', 'draft-dspark'), '--spec-draft-model', 'draft.gguf')
+            command = K.set_option(command, '--spec-draft-device', 'ROCm0')
+            facts = {'architecture': 'deepseek41', 'experts': 8, 'expert_layers': list(range(20)), 'layers': 20, 'nextn': 0,
+                     'mtp_mib': 0, 'model_mib': 2100, 'files': [], 'max_layer_mib': 100}
+            labels = []
+            def probe(command, label):
+                labels.append(label)
+                return self.rows(2000 if label == 'full' else 100)
+            with patch('placement.model_info', side_effect=[facts, {**facts, 'architecture': 'dflash', 'model_mib': 500}]):
+                plan = PL.prepare(c, command, {}, {'ROCm0': 'a'}, {'a': (0, 1000)}, None, probe)
+            self.assertEqual(labels, ['full', 'dense'])
+            self.assertEqual(plan['extra_mib']['ROCm0'], 600)
+            self.assertEqual(plan['candidates'][0]['name'], 'host-experts')
+            self.assertIsNotNone(plan['draft_estimate'])
 
     def test_failed_reference_can_use_verified_policy(self):
         with tempfile.TemporaryDirectory() as d:

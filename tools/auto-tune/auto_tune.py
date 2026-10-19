@@ -370,6 +370,20 @@ def base_launch(cfg: Mapping[str, Any]):
             value = K.option_value(command, old)
             command = K.set_option(K.remove_option(command, old), new, value)
     command = K.set_option(command, '-c', str(cfg['context']))
+    if cfg['devices']:
+        previous_devices = (K.option_value(command, '--device') or '').split(',')
+        requested = list(cfg['devices'])
+        split = (K.option_value(command, '-ts') or '').split(',')
+        if previous_devices != requested:
+            command = K.set_option(command, '--device', ','.join(requested))
+            if set(previous_devices) == set(requested) and len(split) == len(previous_devices):
+                ratios = dict(zip(previous_devices, split))
+                command = K.set_option(command, '-ts', ','.join(ratios[name] for name in requested))
+            else:
+                command = K.remove_option(command, '-ts')
+        draft_devices = K.option_value(command, '--spec-draft-device')
+        if draft_devices and not set(draft_devices.split(',')) <= set(requested):
+            raise TuneError('the draft devices must be included in the device budget')
     return arm, command, {**arm.env, **cfg['env']}
 
 

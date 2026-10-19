@@ -24,7 +24,13 @@ def parse_list(value: str) -> set[int]:
 
 
 def cpu_list(cpus) -> str:
-    return ','.join(str(n) for n in sorted(cpus))
+    ranges = []
+    for cpu in sorted(cpus):
+        if ranges and ranges[-1][-1] == cpu - 1:
+            ranges[-1][-1] = cpu
+        else:
+            ranges.append([cpu, cpu])
+    return ','.join(str(a) if a == b else f'{a}-{b}' for a, b in ranges)
 
 
 def topology(allowed=None, root=Path('/sys/devices/system/cpu')) -> dict[int, tuple[int, int, int]]:

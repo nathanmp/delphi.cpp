@@ -171,6 +171,8 @@ def _threads(ctx: Context) -> list[int]:
 REGISTRY: tuple[Knob, ...] = (
     Knob("-lm", "fit", "option", ("-lm",), ("mmap", "mmap+mlock"), "weight load mode", default=False, unset="auto"),
     Knob("--no-repack", "speed", "switch", ("--no-repack",), (OFF, ON), "disable CPU weight repacking", default=False),
+    Knob("GGML_CPU_NUMA_CHUNKS", "speed", "env", ("GGML_CPU_NUMA_CHUNKS",), (0, 2, 4),
+         "expert row pieces per NUMA worker", requires=lambda c: _host_experts(c) and c.option('--numa') == 'tensors', unset='2'),
     # fit
     Knob("-ub", "fit", "option", ("-ub",), (256, 512, 1024, 2048, 4096), "physical batch; -b is raised to it if lower"),
     Knob("-b", "fit", "option", ("-b",), (2048, 4096, 8192, 10240), "logical batch", requires=lambda c: c.option("-ub") is not None),
