@@ -2,6 +2,7 @@
 #include "llama-model.h"
 #include "llama-impl.h"
 #include "ggml-alloc.h"
+#include "ggml-cpuset.h"
 #include "ggml-stage-copy.h"
 #include "llama-moe-prefill.h"
 
@@ -1134,12 +1135,19 @@ static std::vector<int> local_cpus(ggml_backend_dev_t dev) {
     return cpus;
 }
 
+// The thread stays inside the allowed CPUs (ggml-cpuset.h): the CPUs of the list that are allowed, else all allowed CPUs.
 static void pin_thread(const std::vector<int> & cpus) {
 #ifdef __linux__
-    if (cpus.empty()) { return; }
+    std::vector<int> allowed(cpus);
+    allowed.resize(ggml_cpuset_filter(allowed.data(), (int) allowed.size()));
+    if (allowed.empty()) {
+        allowed.resize(CPU_SETSIZE);
+        allowed.resize(ggml_cpuset_list(allowed.data(), (int) allowed.size()));
+    }
+    if (allowed.empty()) { return; }
     cpu_set_t set;
     CPU_ZERO(&set);
-    for (int c : cpus) { CPU_SET(c, &set); }
+    for (int c : allowed) { CPU_SET(c, &set); }
     pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
 #else
     GGML_UNUSED(cpus);

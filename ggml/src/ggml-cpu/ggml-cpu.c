@@ -10,6 +10,7 @@
 #include "quants.h"
 #include "ggml-threading.h"
 #include "ggml-exec-trace.h"
+#include "ggml-cpuset.h"
 #include "unary-ops.h"
 #include "binary-ops.h"
 #include "vec.h"
@@ -1036,7 +1037,29 @@ static void * ggml_numa_load_expert_worker(void * userdata) {
     struct ggml_numa_load_worker * worker = (struct ggml_numa_load_worker *) userdata;
     const struct ggml_numa_node * node = &g_state.numa.nodes[worker->node];
 
-    const uint32_t cpu = node->cpus[worker->rank % node->n_cpus];
+    // a CPU of the node inside the allowed set (ggml-cpuset.h); the memory policy below sets where the pages go, so any
+    // allowed CPU does when the node has none
+    uint32_t n_ok = 0;
+    for (uint32_t i = 0; i < node->n_cpus; ++i) {
+        n_ok += ggml_cpuset_allowed((int) node->cpus[i]);
+    }
+    uint32_t cpu = node->cpus[worker->rank % node->n_cpus];
+    if (n_ok > 0) {
+        uint32_t k = worker->rank % n_ok;
+        for (uint32_t i = 0; i < node->n_cpus; ++i) {
+            if (ggml_cpuset_allowed((int) node->cpus[i]) && k-- == 0) {
+                cpu = node->cpus[i];
+                break;
+            }
+        }
+    } else {
+        for (int c = 0; c < CPU_SETSIZE; ++c) {
+            if (ggml_cpuset_allowed(c)) {
+                cpu = (uint32_t) c;
+                break;
+            }
+        }
+    }
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
     CPU_SET(cpu, &cpuset);
@@ -3712,7 +3735,8 @@ static bool ggml_thread_apply_affinity(const bool * mask) {
     CPU_ZERO(&cpuset);
 
     for (uint32_t i = 0; i < GGML_MAX_N_THREADS; i++) {
-        if (mask[i]) {
+        // delphi: stay inside the allowed CPUs (ggml-cpuset.h)
+        if (mask[i] && ggml_cpuset_allowed((int) i)) {
             GGML_PRINT_DEBUG("Thread %lx: adding %d to cpuset\n", pthread_self(), i);
             CPU_SET(i, &cpuset);
         }

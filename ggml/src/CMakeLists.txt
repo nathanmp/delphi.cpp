@@ -197,12 +197,14 @@ add_library(ggml-base
             ../include/ggml-opt.h
             ../include/gguf.h
             ../include/ggml-exec-trace.h
+            ../include/ggml-cpuset.h
             ggml.c
             ggml.cpp
             ggml-alloc.c
             ggml-backend.cpp
             ggml-backend-meta.cpp
             ggml-exec-trace.cpp
+            ggml-cpuset.cpp
             ggml-opt.cpp
             ggml-threading.cpp
             ggml-threading.h

@@ -1,5 +1,6 @@
 #include "llama-context.h"
 
+#include "ggml-cpuset.h"
 #include "ggml-exec-trace.h"
 #include "ggml.h"
 #include "llama-arch.h"
@@ -17,6 +18,7 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstdlib>
@@ -3401,31 +3403,57 @@ llm_graph_result * llama_context::get_gf_res_prev() {
     return res.get();
 }
 
-// delphi: a CPU on the NUMA node of a GPU for its scheduler worker: LLAMA_MOE_CACHE_WORKER_CPU, else the node's last CPU
-// (--numa tensors gives the CPU threads the first CPUs of each node), else -1 (not pinned)
+// the last allowed CPU (ggml-cpuset.h) of a "0-7,16-23" list, -1 if the list has none
+static int last_allowed_cpu(const std::string & list) {
+    int last = -1;
+    for (size_t pos = 0; pos < list.size();) {
+        const size_t end = std::min(list.find(',', pos), list.size());
+        const std::string r = list.substr(pos, end - pos);
+        const size_t dash = r.find('-');
+        const int first = atoi(r.c_str());
+        const int hi    = dash == std::string::npos ? first : atoi(r.c_str() + dash + 1);
+        for (int c = std::max(first, 0); c <= hi && c < 4096; ++c) {
+            if (ggml_cpuset_allowed(c)) {
+                last = c;
+            }
+        }
+        pos = end + 1;
+    }
+    return last;
+}
+
+// delphi: a CPU on the NUMA node of a GPU for its scheduler worker: LLAMA_MOE_CACHE_WORKER_CPU, else the last allowed CPU of
+// the node (--numa tensors gives the CPU threads the first CPUs of each node), else the last allowed CPU, else -1 (not pinned).
+// The CPU is always inside the allowed set (ggml-cpuset.h): a restricted CPU set can leave a node without CPUs.
 static int share_worker_cpu(ggml_backend_dev_t dev) {
     if (const char * env = getenv("LLAMA_MOE_CACHE_WORKER_CPU")) {
-        return atoi(env);
+        if (ggml_cpuset_allowed(atoi(env))) {
+            return atoi(env);
+        }
+        LLAMA_LOG_WARN("%s: LLAMA_MOE_CACHE_WORKER_CPU=%s is outside the allowed CPU set, ignored\n", __func__, env);
     }
+    int cpu = -1;
     ggml_backend_dev_props props;
     ggml_backend_dev_get_props(dev, &props);
-    if (props.device_id == nullptr) {
-        return -1;
+    if (props.device_id != nullptr) {
+        std::string id = props.device_id;
+        for (auto & c : id) {
+            c = (char) tolower((unsigned char) c);
+        }
+        int node = -1;
+        std::ifstream("/sys/bus/pci/devices/" + id + "/numa_node") >> node;
+        if (node >= 0) {
+            std::string list;
+            std::ifstream("/sys/devices/system/node/node" + std::to_string(node) + "/cpulist") >> list;
+            cpu = last_allowed_cpu(list);
+        }
     }
-    std::string id = props.device_id;
-    for (auto & c : id) {
-        c = (char) tolower((unsigned char) c);
+    if (cpu < 0) {
+        std::vector<int> all(4096);
+        all.resize(ggml_cpuset_list(all.data(), (int) all.size()));
+        cpu = all.empty() ? -1 : all.back();
     }
-    int node = -1;
-    std::ifstream("/sys/bus/pci/devices/" + id + "/numa_node") >> node;
-    if (node < 0) {
-        return -1;
-    }
-    std::string list;
-    std::ifstream("/sys/devices/system/node/node" + std::to_string(node) + "/cpulist") >> list;
-    const size_t sep = list.find_last_of(",-");
-    const std::string last = sep == std::string::npos ? list : list.substr(sep + 1);
-    return last.empty() ? -1 : atoi(last.c_str());
+    return cpu;
 }
 
 // delphi: the splits of an expert cache tier on another GPU are submitted by a scheduler worker, so that their host time

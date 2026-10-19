@@ -11,6 +11,7 @@
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
 #include "ggml-alloc.h"
+#include "ggml-cpuset.h"
 #include "ggml-exec-trace.h"
 #include "ggml-impl.h"
 #include "ggml-offload-cost.h"
@@ -2802,14 +2803,21 @@ static std::vector<int> ggml_backend_sched_stage_local_cpus(const char * pci_id)
     return cpus;
 }
 
+// the thread stays inside the allowed CPUs (ggml-cpuset.h): the CPUs of the list that are allowed, else all allowed CPUs
 static void ggml_backend_sched_stage_pin(const std::vector<int> & cpus) {
 #ifdef __linux__
-    if (cpus.empty()) {
+    std::vector<int> allowed(cpus);
+    allowed.resize(ggml_cpuset_filter(allowed.data(), (int) allowed.size()));
+    if (allowed.empty()) {
+        allowed.resize(CPU_SETSIZE);
+        allowed.resize(ggml_cpuset_list(allowed.data(), (int) allowed.size()));
+    }
+    if (allowed.empty()) {
         return;
     }
     cpu_set_t set;
     CPU_ZERO(&set);
-    for (int c : cpus) {
+    for (int c : allowed) {
         CPU_SET(c, &set);
     }
     pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
@@ -3746,8 +3754,17 @@ static void ggml_backend_sched_worker_main(ggml_backend_sched_worker * w) {
     if (w->cpu >= 0) {
         cpu_set_t set;
         CPU_ZERO(&set);
-        CPU_SET(w->cpu, &set);
-        if (pthread_setaffinity_np(pthread_self(), sizeof(set), &set) != 0) {
+        if (ggml_cpuset_allowed(w->cpu)) {
+            CPU_SET(w->cpu, &set);
+        } else {
+            // a CPU outside the allowed set: any allowed CPU
+            for (int c = 0; c < CPU_SETSIZE; c++) {
+                if (ggml_cpuset_allowed(c)) {
+                    CPU_SET(c, &set);
+                }
+            }
+        }
+        if (CPU_COUNT(&set) > 0 && pthread_setaffinity_np(pthread_self(), sizeof(set), &set) != 0) {
             GGML_LOG_WARN("%s: cannot pin the worker of %s to CPU %d\n", __func__,
                     ggml_backend_name(w->sched->backends[w->backend_id]), w->cpu);
         }
