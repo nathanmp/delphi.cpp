@@ -4,6 +4,8 @@
 #include "server-ckpt.h"
 #include "server-ckpt-spill.h"
 #include "server-turn.h"
+#include "server-tune.h"
+#include "kld.h"
 #include "server-common.h"
 #include "server-http.h"
 #include "server-task.h"
@@ -188,13 +190,19 @@ struct server_batch {
     }
 
     ~server_batch() {
+        free();
+    }
+
+    void free() {
         if (batch.pos != nullptr) {
             clear();
             llama_batch_free(batch);
+            batch.pos = nullptr;
         }
     }
 
     void init(int32_t n_tokens_alloc, int32_t n_embd) {
+        free(); // the context is made again by POST /tune/context
         this->n_tokens_alloc = n_tokens_alloc;
         this->n_embd = n_embd;
         batch = llama_batch_init(n_tokens_alloc, 0, 1);
@@ -1039,6 +1047,14 @@ private:
 
     int64_t t_last_load_progress_ms = 0;
 
+    int32_t tune_outputs = 0;     // outputs per ubatch that a tune request asked for at least (POST /tune/kld batches)
+    int64_t t_tune_warmup_us = 0; // the warmup of the last context that load_model() made
+
+    // POST /tune/context: a request waits for the running slots, and new tasks wait behind it
+    bool                         tune_pending = false;
+    std::unique_ptr<server_task> tune_task;
+    std::map<std::string, std::string> tune_env; // the environment that requests set (for GET /tune/context)
+
     // do the slots make context checkpoints at all
     bool ckpt_used() const {
         return params_base.n_ctx_checkpoints > 0 && (
@@ -1050,6 +1066,31 @@ private:
     // checkpoints at the ends of chat messages are made only where the slots make checkpoints at all
     int32_t ckpt_turn_step() const {
         return params_base.use_jinja && ckpt_used() ? params_base.ckpt_turn_step : 0;
+    }
+
+    // delphi: free everything that the context owns, the model stays (POST /tune/context); load_model(.., true) follows
+    void destroy_context() {
+        ckpt_async_sync();
+        if (ctx_tgt) {
+            llama_synchronize(ctx_tgt);
+        }
+        vram.free();
+        ckpt_spill.shutdown();
+
+        spec.reset();
+        slots.clear();
+        prompt_cache.reset();
+        batch.free();
+        spec_t_verify.clear();
+
+        if (spec_init) {
+            spec_init->free_context();
+        }
+        ctx_dft = nullptr;
+        if (llama_init) {
+            llama_init->free_context();
+        }
+        ctx_tgt = nullptr;
     }
 
     void destroy() {
@@ -1124,7 +1165,9 @@ private:
 
     // load the model and initialize llama_context
     // this may also be called to resume from sleeping state
-    bool load_model(common_params & params) {
+    // delphi: ctx_only keeps the model (and the draft model and the multimodal projector) and makes the contexts, the
+    // slots and the speculative state again, see destroy_context()
+    bool load_model(common_params & params, bool ctx_only = false) {
         load_progress_data load_progress_text  (this, "text_model");
         load_progress_data load_progress_mmproj(this, "mmproj_model");
         load_progress_data load_progress_spec  (this, "spec_model");
@@ -1133,7 +1176,7 @@ private:
 
         params_base = params;
         const auto output_limits = server_output_limits(params_base);
-        params_base.n_outputs_max = output_limits.total;
+        params_base.n_outputs_max = std::max<int32_t>(output_limits.total, tune_outputs);
         params_base.n_outputs_max_per_seq = output_limits.per_seq;
 
         const bool has_mmproj = !params.mmproj.path.empty();
@@ -1182,7 +1225,7 @@ private:
         }
 
         // optionally get the memory usage of mmproj
-        if (has_mmproj && params_base.fit_params) {
+        if (has_mmproj && params_base.fit_params && !ctx_only) {
             int64_t t_start = ggml_time_us();
             auto mmproj_mem = mtmd_get_memory_usage(mmproj_path.c_str(), mparams);
             int64_t t_elapsed = ggml_time_us() - t_start;
@@ -1217,7 +1260,14 @@ private:
             params_base.load_progress_callback_user_data = &load_progress_text;
         }
 
-        llama_init = common_init_from_params(params_base);
+        if (ctx_only) {
+            GGML_ASSERT(llama_init && llama_init->model());
+            if (!llama_init->recreate_context(params_base, &t_tune_warmup_us)) {
+                llama_init->free_context();
+            }
+        } else {
+            llama_init = common_init_from_params(params_base);
+        }
 
         model_tgt = llama_init->model();
         ctx_tgt   = llama_init->context();
@@ -1250,7 +1300,11 @@ private:
                 params_dft.load_progress_callback           = load_progress_callback;
                 params_dft.load_progress_callback_user_data = &load_progress_spec;
 
-                spec_init = common_speculative_init_from_params(params_dft, model_tgt, ctx_tgt);
+                if (ctx_only && spec_init) {
+                    spec_init->recreate_context(params_dft, model_tgt, ctx_tgt);
+                } else {
+                    spec_init = common_speculative_init_from_params(params_dft, model_tgt, ctx_tgt);
+                }
                 model_dft = spec_init->model();
                 ctx_dft   = spec_init->context();
 
@@ -1271,7 +1325,7 @@ private:
             load_progress_callback(1.0f, &load_progress_spec);
         }
 
-        if (has_mmproj) {
+        if (has_mmproj && !ctx_only) {
             if (callback_state) {
                 callback_state(SERVER_STATE_LOADING, {{"stage", "mmproj_model"}});
             }
@@ -1426,6 +1480,7 @@ private:
 
             slot.callback_on_release = [this](int id_slot) {
                 queue_tasks.pop_deferred_task(id_slot);
+                tune_resume();
             };
 
             slot.callback_on_reset = [this](const server_slot & slot) {
@@ -1528,8 +1583,11 @@ private:
         params = params_base;
 
         if (!is_resume) {
-            const bool ok = init();
+            const bool ok = ctx_only ? true : init();
             if (ok) {
+                if (ctx_only) {
+                    init_vram();
+                }
                 // after the draft or MTP context and the slots hold their memory
                 llama_expert_cache_auto(ctx_tgt);
             }
@@ -1541,6 +1599,25 @@ private:
         }
 
         return true;
+    }
+
+    void init_vram() {
+        vram.init(ctx_tgt, ctx_dft, params_base.devices, model_name, [this]() { queue_tasks.wake(); }, [this]() {
+            // before the KV cache is freed: idle slots go to the host prompt cache (if any) and start empty
+            ckpt_async_sync();
+            for (auto & slot : slots) {
+                if (slot.is_processing() || slot.prompt.tokens.size() == 0) {
+                    continue;
+                }
+                if (prompt_cache) {
+                    slot.prompt_save(*prompt_cache);
+                }
+                slot.prompt_clear();
+            }
+            if (prompt_cache) {
+                prompt_cache->update();
+            }
+        });
     }
 
     // unlike load_model(), this is only called once during initialization
@@ -1563,22 +1640,7 @@ private:
         queue_tasks.on_idle_tick([this]() {
             vram.idle_tick();
         });
-        vram.init(ctx_tgt, ctx_dft, params_base.devices, model_name, [this]() { queue_tasks.wake(); }, [this]() {
-            // before the KV cache is freed: idle slots go to the host prompt cache (if any) and start empty
-            ckpt_async_sync();
-            for (auto & slot : slots) {
-                if (slot.is_processing() || slot.prompt.tokens.size() == 0) {
-                    continue;
-                }
-                if (prompt_cache) {
-                    slot.prompt_save(*prompt_cache);
-                }
-                slot.prompt_clear();
-            }
-            if (prompt_cache) {
-                prompt_cache->update();
-            }
-        });
+        init_vram();
 
         metrics.init();
 
@@ -2696,6 +2758,12 @@ private:
 
                     const int id_task = task.id;
 
+                    if (tune_pending) {
+                        // POST /tune/context waits for the running slots: no new work until it is done
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
+
                     server_slot * slot = get_available_slot(task);
 
                     //
@@ -3030,6 +3098,57 @@ private:
                     res->data = spec_to_json();
                     queue_results.send(std::move(res));
                 } break;
+            case SERVER_TASK_TYPE_TUNE_GET:
+                {
+                    auto res = std::make_unique<server_task_result_tune>();
+                    res->id   = task.id;
+                    res->data = params_base.endpoint_tune ? server_tune_state(params_base, n_ctx, tune_env)
+                                                          : json { { "error", "not enabled" } };
+                    if (params_base.endpoint_tune) {
+                        res->data["n_outputs_max"] = tune_outputs;
+                    }
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_TUNE_SET:
+                {
+                    if (!params_base.endpoint_tune) {
+                        send_error(task, "the tune endpoints are off (--tune-endpoints)", ERROR_TYPE_NOT_SUPPORTED);
+                        break;
+                    }
+                    if (sleeping) {
+                        send_error(task, "the server sleeps", ERROR_TYPE_UNAVAILABLE);
+                        break;
+                    }
+                    if (any_slot_processing()) {
+                        // wait until every slot is idle; new tasks wait behind this one (see tune_resume())
+                        tune_pending = true;
+                        if (tune_task) {
+                            queue_tasks.defer(std::move(task));
+                        } else {
+                            tune_task = std::make_unique<server_task>(std::move(task));
+                        }
+                        break;
+                    }
+                    tune_context(task);
+                    tune_pending = false;
+                    queue_tasks.pop_deferred_all();
+                } break;
+            case SERVER_TASK_TYPE_TUNE_KLD:
+                {
+                    if (!params_base.endpoint_tune) {
+                        send_error(task, "the tune endpoints are off (--tune-endpoints)", ERROR_TYPE_NOT_SUPPORTED);
+                        break;
+                    }
+                    if (sleeping || !ctx_tgt) {
+                        send_error(task, "the server sleeps", ERROR_TYPE_UNAVAILABLE);
+                        break;
+                    }
+                    if (any_slot_processing() || tune_pending) {
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
+                    tune_kld(task);
+                } break;
             case SERVER_TASK_TYPE_SET_SPEC:
                 {
                     const bool busy = std::any_of(slots.begin(), slots.end(), [](const server_slot & slot) {
@@ -3053,6 +3172,168 @@ private:
         }
 
         return true;
+    }
+
+    bool any_slot_processing() const {
+        return std::any_of(slots.begin(), slots.end(), [](const server_slot & slot) {
+            return slot.is_processing();
+        });
+    }
+
+    // POST /tune/kld: the text is the one of the base file; runs here, on the main loop, while every slot is idle
+    void tune_kld(server_task & task) {
+        const json & body = task.tune_body;
+        if (!body.is_object() || !body.contains("base_file") || !body.at("base_file").is_string()) {
+            send_error(task, "base_file is required", ERROR_TYPE_INVALID_REQUEST);
+            return;
+        }
+        const std::string base_file = body.at("base_file").get<std::string>();
+        int n_batch = 4;
+        if (body.contains("batch")) {
+            n_batch = body.at("batch").get<int>();
+        }
+        if (n_batch < 1) {
+            send_error(task, "batch must be at least 1", ERROR_TYPE_INVALID_REQUEST);
+            return;
+        }
+        if (body.contains("n_ctx") && body.at("n_ctx").get<int>() != 0) {
+            // the base file fixes the chunk size; a different value is a mistake of the caller
+            std::ifstream in(base_file, std::ios::binary);
+            char magic[8];
+            uint32_t n_ctx_file = 0;
+            if (in.read(magic, 8) && in.read((char *) &n_ctx_file, sizeof(n_ctx_file)) &&
+                (int) n_ctx_file != body.at("n_ctx").get<int>()) {
+                send_error(task, "n_ctx does not match the base file (" + std::to_string(n_ctx_file) + ")", ERROR_TYPE_INVALID_REQUEST);
+                return;
+            }
+        }
+        const int64_t t_start = ggml_time_us();
+        const int n_out_lim = params_base.n_outputs_max > 0 ? params_base.n_outputs_max : params_base.n_batch;
+        if (n_batch > n_out_lim) {
+            send_error(task, "batch " + std::to_string(n_batch) + " is above the output limit of the context (" +
+                       std::to_string(n_out_lim) + "); POST /tune/context with n_outputs_max >= batch first",
+                       ERROR_TYPE_INVALID_REQUEST);
+            return;
+        }
+        llama_kld_stats st;
+        llama_kld_compute(ctx_tgt, base_file, n_batch, st);
+        for (auto & slot : slots) {
+            slot.prompt_clear();
+        }
+        if (!st.ok) {
+            send_error(task, "kld: " + (st.error.empty() ? std::string("failed") : st.error), ERROR_TYPE_SERVER);
+            return;
+        }
+        auto res = std::make_unique<server_task_result_tune>();
+        res->id   = task.id;
+        res->data = json {
+            { "ok",               true },
+            { "kld",              st.kld },
+            { "kld_se",           st.kld_se },
+            { "ppl",              st.ppl },
+            { "ppl_se",           st.ppl_se },
+            { "ppl_base",         st.ppl_base },
+            { "log_ppl_ratio",    st.log_ppl_ratio },
+            { "log_ppl_ratio_se", st.log_ppl_ratio_se },
+            { "same_top",         st.same_top },
+            { "same_top_se",      st.same_top_se },
+            { "p_diff_rms",       st.p_diff_rms },
+            { "tokens",           (int64_t) st.count },
+            { "chunks",           st.n_chunk },
+            { "n_ctx",            st.n_ctx },
+            { "batch",            n_batch },
+            { "ms",               (ggml_time_us() - t_start) / 1000 },
+        };
+        queue_results.send(std::move(res));
+    }
+
+    // POST /tune/context: when the last slot is idle, run the request that waited for it
+    void tune_resume() {
+        if (tune_task && !any_slot_processing()) {
+            queue_tasks.post(std::move(*tune_task), true);
+            tune_task.reset();
+        }
+    }
+
+    // POST /tune/context: make the contexts again with new parameters, on the same weights. The slots are idle.
+    // On failure the old parameters come back; if that fails too, the process exits (the tuner records a crash).
+    void tune_context(server_task & task) {
+        server_tune_request req;
+        std::string err;
+        if (!server_tune_parse(task.tune_body, req, err)) {
+            send_error(task, err, ERROR_TYPE_INVALID_REQUEST);
+            return;
+        }
+        common_params params_new;
+        if (!server_tune_apply(params_base, n_ctx, req, params_new, err)) {
+            send_error(task, err, ERROR_TYPE_INVALID_REQUEST);
+            return;
+        }
+
+        SRV_INF("tune: making the context again: ubatch %d, batch %d, ctx %d, threads %d/%d, %zu env, %zu spec args\n",
+                params_new.n_ubatch, params_new.n_batch, params_new.n_ctx, params_new.cpuparams.n_threads,
+                params_new.cpuparams_batch.n_threads, req.env.size(), req.spec_args.size());
+
+        const common_params params_old = params_base;
+        const int32_t       n_ctx_old  = n_ctx;
+        const auto          tune_env_old = tune_env;
+        const int32_t       tune_outputs_old = tune_outputs;
+
+        const int64_t t_start = ggml_time_us();
+        if (req.n_outputs_max >= 0) {
+            tune_outputs = req.n_outputs_max;
+        }
+        auto env_prev = server_tune_env_set(req.env);
+        for (const auto & [name, val] : req.env) {
+            if (val) {
+                tune_env[name] = *val;
+            } else {
+                tune_env.erase(name);
+            }
+        }
+
+        destroy_context();
+        t_tune_warmup_us = 0;
+        bool ok = false;
+        try {
+            common_params p = params_new;
+            ok = load_model(p, true);
+        } catch (const std::exception & e) {
+            SRV_ERR("tune: the new context failed: %s\n", e.what());
+        }
+        if (!ok) {
+            SRV_ERR("%s", "tune: the new context failed, going back to the old parameters\n");
+            server_tune_env_restore(env_prev);
+            tune_env = tune_env_old;
+            tune_outputs = tune_outputs_old;
+            destroy_context();
+            bool ok_old = false;
+            try {
+                common_params p = params_old;
+                ok_old = load_model(p, true);
+            } catch (const std::exception & e) {
+                SRV_ERR("tune: the old context failed: %s\n", e.what());
+            }
+            if (!ok_old) {
+                SRV_ERR("%s", "tune: the old context cannot be made again, exiting\n");
+                fflush(nullptr);
+                _exit(1);
+            }
+            n_ctx = n_ctx_old;
+            send_error(task, "the new context could not be made (out of memory?); the old parameters are active", ERROR_TYPE_SERVER);
+            return;
+        }
+
+        const int64_t t_total = ggml_time_us() - t_start;
+        auto res = std::make_unique<server_task_result_tune>();
+        res->id   = task.id;
+        res->data = server_tune_state(params_base, n_ctx, tune_env);
+        res->data["n_outputs_max"] = tune_outputs;
+        res->data["ok"]        = true;
+        res->data["load_ms"]   = (t_total - t_tune_warmup_us) / 1000.0;
+        res->data["warmup_ms"] = t_tune_warmup_us / 1000.0;
+        queue_results.send(std::move(res));
+        SRV_INF("tune: done in %.1f s (warmup %.1f s)\n", t_total / 1e6, t_tune_warmup_us / 1e6);
     }
 
     // measure the verify time by rows for the cost-aware draft depth; the slots must be idle
@@ -5899,6 +6180,38 @@ void server_routes::init_routes() {
         }
         res->ok(result->to_json());
         return res;
+    };
+
+    // delphi: auto-tuner hooks (--tune-endpoints), see server-tune.h
+    auto tune_request = [this](server_task_type type, const json & body, const server_http_req & req) {
+        auto res = create_response();
+        auto & rd = res->rd;
+        {
+            server_task task(type);
+            task.id        = rd.get_new_id();
+            task.tune_body = body;
+            rd.post_task(std::move(task));
+        }
+        auto result = rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+        res->ok(result->to_json());
+        return res;
+    };
+    this->get_tune_context = [tune_request](const server_http_req & req) {
+        return tune_request(SERVER_TASK_TYPE_TUNE_GET, json::object(), req);
+    };
+    this->post_tune_context = [tune_request](const server_http_req & req) {
+        return tune_request(SERVER_TASK_TYPE_TUNE_SET, json::parse(req.body), req);
+    };
+    this->post_tune_kld = [tune_request](const server_http_req & req) {
+        return tune_request(SERVER_TASK_TYPE_TUNE_KLD, json::parse(req.body), req);
     };
 
     this->post_lora_adapters = [this](const server_http_req & req) {
