@@ -34,7 +34,8 @@ DEFAULTS: dict[str, Any] = {
     "placement": {"reserve_mib": {}},  # extra device buffers not measured by llama-fit-params (for example mmproj)
     "context_search": {"reps": 3, "screen_threshold": 8},  # full workload repeats per context point
     "speculation": {"enabled": False, "text": None, "prompt_tokens": 128, "prompts": 3, "osl": 64,
-                    "max_draft": 6, "settle_cycles": 3, "min_cycles": 3, "trace_max_events": 8388608},  # MTP replay; traces currently require a fresh process per point
+                    "max_draft": 6, "settle_cycles": 3, "min_cycles": 3, "trace_max_events": 8388608,
+                    "validation_reps": 3, "validation_candidates": 2},
     "class_order": ["fit", "precision", "accept", "speed"],  # the order in which the knob classes are searched
 }
 
@@ -106,7 +107,8 @@ def load_config(path: Path) -> dict[str, Any]:
     spec = cfg['speculation']
     if set(spec) - set(DEFAULTS['speculation']) or type(spec['enabled']) is not bool:
         raise TuneError('speculation takes the documented keys and a boolean enabled')
-    for name in ('prompt_tokens', 'prompts', 'osl', 'max_draft', 'min_cycles', 'settle_cycles', 'trace_max_events'):
+    for name in ('prompt_tokens', 'prompts', 'osl', 'max_draft', 'min_cycles', 'settle_cycles', 'trace_max_events',
+                 'validation_reps', 'validation_candidates'):
         minimum = 0 if name == 'settle_cycles' else 1
         if type(spec[name]) is not int or spec[name] < minimum:
             raise TuneError(f'speculation.{name} must be an integer >= {minimum}')

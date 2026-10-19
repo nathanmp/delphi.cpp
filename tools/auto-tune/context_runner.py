@@ -54,6 +54,9 @@ class ContextRunner:
         self.handles = contextlib.ExitStack()
         self.supported = None
         self.help_supported = None
+        self.snapshot_supported = None
+        self.snapshot_state = None
+        self.point_events = 0
         self.signature = None
         self.active = None
         self.baseline = None
@@ -72,8 +75,14 @@ class ContextRunner:
             return json.loads(response.read())
 
     def operation(self, command, env):
-        if self.cfg['trace'] or self.spec_enabled(command, env) or self.supported is False or self.process is None or self.process.poll() is not None:
+        if ((self.cfg['trace'] and not self.spec_enabled(command, env))
+                or (self.spec_enabled(command, env) and self.snapshot_supported is not True)
+                or self.supported is False or self.process is None or self.process.poll() is not None):
             return 'launch'
+        if self.spec_enabled(command, env) and self.snapshot_state:
+            remaining = self.snapshot_state['event_capacity'] - self.snapshot_state['event_count']
+            if remaining < max(self.point_events * 1.25, self.snapshot_state['event_capacity'] * .1):
+                return 'launch'
         # A resumed search can first load an explicit level. Its GET value is not the CLI default of an omitted flag.
         if any(K.option_value(command, flag) is None and K.option_value(self.launch_command, flag) is not None for flag in FIELDS):
             return 'launch'
@@ -111,13 +120,15 @@ class ContextRunner:
             if self.spec_enabled(command, env):
                 self.trace_path = directory / 'loop3.trace'
                 self.plog_path = directory / 'mtp-probabilities.jsonl'
+                self.observation_path = directory / 'speculative-passes.jsonl'
                 # The log appends and opens its path once per process. Never append to a previous attempt.
                 self.plog_path.unlink(missing_ok=True)
+                self.observation_path.unlink(missing_ok=True)
                 for key in list(full_env):
                     if key.startswith('GGML_EXEC_TRACE'):
                         del full_env[key]
                 full_env.update(GGML_EXEC_TRACE=str(self.trace_path), GGML_EXEC_TRACE_MAX_EVENTS=str(self.cfg['speculation']['trace_max_events']),
-                                DELPHI_SPEC_PLOG=str(self.plog_path))
+                                DELPHI_SPEC_PLOG=str(self.plog_path), DELPHI_SPEC_TRACE=str(self.observation_path))
             self.process = subprocess.Popen(M.P._render(cmd, values), cwd=M.ROOT, env=full_env, text=True, stdout=stdout, stderr=stderr)
             (directory / 'launch.json').write_text(json.dumps({'command': list(cmd), 'env': dict(env), 'pid': self.process.pid,
                 'binary_version': M.P._version(command[0], env), 'models': M.P._model_identity(self.arm.model_paths)}, indent=2) + '\n')
@@ -135,6 +146,18 @@ class ContextRunner:
                 self.supported = False
                 self.defaults = {}
                 self.log('context: endpoints absent (404); use full launches')
+            self.snapshot_supported = False
+            self.snapshot_state = None
+            self.point_events = 0
+            if self.spec_enabled(command, env) and self.supported:
+                try:
+                    from observations import snapshot_ok
+                    self.snapshot_state = snapshot_ok(self.request({}, path='/tune/snapshot'))
+                    self.snapshot_supported = True
+                except urllib.error.HTTPError as error:
+                    if error.code != 404:
+                        raise
+                    self.log('speculation: live snapshot absent (404); use legacy logging and fresh launches')
         except BaseException:
             self.close()
             raise
@@ -241,6 +264,7 @@ class ContextRunner:
                         from spec_runner import Collector
                         from speculation import Unavailable
                         collector = Collector(self, command, env, directory, continue_measure)
+                        events_before = self.snapshot_state['event_count'] if self.snapshot_state else 0
                         try:
                             collector.collect()
                         except Unavailable as error:
@@ -279,7 +303,10 @@ class ContextRunner:
                         raise M.LaunchFailed('CPU budget audit failed: ' + str(result['cpu_budget']))
                 result['placement_warnings'] = self.warnings(offsets)
                 if collector:
-                    self.close()
+                    if self.snapshot_supported:
+                        self.point_events = max(self.point_events, self.snapshot_state['event_count'] - events_before)
+                    else:
+                        self.close()
                     result['speculation'] = collector.finish()
                     for key in ('wall_s', 'requests', 'policy_updates'):
                         name = 'spec_' + key

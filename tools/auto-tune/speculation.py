@@ -246,9 +246,12 @@ def rank(requests, candidates, table):
             results.append(result)
         except SpecError as error:
             skipped.append({'policy': asdict(policy), 'reason': str(error)})
+    precision = ('Full float probabilities; empirical clipping changes future pass boundaries and their draft distributions.'
+                 if all('request_id' in request for request in requests)
+                 else 'Legacy probabilities have four decimal places; cut-step draft cost uses host-span estimates.')
     return {'candidates': sorted(results, key=lambda r: r['decode_t_s'], reverse=True), 'skipped': skipped,
             'limitations': ['Empirical pass replay changes pass boundaries; fresh real-acceptance confirmation is required.',
-                            'p_min uses the MTP log rounded to four decimals; cut-step draft cost uses host-span estimates.',
+                            precision,
                             'Cost/conf controllers require live timing, shadow tokens or calibration and are not replayed.',
                             'Settled width medians omit graph rebuild and depth-switch costs.']}
 

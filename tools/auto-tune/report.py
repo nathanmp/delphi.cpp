@@ -134,8 +134,7 @@ def write(cfg: Mapping[str, Any], state: Mapping[str, Any], store: Store, out: P
         lines += ['', '## Speculative replay', '',
                   f"Acceptance capture: raw {cfg['speculation']['prompt_tokens']}-token text prompts, {cfg['speculation']['osl']} output tokens, fixed maximum draft depth, adaptation off, p_min=0 and n_min=0. The measurements table uses the recipe client with {cfg['decode']['osl']} output tokens and the recipe policy.",
                   'Replay rows are throughput estimates from empirical acceptance passes and measured T(w). Synthetic output is performance-only. Recommendations require fresh normal-acceptance confirmation.',
-                  'The MTP log has four-decimal probabilities and no tokens or request IDs. Requests are captured separately. Clipping changes future pass boundaries; cost/conf controllers and depth-switch costs are not replayed.',
-                  'Request a shared per-pass server log for DSpark/other speculators, with request/sequence/pass IDs, tokens, full-precision probabilities, accepted length, attempted draft steps, checkpoint-replay markers, and pass timing or trace correlation. A live execution-trace flush hook is also needed to keep loop-2 contexts resident during T(w) collection.', '']
+                  'Structured captures preserve request/sequence/pass IDs, tokens, full float probabilities and checkpoint replay. Older servers use the rounded MTP log and fresh launches. Clipping changes future pass boundaries; cost/conf controllers, block drafters and depth-switch costs are not replayed.', '']
         for row in spec_rows:
             spec = row['metrics']['speculation']
             if spec.get('status') != 'ok':
@@ -149,6 +148,12 @@ def write(cfg: Mapping[str, Any], state: Mapping[str, Any], store: Store, out: P
                     lines.append(f"  Fixed-depth capture check: replay {prediction:.2f} t/s; short real captures {actual:.2f} t/s median "
                                  f"({min(observed):.2f}-{max(observed):.2f}); prediction difference {100 * (prediction / actual - 1):+.1f}%. "
                                  'Short captures include startup/boundary costs. This is diagnostic; prediction accuracy still needs fresh real-acceptance validation.')
+                validation = spec.get('validation', {})
+                for check in validation.get('policies', []):
+                    lines.append(f"  Matched normal-acceptance check {json.dumps(check['policy'], sort_keys=True)}: "
+                                 f"replay {check['prediction_t_s']:.2f}, settled actual {check['aligned_decode_t_s']:.2f} t/s "
+                                 f"({100 * check['error_fraction']:+.1f}% error); full decode {check['decode_t_s']:.2f} t/s. "
+                                 'Fresh requests on the resident process; fresh-process deployment confirmation is separate.')
     (out / "report.md").write_text("\n".join(lines) + "\n")
     (out / "best.json").write_text(json.dumps({"command": list(command), "env": recommended["env"], 'cpu_budget': cpu_budget,
                                                "changes": recommended.get("changes") or {}, "confirm": confirm}, indent=2) + "\n")
