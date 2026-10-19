@@ -105,6 +105,7 @@ class ContextRunner:
             self.active = (tuple(command), dict(env))
             try:
                 self.defaults = self.request()
+                self.current_state = self.defaults
                 self.supported = True
             except urllib.error.HTTPError as error:
                 if error.code != 404:
@@ -131,6 +132,7 @@ class ContextRunner:
             if not response.get('ok'):
                 raise M.LaunchFailed('context hook did not return ok')
             self.active = (tuple(command), dict(env))
+            self.current_state = response
         except urllib.error.HTTPError as error:
             detail = error.read().decode(errors='replace')
             (directory / 'context-error.txt').write_text(detail)
@@ -141,7 +143,8 @@ class ContextRunner:
             # GET succeeds only after restoration. A dead or unavailable server must be launched again.
             restored = self.request()
             previous = payload(*self.active, self.defaults, self.active[1])
-            if any(restored.get(k) != v for k, v in previous.items() if k != 'env'):
+            if (any(restored.get(k) != v for k, v in previous.items() if k != 'env')
+                    or restored.get('env', {}) != getattr(self, 'current_state', {}).get('env', {})):
                 self.close()
                 raise M.LaunchFailed('the context hook did not restore the previous parameters') from error
             raise ContextRejected(f'context rejected (HTTP {error.code}); old parameters restored: {detail}') from error

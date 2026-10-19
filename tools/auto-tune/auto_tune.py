@@ -260,6 +260,13 @@ class Tuner:
     # search
 
     def run(self) -> dict[str, Any]:
+        try:
+            return self._run()
+        finally:
+            if self.context_runner:
+                self.context_runner.close()
+
+    def _run(self) -> dict[str, Any]:
         command, env = self.base
         placement_options = []
         if self.placement_factory:
@@ -426,6 +433,8 @@ def base_launch(cfg: Mapping[str, Any]):
     command = set_option(arm.server_command, "-c", str(cfg["context"]))
     # Canonicalize aliases used by the placement and CPU policy before replacing their values.
     aliases = {'--ctx-size': '-c', '--threads': '-t', '--threads-batch': '-tb', '--tensor-split': '-ts',
+               '--batch-size': '-b', '--ubatch-size': '-ub', '--spec-draft-ubatch-size': '-ubd',
+               '--cache-type-k': '-ctk', '--cache-type-v': '-ctv', '--flash-attn': '-fa',
                '--n-gpu-layers': '-ngl', '-dev': '--device', '--cpu-moe': '-cmoe', '-ncmoe': '--n-cpu-moe',
                '--override-tensor': '-ot', '--load-mode': '-lm', '-nr': '--no-repack', '-fit': '--fit', '-fitt': '--fit-target'}
     for old, new in aliases.items():
