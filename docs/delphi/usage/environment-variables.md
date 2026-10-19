@@ -2,6 +2,8 @@
 
 delphi.cpp reads the environment variables below at run time. Each is an A/B switch: the default is the tested behavior, and the other value restores the previous behavior or enables a diagnostic. Set them in the environment of `llama-server`, `llama-cli`, `llama-bench` and the other tools, for example `GGML_SCHED_INPUT_ORDER=0 llama-server ...`. A value is read once per process.
 
+Most of the variables below are read once, into a function-local `static`, and need a new process. The ones that a context, an expert cache or a scheduler reads when it is made (the `LLAMA_MOE_CACHE_*` sizes and prompt rows, `LLAMA_MOE_PREFILL_*`, `GGML_SCHED_*`) see a new value when the server makes the context again (`POST /tune/context` with `--tune-endpoints`). `tools/auto-tune/env-reload.json` lists the class of each tunable variable (`context` or `process`); see `tune-endpoints.md`.
+
 Execution tracing has its own variables (`GGML_EXEC_TRACE*`); see `exec-trace-record.md`.
 
 ## Model loading
