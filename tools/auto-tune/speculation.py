@@ -196,11 +196,7 @@ def replay(requests, policy, widths):
 
 def policies(command, env, cfg, cap, info=None):
     """Use the request registry domains, clipped to the output capacity of the launch."""
-    active = (*command, '--spec-draft-adaptive')
-    selected = {k.name: values for k, values in K.select(K.Context(tuple(active), env, 1, 1), **cfg['knobs']) if k.reload == 'request'}
     info = info or {}
-    if not selected:
-        return []
     mode = info.get('adaptive', 'bucket' if '--spec-draft-adaptive' in command else 'off')
     def current(suffix, default):
         return K.option_value(command, '--spec-draft-' + suffix) or env.get('LLAMA_ARG_SPEC_DRAFT_' + suffix.upper().replace('-', '_'), str(default))
@@ -209,8 +205,22 @@ def policies(command, env, cfg, cap, info=None):
         '--spec-draft-n-min': [current('n-min', 0)],
         '--spec-draft-p-min': [str(info.get('p_min', current('p-min', 0)))],
         '--spec-draft-adaptive': [mode],
-        '--spec-draft-n-min-adaptive': [current('n-min-adaptive', 3)],
+        '--spec-draft-n-min-adaptive': [current('n-min-adaptive', (info.get('impls') or [{}])[0].get('n_min_adaptive') or 3)],
     }
+    # Expose effective env/default values to the registry. Enable the floor dependency for candidate bucket policies.
+    active = tuple(command)
+    for flag, values in domains.items():
+        if flag != '--spec-draft-adaptive':
+            active = K.set_option(active, flag, values[0])
+    ctx = K.Context((*active, '--spec-draft-adaptive'), env, 1, 1)
+    selected = {k.name: values for k, values in K.select(ctx, **cfg['knobs']) if k.reload == 'request'}
+    if not selected:
+        return []
+    flag = '--spec-draft-adaptive'
+    if flag in selected:
+        values = cfg['knobs']['levels'].get(flag) or K.BY_NAME[flag].level_list(ctx)
+        # The synthetic dependency above is not an observed current bucket policy.
+        selected[flag] = list(dict.fromkeys([str(v) for v in values] + [mode]))
     domains.update(selected)
     result = set()
     for n, minimum, prob, adaptive, floor in itertools.product(*domains.values()):

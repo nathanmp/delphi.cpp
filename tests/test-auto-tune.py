@@ -785,6 +785,14 @@ class Speculation(unittest.TestCase):
                                      'LLAMA_ARG_SPEC_DRAFT_N_START': '2'}, c, 4)
         self.assertTrue(policies)
         self.assertTrue(all(p.n_min == 2 and p.p_min == .6 and p.n_start == 2 for p in policies))
+        c['knobs']['only'] = ['--spec-draft-p-min']
+        c['knobs']['levels'] = {'--spec-draft-p-min': [.8]}
+        policies = SP.policies(BASE, {'LLAMA_ARG_SPEC_DRAFT_P_MIN': '.6'}, c, 4)
+        self.assertEqual({p.p_min for p in policies}, {.6, .8})
+        c['knobs']['only'] = ['--spec-draft-adaptive']
+        c['knobs']['levels'] = {'--spec-draft-adaptive': [K.OFF]}
+        policies = SP.policies(BASE, {}, c, 4, {'adaptive': 'conf'})
+        self.assertEqual({p.adaptive for p in policies}, {'off'})
 
     def trace(self):
         events = []
@@ -863,7 +871,7 @@ class Speculation(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             c = cfg(d, speculation={'enabled': True, 'text': str(Path(d) / 'text'), 'prompts': 2, 'max_draft': 2, 'osl': 32})
             Path(c['speculation']['text']).write_text('some text')
-            info = {'types': 'draft-mtp', 'draft_sampling': 'greedy', 'draft_context': True, 'n_max_launch': 2,
+            info = {'types': 'none,draft-mtp', 'draft_sampling': 'greedy', 'draft_context': True, 'n_max_launch': 2,
                     'n_max': 2, 'adaptive': 'off', 'p_min': 0}
             runner = Mock(cfg=c, url='url', arm=Mock(request_timeout_s=10), plog_path=Path(d) / 'plog')
             def request(body=None, *, path='/speculative'):
@@ -889,6 +897,7 @@ class Speculation(unittest.TestCase):
             self.assertEqual(json.loads((Path(d) / 'restored.json').read_text()), info)
             self.assertTrue(all('--spec-synth-len' not in call.args[0]['args'] for call in runner.request.call_args_list if call.args))
             self.assertIn('real acceptance', unavailable(BASE, {'LLAMA_ARG_SPEC_SYNTH_RATES': '1,0'}))
+            self.assertIsNone(unavailable(K.set_option(BASE, '--spec-type', 'none,draft-mtp')))
 
     def test_loop_three_budget_failure_restores_policy(self):
         with tempfile.TemporaryDirectory() as d:

@@ -15,7 +15,8 @@ from speculation import Policy, SpecError, Unavailable, cost_table, policies, ra
 
 
 def unavailable(command, env=None):
-    if K.option_value(command, '--spec-type') != 'draft-mtp':
+    types = set((K.option_value(command, '--spec-type') or '').split(',')) - {'none'}
+    if types != {'draft-mtp'}:
         return 'Per-pass probability logging is available only for draft-mtp; request a shared server log for DSpark and other speculators.'
     env = env or {}
     if (K.option_value(command, '--spec-synth-rates') or K.option_value(command, '--spec-synth-len')
@@ -64,7 +65,9 @@ class Collector:
 
     def collect(self):
         info = self.runner.request(path='/speculative')
-        if info['types'] != 'draft-mtp' or info['draft_sampling'] != 'greedy' or not info['draft_context']:
+        self.save('speculative-before.json', info)
+        types = set(info['types'].split(',')) - {'none'}
+        if types != {'draft-mtp'} or info['draft_sampling'] != 'greedy' or not info['draft_context']:
             raise Unavailable('replay needs one greedy MTP implementation and its draft context')
         props = self.runner.request(path='/props')
         if props.get('total_slots') != 1:
