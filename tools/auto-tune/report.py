@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import shlex
+import statistics
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -133,13 +134,20 @@ def write(cfg: Mapping[str, Any], state: Mapping[str, Any], store: Store, out: P
         lines += ['', '## Speculative replay', '',
                   'Replay rows are throughput estimates from empirical acceptance passes and measured T(w). Synthetic output is performance-only. Recommendations require fresh normal-acceptance confirmation.',
                   'The MTP log has four-decimal probabilities and no tokens or request IDs. Requests are captured separately. Clipping changes future pass boundaries; cost/conf controllers and depth-switch costs are not replayed.',
-                  'Request a shared per-pass server log for DSpark/other speculators, with request/sequence/pass IDs, tokens, full-precision probabilities, accepted length, and checkpoint-replay markers. A live execution-trace flush hook is also needed to keep loop-2 contexts resident during T(w) collection.', '']
+                  'Request a shared per-pass server log for DSpark/other speculators, with request/sequence/pass IDs, tokens, full-precision probabilities, accepted length, attempted draft steps, checkpoint-replay markers, and pass timing or trace correlation. A live execution-trace flush hook is also needed to keep loop-2 contexts resident during T(w) collection.', '']
         for row in spec_rows:
             spec = row['metrics']['speculation']
             if spec.get('status') != 'ok':
                 lines.append(f"- {row['name']}: unavailable: {spec.get('reason')}")
             else:
                 lines.append(f"- {row['name']}: cap {spec['cap']}, {spec['requests']} measured requests, {len(spec['candidates'])} replay policies, {spec['wall_s']:.1f} s; artifacts: {spec['path']}. {spec['trace_fallback']}")
+                observed = [v for v in spec.get('capture_observed_t_s', []) if isinstance(v, (int, float)) and v > 0]
+                prediction = spec.get('capture_prediction', {}).get('decode_t_s')
+                if observed and prediction:
+                    actual = statistics.median(observed)
+                    lines.append(f"  Source-policy check: replay {prediction:.2f} t/s; short real captures {actual:.2f} t/s median "
+                                 f"({min(observed):.2f}-{max(observed):.2f}); prediction difference {100 * (prediction / actual - 1):+.1f}%. "
+                                 'Short captures include startup/boundary costs. This is diagnostic; prediction accuracy still needs fresh real-acceptance validation.')
     (out / "report.md").write_text("\n".join(lines) + "\n")
     (out / "best.json").write_text(json.dumps({"command": list(command), "env": recommended["env"], 'cpu_budget': cpu_budget,
                                                "changes": recommended.get("changes") or {}, "confirm": confirm}, indent=2) + "\n")
