@@ -6,6 +6,8 @@ import tempfile
 import unittest
 import os
 import subprocess
+import urllib.error
+import io
 from unittest.mock import patch
 from pathlib import Path
 
@@ -21,6 +23,7 @@ from cpu import CpuBudget, parse_list
 import placement as PL
 from measure import vram_violations, P, CpuSampler
 from verify_client import verify
+from context_runner import ContextRunner, ContextRejected, process_key, payload
 
 BASE = ("llama-server", "-m", "model.gguf", "-c", "8192", "-b", "2048", "-ub", "512", "-fa", "on", "-t", "32",
         "--spec-type", "draft-mtp", "--spec-draft-n-max", "4", "--device", "ROCm0,ROCm1")
@@ -461,6 +464,145 @@ class Search(unittest.TestCase):
             text = plan_text(t)
             self.assertIn("kv-type", text)
             self.assertIn("-ub", text)
+
+
+class ContextSearch(unittest.TestCase):
+    class Runner:
+        def __init__(self, supported=True):
+            self.stats = {'launches': 0, 'recreates': 0, 'launch_wall_s': 0, 'recreate_wall_s': 0, 'measurement_wall_s': 0}
+            self.supported = supported
+            self.signature = None
+            self.closed = False
+            self.calls = []
+
+        def operation(self, command, env):
+            return 'context' if self.supported and self.signature == process_key(command, env) else 'launch'
+
+        def measure(self, command, env, name, incumbent=None, continue_measure=lambda: True):
+            op = self.operation(command, env)
+            self.stats['launches' if op == 'launch' else 'recreates'] += 1
+            self.signature = process_key(command, env)
+            self.calls.append((op, tuple(command), dict(env)))
+            return S.aggregate([fake_metrics(command, env)] * 3)
+
+        def close(self):
+            self.closed = True
+            self.signature = None
+
+    def tuner(self, directory, runner=None, **changes):
+        runner = runner or self.Runner()
+        c = cfg(directory, knobs={'only': ['-ub'], 'include': [], 'exclude': [], 'levels': {'-ub': [512, 1024]}})
+        c = _merge(c, changes)
+        fresh = []
+        def launch(command, env, name):
+            self.assertTrue(runner.closed)
+            fresh.append(name)
+            return fake_metrics(command, env)
+        t = Tuner(c, BASE, {}, {}, launch, None, context_runner=runner, log=lambda s: None)
+        return t, runner, fresh
+
+    def test_context_points_do_not_consume_launch_reserve_and_confirm_is_fresh(self):
+        with tempfile.TemporaryDirectory() as d:
+            t, runner, fresh = self.tuner(d, budget={'max_launches': 4, 'max_hours': 1})
+            state = t.run()
+            self.assertEqual(state['budget']['launches'], 4)  # 1 weight load + 3 fresh confirmations
+            self.assertGreater(runner.stats['recreates'], 0)
+            self.assertTrue(state['confirm']['kept'])
+            self.assertEqual(fresh, ['confirm-1 best', 'confirm-2 base', 'confirm-3 best'])
+            self.assertTrue(all(k.cls != 'precision' and k.reload != 'request' for k, _ in t.selected()))
+
+    def test_no_hooks_falls_back_and_honors_launch_count(self):
+        with tempfile.TemporaryDirectory() as d:
+            t, runner, fresh = self.tuner(d, self.Runner(False), budget={'max_launches': 4, 'max_hours': 1})
+            state = t.run()
+            self.assertEqual(state['budget']['launches'], 1)
+            self.assertFalse(fresh)
+            self.assertTrue(state['untested'])
+            self.assertEqual(runner.stats['recreates'], 0)
+
+    def test_joint_batch_margin_escapes_a_bad_coordinate(self):
+        with tempfile.TemporaryDirectory() as d:
+            t, runner, _ = self.tuner(d, noise_margin=0.01, knobs={'only': ['-ub', 'LLAMA_MOE_CACHE_AUTO_MARGIN_MIB'],
+                'levels': {'-ub': [512, 1024], 'LLAMA_MOE_CACHE_AUTO_MARGIN_MIB': [1536, 3072]}})
+            t.base = ((*BASE, '-cmoe'), {'LLAMA_MOE_CACHE_AUTO_MARGIN_MIB': '1536'})
+            def measure(command, env, *args):
+                op = runner.operation(command, env)
+                runner.stats['launches' if op == 'launch' else 'recreates'] += 1
+                runner.signature = process_key(command, env)
+                win = K.option_value(command, '-ub') == '1024' and env['LLAMA_MOE_CACHE_AUTO_MARGIN_MIB'] == '3072'
+                metrics = {'decode_t_s': 100 if win else 50, 'prefill': {'300': {'ttft_s': 1, 't_s': 300}}}
+                return S.aggregate([metrics] * 3)
+            runner.measure = measure
+            state = t.run()
+            best = t.store.find(state['incumbent'], 'launch')
+            self.assertEqual(K.option_value(best['command'], '-ub'), '1024')
+            self.assertEqual(best['env']['LLAMA_MOE_CACHE_AUTO_MARGIN_MIB'], '3072')
+            self.assertTrue(any(s['knob'] == '-ub x LLAMA_MOE_CACHE_AUTO_MARGIN_MIB' for s in state['steps']))
+
+    def test_process_points_get_their_own_context_search(self):
+        with tempfile.TemporaryDirectory() as d:
+            t, runner, _ = self.tuner(d, knobs={'only': ['-ub', '--numa'], 'levels': {'-ub': [512, 1024], '--numa': ['disabled', 'tensors']}})
+            state = t.run()
+            tensors = [c for _, c, _ in runner.calls if K.option_value(c, '--numa') == 'tensors']
+            self.assertTrue(any(K.option_value(c, '-ub') == '512' for c in tensors))
+            self.assertTrue(any(K.option_value(c, '-ub') == '1024' for c in tensors))
+            self.assertGreaterEqual(runner.stats['launches'], 2)
+
+    def test_racing_uses_incumbent_repeats_and_stores_incomplete_status(self):
+        incumbent = S.aggregate([{'decode_t_s': v, 'prefill': {}} for v in [99, 100, 101]])
+        self.assertTrue(S.race([{'decode_t_s': 80, 'prefill': {}}], incumbent, {'decode': 1}, 0.01)['stopped'])
+        self.assertFalse(S.race([{'decode_t_s': 99, 'prefill': {}}], incumbent, {'decode': 1}, 0.01)['stopped'])
+        self.assertFalse(S.race([{'decode_t_s': 80, 'prefill': {}}], {'decode_t_s': 100}, {'decode': 1}, 0.01)['stopped'])
+        with tempfile.TemporaryDirectory() as d:
+            t, runner, _ = self.tuner(d)
+            runner.measure = lambda *args: {**incumbent, 'racing': {'stopped': True}}
+            row = t.evaluate(BASE, {}, 'raced')
+            self.assertEqual(row['status'], 'raced')
+            runner.measure = lambda *args: {**incumbent, 'measurement_complete': False}
+            row = t.evaluate(BASE, {}, 'incomplete')
+            self.assertEqual(row['status'], 'incomplete')
+
+    def test_cpu_limits_filter_custom_levels_and_follow_draft_counts(self):
+        budget = CpuBudget(tuple(range(8)), 8, (0,))
+        command = budget.apply(BASE, 2)
+        selected = dict((k.name, levels) for k, levels in K.select(K.Context(command, {}, 8, 8), only=['-t', '-tb'],
+                                                                 levels={'-t': [0, 2, 8, 64, 96], '-tb': [2, 64]}))
+        self.assertEqual(set(selected['-t']), {'2', '4', '8'})
+        command, _ = K.BY_NAME['-t'].apply(command, {}, '8')
+        self.assertTrue(all(K.option_value(command, flag) == '8' for flag in ('-t', '-tb', '--spec-draft-threads', '--spec-draft-threads-batch')))
+        command, _ = K.BY_NAME['-tb'].apply(command, {}, '2')
+        self.assertEqual(K.option_value(command, '--spec-draft-threads-batch'), '2')
+        self.assertEqual(K.option_value(command, '--cpu-mask'), '0xff')
+
+    def test_process_identity_and_unset_payload(self):
+        changed = K.set_option(BASE, '-ub', '1024')
+        self.assertEqual(process_key(BASE, {}), process_key(changed, {'GGML_SCHED_STAGE_MIN_TOKENS': '2048'}))
+        self.assertNotEqual(process_key(BASE, {}), process_key(changed, {'GGML_CPU_NUMA_CHUNKS': '4'}))
+        self.assertNotEqual(process_key(BASE, {}), process_key((*changed, '--numa', 'tensors'), {}))
+        body = payload(BASE, {}, {'threads': 32}, {'GGML_SCHED_STAGE_MIN_TOKENS': '2048'})
+        self.assertIsNone(body['env']['GGML_SCHED_STAGE_MIN_TOKENS'])
+        self.assertEqual(body['ubatch_size'], 512)
+
+    def test_rejected_context_preserves_active_state_and_process(self):
+        with tempfile.TemporaryDirectory() as d:
+            runner = ContextRunner(cfg(d), P.ServerArm('a', BASE, ('client',)), None)
+            runner.active = (BASE, {})
+            runner.defaults = payload(BASE, {}, {}, {})
+            restored = {k: v for k, v in runner.defaults.items() if k != 'env'}
+            error = urllib.error.HTTPError('http://server/tune/context', 500, 'out of memory', {}, io.BytesIO(b'restored'))
+            with patch.object(runner, 'request', side_effect=[error, restored]):
+                with self.assertRaises(ContextRejected):
+                    runner._recreate(K.set_option(BASE, '-ub', '4096'), {}, Path(d))
+            self.assertEqual(runner.active, (BASE, {}))
+            self.assertEqual(runner.stats['recreates'], 1)
+
+    def test_screening_runs_only_above_threshold(self):
+        with tempfile.TemporaryDirectory() as d:
+            t, runner, _ = self.tuner(d, context_search={'screen_threshold': 1},
+                                    knobs={'only': ['-ub', '-t'], 'levels': {'-ub': [512, 1024], '-t': [24, 32]}})
+            state = t.run()
+            self.assertTrue(state['screening'])
+            self.assertIn('-ub', state['screening'][0]['effects_log'])
 
 
 if __name__ == "__main__":

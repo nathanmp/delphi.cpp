@@ -32,6 +32,7 @@ DEFAULTS: dict[str, Any] = {
     "cpus": None,  # exact Linux CPU list, for example 0-23,32-55
     "max_cores": None,  # at most this many physical cores from the caller's affinity
     "placement": {"reserve_mib": {}},  # extra device buffers not measured by llama-fit-params (for example mmproj)
+    "context_search": {"reps": 3, "screen_threshold": 8},  # full workload repeats per context point
     "class_order": ["fit", "precision", "accept", "speed"],  # the order in which the knob classes are searched
 }
 
@@ -95,6 +96,10 @@ def load_config(path: Path) -> dict[str, Any]:
         raise TuneError("context must be positive")
     if cfg["max_threads"] is not None and cfg["max_threads"] < 1:
         raise TuneError("max_threads must be positive")
+    for name, minimum in (("reps", 2), ("screen_threshold", 1)):
+        value = cfg["context_search"][name]
+        if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+            raise TuneError(f"context_search.{name} must be an integer >= {minimum}")
     for name, value in cfg["placement"]["reserve_mib"].items():
         if not isinstance(value, (int, float)) or value < 0:
             raise TuneError(f"placement.reserve_mib.{name} must be non-negative")

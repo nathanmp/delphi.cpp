@@ -2,7 +2,11 @@
 
 `auto_tune.py` finds better launch flags and environment knobs for one model on a fixed set of devices. It starts from a `tools/bottlenecks` recipe arm, changes one registered knob at a time, keeps a change when it beats the current best by the noise margin, and then confirms the best config against the arm with interleaved runs (best, base, best). It never changes a deployment; it writes a report and `best.json`.
 
-Status: V1 milestone 1. The command searches loop 1 only: placement and process-time knobs. M0 scoring, results, coordinate search and fresh-launch confirmation are reused. Context and request tuning are later milestones.
+Status: V1 milestone 2. Loop 1 searches placement and process-time knobs. For each launch candidate, loop 2 searches context knobs through feature-detected `/tune/context`; a 404 uses full launches within the same budget. Request-policy tuning and precision gates are later milestones. M2 keeps the recipe's speculative policy and precision levels fixed, even when `kld.limit` is set.
+
+Each context point uses three full workload repeats (`context_search.reps`, at least two). A complete repeat contains the recipe's decode client and every weighted prefill length. After each repeat, racing can stop a losing point if its log score is below the incumbent by more than three standard deviations of the incumbent's repeat scores (with `noise_margin` as the minimum gap). Partial points cannot win or be exported. Context points use wall time but no launch slots; three fresh launches stay reserved for confirmation. Server and recipe warmup stay enabled, and prompt caching is disabled.
+
+Context search uses coordinate descent, with batch x auto-cache margin searched jointly while cache precision stays fixed. Explicit NUMA overrides are process knobs and each gets its own thread search. More than eight surviving context knobs trigger two randomized finite-domain Morris screening trajectories; the batch/cache and thread coordinates remain eligible for refinement. The target, batch and following draft thread counts stay inside the CPU budget; custom levels outside it and the prohibited count 64 are removed. Per-launch traces currently use the fresh-launch fallback so trace windows do not mix contexts.
 
 ## Commands
 
@@ -31,6 +35,7 @@ python3 tools/auto-tune/auto_tune.py report tune.json   # rewrite report.md from
   "weights": {"prefill": 30, "decode": 70},
   "prefill": {"text": "/path/real-text.txt", "lengths": {"300": 2, "2048": 1}, "reps": 3},
   "decode": {"osl": 256},
+  "context_search": {"reps": 3, "screen_threshold": 8},
   "context": 32768,
   "kld": {"limit": 0.02, "text": "/path/eval.txt", "chunks": 8, "ctx": 512, "batch": 4},
   "devices": {"ROCm2": {"min_free_mib": 2048}, "ROCm0": {"max_used_mib": 16384}},
@@ -55,7 +60,8 @@ python3 tools/auto-tune/auto_tune.py report tune.json   # rewrite report.md from
 | `kld.batch` | `-b`/`-ub` of `llama-perplexity`; 4 runs the decode path (and lets the GPU expert cache refresh) |
 | `devices` | per llama device: `min_free_mib` (free VRAM at the peak, other processes included) and `max_used_mib` (this launch's own peak use) |
 | `clock_mode` | the forced performance level that every used amdgpu card must have at the start; `null` skips the check |
-| `budget` | at most `max_launches` launches (KLD runs count) and `max_hours`; 3 launches stay reserved for the confirm |
+| `budget` | at most `max_launches` full launches and `max_hours`; re-creates use time only, and 3 launches stay reserved for confirmation |
+| `context_search` | full workload repeats per context point, and the knob count above which screening runs |
 | `knobs` | `only` limits the registry, `include` adds opt-in knobs, `exclude` removes knobs, `levels` replaces the levels of a knob |
 | `class_order` | the search order of the knob classes; the budget can end the search before the last ones |
 | `noise_margin` | a change must beat the current best score by this fraction |
@@ -77,7 +83,7 @@ score = product over the metrics of (metric / base metric) ^ weight. The metrics
 | accept | draft n-max, adaptive depth, adaptive floor | score (real acceptance in the decode client) |
 | precision | KV type, GPU expert cache, `-sm tensor` (opt-in), indexer split (opt-in) | KLD gate, then score |
 
-A knob is offered only where it applies (for example the staging knobs only with `GGML_SCHED_STAGE=1`, the draft knobs only with `--spec-type` and real acceptance). Thread levels stop at the physical core count less 8, or `max_threads`. The KLD of a config is measured with only its precision knobs applied to the base command, against reference logits of the base with every precision knob at its exact level, so the other knobs never cost a KLD run.
+A knob is offered only where it applies (for example staging knobs only with `GGML_SCHED_STAGE=1`, draft batch knobs only with `--spec-type`). Threads start at physical cores less two per GPU and can move up to the physical-core budget or `max_threads`. Unknown env knobs require a process launch. Context requests contain the complete target settings and env changes, including unsets, so rejected points and returning to an earlier point cannot leave stale settings behind. The server restores a rejected context; the tuner records it as infeasible and continues. Transport failures close the owned server and require a new launch.
 
 ## Output
 

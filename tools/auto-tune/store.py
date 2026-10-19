@@ -55,8 +55,8 @@ class Store:
         return record
 
     def find(self, key: str, kind: str, phase: str | None = None) -> dict[str, Any] | None:
-        """The first record of *key*; a failure counts as a result too."""
-        for record in self.records:
+        """The latest record of *key*; incomplete racing runs can be measured again."""
+        for record in reversed(self.records):
             if record["key"] == key and record["kind"] == kind and (phase is None or record.get("phase") == phase):
                 return record
         return None

@@ -45,7 +45,7 @@ def write(cfg: Mapping[str, Any], state: Mapping[str, Any], store: Store, out: P
     by_key = {}
     for record in store.records:
         if record["kind"] == "launch" and record.get("phase") == "search":
-            by_key.setdefault(record["key"], record)
+            by_key[record["key"]] = record
     base = by_key.get(state.get("base"))
     if base is None:
         raise ValueError("no base measurement in the store")
@@ -117,7 +117,7 @@ def write(cfg: Mapping[str, Any], state: Mapping[str, Any], store: Store, out: P
         lines += ["", f"Skipped (no longer applied after an earlier change): {', '.join(skipped)}."]
     placement = state.get('placement')
     if placement:
-        lines += ['', '## Placement verification', '', 'Loop 1 only. Context and request tuning are later milestones.', '']
+        lines += ['', '## Placement verification', '', 'Context tuning uses feature-detected hooks; request tuning and precision gates are later milestones.', '']
         for candidate in placement['candidates']:
             lines.append(f"- {candidate['name']}: " + '; '.join(candidate['warnings'] or ['no planning warnings']))
         for row in store.records:
@@ -125,7 +125,9 @@ def write(cfg: Mapping[str, Any], state: Mapping[str, Any], store: Store, out: P
                 metrics = row.get('metrics', {})
                 lines.append(f"- {row['name']}: context {metrics.get('verified_context', '?')}, CPU audit {metrics.get('cpu_budget', {})}")
                 lines.extend('- ' + warning for warning in metrics.get('placement_warnings', []))
-        lines += ['', 'Stages: ' + json.dumps(state.get('stages', {}))]
+    lines += ['', 'Stages: ' + json.dumps(state.get('stages', {}))]
+    if 'context_hooks' in state:
+        lines += ['', f"Context hooks: {state['context_hooks']}. Context repeats stop early when the score is worse by more than three times incumbent repeat noise."]
     (out / "report.md").write_text("\n".join(lines) + "\n")
     (out / "best.json").write_text(json.dumps({"command": list(command), "env": recommended["env"], 'cpu_budget': cpu_budget,
                                                "changes": recommended.get("changes") or {}, "confirm": confirm}, indent=2) + "\n")

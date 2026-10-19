@@ -55,7 +55,7 @@ class Knob:
             return ENV_RELOAD.get(self.name, "process")
         if self.cls == "accept":
             return "request"
-        if self.name in ("-lm", "--no-repack"):
+        if self.name in ("-lm", "--no-repack", "--numa", "-sm"):
             return "process"
         return "context"
 
@@ -94,6 +94,15 @@ class Knob:
             batch = option_value(cmd, "-b")
             if batch is not None and int(batch) < int(value):
                 cmd = set_option(cmd, "-b", value)
+        if self.name in ("-t", "-tb") and value is not None:
+            previous = option_value(command, self.name)
+            followers = (('-tb', '--spec-draft-threads', '--spec-draft-threads-batch') if self.name == '-t'
+                         else ('--spec-draft-threads-batch',))
+            for target in followers:
+                if previous is not None and option_value(command, target) == previous:
+                    cmd = set_option(cmd, target, value)
+        if self.name == '--numa' and value == 'disabled':
+            cmd = remove_option(cmd, '--numa')
         return cmd, out_env
 
 
@@ -164,11 +173,13 @@ def _multi_device(ctx: Context) -> bool:
 
 def _threads(ctx: Context) -> list[int]:
     # GPU driver threads need free cores: never all of them (64 threads on the 64-core host stalls the GPUs)
-    levels = [16, 24, 32, 40, 48, 56, 64, 96, 128]
-    return [t for t in levels if t <= ctx.max_threads]
+    current = int(ctx.option('-t') or ctx.max_threads)
+    levels = sorted({max(1, current // 2), max(1, current - 8), current, current + 8, ctx.max_threads})
+    return [t for t in levels if t <= ctx.max_threads and t != 64]
 
 
 REGISTRY: tuple[Knob, ...] = (
+    Knob("--numa", "speed", "option", ("--numa",), ("disabled", "tensors"), "NUMA placement override", default=False, unset="disabled"),
     Knob("-lm", "fit", "option", ("-lm",), ("mmap", "mmap+mlock"), "weight load mode", default=False, unset="auto"),
     Knob("--no-repack", "speed", "switch", ("--no-repack",), (OFF, ON), "disable CPU weight repacking", default=False),
     Knob("GGML_CPU_NUMA_CHUNKS", "speed", "env", ("GGML_CPU_NUMA_CHUNKS",), (0, 2, 4),
@@ -182,6 +193,8 @@ REGISTRY: tuple[Knob, ...] = (
          "VRAM left free by the auto expert cache", requires=_cache, unset="1536"),
     # speed
     Knob("-t", "speed", "option", ("-t",), _threads, "CPU threads"),
+    Knob("-tb", "speed", "option", ("-tb",), _threads, "CPU batch threads"),
+    Knob("-fa", "speed", "option", ("-fa",), ("on", "off"), "flash attention", unset="auto", default=False),
     Knob("GGML_SCHED_STAGE_MIN_TOKENS", "speed", "env", ("GGML_SCHED_STAGE_MIN_TOKENS",), (512, 1024, 2048),
          "smallest batch whose host experts stream to a GPU", requires=_staging, unset="512"),
     Knob("GGML_SCHED_STAGE_REGISTER", "speed", "env", ("GGML_SCHED_STAGE_REGISTER",), (0, 1), "page-lock staged host weights", requires=_staging, unset="0"),
@@ -228,6 +241,8 @@ def select(ctx: Context, *, only: Sequence[str] = (), include: Sequence[str] = (
         if current is not None:
             values.remove(current)
             values.insert(0, current)
+        if knob.name in ('-t', '-tb'):
+            values = [v for v in values if 0 < int(v) <= ctx.max_threads and int(v) != 64]
         if len(values) > 1:
             chosen.append((knob, values))
     order = {name: i for i, name in enumerate(CLASSES)}

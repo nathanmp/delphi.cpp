@@ -269,9 +269,8 @@ def _client(base: Sequence[str], osl: int) -> tuple[str, ...]:
     return set_option(base, "--osl", str(osl)) if "--osl" in base else tuple(base)
 
 
-def launch(cfg: Mapping[str, Any], base_arm: P.ServerArm, command: Sequence[str], env: Mapping[str, str], name: str,
-           artifacts: Path, cpu_budget=None) -> dict[str, Any]:
-    """One server launch: the decode client, then the prefill lengths. Returns metrics; raises LaunchFailed."""
+def measurement_arm(cfg, base_arm, command, env, name, cpu_budget=None):
+    """Use the same profiler clients for fresh launches and retained contexts."""
     prefill = cfg["prefill"]
     measures = ()
     if cfg["weights"].get("prefill", 0) > 0:
@@ -285,9 +284,15 @@ def launch(cfg: Mapping[str, Any], base_arm: P.ServerArm, command: Sequence[str]
     if cpu_budget:
         client = (sys.executable, str(Path(__file__).parent / 'verify_client.py'), '--url', '{url}', '--floor', str(cfg['context']),
                   '--output', '{artifact_dir}/verification.json', '--', *client)
-    arm = replace(base_arm, name=name, server_command=tuple(command), env=dict(env), client_command=client,
+    return replace(base_arm, name=name, server_command=tuple(command), env=dict(env), client_command=client,
                   extra_measurements=measures, trace_mode="submit" if cfg["trace"] else "off",
                   trace_prefill_min_tokens=0, trace_prefill_target_tokens=0)
+
+
+def launch(cfg: Mapping[str, Any], base_arm: P.ServerArm, command: Sequence[str], env: Mapping[str, str], name: str,
+           artifacts: Path, cpu_budget=None) -> dict[str, Any]:
+    """One server launch: the decode client, then the prefill lengths. Returns metrics; raises LaunchFailed."""
+    arm = measurement_arm(cfg, base_arm, command, env, name, cpu_budget)
     recipe = P.Recipe(name="auto-tune", description="auto-tuner launch", arms=(arm,))
     started = time.time()
     audit = CpuSampler(command, cpu_budget) if cpu_budget else None

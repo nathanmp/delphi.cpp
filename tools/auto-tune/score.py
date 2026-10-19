@@ -7,9 +7,35 @@ reference; 1.05 means a 5 % better weighted geometric mean. A config that broke 
 from __future__ import annotations
 
 import math
+import statistics
 from typing import Any, Mapping, Sequence
 
 TRADEOFF_DECODE_SHARES = (0.0, 0.25, 0.5, 0.75, 1.0)
+
+
+def aggregate(samples: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Use the median of full workload repeats; keep the samples for racing and reports."""
+    out = dict(samples[-1])
+    def median(values):
+        return statistics.median(values) if all(v is not None and v > 0 for v in values) else None
+    out['decode_t_s'] = median([s.get('decode_t_s') for s in samples])
+    out['prefill'] = {length: {key: median([s.get('prefill', {}).get(length, {}).get(key) for s in samples])
+                               for key in ('ttft_s', 't_s', 'prompt_ms')}
+                      for length in samples[-1].get('prefill', {})}
+    out['samples'] = list(samples)
+    return out
+
+
+def race(samples: Sequence[Mapping[str, Any]], incumbent: Mapping[str, Any], weights: Mapping[str, float], margin: float) -> dict[str, Any]:
+    """Stop a point below the incumbent by more than three repeat standard deviations in log score."""
+    repeats = incumbent.get('samples', [])
+    values = [score(s, incumbent, weights) for s in repeats]
+    logs = [math.log(v) for v in values if v is not None and v > 0]
+    noise = statistics.stdev(logs) if len(logs) > 1 else None
+    relative = score(aggregate(samples), incumbent, weights)
+    threshold = max(3 * noise, math.log1p(margin)) if noise is not None else None
+    return {'stopped': relative is not None and threshold is not None and math.log(relative) < -threshold,
+            'relative_score': relative, 'noise_log': noise, 'threshold_log': threshold, 'repeats': len(samples)}
 
 
 def normalize(weights: Mapping[str, float]) -> dict[str, float]:

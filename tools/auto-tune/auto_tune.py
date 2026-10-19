@@ -69,7 +69,7 @@ class Tuner:
                  launcher: Callable[..., dict[str, Any]], kld_runner: Callable[..., float | None] | None,
                  vram_check: Callable[[Mapping[str, Any], Sequence[str]], list[str]] = lambda metrics, command: [],
                  budget: Budget | None = None, log: Callable[[str], None] = print, *, launch_only: bool = False,
-                 placement_factory=None, cpu_budget=None, placement_feedback=None) -> None:
+                 placement_factory=None, cpu_budget=None, placement_feedback=None, context_runner=None) -> None:
         self.cfg = cfg
         self.base = (tuple(base_command), dict(base_env))
         self.identity = dict(identity)
@@ -83,12 +83,17 @@ class Tuner:
         self.placement_factory = placement_factory
         self.placement_feedback = placement_feedback
         self.cpu_budget = cpu_budget
+        self.context_runner = context_runner
         self.weights = S.metric_weights(cfg["weights"], cfg["prefill"]["lengths"])
         self.measure_spec = {"prefill": cfg["prefill"] if cfg["weights"].get("prefill", 0) > 0 else None,
                              "osl": cfg["decode"]["osl"] if cfg["weights"].get("decode", 0) > 0 else 16,
                              "trace": cfg["trace"], "env": cfg["env"]}
+        if context_runner:
+            self.measure_spec['context_search'] = cfg['context_search']
+            self.measure_spec['version'] = 2
         self.kld_spec = {k: v for k, v in cfg["kld"].items() if k != "limit"}
-        self.max_threads = cpu_budget.threads(len((K.option_value(base_command, '--device') or '').split(',')), cfg['max_threads']) if cpu_budget else cfg["max_threads"] or max(1, physical_cores() - 8)
+        self.max_threads = min(cpu_budget.cores, cfg['max_threads'] or cpu_budget.cores) if cpu_budget else cfg["max_threads"] or max(1, physical_cores() - 8)
+        self.fresh_launch_s = []
         self.state: dict[str, Any] = {"steps": [], "untested": [], "confirm": None}
         self.logits_ready: set[str] = set()  # reference logits written by this process (they live in /dev/shm for one run)
 
@@ -117,13 +122,16 @@ class Tuner:
                 out[name] = [K.ON if name in base.command else K.OFF, K.ON if name in ctx.command else K.OFF]
         return out
 
-    def selected(self) -> list[tuple[K.Knob, list[str]]]:
+    def selected(self, command=None, env=None) -> list[tuple[K.Knob, list[str]]]:
         k = self.cfg["knobs"]
-        chosen = K.select(self.context(*self.base), only=k["only"], include=k["include"], exclude=k["exclude"], levels=k["levels"])
+        chosen = K.select(self.context(command if command is not None else self.base[0], env if env is not None else self.base[1]),
+                          only=k["only"], include=k["include"], exclude=k["exclude"], levels=k["levels"])
         if self.cfg["kld"]["limit"] is None:
             chosen = [(knob, levels) for knob, levels in chosen if knob.cls != "precision"]
         if self.launch_only:
             chosen = [(knob, levels) for knob, levels in chosen if knob.reload == 'process']
+        if self.context_runner:
+            chosen = [(knob, levels) for knob, levels in chosen if knob.reload != 'request' and knob.cls != 'precision']
         order = {name: i for i, name in enumerate(self.cfg.get("class_order") or ("fit", "precision", "accept", "speed"))}
         return sorted(chosen, key=lambda item: order[item[0].cls])
 
@@ -184,11 +192,11 @@ class Tuner:
         return value
 
     def evaluate(self, command: Sequence[str], env: Mapping[str, str], name: str, *, phase: str = "search",
-                 cached: bool = True, reserve: int = 0) -> dict[str, Any]:
+                 cached: bool = True, reserve: int = 0, racing=None) -> dict[str, Any]:
         key = self.key(command, env)
         if cached:
             found = self.store.find(key, "launch", "search")
-            if found:
+            if found and found['status'] not in ('raced', 'incomplete'):
                 self.log(f"{name}: cached ({found['status']})")
                 return found
         record: dict[str, Any] = {"key": key, "kind": "launch", "phase": phase, "name": name, "command": list(command), "env": dict(env),
@@ -196,7 +204,7 @@ class Tuner:
         if key in self.store.crashed:
             return self.store.add({**record, "status": "crashed", "error": "an earlier launch of this config did not end (journal)"})
         kld = None
-        if self.cfg["kld"]["limit"] is not None:
+        if self.cfg["kld"]["limit"] is not None and not self.context_runner:
             kld = self.kld(command, env, reserve)
             record["kld"] = kld
             if kld is None and not K.is_exact(self.context(command, env)):
@@ -204,25 +212,49 @@ class Tuner:
             if kld is not None and kld > self.cfg["kld"]["limit"]:
                 self.log(f"{name}: KLD {kld:.4f} over the limit")
                 return self.store.add({**record, "status": "kld-over"})
-        if not self.budget.allow(reserve):
+        runner = self.context_runner if phase == 'search' else None
+        operation = runner.operation(command, env) if runner else 'launch'
+        _, seconds = self.budget.left()
+        # Context points consume wall time, but do not consume or reserve a full-launch slot.
+        if (operation == 'launch' and not self.budget.allow(reserve)) or seconds <= reserve * self.budget.estimate_s():
             raise BudgetExhausted()
-        self.log(f"{name}: launch {self.budget.used + 1}/{self.budget.max_launches}")
+        record['operation'] = operation
+        self.log(f"{name}: {operation} (launch budget {self.budget.used}/{self.budget.max_launches})")
         started = time.time()
         self.store.start(key, name)
+        before_launches = runner.stats['launches'] if runner else 0
+        before_recreates = runner.stats['recreates'] if runner else 0
+        def account():
+            elapsed = time.time() - started
+            count = runner.stats['launches'] - before_launches if runner else 1
+            if count:
+                self.budget.spend(elapsed)
+                if not runner:
+                    self.fresh_launch_s.append(elapsed)
+            stage = self.state.setdefault('stages', {}).setdefault(phase, {'launches': 0, 'recreates': 0, 'wall_s': 0.0})
+            stage['wall_s'] += elapsed
+            stage['launches'] += count
+            stage['recreates'] += runner.stats['recreates'] - before_recreates if runner else 0
         try:
-            metrics = self.launcher(command, env, name)
+            metrics = runner.measure(command, env, name, racing,
+                                     lambda: self.budget.left()[1] > reserve * self.budget.estimate_s()) if runner else self.launcher(command, env, name)
         except KeyboardInterrupt:
             self.store.end(key)
             raise
         except Exception as error:  # noqa: BLE001 - a failed launch is a measured boundary
             self.store.end(key)
-            self._spend(started)
+            account()
             self.log(f"{name}: failed: {error}")
-            return self.store.add({**record, "status": "failed", "error": str(error)})
+            from context_runner import ContextRejected
+            return self.store.add({**record, "status": "infeasible" if isinstance(error, ContextRejected) else "failed", "error": str(error)})
         self.store.end(key)
-        self._spend(started)
+        account()
         problems = self.vram_check(metrics, command)
         status = "vram-over" if problems else "ok"
+        if status == 'ok' and metrics.get('racing', {}).get('stopped'):
+            status = 'raced'
+        elif status == 'ok' and metrics.get('measurement_complete') is False:
+            status = 'incomplete'
         return self.store.add({**record, "status": status, "metrics": metrics, "error": "; ".join(problems) or None})
 
     # search
@@ -278,56 +310,73 @@ class Tuner:
         self.state["base"] = base_row["key"]
         apply_feedback(command, env, base_row['metrics'])
         incumbent = {"command": command, "env": env, "row": base_row, "score": 1.0}
-        for option in placement_options:
-            step = {'knob': 'placement', 'candidate': option['name']}
+        if self.context_runner:
+            from search import NestedSearch
+            search = NestedSearch(self, reference, CONFIRM_LAUNCHES)
+            search.best = incumbent
             try:
-                row = self.evaluate(option['command'], option['env'], 'placement ' + option['name'], reserve=CONFIRM_LAUNCHES)
+                incumbent = search.run(incumbent, placement_options)
             except BudgetExhausted:
-                self.state['untested'].append('placement ' + option['name'])
-                continue
-            value = S.score(row['metrics'], reference, self.weights) if row['status'] == 'ok' else None
-            step.update(key=row['key'], status=row['status'], score=value)
-            if value is not None and value > incumbent['score'] * (1 + self.cfg['noise_margin']):
-                incumbent = {'command': tuple(option['command']), 'env': option['env'], 'row': row, 'score': value}
-                step['kept'] = option['name']
-            self.state['steps'].append(step)
-        selected = self.selected()
-        index = 0
-        for position, (knob, levels) in enumerate(selected):
-            ctx = self.context(incumbent["command"], incumbent["env"])
-            if not knob.applies(ctx):
-                self.state["steps"].append({"knob": knob.name, "skipped": "does not apply to the incumbent"})
-                continue
-            current = knob.current(ctx.command, ctx.env)
-            step: dict[str, Any] = {"knob": knob.name, "class": knob.cls, "from": current, "tested": []}
-            best = None
-            try:
-                for level in levels:
-                    if level == current:
-                        continue
-                    index += 1
-                    cmd2, env2 = knob.apply(incumbent["command"], incumbent["env"], level)
-                    row = self.evaluate(cmd2, env2, f"{index:02d} {knob.name}={level}", reserve=CONFIRM_LAUNCHES)
-                    s = S.score(row["metrics"], reference, self.weights) if row["status"] == "ok" else None
-                    step["tested"].append({"level": level, "key": row["key"], "status": row["status"], "score": s})
-                    if s is not None and (best is None or s > best[0]):
-                        best = (s, level, cmd2, env2, row)
-            except BudgetExhausted:
+                incumbent = search.best
+                self.state['untested'].append('remaining nested search points')
+                self.log('budget: stop nested search before fresh-launch confirmation')
+            finally:
+                self.context_runner.close()
+        else:
+            for option in placement_options:
+                step = {'knob': 'placement', 'candidate': option['name']}
+                try:
+                    row = self.evaluate(option['command'], option['env'], 'placement ' + option['name'], reserve=CONFIRM_LAUNCHES)
+                except BudgetExhausted:
+                    self.state['untested'].append('placement ' + option['name'])
+                    continue
+                value = S.score(row['metrics'], reference, self.weights) if row['status'] == 'ok' else None
+                step.update(key=row['key'], status=row['status'], score=value)
+                if value is not None and value > incumbent['score'] * (1 + self.cfg['noise_margin']):
+                    incumbent = {'command': tuple(option['command']), 'env': option['env'], 'row': row, 'score': value}
+                    step['kept'] = option['name']
+                self.state['steps'].append(step)
+            selected = self.selected()
+            index = 0
+            for position, (knob, levels) in enumerate(selected):
+                ctx = self.context(incumbent["command"], incumbent["env"])
+                if not knob.applies(ctx):
+                    self.state["steps"].append({"knob": knob.name, "skipped": "does not apply to the incumbent"})
+                    continue
+                current = knob.current(ctx.command, ctx.env)
+                step: dict[str, Any] = {"knob": knob.name, "class": knob.cls, "from": current, "tested": []}
+                best = None
+                try:
+                    for level in levels:
+                        if level == current:
+                            continue
+                        index += 1
+                        cmd2, env2 = knob.apply(incumbent["command"], incumbent["env"], level)
+                        row = self.evaluate(cmd2, env2, f"{index:02d} {knob.name}={level}", reserve=CONFIRM_LAUNCHES)
+                        s = S.score(row["metrics"], reference, self.weights) if row["status"] == "ok" else None
+                        step["tested"].append({"level": level, "key": row["key"], "status": row["status"], "score": s})
+                        if s is not None and (best is None or s > best[0]):
+                            best = (s, level, cmd2, env2, row)
+                except BudgetExhausted:
+                    self.state["steps"].append(step)
+                    self.state["untested"] = [k.name for k, _ in selected[position:]]
+                    self.log(f"budget: stopped at {knob.name}")
+                    break
+                if best and best[0] > incumbent["score"] * (1.0 + self.cfg["noise_margin"]):
+                    step["kept"] = best[1]
+                    incumbent = {"command": best[2], "env": best[3], "row": best[4], "score": best[0]}
+                    self.log(f"keep {knob.name}={best[1]} (score {best[0]:.3f})")
                 self.state["steps"].append(step)
-                self.state["untested"] = [k.name for k, _ in selected[position:]]
-                self.log(f"budget: stopped at {knob.name}")
-                break
-            if best and best[0] > incumbent["score"] * (1.0 + self.cfg["noise_margin"]):
-                step["kept"] = best[1]
-                incumbent = {"command": best[2], "env": best[3], "row": best[4], "score": best[0]}
-                self.log(f"keep {knob.name}={best[1]} (score {best[0]:.3f})")
-            self.state["steps"].append(step)
         self.state["incumbent"] = incumbent["row"]["key"]
         self.state["confirm"] = self.confirm(incumbent)
         self.state["budget"] = {"launches": self.budget.used, "max_launches": self.budget.max_launches,
                                 "hours": (time.time() - self.budget.started) / 3600.0, "max_hours": self.budget.max_s / 3600.0}
         self.state.setdefault('stages', {})['launch'] = {'launches': self.budget.used, 'recreates': 0,
                                                        'wall_s': sum(self.budget.durations)}
+        if self.context_runner:
+            self.state['stages']['context'] = dict(self.context_runner.stats)
+            self.state['context_hooks'] = self.context_runner.supported
+            self.state['stages']['launch']['wall_s'] = self.context_runner.stats['launch_wall_s'] + sum(self.fresh_launch_s)
         return self.state
 
     def confirm(self, incumbent: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -386,6 +435,9 @@ def base_launch(cfg: Mapping[str, Any]):
             value = K.option_value(command, old)
             command = K.set_option(K.remove_option(command, old), new, value)
     command = K.set_option(command, '-c', str(cfg['context']))
+    command = K.remove_option(command, '--cache-prompt', has_value=False)
+    if '--no-cache-prompt' not in command:
+        command = (*command, '--no-cache-prompt')
     if cfg['devices']:
         previous_devices = (K.option_value(command, '--device') or '').split(',')
         requested = list(cfg['devices'])
@@ -448,13 +500,15 @@ def make_tuner(cfg: Mapping[str, Any], log: Callable[[str], None] = print) -> Tu
         return placement.prepare(cfg, command, env, pci_map, M.vram_state(), cpu)
 
     def placement_feedback(observed_command, observed_env, metrics):
-        return placement.prepare(cfg, command, env, pci_map, M.vram_state(), cpu,
+        return placement.prepare(cfg, command, env, pci_map, context_runner.baseline or M.vram_state(), cpu,
                                  observed={'command': observed_command, 'env': observed_env, 'metrics': metrics})
 
     run_identity = {**identity(cfg, arm, command), 'cpu_budget': cpu.summary(), 'devices': cfg['devices'],
                     'clock_mode': cfg['clock_mode']}
+    from context_runner import ContextRunner
+    context_runner = ContextRunner(cfg, arm, cpu, log)
     tuner = Tuner(cfg, command, env, run_identity, launcher, kld_runner, vram_check, log=log,
-                  launch_only=True, placement_factory=placement_factory, cpu_budget=cpu, placement_feedback=placement_feedback)
+                  placement_factory=placement_factory, cpu_budget=cpu, placement_feedback=placement_feedback, context_runner=context_runner)
     tuner.shm = shm
     return tuner
 
@@ -466,14 +520,16 @@ def plan_text(tuner: Tuner) -> str:
     selected = tuner.selected()
     if tuner.cpu_budget:
         lines += ['CPU budget: ' + json.dumps(tuner.cpu_budget.summary()),
-                  'loop 1 only: placement dry runs and fresh-load verification run with the run command']
+                  ('loops 1 and 2: placement/process launches, then context re-creation (404 -> full launch)' if tuner.context_runner
+                   else 'loop 1 only: placement dry runs and fresh-load verification run with the run command')]
     launches = (1 if cfg["warmup_launch"] else 0) + 1 + CONFIRM_LAUNCHES
     if tuner.launch_only:
         launches += 2
     precision = 0
     for knob, levels in selected:
-        lines.append(f"  {knob.cls:9s} {knob.name:34s} {' '.join(levels)}")
-        launches += len(levels) - 1
+        lines.append(f"  {knob.cls:9s} {knob.reload:7s} {knob.name:34s} {' '.join(levels)}")
+        if not tuner.context_runner or knob.reload == 'process':
+            launches += len(levels) - 1
         if knob.cls == "precision":
             precision += sum(1 for level in levels if level != knob.exact)
     if precision:
@@ -487,6 +543,10 @@ def plan_text(tuner: Tuner) -> str:
     if optin:
         lines.append(f"  opt-in knobs that apply (add to knobs.include): {', '.join(optin)}")
     budget = cfg["budget"]
+    if tuner.context_runner:
+        lines += [f"Context points use {cfg['context_search']['reps']} complete workload repeats; stop below the incumbent by >3x repeat noise.",
+                  "Context/request precision changes stay fixed until the KLD milestone; fresh launches confirm the final candidate.",
+                  "The launch estimate excludes context points and their nesting; without hooks each point needs a launch."]
     lines += ["", f"launches at most (KLD runs count as launches): {launches}; budget {budget['max_launches']} launches, {budget['max_hours']} h"]
     if launches > budget["max_launches"]:
         lines.append("the budget ends the search early: the knobs at the end of the list are then not tested")
@@ -529,6 +589,8 @@ def main() -> int:
             with benchmark_locks(tuner.base[0], cfg['devices']):
                 state = tuner.run()
         finally:
+            if tuner.context_runner:
+                tuner.context_runner.close()
             shm = getattr(tuner, "shm", None)
             if shm is not None and shm.is_dir():
                 for path in shm.glob("*.kld"):
