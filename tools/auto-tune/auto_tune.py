@@ -95,6 +95,7 @@ class Tuner:
         self.max_threads = min(cpu_budget.cores, cfg['max_threads'] or cpu_budget.cores) if cpu_budget else cfg["max_threads"] or max(1, physical_cores() - 8)
         self.fresh_launch_s = []
         self.state: dict[str, Any] = {"steps": [], "untested": [], "confirm": None}
+        self.state['identity'] = self.identity
         self.logits_ready: set[str] = set()  # reference logits written by this process (they live in /dev/shm for one run)
 
     # helpers

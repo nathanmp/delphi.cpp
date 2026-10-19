@@ -102,7 +102,8 @@ class ContextRunner:
             # Context measurements cannot use a trace spanning other contexts. Traced runs use the fresh-launch path.
             full_env.update(M.P._trace_env(directory / 'unused.trace', 'off', 0, 0))
             self.process = subprocess.Popen(M.P._render(cmd, values), cwd=M.ROOT, env=full_env, text=True, stdout=stdout, stderr=stderr)
-            (directory / 'launch.json').write_text(json.dumps({'command': list(cmd), 'env': dict(env), 'pid': self.process.pid}, indent=2) + '\n')
+            (directory / 'launch.json').write_text(json.dumps({'command': list(cmd), 'env': dict(env), 'pid': self.process.pid,
+                'binary_version': M.P._version(command[0], env), 'models': M.P._model_identity(self.arm.model_paths)}, indent=2) + '\n')
             M.P._wait_for_server(self.url, self.process, self.arm.ready_timeout_s)
             self.signature = process_key(command, env)
             self.launch_command = tuple(command)

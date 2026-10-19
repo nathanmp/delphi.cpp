@@ -49,13 +49,20 @@ class NestedSearch:
                 alternatives = [v for v in levels if v != knob.current(ctx.command, ctx.env)]
                 if not alternatives:
                     continue
+                try:
+                    grid = {v: float(v) for v in levels}
+                except ValueError:
+                    grid = {v: float(i) for i, v in enumerate(levels)}
+                alternatives.sort(key=grid.get)
                 level = alternatives[-1] if trajectory == 0 else alternatives[0]
+                current = knob.current(ctx.command, ctx.env)
+                delta = abs(grid[level] - grid[current]) / (max(grid.values()) - min(grid.values())) if current in grid else 1.0
                 command, env = knob.apply(ctx.command, ctx.env, level)
                 point = self.point(command, env, 'screen ' + knob.name, None)
                 if point['score'] is None:
                     boundaries.add(knob.name)
                     continue
-                effects[knob.name].append(abs(math.log(point['score'] / previous['score'])))
+                effects[knob.name].append(abs(math.log(point['score'] / previous['score'])) / max(delta, 1e-12))
                 previous = point
         ranked = sorted(selected, key=lambda item: statistics.mean(effects[item[0].name]) if effects[item[0].name] else 0, reverse=True)
         noise = S.race([incumbent['row']['metrics']], incumbent['row']['metrics'], self.t.weights, self.t.cfg['noise_margin'])['threshold_log']
