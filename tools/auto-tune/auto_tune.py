@@ -549,7 +549,8 @@ def plan_text(tuner: Tuner) -> str:
     if skipped:
         lines.append(f"  not tuned without kld.limit: {', '.join(skipped)}")
     optin = [k.name for k in K.REGISTRY if not k.default and k.applies(tuner.context(*tuner.base)) and k.name not in cfg["knobs"]["include"]
-             and (not tuner.launch_only or k.reload == 'process')]
+             and (not tuner.launch_only or k.reload == 'process')
+             and (not tuner.context_runner or k.cls != 'precision' and k.reload != 'request')]
     if optin:
         lines.append(f"  opt-in knobs that apply (add to knobs.include): {', '.join(optin)}")
     budget = cfg["budget"]

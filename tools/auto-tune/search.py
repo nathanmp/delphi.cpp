@@ -125,6 +125,9 @@ class NestedSearch:
                     best = candidate
         process = [(k, v) for k, v in self.t.selected(best['command'], best['env']) if k.reload == 'process']
         for knob, levels in process:
+            if not knob.applies(self.t.context(best['command'], best['env'])):
+                self.t.state['steps'].append({'loop': 1, 'knob': knob.name, 'skipped': 'does not apply to the incumbent'})
+                continue
             origin = best
             for level in levels:
                 if level == knob.current(origin['command'], origin['env']):

@@ -550,6 +550,21 @@ class ContextSearch(unittest.TestCase):
             self.assertTrue(any(K.option_value(c, '-ub') == '1024' for c in tensors))
             self.assertGreaterEqual(runner.stats['launches'], 2)
 
+    def test_process_dependencies_are_checked_after_numa_changes(self):
+        with tempfile.TemporaryDirectory() as d:
+            t, runner, _ = self.tuner(d, knobs={'only': ['--numa', 'GGML_CPU_NUMA_CHUNKS']})
+            t.base = ((*BASE, '--numa', 'tensors', '-cmoe'), {'GGML_CPU_NUMA_CHUNKS': '2'})
+            measure = runner.measure
+            def faster_without_numa(command, env, *args):
+                result = measure(command, env, *args)
+                if K.option_value(command, '--numa') is None:
+                    result['decode_t_s'] *= 2
+                return result
+            runner.measure = faster_without_numa
+            state = t.run()
+            self.assertTrue(any(s['knob'] == 'GGML_CPU_NUMA_CHUNKS' and s.get('skipped') for s in state['steps']))
+            self.assertTrue(all(e.get('GGML_CPU_NUMA_CHUNKS') == '2' for _, _, e in runner.calls))
+
     def test_racing_uses_incumbent_repeats_and_stores_incomplete_status(self):
         incumbent = S.aggregate([{'decode_t_s': v, 'prefill': {}} for v in [99, 100, 101]])
         self.assertTrue(S.race([{'decode_t_s': 80, 'prefill': {}}], incumbent, {'decode': 1}, 0.01)['stopped'])
@@ -642,6 +657,9 @@ class ContextSearch(unittest.TestCase):
             self.assertEqual(K.option_value(normalized, '-ubd'), '128')
             command, _ = K.BY_NAME['--numa'].apply((*BASE, '--numa', 'tensors'), {}, 'disabled')
             self.assertNotIn('--numa', command)
+            self.assertEqual(K.BY_NAME['--numa'].current(command, {'LLAMA_ARG_NUMA': 'tensors'}), 'tensors')
+            selected = K.select(K.Context(command, {'LLAMA_ARG_NUMA': 'tensors'}, 48, 48), only=['--numa'])
+            self.assertEqual(selected, [])
 
     def test_screening_runs_only_above_threshold(self):
         with tempfile.TemporaryDirectory() as d:

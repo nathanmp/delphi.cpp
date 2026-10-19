@@ -72,6 +72,8 @@ class Knob:
         if self.kind == "switch":
             return ON if self.targets[0] in command else OFF
         value = option_value(command, self.targets[0])
+        if self.name == '--numa' and value is None:
+            return env.get('LLAMA_ARG_NUMA', self.unset)
         return self.unset if value is None else value
 
     def apply(self, command: Sequence[str], env: Mapping[str, str], value: str | None) -> tuple[tuple[str, ...], dict[str, str]]:
@@ -243,6 +245,9 @@ def select(ctx: Context, *, only: Sequence[str] = (), include: Sequence[str] = (
             values.insert(0, current)
         if knob.name in ('-t', '-tb'):
             values = [v for v in values if 0 < int(v) <= ctx.max_threads and int(v) != 64]
+        if knob.name == '--numa' and ctx.env.get('LLAMA_ARG_NUMA'):
+            # Off is the absence of --numa; an inherited env option would turn it back on.
+            values = [v for v in values if v != 'disabled']
         if len(values) > 1:
             chosen.append((knob, values))
     order = {name: i for i, name in enumerate(CLASSES)}
