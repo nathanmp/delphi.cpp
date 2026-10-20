@@ -974,9 +974,13 @@ static FILE * get_shared_gguf_file(const shared_gguf & shared) {
 
 static void set_ced_trim_env(int mode) {
 #ifdef _WIN32
-    _putenv_s("LLAMA_DSV41_TRIM", mode == 1 ? "1" : mode == 2 ? "2" : "0");
+    _putenv_s("LLAMA_DSV41_TRIM", mode < 0 ? "" : mode == 1 ? "1" : mode == 2 ? "2" : "0");
 #else
-    setenv("LLAMA_DSV41_TRIM", mode == 1 ? "1" : mode == 2 ? "2" : "0", 1);
+    if (mode < 0) {
+        unsetenv("LLAMA_DSV41_TRIM");
+    } else {
+        setenv("LLAMA_DSV41_TRIM", mode == 1 ? "1" : mode == 2 ? "2" : "0", 1);
+    }
 #endif
 }
 
@@ -1023,7 +1027,7 @@ static int test_deepseek41_ced(const size_t seed) {
         set_ced_trim_env(2);
         auto mask = get_model_and_ctx(nullptr, get_shared_gguf_file(shared), seed, devs,
                 LLAMA_SPLIT_MODE_LAYER, false, LLAMA_CONTEXT_TYPE_DEFAULT, nullptr, nullptr, 2, 4);
-        set_ced_trim_env(1);
+        set_ced_trim_env(-1);
         std::vector<uint32_t> rows(5, 0);
         auto trim = get_model_and_ctx(nullptr, get_shared_gguf_file(shared), seed, devs,
                 LLAMA_SPLIT_MODE_LAYER, false, LLAMA_CONTEXT_TYPE_DEFAULT, count_ced_layers, &rows, 2, 4);

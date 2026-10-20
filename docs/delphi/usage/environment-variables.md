@@ -16,6 +16,22 @@ With mmap (the default load mode), each tensor in a plain device buffer is copie
 
 The gain depends on how evenly the weights are spread and how slow the device links are. With a model split by layers over three GPUs on narrow PCIe links, loading from the page cache took half the time (249 s to 127 s). Models on one device, or with split buffers, load in the same time as before. Outputs are identical.
 
+## DeepSeek V4.1 CED prefill
+
+| variable | default | effect |
+| --- | --- | --- |
+| `LLAMA_DSV41_TRIM` | `1` | Compact decoder prefill. `0` uses full prefill; `2` keeps all queries with the bounded decoder mask as a numerical reference. Read when the context is made. |
+
+For a supported Causal Encoder Decoder (CED) layout, the encoder processes every input row. At the first decoder layer, the graph keeps the last `sliding_window + rollback_depth` query rows. Global KV and index keys still use every encoder row. Decoder attention and FFNs process the retained suffix; subsequent decode runs all layers. Decoder local KV has its own positions, so discarded rows cannot expose stale cache slots. DSpark receives valid features for the retained suffix.
+
+Compaction applies per microbatch. Short batches, batches with multiple sequences, embedding inputs, and requests for logits in the discarded prefix use the full graph. Unsupported source layouts disable CED. This includes decoder engrams or later decoder layers that own global KV or index keys. Ordinary all-row perplexity evaluation therefore uses the full graph; quality tests must prefill with only the final output requested, then score a continuation.
+
+CED and full-prefill state blobs use different layouts and reject restoration across modes. Rebuild saved prompt states after changing the mode or upgrading from full prefill. The server's `/tune/context` endpoint can change this variable without reloading the model weights, but clears the prompt state.
+
+CPU-offloaded DeepSeek V4.1 Flash tests on two R9700s showed about 1.7x faster 1K prefill and 1.9x faster 65K prefill. On 2,048 teacher-forced continuation tokens from prose, documentation and C++, compact versus full prefill had mean KL 0.00278, 98.73% top-token agreement and 0.93% higher aggregate perplexity. Four graded tasks had the same answer accuracy, including an arithmetic failure in both modes; normal DSpark acceptance remained close. These are regression checks on one quantization, not a broad quality evaluation. Outputs can change. A separate full-prefill microbatch-size control also changed distributions, so the measured difference cannot all be assigned to the bounded decoder history.
+
+Adapted from [DeepInfer](https://github.com/deepseek-ai/DeepInfer/tree/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01), Apache-2.0: the consumer boundary in `decoder_layer.py` and `v4_modules/yoco.py`, full global-KV projection in `v4_modules/attn.py`, and bounded SWA visibility in `prepare_tensor_input_v4.cpp`. This implementation uses ggml graphs, separate local cache maps, and a suffix per microbatch rather than DeepInfer's request metadata. No source or kernels were copied.
+
 ## Backend sampling (`-bs`)
 
 | variable | default | set to | effect of the non-default value |

@@ -295,7 +295,7 @@ llama_context::llama_context(
     cparams.ced_compact = false;
     if (model.arch == LLM_ARCH_DEEPSEEK41) {
         const char * LLAMA_DSV41_TRIM = getenv("LLAMA_DSV41_TRIM");
-        const int mode = LLAMA_DSV41_TRIM ? atoi(LLAMA_DSV41_TRIM) : 0;
+        const int mode = LLAMA_DSV41_TRIM ? atoi(LLAMA_DSV41_TRIM) : 1;
         if (mode == 1 || mode == 2) {
             const uint32_t split = hparams.n_layer()/2;
             bool supported = split > 0 && hparams.dsv41_candidate_source == (int32_t) split &&
@@ -309,7 +309,7 @@ llama_context::llama_context(
             if (supported) {
                 cparams.n_layer_prefill = split;
                 cparams.ced_compact = mode == 1;
-                LLAMA_LOG_INFO("%s: experimental CED prefill: %s, encoder layers = %u\n", __func__, mode == 1 ? "compact" : "bounded mask", split);
+                LLAMA_LOG_INFO("%s: CED prefill: %s, encoder layers = %u\n", __func__, mode == 1 ? "compact" : "bounded mask", split);
             } else {
                 LLAMA_LOG_WARN("%s: CED prefill disabled: unsupported decoder source layout\n", __func__);
             }
