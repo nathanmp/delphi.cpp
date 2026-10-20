@@ -151,9 +151,9 @@ def stage_calibrate(cfg, p, args):
     vocab = space.vocab_size(cfg["model"])
     space.preflight("calibrate", info, cfg, directories(p), not args.no_space_check, vocab=vocab)
     extra = {"scratch": p["scratch"]} if "scratch" in inspect.signature(calibrate).parameters else {}
-    # the watcher covers probe encoding, the teacher logits and the passes (it stays quiet when calibrate prints pass lines)
+    # the watcher covers the teacher logits and a probe model; calibrate prints its own pass lines
     try:
-        with progress.CalibrationWatcher(p["calibration"], teacher_bytes=space.teacher_bytes(vocab, c["chunks"], c["context"])):
+        with progress.CalibrationWatcher(p["calibration"], teacher_bytes=space.teacher_bytes(vocab, c["chunks"], c["context"]), passes=False):
             table = calibrate(data, cfg, p["calibration"], aq.encode, aq.verify_output, text_dir=p["prepared"], **extra)
     except (SystemExit, KeyboardInterrupt):
         terminate_children()

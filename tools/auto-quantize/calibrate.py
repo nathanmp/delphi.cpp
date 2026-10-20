@@ -41,6 +41,9 @@ from model import lazy_args, tensor_bytes
 from quality import METHOD, METRIC, SCHEMA, damage_digest, damage_records, modelled_groups, sensitivity
 from timing import gpu, gpu_only, measure_cmoe, measure_env, run
 
+# Running hotswap sessions; SIGTERM ends them so that the session threads stop at once
+LIVE_SESSIONS = set()
+
 
 def hotswap_module():
     spec = importlib.util.spec_from_file_location("hotswap", ROOT / "tools/perplexity/hotswap.py")
@@ -231,12 +234,13 @@ def run_session(command, jobs, writer, members, floor_choices, chunks, output, e
         if label not in ("floor", "recompute", "restore") and k:
             elapsed = time.monotonic() - started
             left = elapsed / k * (len(pending) - k)
-            print(f"calibration {output.name}: pass {k}/{len(pending)} {label} KL {results[label].mean():.5f}, "
+            print(f"[calibration {output.name}] pass {k}/{len(pending)} {label} KL {results[label].mean():.5f}, "
                   f"elapsed {elapsed / 60:.1f} min, about {left / 60:.1f} min left (finish {time.strftime('%H:%M', time.localtime(time.time() + left))})",
                   flush=True)
 
     session = hotswap_module().HotswapSession(command, output / f"session-{time.time_ns()}", timeout,
                                               env=env | {"LLAMA_KLD_TOKENS_FILE": str(tokens)})
+    LIVE_SESSIONS.add(session)
     try:
         save("floor", session.start())
         if previous_floor is not None and (output / "floor.f32").read_bytes() != previous_floor:
@@ -304,6 +308,7 @@ def run_session(command, jobs, writer, members, floor_choices, chunks, output, e
         if failed:
             results["failed"] = failed
     finally:
+        LIVE_SESSIONS.discard(session)
         session.close()
     for label in ("recompute", "restore") if pending else ("recompute",):
         if not np.array_equal(np.fromfile(output / f"{label}.f32", dtype=np.float32),
@@ -509,7 +514,14 @@ def calibrate(data, cfg, output, encode, verify, timeout=7200, text_dir=None, sc
     teacher = teacher_logits(cfg, c, output, timeout)
     results, errors = {}, []
     env = measure_env(cfg)
-    previous = signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
+
+    def terminate(*_):
+        # The session threads are not daemons: end their llama-perplexity processes so that they stop now.
+        for session in list(LIVE_SESSIONS):
+            if session.process and session.process.poll() is None:
+                session.process.terminate()
+        sys.exit(1)
+    previous = signal.signal(signal.SIGTERM, terminate)
 
     def worker(device):
         try:
