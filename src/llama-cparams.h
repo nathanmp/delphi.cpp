@@ -72,6 +72,8 @@ struct llama_cparams {
     bool auto_fgdn;
     bool fused_lid;          // use fused lightning indexer
     bool auto_flid;
+    uint32_t n_layer_prefill; // CED encoder layer count; n_layer without CED
+    bool ced_compact;         // compact decoder queries; otherwise use the bounded mask as a reference
     bool fused_dsv4_hc_pre;
     bool fused_dsv4_hc_comb;
     bool fused_dsv4_hc_post;

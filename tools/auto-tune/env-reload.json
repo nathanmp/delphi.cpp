@@ -39,6 +39,7 @@
  "LLAMA_ATTN_SPLIT": "context",
  "LLAMA_ATTN_SPLIT_COPY": "context",
  "LLAMA_ATTN_SPLIT_INDEXER": "context",
+ "LLAMA_DSV41_TRIM": "context",
  "LLAMA_GRAPH_ALT_MAX_TOKENS": "context",
  "LLAMA_GRAPH_ALT_SLOTS": "context",
  "LLAMA_KV_N_PAD": "process",
