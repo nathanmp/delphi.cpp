@@ -291,6 +291,31 @@ llama_context::llama_context(
         }
     }
 
+    cparams.n_layer_prefill = hparams.n_layer();
+    cparams.ced_compact = false;
+    if (model.arch == LLM_ARCH_DEEPSEEK41) {
+        const char * LLAMA_DSV41_TRIM = getenv("LLAMA_DSV41_TRIM");
+        const int mode = LLAMA_DSV41_TRIM ? atoi(LLAMA_DSV41_TRIM) : 0;
+        if (mode == 1 || mode == 2) {
+            const uint32_t split = hparams.n_layer()/2;
+            bool supported = split > 0 && hparams.dsv41_candidate_source == (int32_t) split &&
+                    hparams.dsv41_is_kv_source(split) && hparams.dsv41_owns_index_k(split);
+            for (uint32_t il = split + 1; il < hparams.n_layer(); ++il) {
+                supported &= !hparams.dsv41_is_kv_source(il) && !hparams.dsv41_owns_index_k(il);
+            }
+            for (uint32_t il = split; il < hparams.n_layer(); ++il) {
+                supported &= model.layers[il].engram_embd == nullptr;
+            }
+            if (supported) {
+                cparams.n_layer_prefill = split;
+                cparams.ced_compact = mode == 1;
+                LLAMA_LOG_INFO("%s: experimental CED prefill: %s, encoder layers = %u\n", __func__, mode == 1 ? "compact" : "bounded mask", split);
+            } else {
+                LLAMA_LOG_WARN("%s: CED prefill disabled: unsupported decoder source layout\n", __func__);
+            }
+        }
+    }
+
     cparams.fused_dsv4_hc_pre  = true;
     cparams.fused_dsv4_hc_comb = true;
     cparams.fused_dsv4_hc_post = true;

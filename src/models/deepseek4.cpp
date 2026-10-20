@@ -933,9 +933,9 @@ ggml_tensor * llama_model_deepseek4::graph::build_raw_attention(
 
     const llama_kv_cache_dsv4_raw_context * mctx_cur = inp_attn->mctx;
 
-    ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, kv, inp_attn->get_k_idxs(), il));
+    ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, kv, inp_attn->get_k_idxs(il), il));
 
-    ggml_tensor * kq_mask = inp_attn->get_kq_mask();
+    ggml_tensor * kq_mask = inp_attn->get_kq_mask(il);
 
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
 

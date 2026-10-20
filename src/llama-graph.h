@@ -228,7 +228,7 @@ public:
     llm_graph_input_out_ids(
             const llama_hparams & hparams,
             const llama_cparams & cparams,
-            uint32_t n_outputs) : hparams(hparams), cparams(cparams), n_outputs(n_outputs) {}
+            uint32_t n_outputs, uint32_t row_offset = 0) : hparams(hparams), cparams(cparams), n_outputs(n_outputs), row_offset(row_offset) {}
     virtual ~llm_graph_input_out_ids() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
@@ -241,6 +241,7 @@ public:
     const llama_cparams cparams;
 
     const uint32_t n_outputs;
+    const uint32_t row_offset;
 };
 
 class llm_graph_input_mean : public llm_graph_input_i {
@@ -577,6 +578,9 @@ public:
 
 // DSV4 raw graph inputs are SWA-only, but their mask may be stream-shaped
 // so raw K can be concatenated with DSV4 compressed K in one attention op.
+//
+// CED gives the decoder group its own write indices and mask. The dec tensors
+// stay null when the trim is off.
 class llm_graph_input_dsv4_raw {
 public:
     llm_graph_input_dsv4_raw(
@@ -588,13 +592,17 @@ public:
 
     void set_input(const llama_ubatch * ubatch);
 
-    ggml_tensor * get_k_idxs() const { return self_k_idxs; }
-    ggml_tensor * get_kq_mask() const { return self_kq_mask_cnv; }
+    ggml_tensor * get_k_idxs(int32_t il = 0) const;
+    ggml_tensor * get_kq_mask(int32_t il = 0) const;
 
     ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
 
     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
+
+    ggml_tensor * self_k_idxs_dec      = nullptr; // I64 [n_batch]
+    ggml_tensor * self_kq_mask_dec     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
+    ggml_tensor * self_kq_mask_dec_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
 
     ggml_tensor * self_k_rot = nullptr;
 
@@ -1238,7 +1246,7 @@ struct llm_graph_context {
     ggml_tensor * build_inp_embd(ggml_tensor * tok_embd) const;
     ggml_tensor * build_inp_pos() const;
     ggml_tensor * build_inp_attn_scale() const;
-    ggml_tensor * build_inp_out_ids() const;
+    ggml_tensor * build_inp_out_ids(uint32_t row_offset = 0) const;
     ggml_tensor * build_inp_mean() const;
     ggml_tensor * build_inp_cls() const;
 
