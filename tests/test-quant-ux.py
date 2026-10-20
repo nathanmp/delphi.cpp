@@ -506,6 +506,15 @@ class ResumeState(unittest.TestCase):
             self.assertEqual(ran, ["prepare", "calibrate", "prepare", "calibrate"])
 
 
+class Interrupt(unittest.TestCase):
+    @unittest.skipUnless(Path("/proc/self/stat").exists(), "needs /proc")
+    def test_children_are_terminated(self):
+        import subprocess
+        child = subprocess.Popen(["sleep", "30"])
+        qc.terminate_children()
+        self.assertEqual(child.wait(10), -15)
+
+
 class Convert(unittest.TestCase):
     def write_safetensors(self, path, tensors):
         header = json.dumps({n: {"dtype": "BF16", "shape": s, "data_offsets": [0, 0]} for n, s in tensors.items()}).encode()

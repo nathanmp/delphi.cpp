@@ -14,6 +14,7 @@ import io
 import json
 import os
 import shutil
+import signal
 import sys
 import time
 from pathlib import Path
@@ -122,6 +123,24 @@ def stage_prepare(cfg, p, args, measurement_seconds=600):
     return aq.prepare(cfg, p["prepared"], measurement_seconds)
 
 
+def terminate_children():
+    """SIGTERM to the child processes of this process (Linux). calibrate's SIGTERM handler raises SystemExit in the main
+    thread, but its session threads are not daemons and keep the process alive until every pass has finished: ending the
+    llama-perplexity sessions makes them stop at once."""
+    me = os.getpid()
+    try:
+        entries = [e for e in os.listdir("/proc") if e.isdigit()]
+    except OSError:
+        return
+    for entry in entries:
+        try:
+            with open(f"/proc/{entry}/stat") as stream:
+                if int(stream.read().rsplit(")", 1)[1].split()[1]) == me:
+                    os.kill(int(entry), signal.SIGTERM)
+        except (OSError, ValueError, IndexError):
+            continue
+
+
 def stage_calibrate(cfg, p, args):
     """Calibration passes with the large files in the scratch directory; only quality.json goes to the work directory."""
     import auto_quantize as aq
@@ -133,8 +152,12 @@ def stage_calibrate(cfg, p, args):
     space.preflight("calibrate", info, cfg, directories(p), not args.no_space_check, vocab=vocab)
     extra = {"scratch": p["scratch"]} if "scratch" in inspect.signature(calibrate).parameters else {}
     # the watcher covers probe encoding, the teacher logits and the passes (it stays quiet when calibrate prints pass lines)
-    with progress.CalibrationWatcher(p["calibration"], teacher_bytes=space.teacher_bytes(vocab, c["chunks"], c["context"])):
-        table = calibrate(data, cfg, p["calibration"], aq.encode, aq.verify_output, text_dir=p["prepared"], **extra)
+    try:
+        with progress.CalibrationWatcher(p["calibration"], teacher_bytes=space.teacher_bytes(vocab, c["chunks"], c["context"])):
+            table = calibrate(data, cfg, p["calibration"], aq.encode, aq.verify_output, text_dir=p["prepared"], **extra)
+    except (SystemExit, KeyboardInterrupt):
+        terminate_children()
+        raise
     if p["calibration"] != p["quality"]:
         p["quality"].mkdir(parents=True, exist_ok=True)
         shutil.copy2(p["calibration"] / "quality.json", p["quality"] / "quality.json")
@@ -592,6 +615,10 @@ def command_run(args):
     encode_inputs = {"output": str(output), "recipe": digest(row["recipe"]["tensor_types"])}
 
     def encode_action():
+        partial = output.with_suffix(".partial" + output.suffix)
+        if partial.exists():
+            print(f"Removing the partial output of an interrupted encode: {partial}", flush=True)
+            partial.unlink()
         space.check("encode", [("encoded GGUF", "output", space.recipe_bytes(payload["prepared"]["model"], row["recipe"]["tensor_types"]))],
                     {"output": output.parent}, enabled)
         aq.encode_from_frontier(payload, row["id"], output)
