@@ -469,6 +469,7 @@ extern "C" {
         bool gptq_feedback;                                        // enable block error feedback for supported scalar and K types
         int32_t gsq_steps;                                         // local Gumbel-softmax refinement steps, 0 disables it
         const char * refine_pattern;                               // optional regex selecting tensors for refinement
+        const char * const * only_tensors;                         // optional nullptr-terminated tensor names: write only these
     } llama_model_quantize_params;
 
     typedef struct llama_logit_bias {

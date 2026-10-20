@@ -14,6 +14,7 @@
 #include <regex>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 
 // result of parsing --tensor-type option
 // (changes to this struct must be reflected in tools/quantize/quantize.cpp)
@@ -1254,6 +1255,26 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     // initialize quantization state counters and metadata categories
     init_quantize_state_counters(qs, metadata);
 
+    // --only-tensors: the type choice still sees every tensor (counters), but only the listed tensors are written
+    std::vector<bool> keep(tensors.size(), true);
+    if (params->only_tensors) {
+        if (params->keep_split) {
+            throw std::runtime_error("only_tensors cannot be used with keep_split");
+        }
+        std::unordered_set<std::string> only;
+        for (const char * const * p = params->only_tensors; *p != nullptr; p++) {
+            only.insert(*p);
+        }
+        size_t found = 0;
+        for (size_t i = 0; i < tensors.size(); ++i) {
+            keep[i] = only.count(metadata[i].name) > 0;
+            found += keep[i];
+        }
+        if (found != only.size()) {
+            throw std::runtime_error(format("only_tensors: %zu of %zu names are not tensors of the model", only.size() - found, only.size()));
+        }
+    }
+
     int idx = 0;
     uint16_t n_split = 1;
 
@@ -1281,7 +1302,9 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         if (!ctx_outs[i_split]) {
             ctx_outs[i_split].reset(gguf_init_empty());
         }
-        gguf_add_tensor(ctx_outs[i_split].get(), tensor);
+        if (keep[i]) {
+            gguf_add_tensor(ctx_outs[i_split].get(), tensor);
+        }
 
         metadata[i].allows_quantization = tensor_allows_quantization(params, model->arch, tensor);
 
@@ -1289,6 +1312,10 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             metadata[i].target_type = llama_tensor_get_type(qs, params, tensor, default_type, metadata[i]);
         } else {
             metadata[i].target_type = tensor->type;
+        }
+
+        if (!keep[i]) {
+            continue;
         }
 
         metadata[i].requires_imatrix = tensor_requires_imatrix(tensor->name, metadata[i].target_type, ftype);
@@ -1370,6 +1397,9 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     //
 
     for (size_t i = 0; i < tensors.size(); ++i) {
+        if (!keep[i]) {
+            continue;
+        }
         const auto & weight = *tensors[i];
         const auto & tm = metadata[i];
         ggml_tensor * tensor = weight.tensor;
@@ -1612,6 +1642,7 @@ llama_model_quantize_params llama_model_quantize_default_params() {
         /*.gptq_feedback              =*/ false,
         /*.gsq_steps                  =*/ 0,
         /*.refine_pattern             =*/ nullptr,
+        /*.only_tensors               =*/ nullptr,
     };
 
     return result;

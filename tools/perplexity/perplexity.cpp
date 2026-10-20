@@ -2245,13 +2245,51 @@ int llama_perplexity(int argc, char ** argv) {
                 if (!perplexity_hotswap_write_status(status, "exiting", iteration, sequence)) { return 1; }
                 break;
             }
-            if (command.action == "compute") { break; }
+            if (command.action == "compute") {
+                if (!resident) {
+                    // add/reset changed tensors without a context; make it now
+                    resident.reset(new hot_context(model, params));
+                    if (!resident->context) {
+                        std::string error;
+                        if (hot->restore(error) > 0) { hot->commit(); }
+                        resident.reset(new hot_context(model, params));
+                        ctx = resident->context.get();
+                        if (!ctx || !hot_signal) { return 1; }
+                        LOG_ERR("hotswap: context creation failed; floor tensors restored\n");
+                        if (!perplexity_hotswap_write_status(status, "reload_failed", iteration, sequence)) { return 1; }
+                        continue;
+                    }
+                    ctx = resident->context.get();
+                }
+                break;
+            }
+            if (command.action == "add" || command.action == "reset") {
+                // Stage tensors without an evaluation: "reset" returns to the floor, "add" applies a patch on top of
+                // the current tensors. The next "compute" makes a new context and evaluates.
+                if (resident) { llama_synchronize(ctx); }
+                std::string error;
+                const int changed = command.action == "reset" ? hot->restore(error) : hot->add(command.path, error);
+                if (changed < 0 || (changed == 0 && command.action == "add")) {
+                    LOG_WRN("hotswap: %s failed: %s\n", command.action.c_str(), error.empty() ? "no tensor changed" : error.c_str());
+                    if (!hot_signal) { terminate = true; break; }
+                    if (!perplexity_hotswap_write_status(status, "reload_failed", iteration, sequence)) { return 1; }
+                    continue;
+                }
+                if (changed > 0) {
+                    resident.reset();
+                    ctx = nullptr;
+                    perplexity_hotswap_clear_packed();
+                }
+                hot->commit();
+                if (hot_signal && !perplexity_hotswap_write_status(status, "staged", iteration, sequence)) { return 1; }
+                continue;
+            }
             if (command.action != "reload" && command.action != "restore") {
                 LOG_ERR("hotswap: unknown command %s\n", command.action.c_str());
                 if (!perplexity_hotswap_write_status(status, "command_failed", iteration, sequence)) { return 1; }
                 continue;
             }
-            llama_synchronize(ctx);
+            if (resident) { llama_synchronize(ctx); }
             std::string error;
             const int changed = command.action == "restore" ? hot->restore(error) : hot->reload(command.path, error);
             if (changed <= 0) {

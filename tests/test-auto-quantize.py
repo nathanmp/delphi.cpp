@@ -16,7 +16,7 @@ from corpus import calibration_text, collect_imatrices, compose_text, imatrix_co
 from model import classify, is_lazy, lazy_args, merge_imatrices, read_model, tensor_bytes
 from search import dominates, llama_layer_devices, make_options, memory, pareto, search
 from quality import LossModel, damage_digest, load_quality, modelled_groups, role_of
-from calibrate import Fit, design, probe_qtypes
+from calibrate import Fit, PatchWriter, design, probe_qtypes
 from timing import Predictor, digest, operation_times, profile_model, regions, signature, token_counts
 from auto_quantize import gpu_descriptions, require_identical_gpus, tensor_plan, verify_output, witness_choices
 from calibrate import perplexity_command
@@ -803,6 +803,50 @@ class Quality(unittest.TestCase):
         self.assertEqual(len(design(more, "Q4_K", "Q6_K", {"bands": 2, "recipes": 5, "seed": 1})), len(jobs))
         records = {(t["name"], q["qtype"]): q["R"] for t in self.damage[0]["tensors"] for q in t["runs"][0]["types"]}
         self.assertEqual(probe_qtypes(groups, records, {"probe_qtypes": None}), ("Q4_K", "Q6_K"))
+
+    def test_plans_beyond_the_top_probe_are_marked_extrapolated(self):
+        model = LossModel(self.model, {**self.table, "probe_qtypes": {"mid": "Q2_K", "top": "Q4_K"}}, self.damage)
+        group = next(iter(model.groups))
+        self.assertEqual(model.extrapolated({**self.floor, group: "Q4_K"}), [])
+        self.assertEqual(model.extrapolated({**self.floor, group: "Q6_K"}), [group])
+        self.assertEqual(LossModel(self.model, self.table, self.damage).extrapolated({**self.floor, group: "Q6_K"}), [])
+
+    def test_patch_chunks_hold_whole_groups_within_the_limit(self):
+        config = {**self.config, "bindir": "/nonexistent", "model": str(self.source), "runtime": {"threads": 1, "env": {}}}
+        writer = PatchWriter(config, self.model, None, self.root / "scratch", patch_mib=1)
+        members = {g["name"]: g["members"] for g in self.model["groups"] if len(g["pool"]) > 1}
+        tensors = {n: "Q6_K" for names in members.values() for n in names}
+        group_bytes = [writer.bytes_of({n: "Q6_K" for n in names}) for names in members.values()]
+        writer.patch_bytes = max(group_bytes) + min(group_bytes) // 2
+        chunks = writer.chunks(tensors, members)
+        self.assertEqual({n: q for c in chunks for n, q in c.items()}, tensors)
+        self.assertGreater(len(chunks), 1)
+        for chunk in chunks:
+            self.assertLessEqual(writer.bytes_of(chunk), writer.patch_bytes)
+            for names in members.values():
+                self.assertIn(len(set(names) & set(chunk)), (0, len(names)))
+        writer.patch_bytes = 1
+        self.assertEqual(len(writer.chunks(tensors, members)), len(members))
+
+    def test_default_pools_reach_q8_0_and_fit_the_row_length(self):
+        base = {"schema": "delphi.auto-quantize/1", "model": str(self.source), "devices": "ROCm1:16000,RAM:16000"}
+        path = self.root / "config.json"
+        write_json(path, base)
+        parsed = load_config(path)
+        self.assertIn("Q8_0", parsed["primary_qtypes"])
+        self.assertEqual(parsed["other_qtypes"], ["Q8_0"])
+        self.assertEqual(parsed["calibration"]["uniform"], "auto")
+        source = {"architecture": "olmoe", "n_expert": 8, "top_k": 2, "tensors": [
+            tensor("blk.0.ffn_down_exps.weight", (96, 256, 8)), tensor("blk.0.ffn_up_exps.weight")]}
+        model = classify(source, {**cfg(), **{k: parsed[k] for k in ("primary_qtypes", "other_qtypes", "default_pools")}})
+        pools = {t["name"]: t["pool"] for t in model["tensors"]}
+        self.assertIn("Q8_0", pools["blk.0.ffn_down_exps.weight"])
+        self.assertNotIn("Q4_K", pools["blk.0.ffn_down_exps.weight"])
+        self.assertIn("Q4_K", pools["blk.0.ffn_up_exps.weight"])
+        for bad in ({"uniform": "maybe"}, {"patch_mib": 0}):
+            write_json(path, {**base, "calibration": bad})
+            with self.assertRaises(QuantError):
+                load_config(path)
 
     def test_configuration(self):
         base = {"schema": "delphi.auto-quantize/1", "model": str(self.source), "devices": "ROCm1:16000,RAM:16000",
