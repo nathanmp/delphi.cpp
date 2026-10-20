@@ -264,7 +264,7 @@ def calibration(c, absolute, cfg):
         raise QuantError("calibration must be an object")
     defaults = {"text": None, "teacher": None, "chunks": 64, "context": 512, "batch": 0, "threads": None,
                 "probe_qtypes": None, "bands": 10, "recipes": 8, "seed": 1, "devices": None, "text_seed": 1,
-                "bytes_per_token": 4.0}
+                "bytes_per_token": 4.0, "patch_mib": 8192, "uniform": "auto"}
     if set(c) - set(defaults):
         raise QuantError(f"unknown calibration keys: {sorted(set(c) - set(defaults))}")
     result = {name: c.get(name, default) for name, default in defaults.items()}
@@ -274,7 +274,9 @@ def calibration(c, absolute, cfg):
     if result["text"] is not None:
         entries = corpora(result["text"], absolute, "calibration.text")
         result["text"] = entries[0]["path"] if len(entries) == 1 else entries
-    for name in ("chunks", "context", "bands", "recipes", "seed", "text_seed", "batch"):
+    if result["uniform"] not in ("auto", "session", "direct"):
+        raise QuantError("calibration.uniform must be auto, session or direct")
+    for name in ("chunks", "context", "bands", "recipes", "seed", "text_seed", "batch", "patch_mib"):
         value = result[name]
         if not isinstance(value, int) or isinstance(value, bool) or value < (0 if name in ("seed", "text_seed", "batch") else 1):
             raise QuantError(f"calibration.{name} must be a valid integer")

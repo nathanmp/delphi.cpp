@@ -8,8 +8,13 @@ Probes measure the KL of the floor recipe with some groups upgraded, paired with
 hotswap llama-perplexity session per device holds the floor and reloads isolated tensor patches. Two probe qtypes are
 used: top (the smallest local error) and mid (local error near the geometric mean of the floor and top errors). Per
 role, contiguous layer bands are upgraded to top and to mid; a few mixed recipes upgrade random groups, and the two
-uniform recipes run the probe models directly. The cost is 2 x bands x roles + recipes passes, independent of the
+uniform recipes upgrade every modelled group. The cost is 2 x bands x roles + recipes passes, independent of the
 number of candidate qtypes and of the layer count. The fit gives the table of quality.py.
+
+Patches are quantized from the source per job (llama-quantize --only-tensors) in chunks of at most patch_mib, so the
+temporary disk space is one chunk, not two probe models. A recipe larger than one chunk is applied chunk by chunk in
+the session. A uniform recipe whose RAM copy does not fit runs as a separate probe model, one at a time, deleted after
+its run.
 """
 from __future__ import annotations
 
@@ -25,15 +30,16 @@ import sys
 import threading
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
 
 from config import ROOT, QuantError, file_identity, imatrix_identities, write_json
 from corpus import calibration_text
-from model import lazy_args
+from model import lazy_args, tensor_bytes
 from quality import METHOD, METRIC, SCHEMA, damage_digest, damage_records, modelled_groups, sensitivity
-from timing import gpu, gpu_only, measure_cmoe, measure_env
+from timing import gpu, gpu_only, measure_cmoe, measure_env, run
 
 
 def hotswap_module():
@@ -43,30 +49,63 @@ def hotswap_module():
     return module
 
 
-class Sources:
-    """Lazy GGUF readers keyed by qtype label."""
+class PatchWriter:
+    """Writes isolated tensor patches straight from the source with llama-quantize --only-tensors.
 
-    def __init__(self, paths):
+    A patch holds only the tensors of one job chunk, quantized with the same source, imatrix and options as encode, so
+    no full probe model is written. Patches stay at most patch_mib (a chunk with one larger group excepted)."""
+
+    def __init__(self, cfg, info, imatrix, scratch, patch_mib):
+        self.cfg, self.imatrix, self.scratch = cfg, imatrix, Path(scratch)
+        self.shapes = {t["name"]: t["shape"] for t in info["tensors"]}
+        self.patch_bytes = int(patch_mib) << 20
+        self.scratch.mkdir(parents=True, exist_ok=True)
+        self.count, self.seconds, self.bytes = 0, 0.0, 0
+
+    def bytes_of(self, tensors):
+        return sum(tensor_bytes(self.shapes[n], q) for n, q in tensors.items())
+
+    def chunks(self, tensors, members):
+        """Split {tensor: qtype} into chunks of whole groups (members: group -> tensor names) of at most patch_bytes."""
+        result, current, size = [], {}, 0
+        for group in members:
+            part = {n: tensors[n] for n in members[group] if n in tensors}
+            if not part:
+                continue
+            b = self.bytes_of(part)
+            if current and size + b > self.patch_bytes:
+                result.append(current)
+                current, size = {}, 0
+            current.update(part)
+            size += b
+        if current:
+            result.append(current)
+        return result
+
+    def write(self, tensors, path):
         from gguf import GGUFReader
-        self.reader_type = GGUFReader
-        self.paths, self.index = dict(paths), {}
-
-    def tensor(self, key, name):
-        if key not in self.index:
-            self.index[key] = {t.name: t for t in self.reader_type(self.paths[key]).tensors}
-        return self.index[key][name]
-
-
-def write_patch(path, sources, tensors):
-    from gguf import GGUFWriter
-    writer = GGUFWriter(str(path), None)
-    for name, key in sorted(tensors.items()):
-        t = sources.tensor(key, name)
-        writer.add_tensor(t.name, t.data, raw_dtype=t.tensor_type)
-    writer.write_header_to_file()
-    writer.write_kv_data_to_file()
-    writer.write_tensors_to_file()
-    writer.close()
+        path = Path(path)
+        path.unlink(missing_ok=True)
+        types = path.with_suffix(".types.txt")
+        names = path.with_suffix(".names.txt")
+        types.write_text("".join(f"^{re.escape(n)}$={q.lower()}\n" for n, q in sorted(tensors.items())))
+        names.write_text("".join(f"{n}\n" for n in sorted(tensors)))
+        command = [str(Path(self.cfg["bindir"]) / "llama-quantize"), "--pure", "--tensor-type-file", str(types),
+                   "--only-tensors", str(names)]
+        if self.imatrix:
+            command += ["--imatrix", str(self.imatrix)]
+        if self.cfg.get("allow_requantize", False):
+            command += ["--allow-requantize"]
+        command += [self.cfg["model"], str(path), "Q2_K", str(self.cfg["runtime"]["threads"])]
+        started = time.monotonic()
+        run(command, path.with_suffix(".log"), self.cfg["runtime"]["env"])
+        found = {t.name: t.tensor_type.name for t in GGUFReader(str(path)).tensors}
+        if found != {n: q.upper() for n, q in tensors.items()}:
+            raise QuantError(f"patch {path} does not hold the planned tensors and types")
+        self.count += 1
+        self.seconds += time.monotonic() - started
+        self.bytes += path.stat().st_size
+        return path
 
 
 def per_chunk(path, chunks):
@@ -160,10 +199,13 @@ def run_direct(command, tokens, log, env, timeout):
         raise QuantError(f"llama-perplexity failed ({completed.returncode}); see {log}")
 
 
-def run_session(command, jobs, sources, floor_choices, chunks, output, env, timeout, restore_bytes=16 << 30):
+def run_session(command, jobs, writer, members, floor_choices, chunks, output, env, timeout, restore_bytes=16 << 30):
     """Measure the floor, a recompute control, every job and a restore control; return {label: per-chunk KL}.
 
-    Completed jobs are kept in output/run.json and skipped when the session is run again."""
+    A job of one patch chunk is an isolated reload. A larger job (a uniform or dense mixed recipe) goes back to the
+    floor, adds its chunks one after another and then computes, so the patch on disk stays one chunk. A job that fails
+    to apply in the session (memory) is skipped and named in the result key "failed". Completed jobs are kept in
+    output/run.json and skipped when the session is run again."""
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
     tokens = output / "latest.f32"
@@ -178,11 +220,20 @@ def run_session(command, jobs, sources, floor_choices, chunks, output, env, time
     if not pending and previous_floor is not None:
         return {job["label"]: per_chunk(output / f"{job['label']}.f32", chunks) for job in jobs}
 
+    started = time.monotonic()
+
     def save(label, result):
         tokens.replace(output / f"{label}.f32")
         results[label] = per_chunk(output / f"{label}.f32", chunks)
         record["jobs"].append({"label": label, "seconds": result["seconds"], "kl": float(results[label].mean())})
         write_json(record_path, record)
+        k = sum(1 for j in pending if j["label"] in results)
+        if label not in ("floor", "recompute", "restore") and k:
+            elapsed = time.monotonic() - started
+            left = elapsed / k * (len(pending) - k)
+            print(f"calibration {output.name}: pass {k}/{len(pending)} {label} KL {results[label].mean():.5f}, "
+                  f"elapsed {elapsed / 60:.1f} min, about {left / 60:.1f} min left (finish {time.strftime('%H:%M', time.localtime(time.time() + left))})",
+                  flush=True)
 
     session = hotswap_module().HotswapSession(command, output / f"session-{time.time_ns()}", timeout,
                                               env=env | {"LLAMA_KLD_TOKENS_FILE": str(tokens)})
@@ -191,24 +242,67 @@ def run_session(command, jobs, sources, floor_choices, chunks, output, env, time
         if previous_floor is not None and (output / "floor.f32").read_bytes() != previous_floor:
             raise QuantError(f"floor differs from the earlier session in {output}; remove it to measure again")
         save("recompute", session.request("compute"))
-        patch = output / "patch.gguf"
-        last = 0
+        last, failed, active = 0, [], False
+
+        def applied(result):
+            return set(re.findall(r"hotswap: reloaded tensor '([^']+)'", result["log"]))
+        # One item per patch chunk; the next chunk is written while the session evaluates the current one, so the
+        # quantization overlaps the passes and at most two chunks are on disk.
+        items = []
         for job in pending:
-            tensors = {n: q for g, q in job["choices"].items() for n in sources.members[g] if q != floor_choices[g]}
-            write_patch(patch, sources, tensors)
-            size = patch.stat().st_size
-            # A reload keeps the previous patch until it commits; free a large previous patch first.
-            if last and last + size > restore_bytes:
-                session.request("restore")
-            last = size
-            result = session.request("reload", patch)
-            applied = set(re.findall(r"hotswap: reloaded tensor '([^']+)'", result["log"]))
-            if set(tensors) - applied:
-                raise QuantError(f"hotswap did not apply every tensor of {job['label']}")
-            save(job["label"], result)
+            tensors = {n: q for g, q in job["choices"].items() for n in members[g] if q != floor_choices[g]}
+            parts = writer.chunks(tensors, {g: members[g] for g in job["choices"]})
+            items += [(job, tensors, part, k, len(parts)) for k, part in enumerate(parts)]
+        names = [writer.scratch / f"patch-{output.name}-{k}.gguf" for k in range(2)]
+        pool = ThreadPoolExecutor(max_workers=1)
+        future = pool.submit(writer.write, items[0][2], names[0]) if items else None
+        done, ok = set(), True
+        try:
+            for i, (job, tensors, part, k, count) in enumerate(items):
+                patch = future.result()
+                if i + 1 < len(items):
+                    future = pool.submit(writer.write, items[i + 1][2], names[(i + 1) % 2])
+                if count == 1:
+                    size = writer.bytes_of(part)
+                    # A reload keeps the previous patch until it commits; free a large previous patch first.
+                    if last and last + size > restore_bytes:
+                        session.request("reset")
+                    last, active = size, True
+                    result = session.request("reload", patch)
+                    patch.unlink(missing_ok=True)
+                    if set(tensors) - applied(result):
+                        raise QuantError(f"hotswap did not apply every tensor of {job['label']}")
+                    save(job["label"], result)
+                    continue
+                if k == 0:
+                    session.request("reset")
+                    done, ok = set(), True
+                if ok:
+                    try:
+                        done |= applied(session.request("add", patch))
+                    except RuntimeError as exc:
+                        print(f"{job['label']}: cannot apply in the session ({exc}); it runs as a separate model", flush=True)
+                        ok = False
+                patch.unlink(missing_ok=True)
+                if k + 1 < count:
+                    continue
+                if ok:
+                    if set(tensors) - done:
+                        raise QuantError(f"hotswap did not apply every tensor of {job['label']}")
+                    save(job["label"], session.request("compute"))
+                else:
+                    failed.append(job["label"])
+                session.request("reset")
+                last, active = 0, False
+        finally:
+            pool.shutdown(wait=True)
+            for name in names:
+                name.unlink(missing_ok=True)
         if pending:
-            save("restore", session.request("restore"))
-        patch.unlink(missing_ok=True)
+            # The control evaluates the floor again after the patches; a reset already went back to it.
+            save("restore", session.request("restore" if active else "compute"))
+        if failed:
+            results["failed"] = failed
     finally:
         session.close()
     for label in ("recompute", "restore") if pending else ("recompute",):
@@ -216,7 +310,7 @@ def run_session(command, jobs, sources, floor_choices, chunks, output, env, time
                               np.fromfile(output / "floor.f32", dtype=np.float32)):
             raise QuantError(f"{label} control differs from the floor; the session is not reproducible")
     for job in jobs:
-        if job["label"] not in results:
+        if job["label"] not in results and job["label"] not in results.get("failed", ()):
             results[job["label"]] = per_chunk(output / f"{job['label']}.f32", chunks)
     return results
 
@@ -362,22 +456,22 @@ def teacher_logits(cfg, c, output, timeout):
     return teacher
 
 
-def measured(output, devices, shares, direct):
-    """Whether every pass has a result that run_session and the direct runs would reuse."""
-    for device in devices:
-        session = output / f"session-{device}"
-        record = session / "run.json"
-        done = {j["label"] for j in json.loads(record.read_text())["jobs"]} if record.exists() else set()
-        if not (session / "floor.f32").exists() or any(j["label"] not in done or not (session / f"{j['label']}.f32").exists()
-                                                       for j in shares[device]):
-            return False
-    return all((output / f"session-{devices[0]}" / f"{j['label']}.f32").exists() for j in direct)
+def available_ram():
+    """MemAvailable in bytes, or None where /proc/meminfo is absent."""
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) << 10
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
 
 
-def calibrate(data, cfg, output, encode, verify, timeout=7200, text_dir=None):
+def calibrate(data, cfg, output, encode, verify, timeout=7200, text_dir=None, scratch=None):
     """Measure the probes and write the quality table; encode/verify are the advisor's model writer and checker.
 
-    Weighted calibration corpora are composed into one text in text_dir (the prepared directory) first."""
+    Weighted calibration corpora are composed into one text in text_dir (the prepared directory) first. Patches (and
+    a probe model for a uniform recipe that runs as a separate model) go to scratch (default: output)."""
     output = Path(output).resolve()
     output.mkdir(parents=True, exist_ok=True)
     text, corpora = calibration_text(cfg["calibration"], text_dir or output)
@@ -392,24 +486,27 @@ def calibrate(data, cfg, output, encode, verify, timeout=7200, text_dir=None):
     print(f"Probe qtypes: mid {mid}, top {top}", flush=True)
     jobs = design(groups, mid, top, c)
     devices = c["devices"] or [gpu(cfg)]
-    hot = [j for j in jobs if "direct" not in j]
-    direct = [j for j in jobs if "direct" in j]
+    members = {g["name"]: g["members"] for g in info["groups"]}
+    writer = PatchWriter(cfg, info, data["imatrix"], Path(scratch or output), c["patch_mib"])
+    # A uniform recipe holds every modelled tensor at the probe qtype next to the floor in the session. With routed
+    # experts in RAM, it runs as a separate probe model instead when that copy does not fit in the available RAM.
+    ram = measure_cmoe(cfg) and (devices == [gpu(cfg)] or gpu_only(cfg))
+    free = available_ram()
+
+    def separate(job):
+        if c["uniform"] != "auto":
+            return c["uniform"] == "direct"
+        need = writer.bytes_of({n: job["direct"] for g in groups for n in g["members"] if "_exps" in n}) if ram else 0
+        return free is not None and need > free - (16 << 30)
+    dev0 = output / f"session-{devices[0]}"
+    recorded = json.loads((dev0 / "run.json").read_text())["jobs"] if (dev0 / "run.json").exists() else []
+    recorded = {j["label"] for j in recorded}
+    # Uniform results from a separate run (older work directories) are kept.
+    direct = [j for j in jobs if "direct" in j and (separate(j) or ((dev0 / f"{j['label']}.f32").exists()
+                                                                   and j["label"] not in recorded))]
+    hot = [j for j in jobs if j not in direct]
     shares = {d: hot[i::len(devices)] for i, d in enumerate(devices)}
-    # The passes depend on the floor, probes and teacher, not on the other candidates, so a table refitted after the
-    # candidate pool changes reuses them; the probe models are only needed while a pass is missing.
-    paths = {}
-    for q in (mid, top) if not measured(output, devices, shares, direct) else ():
-        choices = dict(floor_choices)
-        choices.update({g["name"]: q for g in groups})
-        path = output / f"probe-{q}.gguf"
-        if path.exists():
-            verify(info, {n: choices[g["name"]] for g in info["groups"] for n in g["members"]}, path)
-        else:
-            encode(info, cfg, choices, data["imatrix"], path)
-        paths[q] = str(path)
     teacher = teacher_logits(cfg, c, output, timeout)
-    sources = Sources(paths)
-    sources.members = {g["name"]: g["members"] for g in info["groups"]}
     results, errors = {}, []
     env = measure_env(cfg)
     previous = signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
@@ -417,11 +514,13 @@ def calibrate(data, cfg, output, encode, verify, timeout=7200, text_dir=None):
     def worker(device):
         try:
             command = perplexity_command(cfg, c, data["baseline"]["path"], device, teacher)
-            out = run_session(command, shares[device], sources, floor_choices, c["chunks"], output / f"session-{device}", env, timeout)
+            out = run_session(command, shares[device], writer, members, floor_choices, c["chunks"],
+                              output / f"session-{device}", env, timeout)
             results[device] = out
         except Exception as exc:  # reported after every session ends
             errors.append(f"{device}: {exc}")
-    print(f"Measuring {len(hot)} patch probes on {', '.join(devices)} and {len(direct)} uniform recipes", flush=True)
+    print(f"Measuring {len(hot)} patch probes on {', '.join(devices)}"
+          + (f" and {len(direct)} uniform recipes as separate models" if direct else ""), flush=True)
     try:
         threads = [threading.Thread(target=worker, args=(d,)) for d in devices]
         for t in threads:
@@ -430,16 +529,30 @@ def calibrate(data, cfg, output, encode, verify, timeout=7200, text_dir=None):
             t.join()
         if errors:
             raise QuantError("calibration session failed: " + "; ".join(errors))
-        direct_out = output / f"session-{devices[0]}"
+        failed = {label for out in results.values() for label in out.pop("failed", ())}
+        direct += [j for j in jobs if j["label"] in failed and j not in direct]
         for job in direct:
-            target = direct_out / f"{job['label']}.f32"
+            target = dev0 / f"{job['label']}.f32"
             if not target.exists():
-                command = perplexity_command(cfg, c, paths[job["direct"]], devices[0], teacher)
-                run_direct(command, direct_out / "latest.f32", direct_out / f"{job['label']}.log", env, timeout)
-                (direct_out / "latest.f32").replace(target)
+                # One probe model at a time, deleted after its run.
+                choices = dict(floor_choices)
+                choices.update(job["choices"])
+                path = writer.scratch / f"probe-{job['label']}.gguf"
+                path.unlink(missing_ok=True)
+                encode(info, cfg, choices, data["imatrix"], path)
+                try:
+                    command = perplexity_command(cfg, c, path, devices[0], teacher)
+                    run_direct(command, dev0 / "latest.f32", dev0 / f"{job['label']}.log", env, timeout)
+                    (dev0 / "latest.f32").replace(target)
+                finally:
+                    for suffix in (".gguf", ".encode.json", ".encode.log", ".tensor-types.txt"):
+                        path.with_suffix(suffix).unlink(missing_ok=True)
             results.setdefault(devices[0], {})[job["label"]] = per_chunk(target, c["chunks"])
     finally:
         signal.signal(signal.SIGTERM, previous)
+    if writer.count:
+        print(f"Patches: {writer.count} written from the source, {writer.bytes / 2**30:.1f} GiB in total, "
+              f"{writer.seconds / 60:.1f} min", flush=True)
     observations, probes, floors = [], [], {}
     for device, out in results.items():
         floor = per_chunk(output / f"session-{device}" / "floor.f32", c["chunks"])
