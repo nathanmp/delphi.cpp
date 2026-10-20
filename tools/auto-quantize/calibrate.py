@@ -19,6 +19,7 @@ its run.
 from __future__ import annotations
 
 import importlib.util
+import itertools
 import json
 import math
 import os
@@ -359,6 +360,10 @@ def levenberg_marquardt(fun, x0, iterations=200):
     return x, r
 
 
+# Lower bound of kappa_inf: above about 0.119, kappa(u) * u grows with u everywhere, so more gain never predicts more loss.
+KAPPA_MIN = 0.12
+
+
 class Fit:
     """Parameters of quality.py. Per role: log sensitivities at the probe band centres (piecewise linear in the layer)
     and gamma; global: kappa_inf and u0. A penalty on second differences of the log sensitivities keeps the depth
@@ -385,7 +390,7 @@ class Fit:
             params[r] = {"knots": self.knots[r], "log_s": [float(v) for v in z[i:i + n]],
                          "gamma": float(0.05 + 2.95 / (1 + math.exp(-z[i + n])))}
             i += n + 1
-        kinf = float(1 + 9 / (1 + math.exp(-z[i])))
+        kinf = float(KAPPA_MIN + (10 - KAPPA_MIN) / (1 + math.exp(-z[i])))
         u0 = float(0.01 + 4.99 / (1 + math.exp(-z[i + 1])))
         return params, kinf, u0
 
@@ -422,13 +427,15 @@ class Fit:
         choices = [o[0] for o in observations]
         mean_metric = np.mean([self.metric[g["name"], g["floor"]] for g in self.groups])
         best = None
-        for gamma0 in (0.7, 1.0, 1.5):
+        # kappa_inf starts super-additive (1.54) and sub-additive (0.6): with an IQ2 floor and Q8_0 upgrades the gains
+        # saturate as the KL approaches zero (OLMoE: kappa_inf 0.12, held-out recipe 0.0254 predicted vs 0.0237 measured)
+        for gamma0, kappa0 in itertools.product((0.7, 1.0, 1.5), (1.54, 0.6)):
             zg = math.log((gamma0 - 0.05) / (3.0 - gamma0))
             c0 = math.log(1.0 / (len(self.groups) * max(mean_metric, 1e-12) ** gamma0))
             z0 = []
             for r in self.roles:
                 z0 += [c0] * len(self.knots[r]) + [zg]
-            z0 += [math.log(0.6 / 9.4), 0.0]
+            z0 += [math.log((kappa0 - KAPPA_MIN) / (10 - kappa0)), 0.0]
 
             def residuals(v):
                 return np.concatenate([(self.predict(*self.unpack(v), choices) - y) / se, self.penalty(v)])

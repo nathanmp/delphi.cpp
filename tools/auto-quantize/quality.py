@@ -217,7 +217,7 @@ def load_quality(info, cfg, prepared):
             if not isinstance(value, (int, float)) or not math.isfinite(value):
                 raise QuantError(f"quality role {role} knots and sensitivities must be finite")
         number(entry["gamma"], f"quality role {role} gamma", positive=True)
-    number(table["composition"]["kappa_inf"], "kappa_inf", minimum=1)
+    number(table["composition"]["kappa_inf"], "kappa_inf", minimum=0.12)
     number(table["composition"]["u0"], "u0", positive=True)
     number(table["floor"]["kl"], "floor KL", positive=True)
     table["identity"] = file_identity(path, content=True)

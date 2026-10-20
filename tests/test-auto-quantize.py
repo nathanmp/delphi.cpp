@@ -725,7 +725,7 @@ class Quality(unittest.TestCase):
         self.load()
         bad_knots = {**self.table["roles"], "gu": {"knots": [2.5, 0.5], "log_s": [-2.0, -1.8], "gamma": 1.0}}
         for table in (dict(self.table, roles=bad_knots), dict(self.table, damage="0" * 64), dict(self.table, floor={"choices": {**self.floor, "blk.0.ffn_down_exps.weight": "Q4_K"}, "kl": .1}),
-                      dict(self.table, schema="delphi.floor-quality/2"), dict(self.table, composition={"kappa_inf": .5, "u0": .3})):
+                      dict(self.table, schema="delphi.floor-quality/2"), dict(self.table, composition={"kappa_inf": .05, "u0": .3})):
             with self.assertRaises(QuantError):
                 self.load(table)
         with self.assertRaises(QuantError):
@@ -793,6 +793,20 @@ class Quality(unittest.TestCase):
         self.assertAlmostEqual(params["gu"]["gamma"], 1.1, delta=.15)
         # a step at the first down band survives the smoothness penalty
         self.assertGreater(params["dn"]["log_s"][0] - params["dn"]["log_s"][1], .4)
+
+    def test_fit_recovers_a_saturating_composition(self):
+        groups = modelled_groups(self.model, self.floor)
+        records = {(t["name"], q["qtype"]): q["R"] for t in self.damage[0]["tensors"] for q in t["runs"][0]["types"]}
+        fit = Fit(groups, records, 4, 4)
+        knots = [0.0, 1.0, 2.0, 3.0]
+        truth = {"gu": {"knots": knots, "log_s": [-1.0, -0.9, -0.7, -0.4], "gamma": 1.0},
+                 "dn": {"knots": knots, "log_s": [-0.5, -0.8, -0.9, -1.0], "gamma": 1.0}}
+        jobs = design(groups, "Q4_K", "Q6_K", {"bands": 4, "recipes": 8, "seed": 3})
+        observations = [(j["choices"], float(y), .002) for j, y in zip(jobs, fit.predict(truth, .4, 1.0, [j["choices"] for j in jobs]))]
+        params, kinf, u0, chi2 = fit.fit(observations)
+        predicted = fit.predict(params, kinf, u0, [o[0] for o in observations])
+        self.assertLess(np.max(np.abs(predicted - np.array([o[1] for o in observations]))), .004)
+        self.assertLess(kinf, 1)
 
     def test_design_cost_is_independent_of_the_candidate_count(self):
         groups = modelled_groups(self.model, self.floor)
