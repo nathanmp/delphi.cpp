@@ -151,6 +151,8 @@ python tools/auto-quantize/quant_cli.py plan --config config.json --work /tmp/au
 python tools/auto-quantize/quant_cli.py show --frontier /tmp/autoq/plans/plan-001/frontier.json --detail best
 ```
 
+Long stages print progress lines to stdout: `[stage] step k/n (p%) elapsed HH:MM:SS finish HH:MM:SS (in HH:MM:SS)`, or bytes for file-writing stages. A stage prints at most one line every 30 seconds (`DELPHI_QUANT_PROGRESS_SECONDS` changes it, `0` prints every step) and never uses carriage returns, so a redirected log stays readable. The stages are operation measurement, damage sampling, baseline and probe encoding, baseline profiling, teacher logits, calibration passes (passes done and total, from the mean recorded pass time and the number of sessions), the plan search and the final encode. A stage with no countable step (profiling, search) prints a heartbeat with the elapsed time only.
+
 `--max-size 55GiB` caps the summed tensor bytes over all devices (`bounds.max_total_bytes`: one pooled knapsack, device capacities still checked). `--minimize size --max-kld 0.05` finds the smallest recipe whose predicted KL is within the ceiling (`search.minimize: size`): it bisects the pooled byte cap on the exact minimum-loss knapsack, then plans under that cap. Speed bounds and device capacities are checked on the result only. With a GPU-only configuration, the chosen recipe is followed by a `Run with:` line holding its `--device`, `-sm` and `-ts` arguments, and sizes count the host-resident input embedding. Run `python tests/test-quant-cli.py` for the offline checks.
 
 ## Workflow

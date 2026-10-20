@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 
 from config import ROOT, QuantError, digest, file_identity, write_json
+import progress
 from model import is_lazy, lazy_args, tensor_bytes
 
 sys.path.insert(0, str(ROOT))
@@ -205,6 +206,16 @@ def measure_ops(info, cfg, directory, timeout=600):
             values = old["values"]
     import time
     deadline = time.monotonic() + timeout
+    with progress.stage("prepare: operation measurement", total=len(sigs)) as steps:
+        measure_signatures(sigs, values, binary, cfg, directory, environment, identity, cache_path, deadline, steps)
+    return values
+
+
+def measure_signatures(sigs, values, binary, cfg, directory, environment, identity, cache_path, deadline, steps):
+    import time
+    pending = sum(key not in values for key in sigs)
+    started, fresh = time.monotonic(), 0
+    steps.update(len(sigs) - pending)
     for key, sig in sorted(sigs.items()):
         if key in values:
             continue
@@ -225,7 +236,9 @@ def measure_ops(info, cfg, directory, timeout=600):
         values[key] = {"signature": sig, "ms": statistics.median(measured) / 1000 if measured else None,
                        "command": command, "log": str(log), "reason": None if measured else "backend did not run this signature"}
         write_json(cache_path, {"schema": "delphi.auto-quantize.operations/1", "identity": identity, "values": values})
-    return values
+        # the estimate counts only the signatures that need a run; cached ones cost nothing
+        fresh += 1
+        steps.update(len(sigs) - pending + fresh, eta=(time.monotonic() - started) / fresh * (pending - fresh))
 
 
 def active_experts(count, top_k, tokens):

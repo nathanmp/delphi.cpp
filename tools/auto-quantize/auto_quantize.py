@@ -12,7 +12,8 @@ import sys
 from pathlib import Path
 
 from config import AXES, SCHEMA, QuantError, digest, file_identity, imatrix_identities, imatrix_inputs, load_config, write_json
-from model import classify, is_lazy, merge_imatrices, read_model
+import progress
+from model import classify, is_lazy, merge_imatrices, read_model, tensor_bytes
 from calibrate import calibrate, per_chunk, perplexity_command, run_direct
 from corpus import collect_imatrices
 from quality import LossModel, load_quality, quality_metadata
@@ -70,7 +71,11 @@ def get_damage(info, cfg, directory, imatrix):
         if not cfg["sampling"]["row_stats"]:
             command += ["--no-row-stats"]
         print(f"Sampling {category}: {len(selected)} tensors, {len(qtypes)} qtypes", flush=True)
-        run(command, directory / f"damage-{category}.log", cfg["runtime"]["env"])
+        log = directory / f"damage-{category}.log"
+        # llama-quant-damage prints one header line per sampled tensor
+        probe = lambda: (progress.count_matches(log, r"^\S+ \[[0-9, ]+\] \S+,"), len(selected), None, "")
+        with progress.Watcher(f"prepare: damage sampling ({category})", probe, total=len(selected), poll=5.0):
+            run(command, log, cfg["runtime"]["env"])
         artifact = json.loads((directory / f"damage-{category}.json").read_text())
         artifacts.append(artifact)
         paths.append(str(directory / f"damage-{category}.json"))
@@ -126,7 +131,9 @@ def encode(info, cfg, choices, imatrix, output, quality=None):
         command += ["--allow-requantize"]
     command += [cfg["model"], str(partial), "Q2_K", str(cfg["runtime"]["threads"])]
     print(f"Encoding {output.name}", flush=True)
-    run(command, output.with_suffix(".encode.log"), cfg["runtime"]["env"])
+    expected = sum(tensor_bytes(t["shape"], types[t["name"]]) for t in info["tensors"])
+    with progress.watch_file(f"encode {output.name}", partial, expected):
+        run(command, output.with_suffix(".encode.log"), cfg["runtime"]["env"])
     verify_output(info, types, partial)
     partial.replace(output)
     write_json(output.with_suffix(".encode.json"), {"command": command, "types": types, "source": info["identity"],
@@ -206,7 +213,8 @@ def prepare(cfg, directory, timeout):
     else:
         encode(info, cfg, baseline_choices, imatrix, baseline)
     print("Profiling baseline short/long prefill and decode", flush=True)
-    profile = profile_model(cfg, baseline, directory / "baseline-profile.json", placement=mem.get("layer_split"))
+    with progress.Watcher("prepare: profiling baseline", lambda: None):
+        profile = profile_model(cfg, baseline, directory / "baseline-profile.json", placement=mem.get("layer_split"))
     result = {"schema": SCHEMA, "input_key": key, "config": cfg, "model": info, "damage": damage,
               "operations": operations, "excluded": excluded, "imatrix": imatrix,
               "baseline": {"path": str(baseline), "choices": baseline_choices, "measured_ms": profile_times(profile, cfg),
@@ -254,7 +262,8 @@ def loss_model(data, cfg):
 def plan(data, cfg, output):
     model, table = loss_model(data, cfg)
     predictor = predictor_for(data, cfg)
-    result = search(data["model"], cfg, predictor, data["baseline"]["choices"], model)
+    with progress.Watcher("plan: search", lambda: None):
+        result = search(data["model"], cfg, predictor, data["baseline"]["choices"], model)
     outdir = Path(output).resolve()
     outdir.mkdir(parents=True, exist_ok=True)
     recipes = []
@@ -481,7 +490,8 @@ def main():
                 if not data["imatrix"]:
                     # Without activation statistics R is a weight-space error and misranks groups inside a band.
                     raise QuantError("calibration needs an imatrix so that the sampled local error is activation-weighted")
-                calibrate(data, cfg, args.output, encode, verify_output, text_dir=args.prepared.resolve().parent)
+                with progress.CalibrationWatcher(args.output):
+                    calibrate(data, cfg, args.output, encode, verify_output, text_dir=args.prepared.resolve().parent)
             elif args.command == "plan":
                 plan(data, cfg, args.output)
             else:

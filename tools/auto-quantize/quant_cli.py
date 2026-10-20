@@ -16,6 +16,7 @@ from pathlib import Path
 
 from config import AXES, QuantError, capacity, load_config
 import frontier as fr
+import progress
 
 WEIGHT_NAMES = {"loss": "precision", "kld": "precision", "precision": "precision", "decode": "decode", "short": "short",
                 "long": "long"}
@@ -102,7 +103,8 @@ def command_setup(args):
         if not cfg["calibration"]["text"]:
             raise QuantError("calibration.text is required (or pass --skip-calibrate)")
         data = aq.load_prepared(p["prepared"] / "prepared.json", cfg)
-        calibrate(data, cfg, p["quality"], aq.encode, aq.verify_output, text_dir=p["prepared"])
+        with progress.CalibrationWatcher(p["quality"]):
+            calibrate(data, cfg, p["quality"], aq.encode, aq.verify_output, text_dir=p["prepared"])
     print(f"Ready: python {sys.argv[0]} plan --config {args.config} --work {args.work} ...")
 
 
