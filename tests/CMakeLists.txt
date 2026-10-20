@@ -208,6 +208,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # llama_build_and_test(test-double-float.cpp) # SLOW
 
     llama_build(test-llama-archs.cpp)
+    llama_test(test-llama-archs NAME test-deepseek41-ced ARGS --ced-trim --numa tensors --seed 1234)
     llama_build_and_test(test-glm5next-sparse.cpp)
     # requires a full GLM-5-Next GGUF as argv[1], so it is built but not registered
     llama_build(test-glm5next-pool-cache.cpp)

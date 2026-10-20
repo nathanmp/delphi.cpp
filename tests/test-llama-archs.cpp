@@ -1136,6 +1136,17 @@ static int test_deepseek41_ced(const size_t seed) {
             compare(eval(mask.second.get(), pos, 63, {0}), eval(trim.second.get(), pos, 63, {0}));
         }
         mem_trim->clear(true);
+        mem_mask->clear(true);
+        rows.assign(5, 0);
+        compare(eval(mask.second.get(), 0, 126, {0}), eval(trim.second.get(), 0, 126, {0}));
+        GGML_ASSERT(rows[0] == 126 && rows[1] == 126);
+        GGML_ASSERT(rows[2] == 2*keep && rows[3] == 2*keep && rows[4] == 2*keep);
+        mem_trim->clear(true);
+        mem_mask->clear(true);
+        compare(eval(mask.second.get(), 0, 65, {0}), eval(trim.second.get(), 0, 65, {0}));
+        GGML_ASSERT(dec->get_cells(0).get_used() >= keep + 1);
+        GGML_ASSERT(dec->seq_pos_max(0) == 64);
+        mem_trim->clear(true);
         mem_full->clear(true);
         // All-row logits require the full decoder, including rows outside the suffix.
         compare(get_logits(full.first.get(), full.second.get(), {tokens.begin(), tokens.begin() + 65}),
