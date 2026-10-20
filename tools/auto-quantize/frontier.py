@@ -101,3 +101,37 @@ def detail(recipe):
     for name, q in recipe["tensor_types"].items():
         kinds.setdefault(re.sub(r"^blk\.[0-9]+\.", "", name).removesuffix(".weight"), Counter())[q] += 1
     return {kind: ", ".join(f"{q} x{n}" for q, n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))) for kind, counts in sorted(kinds.items())}
+
+
+DIVERSE_KEYS = ("kld", "size", "decode", "short", "long")
+
+
+def near(a, b, tolerance):
+    """Whether every predicted metric of two rows is within the relative tolerance."""
+    return all(abs(a[k] - b[k]) <= tolerance * max(abs(b[k]), 1e-12) for k in DIVERSE_KEYS)
+
+
+def diverse(all_rows, n, tolerance=0.02):
+    """At most n rows for a choice: the best-score row and the min-KL row, then the best scores that are not within
+    `tolerance` on every predicted metric of a row already chosen. Sorted by size."""
+    ordered = sorted(all_rows, key=lambda r: r["score"])
+    chosen = [ordered[0]]
+    lowest = min(all_rows, key=lambda r: r["kld"])
+    if lowest not in chosen:
+        chosen.append(lowest)
+    for r in ordered:
+        if len(chosen) >= n:
+            break
+        if r not in chosen and not any(near(r, c, tolerance) for c in chosen):
+            chosen.append(r)
+    return sorted(chosen, key=lambda r: (r["size"], r["kld"]))
+
+
+def run_table(shown, loss_label="pred KL"):
+    """Numbered table of the choice of `run`: row, size, predicted KL, decode/short/long t/s and score (* = best score)."""
+    best = min(shown, key=lambda r: r["score"])
+    lines = [f"{'row':>3s}  {'id':<10s} {'size GiB':>9s} {loss_label:>9s} {'decode':>8s} {'short':>8s} {'long':>8s} {'score':>8s}"]
+    for i, r in enumerate(shown, 1):
+        lines.append(f"{i:>3d}{'*' if r is best else ' '} {r['id']:<10s} {r['size'] / GIB:9.2f} {r['kld']:9.4g} {r['decode']:8.2f} "
+                     f"{r['short']:8.1f} {r['long']:8.1f} {r['score']:8.4f}")
+    return "\n".join(lines)
