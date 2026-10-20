@@ -804,6 +804,13 @@ class Quality(unittest.TestCase):
         records = {(t["name"], q["qtype"]): q["R"] for t in self.damage[0]["tensors"] for q in t["runs"][0]["types"]}
         self.assertEqual(probe_qtypes(groups, records, {"probe_qtypes": None}), ("Q4_K", "Q6_K"))
 
+    def test_plans_beyond_the_top_probe_are_marked_extrapolated(self):
+        model = LossModel(self.model, {**self.table, "probe_qtypes": {"mid": "Q2_K", "top": "Q4_K"}}, self.damage)
+        group = next(iter(model.groups))
+        self.assertEqual(model.extrapolated({**self.floor, group: "Q4_K"}), [])
+        self.assertEqual(model.extrapolated({**self.floor, group: "Q6_K"}), [group])
+        self.assertEqual(LossModel(self.model, self.table, self.damage).extrapolated({**self.floor, group: "Q6_K"}), [])
+
     def test_patch_chunks_hold_whole_groups_within_the_limit(self):
         config = {**self.config, "bindir": "/nonexistent", "model": str(self.source), "runtime": {"threads": 1, "env": {}}}
         writer = PatchWriter(config, self.model, None, self.root / "scratch", patch_mib=1)
@@ -821,6 +828,25 @@ class Quality(unittest.TestCase):
         writer.patch_bytes = 1
         self.assertEqual(len(writer.chunks(tensors, members)), len(members))
 
+    def test_default_pools_reach_q8_0_and_fit_the_row_length(self):
+        base = {"schema": "delphi.auto-quantize/1", "model": str(self.source), "devices": "ROCm1:16000,RAM:16000"}
+        path = self.root / "config.json"
+        write_json(path, base)
+        parsed = load_config(path)
+        self.assertIn("Q8_0", parsed["primary_qtypes"])
+        self.assertEqual(parsed["other_qtypes"], ["Q8_0"])
+        self.assertEqual(parsed["calibration"]["uniform"], "auto")
+        source = {"architecture": "olmoe", "n_expert": 8, "top_k": 2, "tensors": [
+            tensor("blk.0.ffn_down_exps.weight", (96, 256, 8)), tensor("blk.0.ffn_up_exps.weight")]}
+        model = classify(source, {**cfg(), **{k: parsed[k] for k in ("primary_qtypes", "other_qtypes", "default_pools")}})
+        pools = {t["name"]: t["pool"] for t in model["tensors"]}
+        self.assertIn("Q8_0", pools["blk.0.ffn_down_exps.weight"])
+        self.assertNotIn("Q4_K", pools["blk.0.ffn_down_exps.weight"])
+        self.assertIn("Q4_K", pools["blk.0.ffn_up_exps.weight"])
+        for bad in ({"uniform": "maybe"}, {"patch_mib": 0}):
+            write_json(path, {**base, "calibration": bad})
+            with self.assertRaises(QuantError):
+                load_config(path)
 
     def test_configuration(self):
         base = {"schema": "delphi.auto-quantize/1", "model": str(self.source), "devices": "ROCm1:16000,RAM:16000",

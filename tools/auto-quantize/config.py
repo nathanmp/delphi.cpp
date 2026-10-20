@@ -138,6 +138,11 @@ def write_json(path, value):
     temporary.replace(path)
 
 
+DEFAULT_PRIMARY_QTYPES = ("IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ2_KS", "IQ2_K", "Q2_K", "IQ3_XXS", "IQ3_S", "IQ3_KS", "IQ3_K",
+                          "Q3_K", "IQ4_XS", "IQ4_KS", "IQ4_NL", "IQ4_K", "Q4_0", "Q4_K", "MXFP4", "Q5_0", "IQ5_KS",
+                          "IQ5_K", "Q5_K", "IQ6_K", "Q6_K", "Q8_0")
+
+
 def load_config(path):
     path = Path(path).resolve()
     cfg = json.loads(path.read_text())
@@ -176,6 +181,11 @@ def load_config(path):
         raise QuantError("at least one importance must be positive")
     cfg["importance"] = {axis: value / total for axis, value in priorities.items()}
     cfg["preserve_below_mib"] = number(cfg.get("preserve_below_mib", 1), "preserve_below_mib")
+    # Without explicit pools: every weight type with GPU kernels up to Q8_0 for the primary (expert or FFN) tensors,
+    # so the top calibration probe is Q8_0 and no plan goes beyond the probed range; the other tensors stay Q8_0.
+    cfg["default_pools"] = [name for name in ("primary_qtypes", "other_qtypes") if name not in cfg]
+    cfg.setdefault("primary_qtypes", list(DEFAULT_PRIMARY_QTYPES))
+    cfg.setdefault("other_qtypes", ["Q8_0"])
     cfg.setdefault("tie_gate_up", True)
     for field in ("tie_gate_up", "allow_requantize"):
         if field in cfg and not isinstance(cfg[field], bool):

@@ -133,6 +133,9 @@ def classify(info, cfg):
             raise QuantError("source is quantized; set allow_requantize for source-relative damage")
         t["preserved"] = preserve
         t["pool"] = [t["source_dtype"]] if preserve else ([qtype(cfg["pins"][name])] if name in cfg["pins"] else pools[t["category"]])
+        if t["category"] + "_qtypes" in cfg.get("default_pools", ()) and not preserve and name not in cfg["pins"]:
+            # default pools: only the types whose block fits the row length of this tensor
+            t["pool"] = [q for q in t["pool"] if shape[0] % GGML_QUANT_SIZES[GGMLQuantizationType[q]][0] == 0]
         t["pool"] = sorted(set(t["pool"]))
     groups, assigned = [], set()
     by_name = {t["name"]: t for t in info["tensors"]}
