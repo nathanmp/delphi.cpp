@@ -804,6 +804,15 @@ class Quality(unittest.TestCase):
         records = {(t["name"], q["qtype"]): q["R"] for t in self.damage[0]["tensors"] for q in t["runs"][0]["types"]}
         self.assertEqual(probe_qtypes(groups, records, {"probe_qtypes": None}), ("Q4_K", "Q6_K"))
 
+    def test_predicted_loss_stops_at_the_measured_uniform_top_recipe(self):
+        full = {g: None for g in LossModel(self.model, self.table, self.damage).groups}
+        free = LossModel(self.model, self.table, self.damage).predict({**self.floor, **full})["loss"]
+        table = {**self.table, "probe_qtypes": {"mid": "Q2_K", "top": "Q6_K"},
+                 "fit": {"probes": [{"label": "uniform-Q6_K", "kl": free + 0.5}]}}
+        model = LossModel(self.model, table, self.damage)
+        self.assertEqual(model.predict({**self.floor, **full})["loss"], free + 0.5)
+        self.assertEqual(model.predict(self.floor)["loss"], max(self.table["floor"]["kl"], free + 0.5))
+
     def test_plans_beyond_the_top_probe_are_marked_extrapolated(self):
         model = LossModel(self.model, {**self.table, "probe_qtypes": {"mid": "Q2_K", "top": "Q4_K"}}, self.damage)
         group = next(iter(model.groups))

@@ -111,6 +111,11 @@ class LossModel:
         self.roles = table["roles"]
         self.kinf, self.u0 = table["composition"]["kappa_inf"], table["composition"]["u0"]
         self.kl_floor = table["floor"]["kl"]
+        # The measured uniform recipe at the top probe qtype is the lowest loss that the pools reach: the linear gains
+        # go below it (and below zero) for large recipes, so predictions stop there.
+        top = table.get("probe_qtypes", {}).get("top")
+        uniform = [p["kl"] for p in table.get("fit", {}).get("probes", []) if p.get("label") == f"uniform-{top}"]
+        self.kl_min = min(uniform) if uniform else 0.0
         self.groups = {g["name"]: g for g in modelled_groups(info, table["floor"]["choices"])}
         for g in self.groups.values():
             if g["role"] not in self.roles:
@@ -174,7 +179,7 @@ class LossModel:
     def predict(self, choices):
         g = sum(self.gain(name, choices[name]) for name in self.groups)
         u = g / self.full
-        return {"loss": self.kl_floor * (1 - self.kappa(u) * g), "gain": g, "u": u}
+        return {"loss": max(self.kl_floor * (1 - self.kappa(u) * g), self.kl_min), "gain": g, "u": u}
 
 
 def check_files(expected, paths, label, weights=None):
