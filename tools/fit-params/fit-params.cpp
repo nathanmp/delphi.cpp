@@ -5,6 +5,7 @@
 #include "common.h"
 #include "fit.h"
 #include "log.h"
+#include "mtmd.h"
 
 #include <cinttypes>
 
@@ -72,6 +73,16 @@ int llama_fit_params(int argc, char ** argv) {
         common_log_flush(common_log_main());
 
         common_fit_print(params.model.path.c_str(), &mparams, &cparams);
+
+        // the multimodal projector (weights and worst-case compute buffers) goes to the first device, as in the server
+        if (!params.mmproj.path.empty()) {
+            mtmd_context_params mp = mtmd_context_params_default();
+            mp.use_gpu = params.mmproj_use_gpu;
+            mp.device  = params.mmproj_device;
+            for (const auto & [dev, size] : mtmd_get_memory_usage(params.mmproj.path.c_str(), mp)) {
+                printf("mmproj %s %zu\n", ggml_backend_dev_name(dev), (size + (1 << 20) - 1) / (1 << 20));
+            }
+        }
     }
 
     return 0;
