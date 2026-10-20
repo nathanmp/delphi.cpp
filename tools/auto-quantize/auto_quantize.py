@@ -490,7 +490,7 @@ def main():
                 if not data["imatrix"]:
                     # Without activation statistics R is a weight-space error and misranks groups inside a band.
                     raise QuantError("calibration needs an imatrix so that the sampled local error is activation-weighted")
-                with progress.CalibrationWatcher(args.output, passes=False):
+                with progress.CalibrationWatcher(args.output):
                     calibrate(data, cfg, args.output, encode, verify_output, text_dir=args.prepared.resolve().parent)
             elif args.command == "plan":
                 plan(data, cfg, args.output)

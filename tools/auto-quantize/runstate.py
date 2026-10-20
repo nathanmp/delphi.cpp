@@ -27,6 +27,7 @@ class State:
     def __init__(self, work):
         self.path = Path(work) / "state.json"
         self.stages = json.loads(self.path.read_text())["stages"] if self.path.exists() else {}
+        self.skipped = set()  # stages that this run found finished
 
     def decide(self, name, inputs, previous):
         """('skip', []) for a finished stage; ('run', []) for a new one; ('rerun', changed keys) when inputs changed.

@@ -72,7 +72,7 @@ class Progress:
         self.interval = INTERVAL if interval is None else interval
         self.out, self.clock = out, clock
         self.start = clock()
-        self.done, self.last = 0, None
+        self.done, self.last, self.final_printed = 0, None, False
         if not quiet_start:
             self.out(f"[{name}] started at {clock_text(self.start, self.start)}"
                      + (f", total {size_text(total)}" if total and unit == "bytes" else f", {total:g} steps" if total else ""))
@@ -83,8 +83,11 @@ class Progress:
         self.done = done
         now = self.clock()
         final = bool(self.total) and done >= self.total
+        if final and self.final_printed:
+            return
         if self.last is not None and now - self.last < self.interval and not final:
             return
+        self.final_printed = final
         self.last = now
         elapsed = now - self.start
         if eta is None:
@@ -239,16 +242,25 @@ class CalibrationWatcher:
     passes (done / total, estimated from the mean pass time and the number of sessions).
 
     The total comes from the line that calibrate prints before the passes; without it the lines show the count only.
-    With passes=False the pass phase is left to calibrate.py, which prints its own pass lines."""
+    With passes=False the pass phase is left to calibrate.py, which prints its own pass lines. With passes=True the watcher
+    reports passes itself, unless calibrate prints a pass line of its own ("[...] ... pass ..."): then it stays quiet."""
 
     def __init__(self, output, teacher_bytes=None, probe_bytes=None, poll=2.0, passes=True, **kwargs):
         self.passes = passes
         self.output, self.teacher_bytes, self.probe_bytes = Path(output), teacher_bytes, probe_bytes
         self.total, self.devices, self.direct = None, 1, 0
-        self.watcher = Watcher("calibration", self.probe, poll=poll, **kwargs)
+        self.sink = kwargs.pop("out", emit)
+        self.own, self.foreign = set(), False
+        self.watcher = Watcher("calibration", self.probe, poll=poll, out=self.say, **kwargs)
         self.sniffer = None
 
+    def say(self, text):
+        self.own.add(text)
+        self.sink(text)
+
     def on_line(self, line):
+        if line not in self.own and re.match(r"\[[^\]]*\].*\bpass", line, re.I):
+            self.foreign = True
         m = PASS_LINE.search(line)
         if m:
             self.direct = int(m[3])
@@ -258,8 +270,9 @@ class CalibrationWatcher:
     def phase(self, name):
         """A new phase restarts the clock of the line, so elapsed and the estimate belong to it."""
         p = self.watcher.progress
+        unit = "" if name.endswith("passes") else "bytes"
         if p.name != name:
-            p.name, p.start, p.last = name, p.clock(), None
+            p.name, p.start, p.last, p.unit, p.final_printed = name, p.clock(), None, unit, False
             p.out(f"[{name}] started at {clock_text(p.start, p.start)}")
         return p
 
@@ -272,7 +285,7 @@ class CalibrationWatcher:
         if teacher.exists():
             self.phase("calibration: teacher logits")
             return teacher.stat().st_size, self.teacher_bytes, None, ""
-        if not self.passes:
+        if not self.passes or self.foreign:
             return False
         done, mean, floor = calibration_counts(self.output)
         if not done and not self.total:
