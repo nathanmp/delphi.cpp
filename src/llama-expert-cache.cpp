@@ -2,6 +2,7 @@
 #include "llama-model.h"
 #include "llama-impl.h"
 #include "ggml-alloc.h"
+#include "ggml-cpuset.h"
 #include "ggml-stage-copy.h"
 #include "llama-moe-prefill.h"
 
@@ -951,6 +952,34 @@ ggml_tensor * llama_expert_cache::build_record(ggml_context * ctx, ggml_tensor *
     return ggml_custom_4d(ctx, GGML_TYPE_I32, 1, 1, 1, 1, args, 1, op_record, 1, &layers[il]);
 }
 
+void llama_expert_cache::op_weighted_sum(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    GGML_UNUSED(userdata);
+    const ggml_tensor * x = dst->src[0];
+    const ggml_tensor * w = dst->src[1];
+    const int64_t n = x->ne[0], k = x->ne[1], rows = x->ne[2];
+    const int64_t per = (n + nth - 1) / nth;
+    const int64_t i0 = std::min(n, ith * per), i1 = std::min(n, i0 + per);
+    for (int64_t r = 0; r < rows; ++r) {
+        float * out = reinterpret_cast<float *>((char *) dst->data + r * dst->nb[1]);
+        for (int64_t j = 0; j < k; ++j) {
+            const float wj = *reinterpret_cast<const float *>((const char *) w->data + j * w->nb[1] + r * w->nb[2]);
+            const float * xj = reinterpret_cast<const float *>((const char *) x->data + j * x->nb[1] + r * x->nb[2]);
+            if (j == 0) {
+                for (int64_t i = i0; i < i1; ++i) { out[i] = xj[i] * wj; }
+            } else {
+                for (int64_t i = i0; i < i1; ++i) { out[i] += xj[i] * wj; }
+            }
+        }
+    }
+}
+
+ggml_tensor * llama_expert_cache::build_weighted_sum(ggml_context * ctx, ggml_tensor * experts, ggml_tensor * weights) {
+    GGML_ASSERT(experts->type == GGML_TYPE_F32 && weights->type == GGML_TYPE_F32 && experts->nb[0] == sizeof(float));
+    GGML_ASSERT(weights->ne[0] == 1 && weights->ne[1] == experts->ne[1] && weights->ne[2] == experts->ne[2]);
+    ggml_tensor * args[] = { experts, weights };
+    return ggml_custom_4d(ctx, GGML_TYPE_F32, experts->ne[0], experts->ne[2], 1, 1, args, 2, op_weighted_sum, GGML_N_TASKS_MAX, nullptr);
+}
+
 bool llama_expert_cache::needs_refresh(int64_t n_tokens, bool is_warmup) {
     // Graph reuse ignores warmup, so the ops read this flag at execution time.
     warmup = is_warmup;
@@ -1106,12 +1135,19 @@ static std::vector<int> local_cpus(ggml_backend_dev_t dev) {
     return cpus;
 }
 
+// The thread stays inside the allowed CPUs (ggml-cpuset.h): the CPUs of the list that are allowed, else all allowed CPUs.
 static void pin_thread(const std::vector<int> & cpus) {
 #ifdef __linux__
-    if (cpus.empty()) { return; }
+    std::vector<int> allowed(cpus);
+    allowed.resize(ggml_cpuset_filter(allowed.data(), (int) allowed.size()));
+    if (allowed.empty()) {
+        allowed.resize(CPU_SETSIZE);
+        allowed.resize(ggml_cpuset_list(allowed.data(), (int) allowed.size()));
+    }
+    if (allowed.empty()) { return; }
     cpu_set_t set;
     CPU_ZERO(&set);
-    for (int c : cpus) { CPU_SET(c, &set); }
+    for (int c : allowed) { CPU_SET(c, &set); }
     pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
 #else
     GGML_UNUSED(cpus);
@@ -1140,8 +1176,8 @@ void llama_expert_cache::upload(const std::vector<upload_job> & jobs) {
         }
         return;
     }
-    static const int per_half = [] { const char * e = getenv("LLAMA_MOE_CACHE_REFILL_SLABS"); return e ? std::max(1, atoi(e)) : 32; }();
-    static const char * env_threads = getenv("LLAMA_MOE_CACHE_REFILL_THREADS");
+    const int per_half = [] { const char * e = getenv("LLAMA_MOE_CACHE_REFILL_SLABS"); return e ? std::max(1, atoi(e)) : 32; }();
+    const char * env_threads = getenv("LLAMA_MOE_CACHE_REFILL_THREADS");
     // Two options for --numa tensors (experts in CPU_NUMA buffers), off by default; for NPS4 set both (MiMo V2.6 Flash, NPS4:
     // refresh 210 -> ~150 ms per prompt; NPS1 is bound by the PCIe upload and not measured with them).
     // The pinned staging buffer next to the GPU is one node's memory, which at NPS4 is one quadrant: its 2 channels take all
@@ -1149,9 +1185,9 @@ void llama_expert_cache::upload(const std::vector<upload_job> & jobs) {
     // An expert stores its rows node by node, in node order. With LLAMA_MOE_CACHE_REFILL_NUMA=1, thread t copies part t of
     // each slab and runs on the node that holds that part (at least 2 threads per node), so that it reads local memory. By
     // default all threads run next to the GPU.
-    static const std::vector<std::vector<int>> node_cpus = numa_node_cpus();
-    static const bool stage_interleave = [] { const char * e = getenv("LLAMA_MOE_CACHE_REFILL_INTERLEAVE"); return e && atoi(e) != 0; }();
-    static const bool pin_nodes = [] { const char * e = getenv("LLAMA_MOE_CACHE_REFILL_NUMA"); return e && atoi(e) != 0; }();
+    const std::vector<std::vector<int>> node_cpus = numa_node_cpus();
+    const bool stage_interleave = [] { const char * e = getenv("LLAMA_MOE_CACHE_REFILL_INTERLEAVE"); return e && atoi(e) != 0; }();
+    const bool pin_nodes = [] { const char * e = getenv("LLAMA_MOE_CACHE_REFILL_NUMA"); return e && atoi(e) != 0; }();
     const ggml_tensor * src0 = model->layers[jobs[0].il].ffn_gate_exps;
     const int n_nodes = (int) node_cpus.size();
     const bool numa = n_nodes > 1 && src0->buffer && strcmp(ggml_backend_buffer_name(src0->buffer), "CPU_NUMA") == 0;
@@ -1179,10 +1215,23 @@ void llama_expert_cache::upload(const std::vector<upload_job> & jobs) {
     char * host = static_cast<char *>(ggml_backend_buffer_get_base(pinned.get()));
     for (const auto & [backend, slabs] : by_backend) {
         ggml_backend_dev_t dev = ggml_backend_get_device(backend);
-        ggml_context_ptr sctx(ggml_init({ggml_tensor_overhead(), nullptr, true}));
-        ggml_tensor * scratch = ggml_new_tensor_1d(sctx.get(), GGML_TYPE_I8, 2 * per_half * bytes);
-        ggml_backend_buffer_ptr sbuf(ggml_backend_alloc_ctx_tensors_from_buft(sctx.get(), ggml_backend_get_default_buffer_type(backend)));
+        // Fewer slabs per batch when the device has no room for the full scratch (its free memory is the auto cache margin, which
+        // the compute buffers of a long prompt can use up): a slower refill, not a failed decode.
+        int half_n = per_half;
+        ggml_context_ptr sctx;
+        ggml_tensor * scratch = nullptr;
+        ggml_backend_buffer_ptr sbuf;
+        for (; half_n >= 1 && !sbuf; half_n /= 2) {
+            sctx.reset(ggml_init({ggml_tensor_overhead(), nullptr, true}));
+            scratch = ggml_new_tensor_1d(sctx.get(), GGML_TYPE_I8, 2 * half_n * bytes);
+            sbuf.reset(ggml_backend_alloc_ctx_tensors_from_buft(sctx.get(), ggml_backend_get_default_buffer_type(backend)));
+            if (sbuf) { break; }
+        }
         if (!sbuf) { throw std::runtime_error("expert-cache: cannot allocate refill scratch"); }
+        if (half_n < per_half) {
+            LLAMA_LOG_WARN("expert-cache: refill scratch on %s: %d of %d slabs per batch, the memory for more is not available\n",
+                    ggml_backend_name(backend), half_n, per_half);
+        }
         ggml_backend_event_t ev[2] = { ggml_backend_event_new(dev), ggml_backend_event_new(dev) };
 
         // workers copy batch `batch` when it changes; each takes an interleaved share of every slab
@@ -1220,7 +1269,7 @@ void llama_expert_cache::upload(const std::vector<upload_job> & jobs) {
                 }
             });
         }
-        const size_t n_batches = (slabs.size() + per_half - 1) / per_half;
+        const size_t n_batches = (slabs.size() + half_n - 1) / half_n;
         for (size_t b = 0; b < n_batches; ++b) {
             const int half = b % 2;
             int64_t t = ggml_time_us();
@@ -1229,9 +1278,9 @@ void llama_expert_cache::upload(const std::vector<upload_job> & jobs) {
             t = ggml_time_us();
             {
                 std::lock_guard<std::mutex> lock(mutex);
-                first = b * per_half;
-                n = std::min<size_t>(per_half, slabs.size() - first);
-                dst = host + half * per_half * bytes;
+                first = b * half_n;
+                n = std::min<size_t>(half_n, slabs.size() - first);
+                dst = host + half * half_n * bytes;
                 done = 0;
                 batch = b;
             }
@@ -1241,10 +1290,10 @@ void llama_expert_cache::upload(const std::vector<upload_job> & jobs) {
                 cv_done.wait(lock, [&] { return done == n_threads; });
             }
             upload_copy_us += ggml_time_us() - t;
-            ggml_backend_tensor_set_async(backend, scratch, dst, half * per_half * bytes, n * bytes);
+            ggml_backend_tensor_set_async(backend, scratch, dst, half * half_n * bytes, n * bytes);
             for (size_t i = 0; i < n; ++i) {
                 const auto & x = slabs[first + i];
-                set_expert(backend, x.bank, x.slot, static_cast<const char *>(scratch->data) + (half * per_half + i) * bytes);
+                set_expert(backend, x.bank, x.slot, static_cast<const char *>(scratch->data) + (half * half_n + i) * bytes);
             }
             ggml_backend_event_record(ev[half], backend);
         }

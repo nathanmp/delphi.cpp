@@ -1112,6 +1112,19 @@ struct llama_model_olmoe : public llama_model_base {
 };
 
 
+struct llama_model_muse_spark : public llama_model_base {
+    llama_model_muse_spark(const struct llama_model_params & params) : llama_model_base(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+
+    struct graph : public llm_graph_context {
+        graph(const llama_model & model, const llm_graph_params & params);
+    };
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
+
+
 struct llama_model_muse_glimmer : public llama_model_base {
     llama_model_muse_glimmer(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;
@@ -1499,7 +1512,9 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
                 ggml_tensor * inp_pos,
                 ggml_tensor ** shared_top_k,
                 ggml_tensor ** shared_cand,
-                int il) const;
+                int il,
+                ggml_tensor * full_cur = nullptr,
+                uint32_t n_skip = 0) const;
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

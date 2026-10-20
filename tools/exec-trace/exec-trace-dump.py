@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import bisect
 import json
 import struct
 import sys
@@ -587,6 +588,50 @@ def gpu_timing_fields(event):
     }
 
 
+# A wait on an idle stream returns in a few us, and a blocked wait returns a few us after the device finishes. This
+# margin covers both: a wait that took longer blocked, and the device finished at most this long before it returned.
+GPU_TIMING_BLOCKED_WAIT_NS = 50_000
+
+
+def host_wait_index(events):
+    """Index the host spans that can contain a backend synchronize, by the backend they wait for."""
+    waits = defaultdict(list)
+    for event in events:
+        kind = event["kind"]
+        if kind in WAIT_KINDS:
+            backend_ids = (event["backend_id"],)
+        elif kind == K_COPY_HANDLING:
+            # A fallback copy synchronizes its source backend; the event belongs to the destination backend.
+            backend_ids = (event["backend_id"], event["args"][3] & 0xffffffff)
+        else:
+            continue
+        for backend_id in set(backend_ids):
+            waits[backend_id].append((event["timestamp_ns"], event["args"][0]))
+    index = {}
+    for backend_id, intervals in waits.items():
+        intervals.sort()
+        index[backend_id] = ([start for start, _ in intervals], intervals)
+    return index
+
+
+def completion_wait_start(index, backend_id, complete_ns):
+    """Return the start of the latest host wait on *backend_id* that contains *complete_ns*, or None.
+
+    The backend reads the completion clock inside its synchronize, so the host span around that call contains it.
+    """
+    entry = index.get(backend_id)
+    if entry is None:
+        return None
+    starts, intervals = entry
+    position = bisect.bisect_right(starts, complete_ns) - 1
+    # Waits on one backend do not nest deeply; a short backward scan finds the innermost containing span.
+    for i in range(position, max(-1, position - 8), -1):
+        start, end = intervals[i]
+        if start <= complete_ns <= end:
+            return start
+    return None
+
+
 def gpu_timing_model(events):
     spans = []
     epochs = {}
@@ -612,7 +657,16 @@ def gpu_timing_model(events):
             members[span["epoch_id"]].append(span)
 
     # All spans of an epoch share one device anchor A. The host reads its clock before each event record, and the device
-    # reaches the event after that and before completion is known, so lower <= A <= upper. The lower bound is the placement.
+    # reaches the event after that and before completion is known, so lower <= A <= upper.
+    #
+    # The enqueue bound alone places work as early as the host allowed. A device that waits for another device (a layer
+    # split) starts much later, and the early placement shows the devices as busy at the same time. The synchronize that
+    # gave the completion time removes most of this uncertainty:
+    # - The wait blocked: the device was busy when the wait started and finished at most GPU_TIMING_BLOCKED_WAIT_NS before
+    #   the wait returned. The latest anchor is the placement, and the lower bound rises to that margin.
+    # - The wait returned at once: the device finished before the wait started, which lowers the upper bound. The
+    #   earliest anchor stays the placement.
+    waits = host_wait_index(events)
     for epoch_id, epoch in epochs.items():
         epoch_spans = members.get(epoch_id, [])
         epoch["resolved_span_count"] = len(epoch_spans)
@@ -623,15 +677,30 @@ def gpu_timing_model(events):
                         span["host_enqueue_end_ns"] - span["device_offset_ns"] - span["device_duration_ns"])
                     for span in epoch_spans)
         upper = min(epoch["complete_ns"] - span["device_offset_ns"] - span["device_duration_ns"] for span in epoch_spans)
+        anchor = "enqueue"
+        wait_start = None
+        if epoch["completion"] == "synchronize":
+            wait_start = completion_wait_start(waits, epoch["backend_id"], epoch["complete_ns"])
+        if wait_start is not None and lower <= upper:
+            device_end = max(span["device_offset_ns"] + span["device_duration_ns"] for span in epoch_spans)
+            if epoch["complete_ns"] - wait_start >= GPU_TIMING_BLOCKED_WAIT_NS:
+                lower = max(lower, min(upper, max(wait_start - device_end, upper - GPU_TIMING_BLOCKED_WAIT_NS)))
+                anchor = "completion"
+            else:
+                upper = min(upper, max(lower, wait_start - device_end))
         epoch["anchor_lower_ns"] = lower
         epoch["anchor_upper_ns"] = upper
+        epoch["anchor"] = anchor
+        epoch["completion_wait_start_ns"] = wait_start
         epoch["placement"] = "consistent" if lower <= upper else "inconsistent"
         epoch["placement_uncertainty_ns"] = upper - lower if lower <= upper else None
+        placed = upper if anchor == "completion" else lower
         for span in epoch_spans:
-            span["device_start_ns"] = lower + span["device_offset_ns"]
+            span["device_start_ns"] = placed + span["device_offset_ns"]
             span["device_end_ns"] = span["device_start_ns"] + span["device_duration_ns"]
             span["placement"] = epoch["placement"]
             span["placement_uncertainty_ns"] = epoch["placement_uncertainty_ns"]
+            span["anchor"] = anchor
     for span in spans:
         if span["epoch_id"] not in epochs and span["status"] == "resolved":
             span["placement"] = "missing_epoch"

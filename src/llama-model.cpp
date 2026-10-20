@@ -184,6 +184,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_olmoe(params);
         case LLM_ARCH_MUSE_GLIMMER:
             return new llama_model_muse_glimmer(params);
+        case LLM_ARCH_MUSE_SPARK:
+            return new llama_model_muse_spark(params);
         case LLM_ARCH_OPENELM:
             return new llama_model_openelm(params);
         case LLM_ARCH_GPTNEOX:
@@ -963,6 +965,7 @@ const char * llm_type_name(llm_type type) {
         case LLM_TYPE_16x3_8B:       return "16x3.8B";
         case LLM_TYPE_10B_128x3_66B: return "10B+128x3.66B";
         case LLM_TYPE_57B_A14B:      return "57B.A14B";
+        case LLM_TYPE_816B_A42B:     return "816B.A42B";
         case LLM_TYPE_17B_16E:       return "17Bx16E (Scout)";
         case LLM_TYPE_17B_128E:      return "17Bx128E (Maverick)";
         case LLM_TYPE_A13B:          return "A13B";
@@ -2520,6 +2523,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             cparams.n_ubatch,
                             1,
                             cparams.n_rs_seq,
+                            cparams.n_layer_prefill,
+                            cparams.ced_compact,
                             nullptr,
                             nullptr);
                 }
@@ -2997,6 +3002,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_DEEPSEEK4:
         case LLM_ARCH_DEEPSEEK41:
         case LLM_ARCH_MUSE_GLIMMER:
+        case LLM_ARCH_MUSE_SPARK:
         case LLM_ARCH_PLM:
         case LLM_ARCH_CHATGLM:
         case LLM_ARCH_GRANITE:
@@ -3371,6 +3377,15 @@ void llama_model_base::create_tensor_qkv(llama_layer & layer, int bid,
         layer.wk_b = create_tensor(tn(LLM_TENSOR_ATTN_K, "bias", bid), {n_embd_k_}, TENSOR_NOT_REQUIRED);
         layer.wv_b = create_tensor(tn(LLM_TENSOR_ATTN_V, "bias", bid), {n_embd_v_}, TENSOR_NOT_REQUIRED);
     }
+}
+
+void llama_model_base::load_swa_pattern(llama_model_loader & ml, uint32_t n_pattern, bool dense_first) {
+    if (ml.get_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.is_swa_impl, false)) {
+        return;
+    }
+
+    ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, n_pattern, false);
+    hparams.set_swa_pattern(n_pattern, dense_first);
 }
 
 const int32_t * llama_model_target_layer_ids(const struct llama_model * model) {

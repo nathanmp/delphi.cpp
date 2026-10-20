@@ -713,7 +713,11 @@ void ggml_cuda_moe_packed_prepare(ggml_backend_cuda_context & ctx, const ggml_cg
             continue;
         }
         // delphi: only for an activation layout that the grouped schedule serves (ggml_cuda_mul_mat_q, mmq.cu); the old path of
-        // any other layout reads the GGUF layout, and a weight packed in place would abort there
+        // any other layout reads the GGUF layout, and a weight packed in place would abort there. A partial MUL_MAT_ID always takes the
+        // old path (supports_op refuses it on packed weights, but it asks before the first pack)
+        if (ggml_mul_mat_id_is_partial(node)) {
+            continue;
+        }
         const ggml_tensor * src1   = node->src[1];
         const int64_t       n_used = node->src[2]->ne[0];
         const bool bcast    = src1->ne[1] == 1 && n_used > 1;

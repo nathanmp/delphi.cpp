@@ -24,6 +24,11 @@ enum common_speculative_type common_speculative_type_from_name(const std::string
 std::string common_speculative_type_to_str(enum common_speculative_type type);
 
 // return the max number of draft tokens based on the speculative parameters
+// delphi: draft-mtp without an explicit adaptive option and without synthetic acceptance uses the conf mode, up to
+// COMMON_SPECULATIVE_CONF_N_MAX_DEFAULT tokens unless --spec-draft-n-max is given. Call after the options are applied.
+#define COMMON_SPECULATIVE_CONF_N_MAX_DEFAULT 7
+void common_speculative_params_resolve(common_params_speculative & spec);
+
 int32_t common_speculative_n_max(const common_params_speculative * spec);
 
 // return the max number of draft tokens from the initialized implementations
@@ -100,6 +105,13 @@ struct common_speculative_draft_params {
 
     // the generated draft from the last _draft() call
     llama_tokens * result;
+
+    // candidate distribution per drafted token; set it to make draft-simple, draft-mtp and DFlash2 sample
+    std::vector<std::vector<llama_token_data>> * result_q = nullptr;
+
+    // the target's temp and seed, read only when the drafter samples probabilistically
+    float    temp = 1.0f;
+    uint32_t seed = LLAMA_DEFAULT_SEED;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
@@ -117,8 +129,10 @@ bool common_speculative_process_async(common_speculative * spec, const llama_bat
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);
 
-// informs the speculative context that n_accepted tokens were accepted by the target model
-void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
+// informs the speculative context that n_accepted tokens were accepted by the target model; id_next is the target's
+// token after the accepted ones (the cost-aware depth compares it with its unverified shadow token)
+void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted,
+                               llama_token id_next = LLAMA_TOKEN_NULL);
 
 // report a partial acceptance that the context could not apply (the server restores a checkpoint and replays the
 // accepted tokens; the replay round's accept is not counted by the adaptive draft depth)
@@ -133,6 +147,48 @@ void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id
 // print statistics about the speculative decoding
 void common_speculative_print_stats(const common_speculative * spec);
 
+// cost-aware draft depth (--spec-draft-adaptive-mode cost): the widest verify batch it needs (0: not in use)
+int32_t common_speculative_cost_width(const common_speculative * spec);
+
+// measure the target's verify time of batches of 1..n_width rows (seconds, index = rows; [0] unused); the sequence
+// must be unused and is cleared after each batch
+std::vector<double> common_speculative_calibrate(llama_context * ctx_tgt, llama_seq_id seq_id, int32_t n_width);
+
+// hand the calibrated verify times to the cost-aware implementations
+void common_speculative_set_verify_times(common_speculative * spec, const std::vector<double> & t_verify);
+
+// statistics and adaptive state of one implementation
+struct common_speculative_impl_info {
+    std::string type;
+    int32_t     n_max          = 0;
+    std::string adaptive;          // "", "bucket" or "cost"
+    int32_t     n_min_adaptive = 0;
+
+    size_t n_gen_drafts = 0;
+    size_t n_acc_drafts = 0;
+    size_t n_gen_tokens = 0;
+    size_t n_acc_tokens = 0;
+    size_t n_call_accept = 0;
+    std::vector<double> acc_rate_per_pos; // accepted tokens per verified draft, per position
+
+    std::vector<int32_t> depth;           // [n_seq] current adaptive depth
+
+    // cost mode
+    std::vector<double> t_verify_ms;      // [rows] calibrated verify time
+    std::vector<double> t_round_ms;       // [n] round time estimate per draft length
+    std::vector<double> n_round;          // [n] live samples per draft length
+    double              t_step_ms = 0.0;  // draft time per token
+    double              t_switch_ms = 0.0; // extra time of a change of depth
+    std::vector<double> accept_rate;      // [k - 1] conditional acceptance over all requests
+
+    // conf mode (also t_verify_ms, t_step_ms)
+    double              conf_rate = 0.0;  // tokens per second of the recent rounds
+    std::vector<double> conf_cal;         // [pos][bin] observed acceptance
+    std::vector<double> conf_trials;      // [pos][bin] decayed trials
+};
+
+std::vector<common_speculative_impl_info> common_speculative_get_info(const common_speculative * spec);
+
 struct common_speculative_deleter {
     void operator()(common_speculative * s) { common_speculative_free(s); }
 };
@@ -146,9 +202,16 @@ struct common_speculative_init_result {
     llama_model   * model();
     llama_context * context();
 
+    // delphi: free the draft or MTP context and create it again, with the context parameters of params; the draft
+    // model stays. The target context must be the one that the draft context follows.
+    void free_context();
+    bool recreate_context(common_params & params, llama_model * model_tgt, llama_context * ctx_tgt);
+
 private:
     struct impl;
     std::unique_ptr<impl> pimpl;
+
+    bool create_context(common_params & params, llama_model * model_tgt, llama_context * ctx_tgt);
 };
 
 using common_speculative_init_result_ptr = std::unique_ptr<common_speculative_init_result>;

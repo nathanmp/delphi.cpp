@@ -16,26 +16,11 @@
 
 bool llama_model_saver_supports_arch(llm_arch arch) {
     switch (arch) {
-        case LLM_ARCH_PLAMO3:
-        case LLM_ARCH_GEMMA3:
         case LLM_ARCH_GEMMA3N:
-        case LLM_ARCH_COHERE2:
-        case LLM_ARCH_COHERE2MOE:
-        case LLM_ARCH_OLMO2:
         case LLM_ARCH_BITNET:
         case LLM_ARCH_T5:
-        case LLM_ARCH_EXAONE_MOE:
-        case LLM_ARCH_AFMOE:
         case LLM_ARCH_APERTUS:
-        case LLM_ARCH_MIMO2:
         case LLM_ARCH_STEP35:
-        case LLM_ARCH_SPARK2_5:
-        case LLM_ARCH_MUSE_GLIMMER:
-        case LLM_ARCH_MELLUM:
-        case LLM_ARCH_LAGUNA:
-        case LLM_ARCH_GRANITE_SWA:
-        case LLM_ARCH_DOTS3NOTE: // TODO: need to handle SWA pattern and MLA+SWA config
-        case LLM_ARCH_MAPLE:
             return false;
         default:
             return true;
@@ -229,6 +214,7 @@ void llama_model_saver::add_kv_from_model() {
     add_kv(LLM_KV_FEED_FORWARD_LENGTH,               hparams.n_ff_arr, true);
     add_kv(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp());
     add_kv(LLM_KV_EXPERT_LATENT_LENGTH,              hparams.n_expert_latent);
+    add_kv(LLM_KV_MOE_LATENT_SIZE,                   hparams.moe_latent_size);
     add_kv(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp);
     add_kv(LLM_KV_EXPERT_CHUNK_FEED_FORWARD_LENGTH,  hparams.n_ff_chexp);
     add_kv(LLM_KV_SWIGLU_CLAMP_EXP, std::vector<float>(
@@ -280,6 +266,7 @@ void llama_model_saver::add_kv_from_model() {
     add_kv(LLM_KV_ATTENTION_VALUE_LENGTH,            hparams.n_embd_head_v_full);
     add_kv(LLM_KV_ATTENTION_LAYERNORM_EPS,           hparams.f_norm_eps);
     add_kv(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
+    add_kv(LLM_KV_POST_NORM_EPS,                     hparams.f_post_norm_eps);
     add_kv(LLM_KV_ATTENTION_GROUPNORM_EPS,           hparams.f_norm_group_eps);
     add_kv(LLM_KV_ATTENTION_GROUPNORM_GROUPS,        hparams.n_norm_groups);
     add_kv(LLM_KV_ATTENTION_CAUSAL,                  hparams.causal_attn);
@@ -292,7 +279,11 @@ void llama_model_saver::add_kv_from_model() {
     add_kv(LLM_KV_ATTENTION_RELATIVE_BUCKETS_COUNT,  hparams.n_rel_attn_bkts);
     add_kv(LLM_KV_ATTENTION_ROPE_PATTERN,            hparams.rope_pattern, true);
     add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW,          hparams.n_swa);
-    // add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN,  ???);
+    if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
+        // never collapsed to a scalar: the loaders read a scalar as a period
+        add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, std::vector<uint32_t>(
+                hparams.is_swa_impl.begin(), hparams.is_swa_impl.begin() + hparams.n_layer_all));
+    }
     add_kv(LLM_KV_ATTENTION_SCALE,                   hparams.f_attention_scale);
     add_kv(LLM_KV_ATTENTION_OUTPUT_SCALE,            hparams.f_attn_out_scale);
     add_kv(LLM_KV_ATTENTION_VALUE_SCALE,             hparams.f_attn_value_scale);
@@ -302,6 +293,9 @@ void llama_model_saver::add_kv_from_model() {
     add_kv(LLM_KV_ATTENTION_VALUE_LENGTH_MLA,        hparams.n_embd_head_v_mla_impl);
     add_kv(LLM_KV_ATTENTION_KEY_LENGTH_SWA,          hparams.n_embd_head_k_swa);
     add_kv(LLM_KV_ATTENTION_VALUE_LENGTH_SWA,        hparams.n_embd_head_v_swa);
+    add_kv(LLM_KV_ATTENTION_KEY_LENGTH_MLA_SWA,      hparams.n_embd_head_k_mla_swa);
+    add_kv(LLM_KV_ATTENTION_VALUE_LENGTH_MLA_SWA,    hparams.n_embd_head_v_mla_swa);
+    add_kv(LLM_KV_ATTENTION_KV_LORA_RANK_SWA,        hparams.n_lora_kv_swa);
     add_kv(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT,      hparams.indexer_n_head);
     add_kv(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH,      hparams.indexer_head_size);
     add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K,           hparams.indexer_top_k);

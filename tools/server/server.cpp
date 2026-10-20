@@ -229,6 +229,8 @@ int llama_server(common_params & params, int argc, char ** argv) {
         routes.post_responses_tok_oai      = models_routes->proxy_post;
         routes.get_lora_adapters           = models_routes->proxy_get;
         routes.post_lora_adapters          = models_routes->proxy_post;
+        routes.get_speculative             = models_routes->proxy_get;
+        routes.post_speculative            = models_routes->proxy_post;
         routes.get_slots                   = models_routes->proxy_get;
         routes.post_slots                  = models_routes->proxy_post;
 
@@ -281,6 +283,14 @@ int llama_server(common_params & params, int argc, char ** argv) {
     // LoRA adapters hotswap
     ctx_http.get ("/lora-adapters",            ex_wrapper(routes.get_lora_adapters));
     ctx_http.post("/lora-adapters",            ex_wrapper(routes.post_lora_adapters));
+    ctx_http.get ("/speculative",              ex_wrapper(routes.get_speculative));
+    ctx_http.post("/speculative",              ex_wrapper(routes.post_speculative));
+    if (params.endpoint_tune && !is_router_server) {
+        // delphi: auto-tuner hooks, off by default
+        ctx_http.get ("/tune/context",         ex_wrapper(routes.get_tune_context));
+        ctx_http.post("/tune/context",         ex_wrapper(routes.post_tune_context));
+        ctx_http.post("/tune/kld",             ex_wrapper(routes.post_tune_kld));
+    }
     // Save & load slots
     ctx_http.get ("/slots",                    ex_wrapper(routes.get_slots));
     ctx_http.post("/slots/:id_slot",           ex_wrapper(routes.post_slots));

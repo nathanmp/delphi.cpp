@@ -2,6 +2,8 @@
 
 delphi.cpp reads the environment variables below at run time. Each is an A/B switch: the default is the tested behavior, and the other value restores the previous behavior or enables a diagnostic. Set them in the environment of `llama-server`, `llama-cli`, `llama-bench` and the other tools, for example `GGML_SCHED_INPUT_ORDER=0 llama-server ...`. A value is read once per process.
 
+Most of the variables below are read once, into a function-local `static`, and need a new process. The ones that a context, an expert cache or a scheduler reads when it is made (the `LLAMA_MOE_CACHE_*` sizes and prompt rows, `LLAMA_MOE_PREFILL_*`, `GGML_SCHED_*`) see a new value when the server makes the context again (`POST /tune/context` with `--tune-endpoints`). `tools/auto-tune/env-reload.json` lists the class of each tunable variable (`context` or `process`); see `tune-endpoints.md`.
+
 Execution tracing has its own variables (`GGML_EXEC_TRACE*`); see `exec-trace-record.md`.
 
 ## Model loading
@@ -14,13 +16,29 @@ With mmap (the default load mode), each tensor in a plain device buffer is copie
 
 The gain depends on how evenly the weights are spread and how slow the device links are. With a model split by layers over three GPUs on narrow PCIe links, loading from the page cache took half the time (249 s to 127 s). Models on one device, or with split buffers, load in the same time as before. Outputs are identical.
 
+## DeepSeek V4.1 CED prefill
+
+| variable | default | effect |
+| --- | --- | --- |
+| `LLAMA_DSV41_TRIM` | `1` | Compact decoder prefill. `0` uses full prefill; `2` keeps all queries with the bounded decoder mask as a numerical reference. Read when the context is made. |
+
+For a supported Causal Encoder Decoder (CED) layout, the encoder processes every input row. At the first decoder layer, the graph keeps the last `sliding_window + rollback_depth` query rows. Global KV and index keys still use every encoder row. Decoder attention and FFNs process the retained suffix; subsequent decode runs all layers. Decoder local KV has its own positions, so discarded rows cannot expose stale cache slots. DSpark receives valid features for the retained suffix.
+
+Compaction applies per microbatch. Short batches, batches with multiple sequences, embedding inputs, and requests for logits in the discarded prefix use the full graph. Unsupported source layouts disable CED. This includes decoder engrams or later decoder layers that own global KV or index keys. Ordinary all-row perplexity evaluation therefore uses the full graph; quality tests must prefill with only the final output requested, then score a continuation.
+
+CED and full-prefill state blobs use different layouts and reject restoration across modes. Rebuild saved prompt states after changing the mode or upgrading from full prefill. The server's `/tune/context` endpoint can change this variable without reloading the model weights, but clears the prompt state.
+
+CPU-offloaded DeepSeek V4.1 Flash tests on two R9700s showed about 1.7x faster 1K prefill and 1.9x faster 65K prefill. On 2,048 teacher-forced continuation tokens from prose, documentation and C++, compact versus full prefill had mean KL 0.00278, 98.73% top-token agreement and 0.93% higher aggregate perplexity. Four graded tasks had the same answer accuracy, including an arithmetic failure in both modes; normal DSpark acceptance remained close. These are regression checks on one quantization, not a broad quality evaluation. Outputs can change. A separate full-prefill microbatch-size control also changed distributions, so the measured difference cannot all be assigned to the bounded decoder history.
+
+Adapted from [DeepInfer](https://github.com/deepseek-ai/DeepInfer/tree/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01), Apache-2.0: the consumer boundary in `decoder_layer.py` and `v4_modules/yoco.py`, full global-KV projection in `v4_modules/attn.py`, and bounded SWA visibility in `prepare_tensor_input_v4.cpp`. This implementation uses ggml graphs, separate local cache maps, and a suffix per microbatch rather than DeepInfer's request metadata. No source or kernels were copied.
+
 ## Backend sampling (`-bs`)
 
 | variable | default | set to | effect of the non-default value |
 | --- | --- | --- | --- |
 | `LLAMA_SAMPLER_RESERVE_ALWAYS` | off | `1` | Reserve the compute buffers again at each sampler change (upstream behavior) |
 
-The server sets a new sampler object for each request and removes it at the end. A reservation recreates the scheduler and all its compute buffers, and with staging the staging slots: 0.6 s per request on GLM-5.3 and Qwen 3.8, 1.7 s on DeepSeek V4.1 (measured from the execution trace of the first prompt batch). By default, the context reserves again only when the sampler chains of the sequences (the sampler names in each chain) are not the same as at the last reservation. A new sampler object always causes a new graph, not the reuse of a graph that was built with the old object. A sampler parameter that changes a tensor size (for example a larger top-k) can make the compute buffer grow on the next batch.
+The server keeps the sampler object of a slot between requests when the sampling parameters are equal and the chain has no grammar or reasoning-budget sampler (it is reset, not made again); otherwise it sets a new sampler object. A reservation recreates the scheduler and all its compute buffers, and with staging the staging slots: 0.6 s per request on GLM-5.3 and Qwen 3.8, 1.7 s on DeepSeek V4.1 (measured from the execution trace of the first prompt batch). By default, the context reserves again only when the sampler chains of the sequences (the sampler names in each chain) are not the same as at the last reservation. A new sampler object always causes a new graph, not the reuse of a graph that was built with the old object. A sampler parameter that changes a tensor size (for example a larger top-k) can make the compute buffer grow on the next batch.
 
 ## Multi-device scheduler
 
@@ -74,6 +92,20 @@ hipBLASLt can pick a different kernel for the same GEMM in different processes, 
 | `GGML_CUDA_GRAPH_CACHE_SIZE` | `2048` | number of captured graphs a device keeps; graphs with more than 256 nodes stay bounded at 64 |
 
 Every distinct graph (each verify width and each draft step of speculative decoding, on every device) takes an entry. With 256 entries, Qwen 3.8 Flash Next with MTP on three R9700s (layer split) sometimes evicted its decode graphs: a whole request at draft depth 3 ran at 18 instead of 58 t/s, and at depth 5 most requests ran at 7-17 t/s. With 2048 entries every request ran at full speed, at under 0.1 GiB more memory per device.
+
+## Speculative decoding: graphs of the verify widths
+
+A per-round draft depth (the default conf mode of `draft-mtp`, see `speculative-draft-depth.md`) verifies a different number of tokens in most rounds, so the target and the draft context keep one graph per width. These switches keep those graphs valid.
+
+| variable | default | effect |
+| --- | --- | --- |
+| `LLAMA_KV_N_PAD` | unset: 256, 2048 with a per-round draft depth | the KV view grows in steps of this many cells (multiple of 256). A step makes the graphs of all widths stale. Set, it wins over the reservation of the conf mode: `256` gives the upstream step |
+| `GGML_CUDA_FA_KV_MAX_DECODE` | `1` | flash attention scans the mask for a fully masked tail also for fewer than 1024 query rows, so that the masked cells of a padded KV view cost nothing. `0`: upstream behavior. Outputs are identical |
+| `LLAMA_GRAPH_ALT_SLOTS` | `4`, n_max + 2 with a per-round draft depth | graphs kept for small batches (up to `LLAMA_GRAPH_ALT_MAX_TOKENS`, default 32, tokens); set, it wins |
+| `LLAMA_GRAPH_BUILD_LOG` | off | `1` logs each graph build with the reuse check that failed, and its host times (build, scheduler allocation, first compute) |
+| `DELPHI_SPEC_PLOG` | off | a file name: the MTP draft writes the top-1 probability of each draft step and the accepted count per round (JSON lines), for offline replays of stop rules |
+
+On GLM-5.3 Flash (3x CMP 170HX) a graph build of a target width costs about 2 ms (build) + 10 ms (allocation) + 20 ms (first run); with the step 256 the conf mode built 68 graphs per 2048-token request and lost to a fixed depth, with 2048 it was the fastest mode. The masked cells cost GLM's sparse attention about 0.5 ms per round at the step 2048. On Qwen 3.8 Flash Next (3x R9700) they cost 4.4 ms per round (44.0 instead of 39.6 ms) until the flash-attention scan skipped them.
 
 ## Weight streaming (staging ring)
 
@@ -149,7 +181,7 @@ These variables choose how routed-expert matrix multiplications (`MUL_MAT_ID`) r
 | `GGML_CUDA_MOE_GROUPED_MIN_TOKENS` | `128` | token threshold of `auto` |
 | `GGML_CUDA_MOE_PACKED_VERIFY` | `0` | `1` unpacks every newly packed tensor on the device and aborts if a byte differs from the GGUF data |
 | `GGML_CUDA_MOE_PACKED_NOCACHE` | `0` | `1` rebuilds the packed weights on every call (for tests that reuse buffer addresses; slow; disables in-place packing) |
-| `GGML_CUDA_MOE_INT4_DECODE` | `1` | `0` disables the fused INT4 FFN kernels for `Q4_G128` routed experts (GLM INT4 models). They are on by default only when a `Q4_G128` tensor is in an NVIDIA GPU buffer. Without them, GLM-5.3 Flash INT4 adaptive MTP decode is about 12% slower (79.9 vs 90.7 t/s). |
+| `GGML_CUDA_MOE_INT4_DECODE` | `1` | `0` disables the fused INT4 FFN kernels for `Q4_G128` routed experts (GLM INT4 models). They are on by default only when a `Q4_G128` tensor is in an NVIDIA GPU buffer. Without them, GLM-5.3 Flash INT4 adaptive MTP decode is about 12% slower (79.9 vs 90.7 t/s). `GGML_CUDA_DISABLE_FUSION=1` does not disable them: without them the packed experts would be converted to `Q4_0` for each operation. |
 
 **Packed mode.** Before a graph first uses an expert weight, the weight is rearranged into a layout that the tensor cores can read directly. The rearrangement is lossless and keeps the tensor size, so by default it is done in place. Prompt processing then uses a packed grouped kernel, and single-token and speculative verification batches use packed-aware MMVQ kernels. Packed types: Q8_0, Q5_0, Q4_1, Q5_1, IQ4_NL, MXFP4, Q3_K, Q4_K, Q5_K, Q6_K, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ2_K, IQ3_K, IQ4_K, IQ5_K, IQ2_KS, IQ3_KS, IQ4_KS and IQ5_KS. Other types use grouped MMQ. A weight is packed only if its activations have a layout that the grouped kernels serve (broadcast gate/up inputs or gathered down inputs, as produced by the standard MoE graph); otherwise it keeps the GGUF layout.
 

@@ -94,6 +94,10 @@ struct llama_expert_cache {
     ggml_tensor * build_cold_ids(ggml_context * ctx, ggml_tensor * ids, int il);
     // CPU op: records the routed ids (I32 [top_k, n_tokens]) of a batch that does not use the arena. Null if not recorded.
     ggml_tensor * build_record(ggml_context * ctx, ggml_tensor * ids, int il);
+    // CPU op: the sum over the expert slots of experts (F32 [n_embd, top_k, n_tokens]) times weights (F32 [1, top_k, n_tokens]),
+    // F32 [n_embd, n_tokens]. The same sums in the same order as ggml_mul and a chain of ggml_add, in one op (one thread barrier
+    // instead of top_k)
+    static ggml_tensor * build_weighted_sum(ggml_context * ctx, ggml_tensor * experts, ggml_tensor * weights);
 
     // Call before each decoded batch while no graph is running. True at the first small batch after a prompt (or after a tier
     // was added): then the caller synchronizes, reclaims lent staging slots from every scheduler, and calls refresh(). Other
@@ -141,6 +145,7 @@ private:
     static void op_record(ggml_tensor * dst, int ith, int nth, void * userdata);
     static void op_prefill_plan(ggml_tensor * dst, int ith, int nth, void * userdata);
     static void op_prefill_ready(ggml_tensor * dst, int ith, int nth, void * userdata);
+    static void op_weighted_sum(ggml_tensor * dst, int ith, int nth, void * userdata);
 
     struct prefill_share;
     std::unique_ptr<prefill_share> prefill;

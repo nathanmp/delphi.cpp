@@ -227,6 +227,24 @@ static void init_tensor_kq_mask_swa(ggml_tensor * tensor, int64_t n_swa) {
     ggml_backend_tensor_set(tensor, data_f16.data(), 0, data_f16.size()*sizeof(ggml_fp16_t));
 }
 
+// masked tail, as in a KV view padded past the used cells: cells >= n_visible are -inf in every row, the others random
+static void init_tensor_kq_mask_tail(ggml_tensor * tensor, int64_t n_visible) {
+    GGML_ASSERT(tensor->type == GGML_TYPE_F16);
+    init_tensor_kq_mask(tensor);
+
+    std::vector<ggml_fp16_t> data_f16(ggml_nelements(tensor));
+    ggml_backend_tensor_get(tensor, data_f16.data(), 0, data_f16.size()*sizeof(ggml_fp16_t));
+    const int64_t ne0 = tensor->ne[0];
+    for (int64_t row = 0; row < ggml_nrows(tensor); ++row) {
+        // keep one visible cell per row, so that no row is fully masked
+        data_f16[row*ne0] = ggml_fp32_to_fp16(0.0f);
+        for (int64_t i0 = n_visible; i0 < ne0; ++i0) {
+            data_f16[row*ne0 + i0] = ggml_fp32_to_fp16(-INFINITY);
+        }
+    }
+    ggml_backend_tensor_set(tensor, data_f16.data(), 0, data_f16.size()*sizeof(ggml_fp16_t));
+}
+
 // edge: every query row of a sequence sees a different causal prefix (query j sees cells < ne0 - (ne1 - 1 - j)),
 // selects a count that cycles through awkward values, and always keeps its newest visible cell
 // (a fully masked row gives NaN on the dense ROCm kernels and 0 on the CPU, so it is not a CPU-comparable case)
@@ -535,6 +553,7 @@ static std::string var_to_str(ggml_scale_mode mode) {
 #define VARS_TO_STR17(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q) VAR_TO_STR(a) + "," + VARS_TO_STR16(b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q)
 #define VARS_TO_STR18(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r) VAR_TO_STR(a) + "," + VARS_TO_STR17(b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r)
 #define VARS_TO_STR19(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s) VAR_TO_STR(a) + "," + VARS_TO_STR18(b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s)
+#define VARS_TO_STR20(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t) VAR_TO_STR(a) + "," + VARS_TO_STR19(b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t)
 
 // accept FLT_MAX as infinity
 static bool isinf_or_max(float f) {
@@ -8579,9 +8598,10 @@ struct test_flash_attn_ext : public test_case {
     const int64_t n_kv_max;
     const bool sparse_edge; // sparse mask with per-query causal prefixes and awkward counts
     const int64_t n_swa; // > 0: causal sliding-window mask of this many cells
+    const int64_t n_visible; // > 0: cells from this one on are masked in every row (padded KV view)
 
     std::string vars() override {
-        return VARS_TO_STR19(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k, n_kv_max, sparse_edge, n_swa);
+        return VARS_TO_STR20(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k, n_kv_max, sparse_edge, n_swa, n_visible);
     }
 
     double max_nmse_err() override {
@@ -8598,10 +8618,10 @@ struct test_flash_attn_ext : public test_case {
     test_flash_attn_ext(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 32, std::array<int64_t, 2> nr23 = {1, 1}, int64_t kv = 96, int64_t nb = 8,
                         bool mask = true, bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
                         ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3},
-                        bool kv_view = true, bool v_is_view_of_k = false, int64_t n_kv_max = 0, bool sparse_edge = false, int64_t n_swa = 0)
+                        bool kv_view = true, bool v_is_view_of_k = false, int64_t n_kv_max = 0, bool sparse_edge = false, int64_t n_swa = 0, int64_t n_visible = 0)
         : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
           type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), n_kv_max(n_kv_max), sparse_edge(sparse_edge),
-          n_swa(n_swa) {}
+          n_swa(n_swa), n_visible(n_visible) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
@@ -8678,6 +8698,8 @@ struct test_flash_attn_ext : public test_case {
                     init_tensor_kq_mask_sparse(t, n_kv_max, sparse_edge);
                 } else if (n_swa > 0) {
                     init_tensor_kq_mask_swa(t, n_swa);
+                } else if (n_visible > 0) {
+                    init_tensor_kq_mask_tail(t, n_visible);
                 } else {
                     init_tensor_kq_mask(t);
                 }
@@ -12094,6 +12116,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // MLA shape: the V cache is a sub-view of the K cache, with quantized KV
     // sliding-window masks wide enough for the KV range scan (>= 1024 queries or several sequences), MiMo V2 heads among them
+    // padded KV view with few query rows (GGML_CUDA_FA_KV_MAX_DECODE): a long masked tail, several KV blocks per Q tile
+    for (int64_t nb : {1, 2, 4, 8}) {
+        for (int64_t n_visible : {1, 300, 700}) {
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, 1024, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, false, 0, n_visible));
+            test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {16, 1}, 4096, nb, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, 0, false, 0, n_visible));
+        }
+    }
+
     for (int64_t n_swa : {1, 128, 300}) {
         test_cases.emplace_back(new test_flash_attn_ext(192, 128, 8, {8, 1}, 2048, 1024, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, false, n_swa));
         test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {2, 2}, 1280,  200, true, true,  0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, false, n_swa));
@@ -12299,6 +12329,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                     test_cases.emplace_back(new test_topk_moe({160, 4, 1, 1}, 160, with_norm, bias_probs, gate, scale_w));
                     test_cases.emplace_back(new test_topk_moe({256, 22, 1, 1}, 6, with_norm, bias_probs, gate, scale_w)); // Used by DeepSeek-V4
                     test_cases.emplace_back(new test_topk_moe({288, 22, 1, 1}, 8, with_norm, bias_probs, gate, scale_w)); // Used by StepFun 3.7
+                    test_cases.emplace_back(new test_topk_moe({384, 1, 1, 1}, 6, with_norm, bias_probs, gate, scale_w)); // Used by DeepSeek V4.1 Flash (decode)
+                    test_cases.emplace_back(new test_topk_moe({384, 5, 1, 1}, 6, with_norm, bias_probs, gate, scale_w));
                     // rows at and just past the limit where one block still covers all rows
                     test_cases.emplace_back(new test_topk_moe({32, 8, 1, 1}, 4, with_norm, bias_probs, gate, scale_w));
                     test_cases.emplace_back(new test_topk_moe({32, 8, 1, 1}, 8, with_norm, bias_probs, gate, scale_w));
@@ -12309,8 +12341,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // Cover the supported boundaries, common k = 8 shapes, interleaved views and adds, and k = 16 fallback.
+    // The n_tokens = 1 cases run the fused kernel on CUDA and HIP since decode fusion is enabled.
     test_cases.emplace_back(new test_moe_weighted_reduction(63,  2, 17));
     test_cases.emplace_back(new test_moe_weighted_reduction(2048, 8, 1, false, true));
+    test_cases.emplace_back(new test_moe_weighted_reduction(2048, 2, 1));
+    test_cases.emplace_back(new test_moe_weighted_reduction(2048, 3, 1, false, false, true));
+    test_cases.emplace_back(new test_moe_weighted_reduction(5120, 8, 1));
     test_cases.emplace_back(new test_moe_weighted_reduction(2048, 8, 128));
     test_cases.emplace_back(new test_moe_weighted_reduction(2048, 8, 128, false, true));
     test_cases.emplace_back(new test_moe_weighted_reduction(63,   12, 33, true,  true, true));

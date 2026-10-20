@@ -190,6 +190,13 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_COUNT          // number of types, unknown type
 };
 
+// controller of the adaptive draft depth (--spec-draft-adaptive-mode)
+enum common_speculative_adaptive_mode {
+    COMMON_SPECULATIVE_ADAPTIVE_BUCKET, // acceptance credit bucket (speculative-adaptive.h)
+    COMMON_SPECULATIVE_ADAPTIVE_COST,   // expected tokens per second from the acceptance and the round time (speculative-cost.h)
+    COMMON_SPECULATIVE_ADAPTIVE_CONF,   // per-round stop from the draft confidence and the verify cost per row (speculative-cost.h)
+};
+
 // Grammar type enumeration
 enum common_grammar_type {
     COMMON_GRAMMAR_TYPE_NONE,           // no grammar set
@@ -334,14 +341,22 @@ struct common_params_speculative_draft {
     int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding
 
     // adaptive draft depth (--spec-draft-adaptive): the depth moves within [n_min_adaptive, n_max] with the acceptance
+    // delphi: draft-mtp defaults to the conf mode (common_speculative_params_resolve); the *_set flags record explicit options
     bool    adaptive       = false;
-    int32_t n_min_adaptive = 3; // floor of the adaptive depth
-    int32_t n_start        = 0; // adaptive depth at the start of a generation (0: n_max - 3, bounded by the floor)
+    enum common_speculative_adaptive_mode adaptive_mode = COMMON_SPECULATIVE_ADAPTIVE_BUCKET;
+    bool    adaptive_set      = false; // --spec-draft-adaptive, --no-spec-draft-adaptive or --spec-draft-adaptive-mode given
+    bool    adaptive_mode_set = false; // --spec-draft-adaptive-mode given
+    bool    n_max_set         = false; // --spec-draft-n-max given
+    bool    n_max_auto        = false; // n_max is the default cap of the conf mode
+    int32_t n_min_adaptive = 0; // floor of the adaptive depth (0: 3 for the bucket, 1 for the cost mode)
+    int32_t n_start        = 0; // adaptive depth at the start of a generation (0: bucket n_max - 3, cost 3; bounded by the floor)
 
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
 
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
+
+    bool probabilistic = false; // sample the draft and verify by rejection, instead of argmax and match
 
     common_params_model mparams;
 
@@ -704,6 +719,7 @@ struct common_params {
     bool endpoint_slots   = true;
     bool endpoint_props   = false; // only control POST requests, not GET
     bool endpoint_metrics = false;
+    bool endpoint_tune    = false; // POST/GET /tune/context, POST /tune/kld (delphi: auto-tuner hooks)
 
     // enable built-in tools
     std::vector<std::string> server_tools;
@@ -971,9 +987,17 @@ struct common_init_result {
 
     std::vector<llama_adapter_lora_ptr> & lora();
 
+    // delphi: free the context (and its samplers and thread pools) and create it again on the same model, with the
+    // context parameters of params; the weights stay. Returns false if the context cannot be created.
+    // t_warmup_us (optional) gets the time of the warmup run.
+    void free_context();
+    bool recreate_context(common_params & params, int64_t * t_warmup_us = nullptr);
+
 private:
     struct impl;
     std::unique_ptr<impl> pimpl;
+
+    bool init_context(common_params & params, llama_context_params cparams);
 };
 
 using common_init_result_ptr = std::unique_ptr<common_init_result>;
@@ -1006,6 +1030,7 @@ struct common_threadpools {
     common_threadpools & operator=(const common_threadpools &) = delete;
 
     void init(llama_context * ctx, const common_params & params);
+    void reset(); // free the pools; the context that they are attached to must be gone
 
 private:
     ggml_threadpool * threadpool       = nullptr;

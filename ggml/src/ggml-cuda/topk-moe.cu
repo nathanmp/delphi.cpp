@@ -237,25 +237,26 @@ __global__ void topk_moe_cuda(const float *         logits,
             }
         }
 
+        // Lane k holds weight k, as in the SUM_ROWS kernel, so that the normalization sum below adds in the same order
+        // and the fused result is bit-identical to the unfused SUM_ROWS -> CLAMP -> DIV chain.
         if ((k & (WARP_SIZE - 1)) == threadIdx.x) {
             output_weights[k / WARP_SIZE] = max_val;
-        }
-
-        if ((max_expert & (WARP_SIZE - 1)) == threadIdx.x) {
-            ids[k] = max_expert;
             if (config.with_norm) {
                 wt_sum += max_val;
             }
         }
+
+        if ((max_expert & (WARP_SIZE - 1)) == threadIdx.x) {
+            ids[k] = max_expert;
+        }
     }
 
     if (config.with_norm) {
-        wt_sum              = warp_reduce_sum(wt_sum);
-        wt_sum              = max(wt_sum, clamp_val);
-        const float inv_sum = 1.0f / wt_sum;
+        wt_sum = warp_reduce_sum(wt_sum);
+        wt_sum = max(wt_sum, clamp_val);
 
         for (int i = 0; i < experts_per_thread; i++) {
-            output_weights[i] *= inv_sum;
+            output_weights[i] /= wt_sum;
         }
     }
 
@@ -333,6 +334,10 @@ static void launch_topk_moe_cuda(ggml_backend_cuda_context & ctx,
             ggml_cuda_kernel_launch(topk_moe_cuda<288, has_bias>, launch_params,
                 logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
             break;
+        case 384: // DeepSeek V4.1 Flash
+            ggml_cuda_kernel_launch(topk_moe_cuda<384, has_bias>, launch_params,
+                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
+            break;
         case 512:
             ggml_cuda_kernel_launch(topk_moe_cuda<512, has_bias>, launch_params,
                 logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
@@ -402,7 +407,7 @@ bool ggml_cuda_should_use_topk_moe(const ggml_tensor * gating_op,
     // must match an instantiation of launch_topk_moe_cuda: a power of 2 up to 512,
     // or one of the non-power-of-2 expert counts of supported models
     const int n_expert = ids->nb[1] / ids->nb[0];
-    if (((n_expert & (n_expert - 1)) != 0 || n_expert > 512) && n_expert != 288 && n_expert != 576) {
+    if (((n_expert & (n_expert - 1)) != 0 || n_expert > 512) && n_expert != 288 && n_expert != 384 && n_expert != 576) {
         return false;
     }
 

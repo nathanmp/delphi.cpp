@@ -36,6 +36,7 @@
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
+#include "ggml-cuda/mmid-partial.cuh"
 #include "ggml-cuda/mmvq-q8-tc.cuh"
 #include "ggml-cuda/moe-devsort.cuh"
 #include "ggml-cuda/moe-schedule.cuh"
@@ -2442,7 +2443,12 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
     if (ggml_mul_mat_id_is_partial(dst)) {
-        // only the MMQ path skips the out-of-range ids of a partial MUL_MAT_ID (see supports_op)
+        // the MMQ path and, for small batches, the MMVQ path skip the out-of-range ids of a partial MUL_MAT_ID (see supports_op)
+        if (ggml_cuda_mul_mat_id_partial_mmvq(ctx, src0, src1, ids, dst)) {
+            ggml_exec_trace_dispatch(dst->op, GGML_EXEC_TRACE_DISPATCH_GPU_MMVQ,
+                    GGML_EXEC_TRACE_DISPATCH_VARIANT_DEFAULT, cc, (uint32_t) dst->ne[2]);
+            return;
+        }
         ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
         return;
     }
@@ -3765,8 +3771,7 @@ struct ggml_cuda_moe_weighted_reduction_match {
 static bool ggml_cuda_match_moe_weighted_reduction(
         const ggml_cgraph * cgraph,
         int node_idx,
-        ggml_cuda_moe_weighted_reduction_match & match,
-        bool allow_single_token = false) {
+        ggml_cuda_moe_weighted_reduction_match & match) {
     const ggml_tensor * first = cgraph->nodes[node_idx];
     if (first->op != GGML_OP_MUL || first->type != GGML_TYPE_F32 || !ggml_is_contiguous(first)) {
         return false;
@@ -3827,11 +3832,12 @@ static bool ggml_cuda_match_moe_weighted_reduction(
 
     const int n_expert_used = (int) weighted->ne[1];
     const int64_t n_tokens = weighted->ne[2] * weighted->ne[3];
-    // For single-token decode, launching one reduction kernel is slower than the
-    // existing chain of vector operations. Keep the fusion for multi-token
-    // prefill and speculative verification batches.
+    // The fused kernel is not bit-identical to the unfused MUL/ADD chain: the kernel's accumulate can contract to an
+    // FMA, while the chain rounds each product and each sum. GGML_SPEC_INVARIANT therefore keeps widths 1-8 unfused so
+    // that a verify batch matches a 1-token decode. Outside that mode the fusion runs at 1 token too: one kernel
+    // replaces the MUL + (k-1) ADD chain and its intermediate global-memory traffic.
     if (n_expert_used < 2 || n_expert_used > MOE_WEIGHTED_REDUCTION_MAX_EXPERTS ||
-            (n_tokens <= 1 && !allow_single_token) || ggml_cuda_spec_inv(n_tokens)) {
+            n_tokens < 1 || ggml_cuda_spec_inv(n_tokens)) {
         return false;
     }
 
@@ -3923,7 +3929,7 @@ static bool ggml_cuda_match_moe_down_reduction(
     }
 
     ggml_cuda_moe_weighted_reduction_match reduction;
-    if (!ggml_cuda_match_moe_weighted_reduction(cgraph, node_idx + 1, reduction, true) ||
+    if (!ggml_cuda_match_moe_weighted_reduction(cgraph, node_idx + 1, reduction) ||
             reduction.experts != mmid || reduction.expert_scale != nullptr) {
         return false;
     }
@@ -3950,6 +3956,17 @@ static bool ggml_cuda_match_moe_down_reduction(
     match.dst = reduction.dst;
     match.node_count = node_count;
     return true;
+}
+
+// delphi: GGML_CUDA_DISABLE_FUSION does not disable the INT4 FFN region on NVIDIA. Packed weights have no unfused kernel there:
+// ggml_cuda_mul_mat_id converts all experts of the tensor to Q4_0 in the pool (1.3 GiB per op on GLM), which is slow, and the
+// pool keeps it. HIP runs packed weights per node with the direct G128 kernel, so there the switch disables the region too.
+static constexpr bool ggml_cuda_moe_int4_ffn_ignores_disable_fusion() {
+#ifdef GGML_HIP_MOE_INT4_AVAILABLE
+    return false;
+#else
+    return true;
+#endif
 }
 
 // delphi: one complete routed FFN for the INT4 path (moe-int4-decode.cuh): the gate and up MUL_MAT_ID in either order, the
@@ -3997,7 +4014,7 @@ static bool ggml_cuda_match_moe_int4_ffn(
 #endif
 
     ggml_cuda_moe_weighted_reduction_match reduction;
-    if (!ggml_cuda_match_moe_weighted_reduction(cgraph, node_idx + 4, reduction, true) || reduction.experts != down ||
+    if (!ggml_cuda_match_moe_weighted_reduction(cgraph, node_idx + 4, reduction) || reduction.experts != down ||
             reduction.expert_scale != nullptr) {
         return false;
     }
@@ -4448,11 +4465,10 @@ static bool ggml_cuda_sibling_mm_group(ggml_tensor ** mm, const int n, const int
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
-    if (disable_fusion) {
+    ggml_tensor * node = cgraph->nodes[i];
+    if (disable_fusion && (node->op != GGML_OP_MUL_MAT_ID || !ggml_cuda_moe_int4_ffn_ignores_disable_fusion())) {
         return 0;
     }
-
-    ggml_tensor * node = cgraph->nodes[i];
 
     const auto trace_fused_mul_mat = [&](int node_index, ggml_op op, enum ggml_exec_trace_dispatch_impl implementation) {
         if (!ggml_exec_trace_observing()) {
@@ -4495,6 +4511,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             }
 #endif
         }
+    }
+
+    if (disable_fusion) {
+        return 0;
     }
 
     if (node->op == GGML_OP_MUL_MAT_ID) {
@@ -5870,7 +5890,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         }
     }
 
-    if (!disable_fusion) {
+    if (!disable_fusion || ggml_cuda_moe_int4_ffn_ignores_disable_fusion()) {
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT_ID) {
                 ggml_cuda_moe_int4_ffn ffn;
@@ -5882,6 +5902,12 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                     i += ffn_nodes - 1;
                     continue;
                 }
+            }
+            if (disable_fusion) {
+                continue;
+            }
+
+            if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT_ID) {
                 ggml_cuda_moe_down_reduction_match match;
                 if (ggml_cuda_match_moe_down_reduction(cgraph, i, match)) {
                     params->add_alloc_dep(

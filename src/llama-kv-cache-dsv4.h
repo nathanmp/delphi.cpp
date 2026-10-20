@@ -104,6 +104,8 @@ public:
                      uint32_t   n_ubatch,
                      uint32_t   n_pad,
                      uint32_t   n_rs_seq,
+                     uint32_t   n_layer_prefill,
+                         bool   compact_prefill,
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse);
 
@@ -145,6 +147,10 @@ public:
     //
 
     llama_kv_cache_iswa * get_raw() const;
+    llama_kv_cache_iswa * get_raw_dec() const;
+    uint32_t              get_n_split_raw() const;
+    uint32_t              get_ced_skip(const llama_ubatch & ubatch) const;
+    llama_ubatch          decoder_ubatch(const llama_ubatch & ubatch) const;
     llama_kv_cache      * get_csa() const;
     llama_kv_cache      * get_hca() const;
     llama_kv_cache      * get_lid() const;
@@ -165,6 +171,11 @@ private:
     const uint32_t n_seq_max;
     const uint32_t n_rs_seq;
 
+    // Separate occupancy prevents trimmed prompt rows from exposing unwritten decoder KV.
+    const uint32_t n_split_raw;
+    const uint32_t n_keep_dec;
+    const bool compact_prefill;
+
     std::vector<uint32_t> rs_idx;
 
     // tokens per row that each compressed cache is indexed at, for trimming and saving its used rows.
@@ -174,6 +185,7 @@ private:
     uint32_t row_ratio_lid = 0;
 
     std::unique_ptr<llama_kv_cache_iswa> kv_raw;
+    std::unique_ptr<llama_kv_cache_iswa> kv_raw_dec;
     std::unique_ptr<llama_kv_cache>      kv_csa;
     std::unique_ptr<llama_kv_cache>      kv_hca;
     std::unique_ptr<llama_kv_cache>      kv_lid;
@@ -186,22 +198,28 @@ private:
 
 // DSV4 raw attention only uses the SWA half of kv_raw. The base half is kept
 // for generic ISWA bookkeeping, but it has no DSV4 layers to expose here.
+//
+// CED keeps only the retained query rows in the decoder cache above n_split.
+// Without CED, all layers use kv_swa_enc.
 class llama_kv_cache_dsv4_raw_context : public llama_memory_context_i {
 public:
     using slot_info_vec_t = llama_kv_cache::slot_info_vec_t;
 
-    llama_kv_cache_dsv4_raw_context(llama_kv_cache_iswa * kv);
+    llama_kv_cache_dsv4_raw_context(llama_kv_cache_dsv4 * cache);
 
     llama_kv_cache_dsv4_raw_context(
-            llama_kv_cache_iswa * kv,
+            llama_kv_cache_dsv4 * cache,
             llama_context * lctx,
             bool optimize);
 
     llama_kv_cache_dsv4_raw_context(
-            llama_kv_cache_iswa * kv,
+            llama_kv_cache_dsv4 * cache,
             slot_info_vec_t sinfos_base_write,
             slot_info_vec_t sinfos_swa_write,
             slot_info_vec_t sinfos_swa_read,
+            slot_info_vec_t sinfos_dec_write,
+            slot_info_vec_t sinfos_dec_read,
+            std::vector<llama_ubatch> ubatches_dec_write,
             std::vector<llama_ubatch> ubatches,
             std::vector<llama_ubatch> ubatches_write);
 
@@ -212,16 +230,25 @@ public:
     const llama_ubatch & get_ubatch() const override;
 
     uint32_t get_n_kv() const;
+    uint32_t get_n_kv_dec() const;
     uint32_t get_n_write() const;
+    uint32_t get_n_write_dec() const;
+
+    bool has_dec() const;
+    bool is_dec(int32_t il) const;
+    llama_ubatch decoder_ubatch(const llama_ubatch & ubatch) const;
 
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;
 
     ggml_tensor * build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
+    ggml_tensor * build_input_k_idxs_dec(ggml_context * ctx, const llama_ubatch & ubatch) const;
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
 
     void set_input_k_idxs(ggml_tensor * dst) const;
+    void set_input_k_idxs_dec(ggml_tensor * dst) const;
     void set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    void set_input_kq_mask_dec(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_k_rot(ggml_tensor * dst) const;
 
     // see llama_kv_cache::get_prev_tokens(); the engram n-gram hash needs the preceding tokens
@@ -230,17 +257,31 @@ public:
 private:
     size_t i_next = 0;
 
-    llama_kv_cache * kv_swa = nullptr;
+    const llama_kv_cache_dsv4 * cache;
+
+    llama_kv_cache * kv_swa_enc = nullptr;
+    llama_kv_cache * kv_swa_dec = nullptr;
+
+    // last encoder-group layer; only used when the decoder group exists
+    uint32_t n_split = 0;
 
     slot_info_vec_t sinfos_write;
     slot_info_vec_t sinfos_read;
+
+    // Decoder slots and ubatches have their own row counts after compaction.
+    slot_info_vec_t sinfos_write_dec;
+    slot_info_vec_t sinfos_read_dec;
+    std::vector<llama_ubatch> ubatches_dec_write;
+
     std::vector<llama_ubatch> ubatches;
     std::vector<llama_ubatch> ubatches_write;
 
     const llama_memory_context_ptr ctx_base_mem;
     const llama_memory_context_ptr ctx_swa_mem;
+    const llama_memory_context_ptr ctx_dec_mem;
 
     uint32_t n_kv = 0;
+    uint32_t n_kv_dec = 0;
 
     const llama_memory_status status;
 };
@@ -349,6 +390,9 @@ public:
             slot_info_vec_t sinfos_raw_base_write,
             slot_info_vec_t sinfos_raw_swa_write,
             slot_info_vec_t sinfos_raw_swa_read,
+            slot_info_vec_t sinfos_raw_dec_write,
+            slot_info_vec_t sinfos_raw_dec_read,
+            std::vector<llama_ubatch> ubatches_dec_write,
             std::vector<llama_ubatch> ubatches,
             std::vector<llama_ubatch> ubatches_raw);
 

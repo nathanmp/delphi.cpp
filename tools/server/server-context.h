@@ -154,6 +154,11 @@ struct server_routes {
     server_http_context::handler_t post_rerank;
     server_http_context::handler_t get_lora_adapters;
     server_http_context::handler_t post_lora_adapters;
+    server_http_context::handler_t get_speculative;
+    server_http_context::handler_t post_speculative;
+    server_http_context::handler_t get_tune_context;  // delphi: only with --tune-endpoints
+    server_http_context::handler_t post_tune_context;
+    server_http_context::handler_t post_tune_kld;
 
     // to be used in router mode
     json get_model_info() const;

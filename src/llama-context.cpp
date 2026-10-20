@@ -1,5 +1,6 @@
 #include "llama-context.h"
 
+#include "ggml-cpuset.h"
 #include "ggml-exec-trace.h"
 #include "ggml.h"
 #include "llama-arch.h"
@@ -17,6 +18,7 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstdlib>
@@ -286,6 +288,31 @@ llama_context::llama_context(
         if (LLAMA_FUSED_LID_DISABLE && atoi(LLAMA_FUSED_LID_DISABLE) != 0) {
             cparams.fused_lid = false;
             cparams.auto_flid = false;
+        }
+    }
+
+    cparams.n_layer_prefill = hparams.n_layer();
+    cparams.ced_compact = false;
+    if (model.arch == LLM_ARCH_DEEPSEEK41) {
+        const char * LLAMA_DSV41_TRIM = getenv("LLAMA_DSV41_TRIM");
+        const int mode = LLAMA_DSV41_TRIM ? atoi(LLAMA_DSV41_TRIM) : 1;
+        if (mode == 1 || mode == 2) {
+            const uint32_t split = hparams.n_layer()/2;
+            bool supported = split > 0 && hparams.dsv41_candidate_source == (int32_t) split &&
+                    hparams.dsv41_is_kv_source(split) && hparams.dsv41_owns_index_k(split);
+            for (uint32_t il = split + 1; il < hparams.n_layer(); ++il) {
+                supported &= !hparams.dsv41_is_kv_source(il) && !hparams.dsv41_owns_index_k(il);
+            }
+            for (uint32_t il = split; il < hparams.n_layer(); ++il) {
+                supported &= model.layers[il].engram_embd == nullptr;
+            }
+            if (supported) {
+                cparams.n_layer_prefill = split;
+                cparams.ced_compact = mode == 1;
+                LLAMA_LOG_INFO("%s: CED prefill: %s, encoder layers = %u\n", __func__, mode == 1 ? "compact" : "bounded mask", split);
+            } else {
+                LLAMA_LOG_WARN("%s: CED prefill disabled: unsupported decoder source layout\n", __func__);
+            }
         }
     }
 
@@ -2073,6 +2100,13 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
         llama_sampler_chain_n(sampler) > 0;
 
     if (sampler && can_offload) {
+        auto it = sampling.samplers.find(seq_id);
+        if (it != sampling.samplers.end() && it->second == sampler) {
+            // the same object stays attached (the server keeps it between requests with equal parameters): its
+            // backend state and the graphs built with it remain valid
+            return true;
+        }
+
         auto * buft = ggml_backend_dev_buffer_type(model.dev_output());
 
         sampler->iface->backend_init(sampler, buft, cparams.n_outputs_max_per_seq);
@@ -2181,6 +2215,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     auto gparams = graph_params(res, ubatch, mctx, gtype);
 
+    static const bool build_log = getenv("LLAMA_GRAPH_BUILD_LOG") != nullptr;
+    int64_t t_build_us = -1;
+    int64_t t_alloc_us = -1;
+
     auto can_reuse = [&]() {
         return !graph_reuse_disable && gf_res_prev_active == res && gf_res_prev_threads == backend_n_threads && res->can_reuse(gparams);
     };
@@ -2239,15 +2277,23 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         n_reused++;
     } else {
+        if (build_log) {
+            const bool fresh = gf_res_prev_active != res || res->get_gf() == nullptr;
+            LLAMA_LOG_WARN("graph build: ctx %p n_tokens %u slot %d reason %s\n", (void *) this, ubatch.n_tokens, graph_slot_live,
+                    fresh ? "slot" : gf_res_prev_threads != backend_n_threads ? "threads" : res->reuse_fail_reason(gparams).c_str());
+        }
         gf_res_prev_active = nullptr;
         res->reset();
+        n_graph_built++;
 
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
         //const auto t_start_us = ggml_time_us();
 
+        t_build_us = ggml_time_us();
         gf = model.build_graph(gparams);
+        t_build_us = ggml_time_us() - t_build_us;
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
@@ -2258,12 +2304,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        t_alloc_us = ggml_time_us();
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             ggml_exec_trace_ubatch_end(trace_ubatch_id, ret);
             return nullptr;
         }
+        t_alloc_us = ggml_time_us() - t_alloc_us;
 
         gf_res_prev_active  = res;
         gf_res_prev_threads = backend_n_threads;
@@ -2279,12 +2327,18 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    const int64_t t_compute_us0 = build_log ? ggml_time_us() : 0;
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         ggml_exec_trace_ubatch_end(trace_ubatch_id, ret);
         return nullptr;
+    }
+    if (build_log && t_build_us >= 0) {
+        // host times; the first compute of a new graph includes its eager run or CUDA/HIP graph capture
+        LLAMA_LOG_WARN("graph build time: ctx %p n_tokens %u build %.2f alloc %.2f compute %.2f ms\n", (void *) this,
+                ubatch.n_tokens, t_build_us/1e3, t_alloc_us/1e3, (ggml_time_us() - t_compute_us0)/1e3);
     }
 
     ret = GGML_STATUS_SUCCESS;
@@ -2569,7 +2623,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const auto & hparams = model.hparams;
 
     const int64_t n_vocab = vocab.n_tokens();
-    const bool    mtp_embd = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && batch_inp.embd;
+    // an MTP batch with embd and no embd_h carries the hidden state in embd; with embd_h, embd holds input (media) embeddings
+    const bool    mtp_embd = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && batch_inp.embd && !batch_inp.embd_h;
     // DFlash embd batches carry the fused target features at the encoder input width
     const bool    dflash_embd = model.arch == LLM_ARCH_DFLASH && batch_inp.embd;
     const int64_t n_embd  = mtp_embd ? hparams.n_embd_out() : dflash_embd ? hparams.n_embd_inp_enc() : hparams.n_embd_inp();
@@ -3373,37 +3428,63 @@ llm_graph_result * llama_context::get_gf_res_prev() {
     return res.get();
 }
 
-// delphi: a CPU on the NUMA node of a GPU for its scheduler worker: LLAMA_MOE_CACHE_WORKER_CPU, else the node's last CPU
-// (--numa tensors gives the CPU threads the first CPUs of each node), else -1 (not pinned)
+// the last allowed CPU (ggml-cpuset.h) of a "0-7,16-23" list, -1 if the list has none
+static int last_allowed_cpu(const std::string & list) {
+    int last = -1;
+    for (size_t pos = 0; pos < list.size();) {
+        const size_t end = std::min(list.find(',', pos), list.size());
+        const std::string r = list.substr(pos, end - pos);
+        const size_t dash = r.find('-');
+        const int first = atoi(r.c_str());
+        const int hi    = dash == std::string::npos ? first : atoi(r.c_str() + dash + 1);
+        for (int c = std::max(first, 0); c <= hi && c < 4096; ++c) {
+            if (ggml_cpuset_allowed(c)) {
+                last = c;
+            }
+        }
+        pos = end + 1;
+    }
+    return last;
+}
+
+// delphi: a CPU on the NUMA node of a GPU for its scheduler worker: LLAMA_MOE_CACHE_WORKER_CPU, else the last allowed CPU of
+// the node (--numa tensors gives the CPU threads the first CPUs of each node), else the last allowed CPU, else -1 (not pinned).
+// The CPU is always inside the allowed set (ggml-cpuset.h): a restricted CPU set can leave a node without CPUs.
 static int share_worker_cpu(ggml_backend_dev_t dev) {
     if (const char * env = getenv("LLAMA_MOE_CACHE_WORKER_CPU")) {
-        return atoi(env);
+        if (ggml_cpuset_allowed(atoi(env))) {
+            return atoi(env);
+        }
+        LLAMA_LOG_WARN("%s: LLAMA_MOE_CACHE_WORKER_CPU=%s is outside the allowed CPU set, ignored\n", __func__, env);
     }
+    int cpu = -1;
     ggml_backend_dev_props props;
     ggml_backend_dev_get_props(dev, &props);
-    if (props.device_id == nullptr) {
-        return -1;
+    if (props.device_id != nullptr) {
+        std::string id = props.device_id;
+        for (auto & c : id) {
+            c = (char) tolower((unsigned char) c);
+        }
+        int node = -1;
+        std::ifstream("/sys/bus/pci/devices/" + id + "/numa_node") >> node;
+        if (node >= 0) {
+            std::string list;
+            std::ifstream("/sys/devices/system/node/node" + std::to_string(node) + "/cpulist") >> list;
+            cpu = last_allowed_cpu(list);
+        }
     }
-    std::string id = props.device_id;
-    for (auto & c : id) {
-        c = (char) tolower((unsigned char) c);
+    if (cpu < 0) {
+        std::vector<int> all(4096);
+        all.resize(ggml_cpuset_list(all.data(), (int) all.size()));
+        cpu = all.empty() ? -1 : all.back();
     }
-    int node = -1;
-    std::ifstream("/sys/bus/pci/devices/" + id + "/numa_node") >> node;
-    if (node < 0) {
-        return -1;
-    }
-    std::string list;
-    std::ifstream("/sys/devices/system/node/node" + std::to_string(node) + "/cpulist") >> list;
-    const size_t sep = list.find_last_of(",-");
-    const std::string last = sep == std::string::npos ? list : list.substr(sep + 1);
-    return last.empty() ? -1 : atoi(last.c_str());
+    return cpu;
 }
 
 // delphi: the splits of an expert cache tier on another GPU are submitted by a scheduler worker, so that their host time
 // overlaps the CPU expert part (LLAMA_MOE_CACHE_WORKER=0 turns this off)
 void llama_context::sched_set_workers(ggml_backend_sched_t s) {
-    static const bool enabled = [] { const char * e = getenv("LLAMA_MOE_CACHE_WORKER"); return e == nullptr || atoi(e) != 0; }();
+    const bool enabled = [] { const char * e = getenv("LLAMA_MOE_CACHE_WORKER"); return e == nullptr || atoi(e) != 0; }();
     if (s == nullptr) {
         return;
     }
@@ -3440,7 +3521,7 @@ void llama_context::expert_cache_auto() {
         return;
     }
     expert_cache->auto_size = false;
-    static const size_t margin = [] {
+    const size_t margin = [] {
         const char * e = getenv("LLAMA_MOE_CACHE_AUTO_MARGIN_MIB");
         return size_t(e ? std::max(0LL, atoll(e)) : 1536LL) << 20;
     }();
@@ -5686,6 +5767,34 @@ const float * llama_feature_handoff_nextn(llama_context * ctx, int32_t ticket) {
 
 const float * llama_feature_handoff_layer_inp(llama_context * ctx, int32_t ticket, uint32_t lid) {
     return ctx->feature_handoff_layer_inp(ticket, lid);
+}
+
+uint64_t llama_graph_n_built(const llama_context * ctx) {
+    return ctx->n_graph_built;
+}
+
+void llama_graph_alt_slots_reserve(llama_context * ctx, uint32_t n_slots, uint32_t n_max_tokens) {
+    ctx->graph_alt_slots_reserve(n_slots, n_max_tokens);
+}
+
+void llama_context::graph_alt_slots_reserve(uint32_t n_slots, uint32_t n_max_tokens) {
+    if (graph_reuse_disable) {
+        return;
+    }
+    if (!getenv("LLAMA_GRAPH_ALT_MAX_TOKENS")) {
+        graph_alt_max_tokens = std::max(graph_alt_max_tokens, n_max_tokens);
+    }
+    if (!getenv("LLAMA_GRAPH_ALT_SLOTS")) {
+        graph_alt_slots = std::max(graph_alt_slots, n_slots);
+    }
+    if (graph_alt_max_tokens > 0 && graph_alt_slots > 0) {
+        // new slots are empty; their schedulers are created on first use (graph_slot_activate)
+        const size_t n = 1 + (size_t) graph_alt_slots;
+        if (graph_slots.size() < n) {
+            graph_slots.resize(n);
+            LLAMA_LOG_INFO("%s: %u alternate graph slots of up to %u tokens\n", __func__, graph_alt_slots, graph_alt_max_tokens);
+        }
+    }
 }
 
 void llama_feature_handoff_release(llama_context * ctx, int32_t ticket) {
