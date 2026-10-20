@@ -220,7 +220,10 @@ def measure_ops(info, cfg, directory, timeout=600):
         command = [str(binary), "perf", "-b", sig["device"], "--numa", "tensors", "--threads", str(cfg["runtime"]["threads"]),
                    "--output", "csv", "--custom", spec]
         log = directory / f"op-{key[:16]}.csv"
-        run(command, log, environment, timeout=max(1, remaining))
+        try:
+            run(command, log, environment, timeout=max(1, remaining))
+        except subprocess.TimeoutExpired:
+            raise QuantError("operation measurement time cap reached; completed signatures were cached") from None
         measured = operation_times(log.read_text())
         values[key] = {"signature": sig, "ms": statistics.median(measured) / 1000 if measured else None,
                        "command": command, "log": str(log), "reason": None if measured else "backend did not run this signature"}
