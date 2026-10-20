@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import copy
+import inspect
 import io
 import json
 import shutil
@@ -117,11 +118,12 @@ def stage_calibrate(cfg, p, args):
     info = aq.configured_model(cfg)
     c = cfg["calibration"]
     vocab = space.vocab_size(cfg["model"])
-    rows = space.preflight("calibrate", info, cfg, directories(p), not args.no_space_check, vocab=vocab)
-    sizes = {name: size for name, _, size in rows}
+    space.preflight("calibrate", info, cfg, directories(p), not args.no_space_check, vocab=vocab)
+    extra = {"scratch": p["scratch"]} if "scratch" in inspect.signature(calibrate).parameters else {}
+    # calibrate prints its own pass lines; the watcher covers probe encoding and the teacher logits
     with progress.CalibrationWatcher(p["calibration"], teacher_bytes=space.teacher_bytes(vocab, c["chunks"], c["context"]),
-                                     probe_bytes=sizes["probe model (mid)"]):
-        table = calibrate(data, cfg, p["calibration"], aq.encode, aq.verify_output, text_dir=p["prepared"])
+                                     passes=False):
+        table = calibrate(data, cfg, p["calibration"], aq.encode, aq.verify_output, text_dir=p["prepared"], **extra)
     if p["calibration"] != p["quality"]:
         p["quality"].mkdir(parents=True, exist_ok=True)
         shutil.copy2(p["calibration"] / "quality.json", p["quality"] / "quality.json")

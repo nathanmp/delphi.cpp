@@ -1,8 +1,7 @@
 """Disk space of the stages: one estimate function with one row per artifact, and the free-space check.
 
 Every full GGUF that the tool writes holds the lazy tables (engram, per-layer embeddings) at their stored size, so the
-rows include them. The probe rows are upper bounds: they assume the largest qtype of every group. When probe models go
-away or patches become one layer band, change only the rows of artifacts() that name them."""
+rows include them. The probe model row is an upper bound (the largest qtype of every group)."""
 from __future__ import annotations
 
 import os
@@ -13,8 +12,9 @@ from config import QuantError
 from model import is_lazy, tensor_bytes
 from progress import size_text
 
-# Fraction of the groups in the largest random mix of the calibration design (densities 0.15, 0.35, 0.6)
-LARGEST_MIX = 0.6
+# Calibration writes one patch chunk (calibration.patch_mib, default 8192) at a time; the previous one stays until the
+# reload commits, so two chunks are on disk
+PATCH_MIB_DEFAULT = 8192
 # Small files of every stage: JSON records, logs, per-chunk KL values
 RECORDS = 256 << 20
 
@@ -59,7 +59,7 @@ def recipe_bytes(info, tensor_types):
     return sum(tensor_bytes(t["shape"], tensor_types[t["name"]]) for t in info["tensors"])
 
 
-def artifacts(stage, sizes, calibration=None, vocab=None, source_bytes=0, mmproj_bytes=0, output_bytes=None):
+def artifacts(stage, sizes, calibration=None, vocab=None, source_bytes=0, mmproj_bytes=0, output_bytes=None, ram=None):
     """[(artifact, directory key, bytes)] that a stage holds at its peak.
 
     sizes is model_sizes(info); calibration is the calibration section of the configuration. Directory keys: work
@@ -71,9 +71,12 @@ def artifacts(stage, sizes, calibration=None, vocab=None, source_bytes=0, mmproj
         return [("baseline GGUF", "work", low), ("records and logs", "work", RECORDS)]
     if stage == "calibrate":
         teacher = teacher_bytes(vocab, calibration["chunks"], calibration["context"]) if vocab else 0
-        return [("probe model (mid)", "scratch", high), ("probe model (top)", "scratch", high),
-                ("patch file", "scratch", int(LARGEST_MIX * high)), ("teacher logits", "scratch", teacher),
-                ("records and logs", "scratch", RECORDS)]
+        patch = 2 * calibration.get("patch_mib", PATCH_MIB_DEFAULT) * (1 << 20)
+        rows = [("patch files", "scratch", patch), ("teacher logits", "scratch", teacher), ("records and logs", "scratch", RECORDS)]
+        # a uniform recipe that does not fit in RAM runs as one separate probe model at the top probe qtype
+        if calibration.get("uniform") == "direct" or (ram is not None and high > ram):
+            rows.insert(0, ("probe model (uniform recipe)", "scratch", high))
+        return rows
     if stage == "encode":
         return [("encoded GGUF", "output", high if output_bytes is None else output_bytes)]
     if stage == "verify":
@@ -110,8 +113,20 @@ def check(stage, rows, directories, enabled=True, disk_usage=shutil.disk_usage):
                              "Use --scratch DIR on a larger disk, free space, or pass --no-space-check")
 
 
+def ram_available():
+    """Bytes of memory available to programs (MemAvailable of /proc/meminfo), None where that file does not exist."""
+    try:
+        with open("/proc/meminfo") as stream:
+            for line in stream:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return None
+
+
 def preflight(stage, info, cfg, directories, enabled=True, **extra):
     """Estimate and check one stage for a classified model (config.py configuration cfg)."""
-    rows = artifacts(stage, model_sizes(info), cfg.get("calibration"), **extra)
+    rows = artifacts(stage, model_sizes(info), cfg.get("calibration"), ram=ram_available(), **extra)
     check(stage, rows, directories, enabled)
     return rows

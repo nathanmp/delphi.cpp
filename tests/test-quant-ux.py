@@ -122,6 +122,15 @@ class CalibrationFiles(unittest.TestCase):
             self.assertAlmostEqual(eta, 8 * 10 / 2 + 2 * 30)
             self.assertEqual(w.watcher.progress.name, "calibration: passes")
 
+    def test_passes_left_to_calibrate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lines, clock = [], Clock()
+            w = progress.CalibrationWatcher(tmp, passes=False, interval=0, out=lines.append, clock=clock)
+            self.record(tmp, "ROCm0", [("floor", 30), ("a", 10)])
+            self.assertIs(w.probe(), False)
+            w.watcher.tick()
+            self.assertEqual(len(lines), 1)  # the start line only
+
     def test_stdout_sniffer_forwards_text(self):
         seen, out = [], io.StringIO()
         saved = sys.stdout
@@ -179,11 +188,16 @@ class Space(unittest.TestCase):
 
     def test_rows_have_one_entry_per_artifact(self):
         sizes = space.model_sizes(info())
-        rows = space.artifacts("calibrate", sizes, {"chunks": 64, "context": 512}, vocab=1000)
-        names = [name for name, _, _ in rows]
-        self.assertEqual(names, ["probe model (mid)", "probe model (top)", "patch file", "teacher logits", "records and logs"])
+        c = {"chunks": 64, "context": 512, "patch_mib": 100}
+        rows = space.artifacts("calibrate", sizes, c, vocab=1000, ram=10 * sizes[1])
+        self.assertEqual([n for n, _, _ in rows], ["patch files", "teacher logits", "records and logs"])
         self.assertTrue(all(key == "scratch" for _, key, _ in rows))
-        self.assertEqual(dict((n, b) for n, _, b in rows)["teacher logits"], space.teacher_bytes(1000, 64, 512))
+        by_name = {n: b for n, _, b in rows}
+        self.assertEqual(by_name["teacher logits"], space.teacher_bytes(1000, 64, 512))
+        self.assertEqual(by_name["patch files"], 200 << 20)  # the previous patch stays until the reload commits
+        # a uniform recipe that does not fit in RAM adds a probe model of the largest qtypes
+        rows = space.artifacts("calibrate", sizes, c, vocab=1000, ram=sizes[1] // 2)
+        self.assertEqual(rows[0], ("probe model (uniform recipe)", "scratch", sizes[1]))
         self.assertEqual(space.artifacts("prepare", sizes)[0], ("baseline GGUF", "work", sizes[0]))
         self.assertEqual(space.artifacts("encode", sizes)[0][1:], ("output", sizes[1]))
         self.assertEqual(space.artifacts("encode", sizes, output_bytes=5)[0][2], 5)

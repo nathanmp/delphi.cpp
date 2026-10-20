@@ -124,6 +124,8 @@ class Watcher:
         except OSError:
             seen = None
         p = self.progress
+        if seen is False:  # the stage reports on its own
+            return
         if seen is None:
             if p.last is None or p.clock() - p.last >= p.interval:
                 p.last = p.clock()
@@ -236,9 +238,11 @@ class CalibrationWatcher:
     """Progress of calibrate() without hooks in it: probe model encoding and teacher logits by file size, then the
     passes (done / total, estimated from the mean pass time and the number of sessions).
 
-    The total comes from the line that calibrate prints before the passes; without it the lines show the count only."""
+    The total comes from the line that calibrate prints before the passes; without it the lines show the count only.
+    With passes=False the pass phase is left to calibrate.py, which prints its own pass lines."""
 
-    def __init__(self, output, teacher_bytes=None, probe_bytes=None, poll=2.0, **kwargs):
+    def __init__(self, output, teacher_bytes=None, probe_bytes=None, poll=2.0, passes=True, **kwargs):
+        self.passes = passes
         self.output, self.teacher_bytes, self.probe_bytes = Path(output), teacher_bytes, probe_bytes
         self.total, self.devices, self.direct = None, 1, 0
         self.watcher = Watcher("calibration", self.probe, poll=poll, **kwargs)
@@ -268,6 +272,8 @@ class CalibrationWatcher:
         if teacher.exists():
             self.phase("calibration: teacher logits")
             return teacher.stat().st_size, self.teacher_bytes, None, ""
+        if not self.passes:
+            return False
         done, mean, floor = calibration_counts(self.output)
         if not done and not self.total:
             return None
