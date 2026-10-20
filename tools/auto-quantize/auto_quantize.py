@@ -262,6 +262,8 @@ def plan(data, cfg, output):
         state.pop("key")
         state["id"] = f"recipe-{index:03d}"
         state["tensor_types"] = tensor_plan(data["model"], state["choices"])
+        if model:
+            state["extrapolated_groups"] = model.extrapolated(state["choices"])
         write_json(outdir / f"{state['id']}.json", state)
         recipes.append(state)
     projection = projected(cfg) and any(cfg["multi_gpu_speedup_percent"].values())
@@ -291,6 +293,11 @@ def plan(data, cfg, output):
     print(f"Saved {outdir / 'frontier.json'}; timing predictions are {status}")
     if table:
         print(f"Predicted KL is against the teacher on the calibration text (floor {table['floor']['kl']:.5f}); max_loss is a model ceiling, not a bound")
+        beyond = [len(state["extrapolated_groups"]) for state in recipes if state["extrapolated_groups"]]
+        if beyond:
+            print(f"warning: {len(beyond)} of {len(recipes)} recipes use qtypes more precise than the top probe "
+                  f"{table['probe_qtypes']['top']} in up to {max(beyond)} groups; their predicted KL is extrapolated "
+                  "(calibrate with a more precise top probe, for example without calibration.probe_qtypes)")
     return payload
 
 

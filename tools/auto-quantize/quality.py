@@ -156,6 +156,21 @@ class LossModel:
         """d(kappa(u) G)/dG at u: the composed value of one unit of additive gain."""
         return self.kappa(u) + u * (self.kinf - 1) * math.exp(-u / self.u0) / self.u0
 
+    def extrapolated(self, choices, tolerance=0.02):
+        """Groups whose chosen qtype has a smaller local error than the top probe qtype: the fit did not measure that
+        range, so their predicted gain is an extrapolation."""
+        top = self.table.get("probe_qtypes", {}).get("top")
+        if top is None:
+            return []
+        result = []
+        for name, g in self.groups.items():
+            q = choices.get(name)
+            if q in (None, g["floor"], top) or top not in g["pool"]:
+                continue
+            if self.metric(g, q) < (1 - tolerance) * self.metric(g, top):
+                result.append(name)
+        return result
+
     def predict(self, choices):
         g = sum(self.gain(name, choices[name]) for name in self.groups)
         u = g / self.full
