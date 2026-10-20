@@ -325,6 +325,20 @@ int perplexity_hotswap::reload(const std::string & patch_path, std::string & err
     return -1;
 }
 
+int perplexity_hotswap::add(const std::string & patch_path, std::string & error) try {
+    if (!pimpl->pending.empty()) { throw std::runtime_error("previous update is not committed"); }
+    hot_file patch(patch_path);
+    if (gguf_get_n_tensors(patch.meta) == 0) { throw std::runtime_error("empty tensor patch"); }
+    pimpl->stage(patch, true);
+    const int count = pimpl->pending.size();
+    pimpl->apply();
+    return count;
+} catch (const std::exception & e) {
+    error = e.what();
+    rollback();
+    return -1;
+}
+
 int perplexity_hotswap::restore(std::string & error) {
     if (!pimpl->pending.empty()) { error = "previous update is not committed"; return -1; }
     for (auto & entry : pimpl->targets) {
