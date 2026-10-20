@@ -11,12 +11,14 @@ import contextlib
 import copy
 import io
 import json
+import shutil
 import sys
 from pathlib import Path
 
 from config import AXES, QuantError, capacity, load_config
 import frontier as fr
 import progress
+import space
 
 WEIGHT_NAMES = {"loss": "precision", "kld": "precision", "precision": "precision", "decode": "decode", "short": "short",
                 "long": "long"}
@@ -83,17 +85,53 @@ def apply_query(cfg, args):
     return cfg
 
 
-def paths(work):
+def paths(work, scratch=None):
+    """Directories of a work directory. work keeps the durable results (prepared tables, quality table, plans, state);
+    scratch (default WORK/scratch) keeps what can be deleted: calibration probe models, patches and teacher logits.
+
+    A work directory from before the scratch option keeps its calibration files in WORK/quality; they stay there."""
     work = Path(work).resolve()
-    return {"prepared": work / "prepared", "quality": work / "quality", "plans": work / "plans"}
+    quality = work / "quality"
+    legacy = scratch is None and (any(quality.glob("session-*")) or (quality / "teacher.kld").exists())
+    scratch = Path(scratch).resolve() if scratch else work / "scratch"
+    return {"work": work, "scratch": scratch, "prepared": work / "prepared", "quality": quality, "plans": work / "plans",
+            "calibration": quality if legacy else scratch / "calibration"}
+
+
+def directories(p, output=None):
+    return {"work": p["work"], "scratch": p["scratch"], "output": Path(output).resolve().parent if output else p["work"]}
+
+
+def stage_prepare(cfg, p, args, measurement_seconds=600):
+    import auto_quantize as aq
+    if not (p["prepared"] / "prepared.json").exists():
+        space.preflight("prepare", aq.configured_model(cfg), cfg, directories(p), not args.no_space_check)
+    return aq.prepare(cfg, p["prepared"], measurement_seconds)
+
+
+def stage_calibrate(cfg, p, args):
+    """Calibration passes with the large files in the scratch directory; only quality.json goes to the work directory."""
+    import auto_quantize as aq
+    from calibrate import calibrate
+    data = aq.load_prepared(p["prepared"] / "prepared.json", cfg)
+    info = aq.configured_model(cfg)
+    c = cfg["calibration"]
+    vocab = space.vocab_size(cfg["model"])
+    rows = space.preflight("calibrate", info, cfg, directories(p), not args.no_space_check, vocab=vocab)
+    sizes = {name: size for name, _, size in rows}
+    with progress.CalibrationWatcher(p["calibration"], teacher_bytes=space.teacher_bytes(vocab, c["chunks"], c["context"]),
+                                     probe_bytes=sizes["probe model (mid)"]):
+        table = calibrate(data, cfg, p["calibration"], aq.encode, aq.verify_output, text_dir=p["prepared"])
+    if p["calibration"] != p["quality"]:
+        p["quality"].mkdir(parents=True, exist_ok=True)
+        shutil.copy2(p["calibration"] / "quality.json", p["quality"] / "quality.json")
+    return table
 
 
 def command_setup(args):
-    import auto_quantize as aq
-    from calibrate import calibrate
     cfg = load_config(args.config)
-    p = paths(args.work)
-    aq.prepare(cfg, p["prepared"], args.measurement_seconds)
+    p = paths(args.work, args.scratch)
+    stage_prepare(cfg, p, args, args.measurement_seconds)
     table = p["quality"] / "quality.json"
     if args.skip_calibrate:
         print("Skipped calibration: plans will use the local error proxy, not predicted KL")
@@ -102,15 +140,13 @@ def command_setup(args):
     else:
         if not cfg["calibration"]["text"]:
             raise QuantError("calibration.text is required (or pass --skip-calibrate)")
-        data = aq.load_prepared(p["prepared"] / "prepared.json", cfg)
-        with progress.CalibrationWatcher(p["quality"]):
-            calibrate(data, cfg, p["quality"], aq.encode, aq.verify_output, text_dir=p["prepared"])
+        stage_calibrate(cfg, p, args)
     print(f"Ready: python {sys.argv[0]} plan --config {args.config} --work {args.work} ...")
 
 
 def command_plan(args):
     cfg = load_config(args.config)
-    p = paths(args.work)
+    p = paths(args.work, args.scratch)
     table = p["quality"] / "quality.json"
     if "quality" not in cfg and table.exists():
         cfg["quality"] = {"table": str(table)}
@@ -167,6 +203,10 @@ def choose(payload, path, args, default_pick=None):
         print("Run with: " + " ".join(row["recipe"]["memory"]["runtime_args"]))
     if getattr(args, "output", None):
         import auto_quantize as aq
+        out = Path(args.output).resolve().parent
+        info = payload["prepared"]["model"]
+        space.check("encode", [("encoded GGUF", "output", space.recipe_bytes(info, row["recipe"]["tensor_types"]))],
+                    {"output": out}, not args.no_space_check)
         print(f"Encoding to {args.output}")
         aq.encode_from_frontier(payload, row["id"], args.output)
     else:
@@ -182,16 +222,24 @@ def build_parser():
             p.add_argument("--config", type=Path, required=True)
             p.add_argument("--work", type=Path, required=True, help="directory for prepared inputs, quality table and plans")
 
+    def space_options(p, scratch=True):
+        if scratch:
+            p.add_argument("--scratch", type=Path, help="directory for temporary files (probe models, patches, teacher logits); "
+                           "default WORK/scratch")
+        p.add_argument("--no-space-check", action="store_true", help="skip the free disk space check before large writes")
+
     def display(p):
         p.add_argument("--rows", type=int, default=10, help="rows to show (thinned from the whole frontier)")
         p.add_argument("--pick", help="row number, recipe id, best, min-kld, min-size, fastest-decode|short|long")
         p.add_argument("--detail", help="print the qtype histogram per tensor kind of this pick")
         p.add_argument("--output", type=Path, help="encode the pick to this GGUF (without it the pick is only named)")
+        space_options(p)
 
     p = sub.add_parser("setup", help="prepare and calibrate once per model and machine state")
     common(p)
     p.add_argument("--measurement-seconds", type=float, default=600)
     p.add_argument("--skip-calibrate", action="store_true")
+    space_options(p)
     p = sub.add_parser("plan", help="plan for a query and choose from the frontier")
     common(p)
     p.add_argument("--weights", help="loss=.4,decode=.3,short=.2,long=.1 (relative; omitted axes count 0)")
@@ -212,6 +260,7 @@ def build_parser():
     p.add_argument("--rows", type=int, default=10)
     p.add_argument("--pick", required=True)
     p.add_argument("--output", type=Path, required=True)
+    space_options(p, scratch=False)
     return parser
 
 

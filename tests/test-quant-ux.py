@@ -10,6 +10,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools/auto-quantize"))
 import progress
+import space
+from config import QuantError
 
 GIB = 1 << 30
 
@@ -139,6 +141,87 @@ class CalibrationFiles(unittest.TestCase):
             self.assertEqual(progress.count_matches(log, "a"), 0)
             log.write_text("blk.0.w [1, 2] q8_0, 4 experts\nnoise\nblk.1.w [1, 2] q8_0, 4 experts\n")
             self.assertEqual(progress.count_matches(log, r"^\S+ \[[0-9, ]+\] \S+,"), 2)
+
+
+def info():
+    """Two decision groups (an MoE expert pair and a dense matrix), a preserved norm and a lazy table."""
+    return {"tensors": [
+        {"name": "blk.0.ffn_gate_exps.weight", "shape": [2048, 1024, 8]},
+        {"name": "blk.0.ffn_up_exps.weight", "shape": [2048, 1024, 8]},
+        {"name": "blk.0.attn_q.weight", "shape": [2048, 2048]},
+        {"name": "blk.0.attn_norm.weight", "shape": [2048]},
+        {"name": "engram_embd.weight", "shape": [4096, 1000]}],
+        "groups": [{"name": "blk.0.ffn_gate_exps.weight", "members": ["blk.0.ffn_gate_exps.weight", "blk.0.ffn_up_exps.weight"],
+                    "pool": ["Q2_K", "Q4_0", "Q8_0"]},
+                   {"name": "blk.0.attn_q.weight", "members": ["blk.0.attn_q.weight"], "pool": ["Q8_0"]},
+                   {"name": "blk.0.attn_norm.weight", "members": ["blk.0.attn_norm.weight"], "pool": ["F32"]},
+                   {"name": "engram_embd.weight", "members": ["engram_embd.weight"], "pool": ["Q4_0"]}]}
+
+
+class Space(unittest.TestCase):
+    def test_teacher_size_matches_a_real_file(self):
+        # llama-perplexity wrote this file: 64 chunks of 512 tokens, vocabulary 248320 (measured 2026-10-19)
+        self.assertEqual(space.teacher_bytes(248320, 64, 512), 8105426452)
+
+    def test_teacher_size_grows_with_chunks_and_vocab(self):
+        base = space.teacher_bytes(1000, 8, 128)
+        self.assertGreater(space.teacher_bytes(1000, 16, 128), base)
+        self.assertGreater(space.teacher_bytes(2000, 8, 128), base)
+        self.assertEqual(space.teacher_bytes(1001, 8, 128), space.teacher_bytes(1002, 8, 128))  # nv rounds up to even
+
+    def test_model_sizes_include_lazy_tables(self):
+        low, high, lazy = space.model_sizes(info())
+        block = 2048 * 1024 * 8
+        # Q2_K 84/256 B per weight, Q4_0 18/32, Q8_0 34/32; two experts tensors per group
+        self.assertEqual(lazy, 4096 * 1000 // 32 * 18)
+        self.assertEqual(low, 2 * block // 256 * 84 + 2048 * 2048 // 32 * 34 + 2048 * 4 + lazy)
+        self.assertEqual(high, 2 * block // 32 * 34 + 2048 * 2048 // 32 * 34 + 2048 * 4 + lazy)
+
+    def test_rows_have_one_entry_per_artifact(self):
+        sizes = space.model_sizes(info())
+        rows = space.artifacts("calibrate", sizes, {"chunks": 64, "context": 512}, vocab=1000)
+        names = [name for name, _, _ in rows]
+        self.assertEqual(names, ["probe model (mid)", "probe model (top)", "patch file", "teacher logits", "records and logs"])
+        self.assertTrue(all(key == "scratch" for _, key, _ in rows))
+        self.assertEqual(dict((n, b) for n, _, b in rows)["teacher logits"], space.teacher_bytes(1000, 64, 512))
+        self.assertEqual(space.artifacts("prepare", sizes)[0], ("baseline GGUF", "work", sizes[0]))
+        self.assertEqual(space.artifacts("encode", sizes)[0][1:], ("output", sizes[1]))
+        self.assertEqual(space.artifacts("encode", sizes, output_bytes=5)[0][2], 5)
+        self.assertEqual(space.artifacts("convert", sizes, source_bytes=7, mmproj_bytes=3)[0][2:], (7,))
+        with self.assertRaises(ValueError):
+            space.artifacts("nope", sizes)
+
+    def test_check_names_directory_bytes_needed_and_free(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            scratch = Path(tmp) / "scratch" / "deep"  # does not exist yet: the check uses the nearest parent
+            rows = [("probe model (mid)", "scratch", 30 * GIB), ("teacher logits", "scratch", 8 * GIB)]
+            usage = lambda path: type("U", (), {"free": 20 * GIB})()
+            with self.assertRaises(QuantError) as raised:
+                space.check("calibrate", rows, {"scratch": scratch}, True, usage)
+            text = str(raised.exception)
+            for part in ("calibrate", str(scratch), "38.0 GiB needed", "20.0 GiB free", "probe model (mid) 30.0 GiB", "--no-space-check"):
+                self.assertIn(part, text)
+            space.check("calibrate", rows, {"scratch": scratch}, False, usage)  # --no-space-check
+            space.check("calibrate", rows[1:], {"scratch": scratch}, True, usage)  # 8 GiB fits
+
+    def test_directories_on_one_file_system_add_up(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dirs = {"work": Path(tmp) / "work", "scratch": Path(tmp) / "scratch"}
+            usage = lambda path: type("U", (), {"free": 20 * GIB})()
+            rows = [("baseline GGUF", "work", 12 * GIB), ("probe", "scratch", 12 * GIB)]
+            with self.assertRaises(QuantError) as raised:
+                space.check("calibrate", rows, dirs, True, usage)
+            self.assertIn("24.0 GiB needed", str(raised.exception))
+            space.check("calibrate", [rows[0]], dirs, True, usage)
+
+    def test_zero_rows_are_ignored(self):
+        space.check("convert", [("mmproj GGUF", "scratch", 0)], {"scratch": Path("/nonexistent/x")}, True)
+
+    def test_recipe_bytes(self):
+        types = {t["name"]: "Q8_0" for t in info()["tensors"]}
+        types["engram_embd.weight"] = "Q4_0"
+        types["blk.0.attn_norm.weight"] = "F32"
+        self.assertEqual(space.recipe_bytes(info(), types), space.model_sizes(info())[1])
 
 
 if __name__ == "__main__":
