@@ -1452,7 +1452,17 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
     ggml_tensor * shared_top_k = nullptr;
     ggml_tensor * shared_cand  = nullptr;
 
-    for (int il = 0; il < n_layer; ++il) {
+    // Phase 0 spike (LLAMA_DSV41_TRIM_SPIKE=1): prompt ubatches build only the encoder trunk,
+    // layers 0..n_layer/2 (layer n_layer/2 included: the decoder Full layer). Outputs are invalid
+    // in this mode. It exists to measure the prefill wall-time direction and to expose cache
+    // bookkeeping assumptions that a trimmed prefill must handle. Decode keeps all layers.
+    static const bool trim_spike = [] {
+        const char * env = getenv("LLAMA_DSV41_TRIM_SPIKE");
+        return env && atoi(env) != 0;
+    }();
+    const int64_t n_layer_build = trim_spike && n_tokens > 1 ? n_layer/2 + 1 : n_layer;
+
+    for (int il = 0; il < n_layer_build; ++il) {
         if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
             res->t_layer_inp[il] = dsv41_hc_mean(ctx0, inpL);
             cb(res->t_layer_inp[il], "layer_inp", il);
