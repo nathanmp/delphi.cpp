@@ -606,6 +606,8 @@ def command_run(args):
     def calibrate_reset():
         (p["quality"] / "quality.json").unlink(missing_ok=True)
         shutil.rmtree(p["calibration"], ignore_errors=True)
+        # the measured/predicted KL ratio belongs to the old quality table
+        (work / vf.RATIO_FILE).unlink(missing_ok=True)
     def calibrate_foreign():
         record = p["calibration"] / "teacher.json"
         model = json.loads(record.read_text()).get("model") if record.exists() else None
