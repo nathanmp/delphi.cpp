@@ -5298,21 +5298,17 @@ static VEC_DOT_BATCH_INLINE void q4_0_batch_impl(int n, float * s, const void * 
     const int nb = n / QK8_0;
 
     const __m256i off = _mm256_set1_epi8( 8 );
-    const __m256i ones = _mm256_set1_epi16(1);
 
     __m256 acc[4];
     for (int r = 0; r < nr; ++r) acc[r] = _mm256_setzero_ps();
     for (int ib = 0; ib < nb; ++ib) {
         const float xd = GGML_CPU_FP16_TO_FP32(x[ib].d);
         const __m256i qx = _mm256_sub_epi8(bytes_from_nibbles_32(x[ib].qs), off);
-        // mul_sum_i8_pairs_float split: |x| once, sign(y, x) per row
-        const __m256i ax = _mm256_sign_epi8(qx, qx);
         for (int r = 0; r < nr; ++r) {
             const block_q8_0 * y = &((const block_q8_0 *) vy[r])[ib];
             const __m256 d = _mm256_set1_ps( xd * GGML_CPU_FP16_TO_FP32(y->d) );
             const __m256i qy = _mm256_loadu_si256((const __m256i *)y->qs);
-            const __m256i dot = _mm256_maddubs_epi16(ax, _mm256_sign_epi8(qy, qx));
-            const __m256 q = _mm256_cvtepi32_ps(_mm256_madd_epi16(ones, dot));
+            const __m256 q = mul_sum_i8_pairs_float(qx, qy);
             acc[r] = _mm256_fmadd_ps( d, q, acc[r] );
         }
     }
@@ -5323,20 +5319,16 @@ static VEC_DOT_BATCH_INLINE void q8_0_batch_impl(int n, float * s, const void * 
     const block_q8_0 * GGML_RESTRICT x = vx;
     const int nb = n / QK8_0;
 
-    const __m256i ones = _mm256_set1_epi16(1);
-
     __m256 acc[4];
     for (int r = 0; r < nr; ++r) acc[r] = _mm256_setzero_ps();
     for (int ib = 0; ib < nb; ++ib) {
         const float xd = GGML_CPU_FP16_TO_FP32(x[ib].d);
         const __m256i qx = _mm256_loadu_si256((const __m256i *)x[ib].qs);
-        const __m256i ax = _mm256_sign_epi8(qx, qx);
         for (int r = 0; r < nr; ++r) {
             const block_q8_0 * y = &((const block_q8_0 *) vy[r])[ib];
             const __m256 d = _mm256_set1_ps( xd * GGML_CPU_FP16_TO_FP32(y->d) );
             const __m256i qy = _mm256_loadu_si256((const __m256i *)y->qs);
-            const __m256i dot = _mm256_maddubs_epi16(ax, _mm256_sign_epi8(qy, qx));
-            const __m256 q = _mm256_cvtepi32_ps(_mm256_madd_epi16(ones, dot));
+            const __m256 q = mul_sum_i8_pairs_float(qx, qy);
             acc[r] = _mm256_fmadd_ps( d, q, acc[r] );
         }
     }
@@ -5398,51 +5390,64 @@ static VEC_DOT_BATCH_INLINE void mxfp4_batch_impl(int n, float * s, const void *
     }
 }
 
-// Literal row counts let the compiler keep each row's accumulators in registers.
-#define VEC_DOT_BATCH_DEFINE(NAME) \
-    static void NAME##_batch(int n, float * s, const void * vx, const void * const * vy, int nr) { \
+// Select the row count once per group. A single row uses the original vec_dot.
+#define VEC_DOT_BATCH_ROWS(NAME, NR) \
+    for (int64_t row = 0; row < rows; ++row) { \
+        float sums[4]; \
+        NAME##_batch_impl(n, sums, (const char *) vx + row * stride, vy, NR); \
+        for (int r = 0; r < NR; ++r) dst[r][row] = sums[r]; \
+    }
+#define VEC_DOT_BATCH_DEFINE(NAME, VEC_DOT_TYPE) \
+    static void NAME##_rows(int n, float * const * dst, const void * vx, size_t stride, \
+                            const void * const * vy, int nr, int64_t rows) { \
+        assert(nr >= 1 && nr <= 4); \
         switch (nr) { \
-            case 1: NAME##_batch_impl(n, s, vx, vy, 1); break; \
-            case 2: NAME##_batch_impl(n, s, vx, vy, 2); break; \
-            case 3: NAME##_batch_impl(n, s, vx, vy, 3); break; \
-            case 4: NAME##_batch_impl(n, s, vx, vy, 4); break; \
+            case 1: \
+                for (int64_t row = 0; row < rows; ++row) { \
+                    ggml_vec_dot_##NAME##_##VEC_DOT_TYPE(n, dst[0] + row, 0, (const char *) vx + row * stride, 0, vy[0], 0, 1); \
+                } \
+                break; \
+            case 2: VEC_DOT_BATCH_ROWS(NAME, 2) break; \
+            case 3: VEC_DOT_BATCH_ROWS(NAME, 3) break; \
+            case 4: VEC_DOT_BATCH_ROWS(NAME, 4) break; \
         } \
     }
-VEC_DOT_BATCH_DEFINE(iq2_xxs)
-VEC_DOT_BATCH_DEFINE(iq2_xs)
-VEC_DOT_BATCH_DEFINE(iq2_s)
-VEC_DOT_BATCH_DEFINE(iq3_xxs)
-VEC_DOT_BATCH_DEFINE(iq3_s)
-VEC_DOT_BATCH_DEFINE(iq4_nl)
-VEC_DOT_BATCH_DEFINE(q4_K)
-VEC_DOT_BATCH_DEFINE(q3_K)
-VEC_DOT_BATCH_DEFINE(q5_K)
-VEC_DOT_BATCH_DEFINE(q6_K)
-VEC_DOT_BATCH_DEFINE(q2_K)
-VEC_DOT_BATCH_DEFINE(iq4_xs)
-VEC_DOT_BATCH_DEFINE(q4_0)
-VEC_DOT_BATCH_DEFINE(q8_0)
-VEC_DOT_BATCH_DEFINE(mxfp4)
+VEC_DOT_BATCH_DEFINE(iq2_xxs, q8_K)
+VEC_DOT_BATCH_DEFINE(iq2_xs,  q8_K)
+VEC_DOT_BATCH_DEFINE(iq2_s,   q8_K)
+VEC_DOT_BATCH_DEFINE(iq3_xxs, q8_K)
+VEC_DOT_BATCH_DEFINE(iq3_s,   q8_K)
+VEC_DOT_BATCH_DEFINE(iq4_nl,  q8_0)
+VEC_DOT_BATCH_DEFINE(q4_K,    q8_K)
+VEC_DOT_BATCH_DEFINE(q3_K,    q8_K)
+VEC_DOT_BATCH_DEFINE(q5_K,    q8_K)
+VEC_DOT_BATCH_DEFINE(q6_K,    q8_K)
+VEC_DOT_BATCH_DEFINE(q2_K,    q8_K)
+VEC_DOT_BATCH_DEFINE(iq4_xs,  q8_K)
+VEC_DOT_BATCH_DEFINE(q4_0,    q8_0)
+VEC_DOT_BATCH_DEFINE(q8_0,    q8_0)
+VEC_DOT_BATCH_DEFINE(mxfp4,   q8_0)
 #undef VEC_DOT_BATCH_DEFINE
+#undef VEC_DOT_BATCH_ROWS
 #undef VEC_DOT_BATCH_INLINE
 
-ggml_vec_dot_batch_t ggml_get_vec_dot_batch(enum ggml_type type) {
+ggml_vec_dot_batch_rows_t ggml_get_vec_dot_batch_rows(enum ggml_type type) {
     switch (type) {
-        case GGML_TYPE_IQ2_XXS: return iq2_xxs_batch;
-        case GGML_TYPE_IQ2_XS:  return iq2_xs_batch;
-        case GGML_TYPE_IQ2_S:   return iq2_s_batch;
-        case GGML_TYPE_IQ3_XXS: return iq3_xxs_batch;
-        case GGML_TYPE_IQ3_S:   return iq3_s_batch;
-        case GGML_TYPE_IQ4_NL:  return iq4_nl_batch;
-        case GGML_TYPE_Q4_K:    return q4_K_batch;
-        case GGML_TYPE_Q3_K:    return q3_K_batch;
-        case GGML_TYPE_Q5_K:    return q5_K_batch;
-        case GGML_TYPE_Q6_K:    return q6_K_batch;
-        case GGML_TYPE_Q2_K:    return q2_K_batch;
-        case GGML_TYPE_IQ4_XS:  return iq4_xs_batch;
-        case GGML_TYPE_Q4_0:    return q4_0_batch;
-        case GGML_TYPE_Q8_0:    return q8_0_batch;
-        case GGML_TYPE_MXFP4:   return mxfp4_batch;
+        case GGML_TYPE_IQ2_XXS: return iq2_xxs_rows;
+        case GGML_TYPE_IQ2_XS:  return iq2_xs_rows;
+        case GGML_TYPE_IQ2_S:   return iq2_s_rows;
+        case GGML_TYPE_IQ3_XXS: return iq3_xxs_rows;
+        case GGML_TYPE_IQ3_S:   return iq3_s_rows;
+        case GGML_TYPE_IQ4_NL:  return iq4_nl_rows;
+        case GGML_TYPE_Q4_K:    return q4_K_rows;
+        case GGML_TYPE_Q3_K:    return q3_K_rows;
+        case GGML_TYPE_Q5_K:    return q5_K_rows;
+        case GGML_TYPE_Q6_K:    return q6_K_rows;
+        case GGML_TYPE_Q2_K:    return q2_K_rows;
+        case GGML_TYPE_IQ4_XS:  return iq4_xs_rows;
+        case GGML_TYPE_Q4_0:    return q4_0_rows;
+        case GGML_TYPE_Q8_0:    return q8_0_rows;
+        case GGML_TYPE_MXFP4:   return mxfp4_rows;
         default:                return NULL;
     }
 }

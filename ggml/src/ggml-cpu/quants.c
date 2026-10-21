@@ -22,6 +22,13 @@
 
 #define UNUSED GGML_UNUSED
 
+#if !defined(__AVX2__)
+ggml_vec_dot_batch_rows_t ggml_get_vec_dot_batch_rows(enum ggml_type type) {
+    UNUSED(type);
+    return NULL;
+}
+#endif
+
 void quantize_row_q1_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_q1_0_ref(x, y, k);
 }
