@@ -15,7 +15,7 @@ import progress
 from model import is_lazy, lazy_args, tensor_bytes
 
 sys.path.insert(0, str(ROOT))
-from tools.bottlenecks.profile import BenchArm, Recipe, ProfileError, GPU_SETTING_KEYS, _gpu_state, run_recipe
+from tools.bottlenecks.profile import BenchArm, Recipe, ProfileError, GPU_SETTING_KEYS, TRACE, _gpu_state, run_recipe
 
 MODEL_REVISION = 3
 
@@ -94,16 +94,41 @@ def profile_model(cfg, model, output, trace=True, placement=None):
         command += ["-ncmoe", "999"]
     environment = dict(r["env"])
     environment["LLAMA_MOE_CACHE_MIB"] = str(int(cfg["cache_mib"]))
-    arm = BenchArm(name="plain", command=tuple(command), model_paths=(str(model),), env=environment,
-                   trace_mode="submit" if trace else "off", trace_max_events=r["trace_max_events"],
-                   trace_prefill_target_tokens=r["long_tokens"])
-    recipe = Recipe(name="auto-quantize", description="Fixed V1 short/long prefill and decode with one model load.", arms=(arm,))
-    try:
-        result = run_recipe(recipe, Path(output).with_suffix(".artifacts"))
-    except ProfileError as exc:
-        raise QuantError(str(exc)) from exc
+    artifacts = Path(output).with_suffix(".artifacts")
+    events = max(r["trace_max_events"], TRACE_EVENTS[0])
+    for attempt in range(2):
+        arm = BenchArm(name="plain", command=tuple(command), model_paths=(str(model),), env=environment,
+                       trace_mode="submit" if trace else "off", trace_max_events=events,
+                       trace_prefill_target_tokens=r["long_tokens"])
+        recipe = Recipe(name="auto-quantize", description="Fixed V1 short/long prefill and decode with one model load.", arms=(arm,))
+        try:
+            result = run_recipe(recipe, artifacts)
+            break
+        except ProfileError as exc:
+            needed = trace_events_needed(artifacts / arm.name / "execution.trace") if trace and attempt == 0 else 0
+            if not events < needed <= TRACE_LIMIT:
+                raise QuantError(str(exc)) from exc
+            events = min(TRACE_LIMIT, 1 << math.ceil(math.log2(needed * 1.25)))
+            TRACE_EVENTS[0] = events
+            print(f"The trace needs {needed} events; profiling again with a buffer of {events}", flush=True)
     write_json(output, result)
     return result
+
+
+# The native tracer limit, and the largest trace buffer this process needed (later profiles start with it). It stays out
+# of the configuration: runtime keys are inputs of the prepared tables
+TRACE_LIMIT = 128 * 1024 * 1024
+TRACE_EVENTS = [0]
+
+
+def trace_events_needed(path):
+    """Events that a trace with dropped events tried to record, else 0. A large model on several GPUs records more
+    events than the default buffer (Qwen 3.8 on 3 GPUs: 2.3 M)."""
+    try:
+        stats = TRACE.read_trace(Path(path))["trace_stats"]
+    except Exception:
+        return 0
+    return stats.get("attempted_event_count", 0) if stats.get("dropped_event_count", 0) else 0
 
 
 def profile_times(profile, cfg):

@@ -202,7 +202,7 @@ CPU expert probes also set `numa_expert=1`. `--numa tensors` alone pins workers 
 
 Lazy tables (`engram_embd`, `per_layer_token_embd`) are read row by row from disk. They stay at the source type, or at the type of a `pins` entry (a BF16 table can be about 100 GB in every encoded model; the production Qwen 3.8 quant pins `per_layer_token_embd.weight` to Q4_0), are not part of any qtype pool and do not count in device budgets, `bounds.max_total_bytes` or the reported sizes; plans report them as `lazy_bytes`. Every run of the tool on such a model (`llama-bench`, `llama-perplexity`, `llama-imatrix`) adds `-lm mmap -lzm on -ot <tables>=CPU`, so the tables are not loaded into a device. The measured speeds include the lazy lookups of the baseline's page-cache state (the same for every recipe), and the page cache decides how much RAM they use: size the RAM budget for the page cache you want to leave to them. `encode` copies the tables unchanged and verifies the copy.
 
-`runtime.trace_max_events` sets the profiler trace capacity; default 1048576. Increase it for larger models or workloads if the profiler reports dropped events. A truncated trace is rejected rather than used for CPU calibration.
+`runtime.trace_max_events` sets the profiler trace capacity; default 1048576 (80 bytes per event). A truncated trace is rejected rather than used for CPU calibration. When a trace drops events, the tool profiles once more with a buffer of 1.25 times the events that the trace tried to record, rounded up to a power of two (Qwen 3.8 Flash Next on 3 GPUs: 2.3 M events, so 4 M), and later profiles of the same process start with that size.
 
 ## Cache and multiple GPUs
 

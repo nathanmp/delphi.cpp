@@ -17,7 +17,7 @@ from model import classify, is_lazy, lazy_args, merge_imatrices, read_model, ten
 from search import dominates, llama_layer_devices, make_options, memory, pareto, search
 from quality import LossModel, damage_digest, load_quality, modelled_groups, role_of
 from calibrate import Fit, PatchWriter, anchor_qtypes, design, probe_qtypes
-from timing import Predictor, digest, operation_times, profile_model, regions, signature, token_counts
+from timing import Predictor, ProfileError, digest, operation_times, profile_model, regions, signature, token_counts
 from auto_quantize import gpu_descriptions, require_identical_gpus, tensor_plan, verify_output, witness_choices
 from calibrate import perplexity_command
 import numpy as np
@@ -1109,6 +1109,22 @@ class GpuOnly(unittest.TestCase):
             one = cfg(devices={"ROCm1": 1, "RAM": 1}, bindir="/b", model="/m.gguf", runtime=config["runtime"])
             profile_model(one, "/m.gguf", Path(d) / "r.json")
         command = seen[0]
+        events = []
+
+        def truncated(recipe, out):
+            events.append(recipe.arms[0].trace_max_events)
+            if len(events) == 1:
+                raise ProfileError("trace is truncated or dropped events")
+            return {}
+        with tempfile.TemporaryDirectory() as d, mock.patch("timing.lazy_args", return_value=[]), \
+                mock.patch("timing.run_recipe", side_effect=truncated), mock.patch("timing.trace_events_needed", return_value=1000), \
+                mock.patch("timing.TRACE_EVENTS", [0]):
+            profile_model(config, "/m.gguf", Path(d) / "s.json", placement=[3, 4, 5])
+        self.assertEqual(events, [10, 2048])
+        with tempfile.TemporaryDirectory() as d, mock.patch("timing.lazy_args", return_value=[]), \
+                mock.patch("timing.run_recipe", side_effect=ProfileError("other")), mock.patch("timing.trace_events_needed", return_value=0):
+            with self.assertRaisesRegex(QuantError, "other"):
+                profile_model(config, "/m.gguf", Path(d) / "t.json", placement=[3, 4, 5])
         self.assertEqual(command[command.index("--device") + 1], "ROCm0/ROCm1/ROCm2")
         self.assertEqual(command[command.index("-sm") + 1], "layer")
         self.assertEqual(command[command.index("-ts") + 1], "3/4/5")
