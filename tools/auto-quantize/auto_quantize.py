@@ -133,7 +133,8 @@ def encode(info, cfg, choices, imatrix, output, quality=None):
     print(f"Encoding {output.name}", flush=True)
     expected = sum(tensor_bytes(t["shape"], types[t["name"]]) for t in info["tensors"])
     with progress.watch_file(f"encode {output.name}", partial, expected):
-        run(command, output.with_suffix(".encode.log"), cfg["runtime"]["env"])
+        # no time limit: a large model with slow types (IQ2_XXS) takes hours
+        run(command, output.with_suffix(".encode.log"), cfg["runtime"]["env"], timeout=None)
     verify_output(info, types, partial)
     partial.replace(output)
     write_json(output.with_suffix(".encode.json"), {"command": command, "types": types, "source": info["identity"],
@@ -216,6 +217,10 @@ def prepare(cfg, directory, timeout):
             print(f"Encoding {baseline} again: {exc}", flush=True)
             baseline.unlink()
     if not baseline.exists():
+        partial = baseline.with_suffix(".partial.gguf")
+        if partial.exists():
+            print(f"Removing the partial baseline of an interrupted encode: {partial}", flush=True)
+            partial.unlink()
         encode(info, cfg, baseline_choices, imatrix, baseline)
     print("Profiling baseline short/long prefill and decode", flush=True)
     with progress.Watcher("prepare: profiling baseline", lambda: None):
