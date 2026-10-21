@@ -119,29 +119,50 @@ def per_chunk(path, chunks):
     return values.reshape(chunks, -1).mean(axis=1)
 
 
+def qtype_levels(groups, records):
+    """(mean log local error of every qtype above the floor in all modelled groups, mean log error of the floors)."""
+    def level(q):
+        values = [records.get((n, q)) for g in groups for n in g["members"]]
+        values = [v for v in values if v is not None and v > 0]
+        return float(np.mean(np.log(values))) if values else None
+    common = set.intersection(*(set(g["pool"]) for g in groups)) - {g["floor"] for g in groups}
+    levels = {q: v for q, v in ((q, level(q)) for q in common) if v is not None}
+    floors = [v for v in (level(q) for q in {g["floor"] for g in groups}) if v is not None]
+    return levels, float(np.mean(floors)) if floors else None
+
+
 def probe_qtypes(groups, records, c):
     """(mid, top): top has the smallest mean log local error, mid the error nearest the floor/top geometric mean."""
     if c.get("probe_qtypes"):
         mid, top = (q.upper() for q in c["probe_qtypes"])
     else:
-        common = set.intersection(*(set(g["pool"]) for g in groups)) - {g["floor"] for g in groups}
-
-        def level(q):
-            values = [records.get((n, q)) for g in groups for n in g["members"]]
-            values = [v for v in values if v is not None and v > 0]
-            return float(np.mean(np.log(values))) if values else None
-        levels = {q: level(q) for q in common}
-        levels = {q: v for q, v in levels.items() if v is not None}
+        levels, floor_level = qtype_levels(groups, records)
         if len(levels) < 2:
             raise QuantError("calibration needs two quantized candidate qtypes above the floor in every modelled group")
         top = min(levels, key=levels.get)
-        floor_level = float(np.mean([level(q) for q in {g["floor"] for g in groups}]))
         target = (floor_level + levels[top]) / 2
         mid = min((q for q in levels if q != top), key=lambda q: abs(levels[q] - target))
     for q in (mid, top):
         if any(q not in g["pool"] for g in groups):
             raise QuantError(f"probe qtype {q} is not a candidate of every modelled group")
     return mid, top
+
+
+def anchor_qtypes(groups, records, mid, top):
+    """Qtypes for the extra uniform and mixed recipes: the errors nearest the geometric means of floor/mid and mid/top.
+
+    The bands measure gains from the floor; a recipe far above the floor depends on the small remaining error of its
+    qtypes. Uniform recipes between the probes measure that range directly (Qwen2.5 1.5B with an IQ2_XXS floor and
+    probes Q5_0/Q8_0: the IQ4 picks measured 3x to 8x the KL that the band fit predicts)."""
+    levels, floor_level = qtype_levels(groups, records)
+    if mid not in levels or top not in levels or floor_level is None:
+        return []
+    anchors = []
+    for high, low in ((floor_level, levels[mid]), (levels[mid], levels[top])):
+        between = [q for q in levels if low < levels[q] < high]
+        if between:
+            anchors.append(min(between, key=lambda q: abs(levels[q] - (high + low) / 2)))
+    return anchors
 
 
 def band_layers(layers, count):
@@ -159,8 +180,8 @@ def role_bands(groups, count):
     return {role: band_layers(layers, count) for role, layers in sorted(by_role.items())}
 
 
-def design(groups, mid, top, c):
-    """Band jobs per role and mixed recipes; uniform recipes are direct runs of the probe models."""
+def design(groups, mid, top, c, anchors=()):
+    """Band jobs per role (mid and top), mixed recipes and one uniform recipe per probe and anchor qtype."""
     jobs = []
     for role, bands in role_bands(groups, c["bands"]).items():
         for b, selected in enumerate(bands):
@@ -169,12 +190,14 @@ def design(groups, mid, top, c):
                              "choices": {g["name"]: q for g in groups if g["role"] == role and g["layer"] in selected}})
     rng = random.Random(c["seed"])
     densities = (0.15, 0.35, 0.6)
-    for i in range(max(0, c["recipes"] - 2)):
+    qtypes = (*anchors, mid, top)
+    tag = "" if not anchors else "-" + "-".join(anchors)
+    for i in range(max(0, c["recipes"] - len(qtypes))):
         p = densities[i % len(densities)]
-        choices = {g["name"]: rng.choice((mid, top)) for g in groups if rng.random() < p}
+        choices = {g["name"]: rng.choice(qtypes) for g in groups if rng.random() < p}
         if choices:
-            jobs.append({"label": f"mix{i:02d}-p{round(100 * p)}", "choices": choices})
-    for q in (mid, top):
+            jobs.append({"label": f"mix{i:02d}-p{round(100 * p)}{tag}", "choices": choices})
+    for q in qtypes:
         jobs.append({"label": f"uniform-{q}", "choices": {g["name"]: q for g in groups}, "direct": q})
     return jobs
 
@@ -496,7 +519,10 @@ def calibrate(data, cfg, output, encode, verify, timeout=7200, text_dir=None, sc
     records = damage_records(data["damage"])
     mid, top = probe_qtypes(groups, records, c)
     print(f"Probe qtypes: mid {mid}, top {top}", flush=True)
-    jobs = design(groups, mid, top, c)
+    anchors = anchor_qtypes(groups, records, mid, top)
+    if anchors:
+        print(f"Anchor qtypes: {', '.join(anchors)}", flush=True)
+    jobs = design(groups, mid, top, c, anchors)
     devices = c["devices"] or [gpu(cfg)]
     members = {g["name"]: g["members"] for g in info["groups"]}
     writer = PatchWriter(cfg, info, data["imatrix"], Path(scratch or output), c["patch_mib"])
@@ -578,8 +604,12 @@ def calibrate(data, cfg, output, encode, verify, timeout=7200, text_dir=None, sc
         floors[device] = float(floor.mean())
         for job in jobs:
             if job["label"] in out and job["label"] not in ("floor", "recompute", "restore"):
-                d = (floor - out[job["label"]]) / floor.mean()
-                y, se = float(d.mean()), float(d.std(ddof=1) / math.sqrt(len(d)))
+                x = out[job["label"]]
+                y = float(1 - x.mean() / floor.mean())
+                # Ratio-estimator error of mean(x) / mean(floor) over paired chunks. The error of the paired
+                # difference is the scatter of the floor itself when x is small, and it gave the uniform recipes no
+                # weight (Qwen2.5 1.5B, floor KL 0.81: +-0.025 against +-0.00005 for uniform Q8_0).
+                se = float((x - (1 - y) * floor).std(ddof=1) / floor.mean() / math.sqrt(len(x)))
                 observations.append((job["choices"], y, max(se, 1e-6)))
                 probes.append({"label": job["label"], "device": device, "gain": y, "se": se,
                                "kl": float(out[job["label"]].mean()), "choices": job["choices"]})
@@ -601,7 +631,7 @@ def calibrate(data, cfg, output, encode, verify, timeout=7200, text_dir=None, sc
              "execution": {"devices": devices, "ram_routed": measure_cmoe(cfg) and (devices == [gpu(cfg)] or gpu_only(cfg)),
                            "numa": "off", "command": perplexity_command(cfg, c, "FLOOR", devices[0], "TEACHER"),
                            "env": env},
-             "probe_qtypes": {"mid": mid, "top": top}, "n_layer": n_layer, "roles": params,
+             "probe_qtypes": {"mid": mid, "top": top, "anchors": anchors}, "n_layer": n_layer, "roles": params,
              "composition": {"kappa_inf": kinf, "u0": u0},
              "fit": {"chi2_dof": chi2, "passes": len(jobs), "probes": probes}}
     path = output / "quality.json"

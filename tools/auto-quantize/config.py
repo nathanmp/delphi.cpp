@@ -273,7 +273,7 @@ def calibration(c, absolute, cfg):
     if not isinstance(c, dict):
         raise QuantError("calibration must be an object")
     defaults = {"text": None, "teacher": None, "chunks": 64, "context": 512, "batch": 0, "threads": None,
-                "probe_qtypes": None, "bands": 10, "recipes": 8, "seed": 1, "devices": None, "text_seed": 1,
+                "probe_qtypes": None, "bands": 10, "recipes": 10, "seed": 1, "devices": None, "text_seed": 1,
                 "bytes_per_token": 4.0, "patch_mib": 8192, "uniform": "auto"}
     if set(c) - set(defaults):
         raise QuantError(f"unknown calibration keys: {sorted(set(c) - set(defaults))}")

@@ -16,7 +16,7 @@ from corpus import calibration_text, collect_imatrices, compose_text, imatrix_co
 from model import classify, is_lazy, lazy_args, merge_imatrices, read_model, tensor_bytes
 from search import dominates, llama_layer_devices, make_options, memory, pareto, search
 from quality import LossModel, damage_digest, load_quality, modelled_groups, role_of
-from calibrate import Fit, PatchWriter, design, probe_qtypes
+from calibrate import Fit, PatchWriter, anchor_qtypes, design, probe_qtypes
 from timing import Predictor, digest, operation_times, profile_model, regions, signature, token_counts
 from auto_quantize import gpu_descriptions, require_identical_gpus, tensor_plan, verify_output, witness_choices
 from calibrate import perplexity_command
@@ -817,6 +817,22 @@ class Quality(unittest.TestCase):
         self.assertEqual(len(design(more, "Q4_K", "Q6_K", {"bands": 2, "recipes": 5, "seed": 1})), len(jobs))
         records = {(t["name"], q["qtype"]): q["R"] for t in self.damage[0]["tensors"] for q in t["runs"][0]["types"]}
         self.assertEqual(probe_qtypes(groups, records, {"probe_qtypes": None}), ("Q4_K", "Q6_K"))
+
+    def test_anchor_qtypes_fill_the_range_between_the_probes(self):
+        groups = modelled_groups(self.model, self.floor)
+        errors = {"Q2_K": 1e-1, "Q3_K": 3e-2, "Q4_K": 1e-2, "Q5_K": 3e-3, "Q6_K": 1e-3, "IQ6_K": 1e-4, "Q8_0": 1e-5}
+        wide = [dict(g, floor="Q2_K", pool=list(errors)) for g in groups]
+        records = {(n, q): r for g in wide for n in g["members"] for q, r in errors.items()}
+        self.assertEqual(probe_qtypes(wide, records, {"probe_qtypes": None}), ("Q6_K", "Q8_0"))
+        self.assertEqual(anchor_qtypes(wide, records, "Q6_K", "Q8_0"), ["Q4_K", "IQ6_K"])
+        jobs = design(wide, "Q6_K", "Q8_0", {"bands": 2, "recipes": 10, "seed": 1}, ["Q4_K", "IQ6_K"])
+        self.assertEqual(sorted(j["direct"] for j in jobs if "direct" in j), ["IQ6_K", "Q4_K", "Q6_K", "Q8_0"])
+        mixed = [j for j in jobs if j["label"].startswith("mix")]
+        self.assertEqual(len(mixed), 6)
+        self.assertTrue(all(j["label"].endswith("-Q4_K-IQ6_K") for j in mixed))
+        self.assertEqual({q for j in mixed for q in j["choices"].values()}, {"Q4_K", "Q6_K", "IQ6_K", "Q8_0"})
+        # no qtype between floor and top: no anchors
+        self.assertEqual(anchor_qtypes(groups, {k: v for k, v in records.items() if k[1] in ("Q4_K", "Q6_K")}, "Q4_K", "Q6_K"), [])
 
     def test_predicted_loss_stops_at_the_measured_uniform_top_recipe(self):
         full = {g: None for g in LossModel(self.model, self.table, self.damage).groups}
