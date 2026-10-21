@@ -106,14 +106,18 @@ def detail(recipe):
 DIVERSE_KEYS = ("kld", "size", "decode", "short", "long")
 
 
-def near(a, b, tolerance):
-    """Whether every predicted metric of two rows is within the relative tolerance."""
-    return all(abs(a[k] - b[k]) <= tolerance * max(abs(b[k]), 1e-12) for k in DIVERSE_KEYS)
+# The predicted KL is uncertain by more than 2 % (verify measured 0.9x to 1.6x), so rows closer than this are one choice
+KLD_TOLERANCE = 0.10
+
+
+def near(a, b, tolerance, kld_tolerance=KLD_TOLERANCE):
+    """Whether every predicted metric of two rows is within the relative tolerance (kld_tolerance for the KL)."""
+    return all(abs(a[k] - b[k]) <= (kld_tolerance if k == "kld" else tolerance) * max(abs(b[k]), 1e-12) for k in DIVERSE_KEYS)
 
 
 def diverse(all_rows, n, tolerance=0.02):
     """At most n rows for a choice: the best-score row and the min-KL row, then the best scores that are not within
-    `tolerance` on every predicted metric of a row already chosen. Sorted by size."""
+    `tolerance` (KL: KLD_TOLERANCE) on every predicted metric of a row already chosen. Sorted by size."""
     ordered = sorted(all_rows, key=lambda r: r["score"])
     chosen = [ordered[0]]
     lowest = min(all_rows, key=lambda r: r["kld"])
