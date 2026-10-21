@@ -77,7 +77,25 @@ def source_identity(source):
             "converter": file_identity(ROOT / "convert_hf_to_gguf.py")}
 
 
+# modules that convert_hf_to_gguf.py imports at the start or for the tokenizer
+CONVERTER_MODULES = ("torch", "numpy", "sentencepiece", "transformers")
+
+
+def check_converter(python, env=None):
+    """Stop before a long conversion when `python` lacks a module of the converter."""
+    code = "import importlib.util, sys; print(' '.join(m for m in sys.argv[1:] if importlib.util.find_spec(m) is None))"
+    try:
+        completed = subprocess.run([python, "-c", code, *CONVERTER_MODULES], capture_output=True, text=True, env={**os.environ, **(env or {})})
+        missing = completed.stdout.split() if completed.returncode == 0 else ["(the interpreter failed)"]
+    except OSError as e:
+        missing = [f"(the interpreter does not start: {e.strerror})"]
+    if missing:
+        raise QuantError(f"{python} cannot run convert_hf_to_gguf.py, missing: {' '.join(missing)}. Install "
+                         f"{ROOT / 'requirements/requirements-convert_hf_to_gguf.txt'} into it or give another python with --converter-python")
+
+
 def run_converter(python, source, outfile, extra, log, env, expected):
+    check_converter(python, env)
     command = [python, str(ROOT / "convert_hf_to_gguf.py"), str(source), "--outfile", str(outfile), *extra]
     environment = {**os.environ, "PYTHONPATH": str(ROOT / "gguf-py") + os.pathsep + os.environ.get("PYTHONPATH", ""), **env}
     with open(log, "w") as stream, progress.watch_file(f"convert {Path(outfile).name}", outfile, expected, poll=5.0):

@@ -537,6 +537,15 @@ class Convert(unittest.TestCase):
             (Path(d) / "config.json").write_text('{"hidden_size": 4}')
             self.assertFalse(cv.has_vision(d))
 
+    def test_converter_python_without_a_module_is_refused(self):
+        with unittest.mock.patch.object(cv, "CONVERTER_MODULES", ("json",)):
+            cv.check_converter(sys.executable)
+        with unittest.mock.patch.object(cv, "CONVERTER_MODULES", ("json", "no_such_module_x")):
+            with self.assertRaisesRegex(QuantError, "no_such_module_x"):
+                cv.check_converter(sys.executable)
+        with self.assertRaisesRegex(QuantError, "does not start"):
+            cv.check_converter("/nonexistent/python")
+
     def test_missing_safetensors_is_an_error(self):
         with tempfile.TemporaryDirectory() as d:
             with self.assertRaises(QuantError):
@@ -560,6 +569,7 @@ class RunConfig(unittest.TestCase):
         self.assertEqual(cfg["devices"], {"ROCm0": 20 * GIB, "ROCm1": 10 * GIB})
         self.assertEqual(cfg["runtime"]["extra_args"], ["-ctv", "q8_0"])
         self.assertEqual(cfg["calibration"]["text"], "/c/text.txt")
+        self.assertTrue(cfg["allow_requantize"])
 
     def test_override_wins_for_devices_and_merges_runtime(self):
         override = {"devices": {"ROCm1": "4GiB"}, "primary_qtypes": ["Q2_K"], "runtime": {"threads": 8, "extra_args": ["-fa", "on"]}}

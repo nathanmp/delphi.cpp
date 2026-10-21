@@ -365,7 +365,9 @@ def build_config(args, gguf, rows, user_reserve, measured, override):
     for name in user_reserve:
         if name not in capacities:
             raise QuantError(f"the config reserve names {name}, which is not in --devices")
-    cfg = {"schema": SCHEMA, "model": str(gguf), "devices": capacities, "reserve": reserve, "imatrix": [str(x.resolve()) for x in args.imatrix]}
+    cfg = {"schema": SCHEMA, "model": str(gguf), "devices": capacities, "reserve": reserve, "imatrix": [str(x.resolve()) for x in args.imatrix],
+           # the converted source is Q8_0; with an F16/BF16 source the option changes nothing
+           "allow_requantize": True}
     if args.bindir:
         cfg["bindir"] = str(args.bindir.resolve())
     if args.calibration_text:
