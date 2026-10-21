@@ -114,6 +114,12 @@ void ggml_vec_dot_iq3_ks_q8_K (int n, float * GGML_RESTRICT s, size_t bs, const 
 void ggml_vec_dot_iq4_ks_q8_K (int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_vec_dot_iq5_ks_q8_K (int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 
+#if defined(__AVX2__)
+// Batched AVX2 vec_dot (arch/x86/quants.c): s[r] = x . vy[r] for nr <= 4 activation rows in the type's vec_dot_type, each bit-identical to vec_dot. NULL when the type has no batched kernel.
+typedef void (*ggml_vec_dot_batch_t)(int n, float * s, const void * vx, const void * const * vy, int nr);
+ggml_vec_dot_batch_t ggml_get_vec_dot_batch(enum ggml_type type);
+#endif
+
 // Generic implementation
 void quantize_row_q8_0_generic(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k);
 void quantize_row_q8_1_generic(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k);

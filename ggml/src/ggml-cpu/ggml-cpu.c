@@ -2093,6 +2093,32 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
         return;
     }
 
+#if defined(__AVX2__)
+    // A piece with several activation rows: each decoded weight row is dotted against up to four
+    // of them in one batched call, bit-identical per row to the vec_dot loop below.
+    const ggml_vec_dot_batch_t batch = ggml_get_vec_dot_batch(type);
+    if (batch && ir1_end - ir1_start > 1) {
+        for (int64_t first = ir1_start; first < ir1_end; first += 4) {
+            const int nr = (int) MIN(4, ir1_end - first);
+            const void * ys[4];
+            float * outs[4];
+            for (int r = 0; r < nr; ++r) {
+                const struct mmid_row_mapping rm = MMID_MATRIX_ROW(cur_a, first + r);
+                const int64_t i11 = rm.i1 % ne11;
+                ys[r] = (const char *) wdata + (src1_cont || src1->type != vec_dot_type
+                    ? (i11 + rm.i2 * ne11) * row_size : i11 * nb11 + rm.i2 * nb12);
+                outs[r] = (float *) ((char *) dst->data + rm.i1 * nb1 + rm.i2 * nb2);
+            }
+            for (int64_t row = ir0_start; row < ir0_end; ++row) {
+                float sums[4];
+                batch(ne00, sums, src0_cur + row * nb01, ys, nr);
+                for (int r = 0; r < nr; ++r) outs[r][row] = sums[r];
+            }
+        }
+        return;
+    }
+#endif
+
     const int64_t blck_0 = 16;
     const int64_t blck_1 = 16;
 
