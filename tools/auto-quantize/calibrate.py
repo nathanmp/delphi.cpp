@@ -478,16 +478,18 @@ def teacher_logits(cfg, c, output, timeout):
     text = file_identity(c["text"], content=True)
     if teacher.exists():
         record = output / "teacher.json"
-        recorded = json.loads(record.read_text()).get("text", {}).get("sha256") if record.exists() else None
-        if recorded not in (None, text["sha256"]):
+        recorded = json.loads(record.read_text()) if record.exists() else {}
+        if recorded.get("text", {}).get("sha256") not in (None, text["sha256"]):
             raise QuantError(f"teacher logits in {output} come from a different calibration text; use a new output directory")
+        if recorded.get("model") not in (None, file_identity(cfg["model"])):
+            raise QuantError(f"teacher logits in {output} come from a different model; use a new output directory")
         return teacher
     partial = output / "teacher.partial.kld"
     command = perplexity_command(cfg, c, cfg["model"], gpu(cfg), partial, base=True)
     print("Computing teacher logits from the source model", flush=True)
     run_direct(command, output / "teacher.tokens.f32", output / "teacher.log", measure_env(cfg), timeout)
     partial.replace(teacher)
-    write_json(output / "teacher.json", {"command": command, "text": text})
+    write_json(output / "teacher.json", {"command": command, "text": text, "model": file_identity(cfg["model"])})
     return teacher
 
 

@@ -458,28 +458,44 @@ def pick_row(payload, args, default_pick):
             print(exc)
 
 
-def run_stage(state, name, inputs, previous, action, outputs=(), reset=None):
+def run_stage(state, name, inputs, previous, action, outputs=(), reset=None, foreign=None):
     """One resumable stage: skip it when finished, otherwise say why it runs, run it and record it.
 
-    Returns (fingerprint, record). A stage that re-runs because its inputs changed also drops the later stages."""
+    Returns (fingerprint, record). A stage that re-runs because its inputs changed also re-runs the later stages and
+    calls reset to remove its files from the earlier inputs. foreign() names such files (or returns None) when the
+    state has no record of the stage, for example in a work directory of another model before the stage records."""
     decision, why = state.decide(name, inputs, previous)
     fp = runstate.fingerprint(inputs, previous)
     if decision == "skip":
         print(f"Stage {name}: finished earlier with the same inputs, skipping", flush=True)
         state.skipped.add(name)
         return fp, state.stages[name]
+    if decision == "run" and not why and foreign and (found := foreign()):
+        decision, why = "rerun", [found]
     if decision == "rerun":
         print(f"Stage {name}: input changed ({', '.join(why)}); running it again and the stages after it", flush=True)
         state.forget_from(name)
         if reset:
             reset()
+    elif decision == "resume":
+        print(f"Stage {name}: continuing an interrupted run with the same inputs", flush=True)
     elif why:
         print(f"Stage {name}: {why[0]}; running it again", flush=True)
+    state.start(name, inputs, previous)
     started = time.monotonic()
     print(f"Stage {name}: running", flush=True)
     extra = action() or {}
     state.mark(name, inputs, previous, time.monotonic() - started, outputs() if callable(outputs) else outputs, **extra)
     return fp, state.stages[name]
+
+
+def same_tensors(gguf, info):
+    """Whether a GGUF has the tensor names of the model (a cheap check that reads only the header)."""
+    import model as mdl
+    try:
+        return {t["name"] for t in mdl.read_model(gguf)["tensors"]} == {t["name"] for t in info["tensors"]}
+    except (OSError, ValueError, KeyError):
+        return False
 
 
 def command_run(args):
@@ -569,7 +585,18 @@ def command_run(args):
 
     def prepare_reset():
         (p["prepared"] / "prepared.json").unlink(missing_ok=True)
-    fp = timed("prepare", run_stage(state, "prepare", prepare_inputs, fp, prepare_action, [p["prepared"] / "prepared.json"], prepare_reset))
+        baseline = p["prepared"] / "baseline.gguf"
+        if baseline.exists() and not same_tensors(baseline, info):
+            print(f"Removing {baseline}: it is a baseline of another model", flush=True)
+            baseline.unlink()
+
+    def prepare_foreign():
+        snapshot = p["prepared"] / "prepared.json"
+        if snapshot.exists() and json.loads(snapshot.read_text()).get("input_key") != digest(aq.inputs(cfg, info)):
+            return f"{snapshot} is for other inputs"
+        return None
+    fp = timed("prepare", run_stage(state, "prepare", prepare_inputs, fp, prepare_action, [p["prepared"] / "prepared.json"],
+                                    prepare_reset, prepare_foreign))
 
     # 4. calibrate
     calibration_inputs = {"calibration": cfg["calibration"],
@@ -579,8 +606,12 @@ def command_run(args):
     def calibrate_reset():
         (p["quality"] / "quality.json").unlink(missing_ok=True)
         shutil.rmtree(p["calibration"], ignore_errors=True)
+    def calibrate_foreign():
+        record = p["calibration"] / "teacher.json"
+        model = json.loads(record.read_text()).get("model") if record.exists() else None
+        return f"{p['calibration']} holds teacher logits of another model" if model not in (None, file_identity(cfg["model"])) else None
     fp = timed("calibrate", run_stage(state, "calibrate", calibration_inputs, fp, lambda: stage_calibrate(cfg, p, args) and None,
-                                      [p["quality"] / "quality.json"], calibrate_reset))
+                                      [p["quality"] / "quality.json"], calibrate_reset, calibrate_foreign))
     cfg["quality"] = {"table": str(p["quality"] / "quality.json")}
 
     # 5. plan and pick (with the check of the reserves of the chosen split)

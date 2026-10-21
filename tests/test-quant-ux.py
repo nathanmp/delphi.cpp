@@ -476,13 +476,58 @@ class ResumeState(unittest.TestCase):
             (Path(d) / "out.gguf").write_text("x")
             self.assertEqual(state.decide("encode", {}, None)[0], "skip")
 
-    def test_forget_drops_the_stage_and_later_ones(self):
+    def test_forget_drops_the_stage_and_marks_later_ones_stale(self):
         with tempfile.TemporaryDirectory() as d:
             state = runstate.State(d)
             for name in runstate.STAGES:
-                state.mark(name, {}, None, 1)
+                state.mark(name, {"k": 1}, None, 1)
             state.forget_from("calibrate")
-            self.assertEqual(sorted(runstate.State(d).stages), ["convert", "prepare"])
+            stages = runstate.State(d).stages
+            self.assertEqual(sorted(stages), ["convert", "encode", "plan", "prepare", "verify"])
+            self.assertTrue(all(stages[n].get("stale") for n in ("plan", "encode", "verify")))
+            self.assertEqual(state.decide("plan", {"k": 1}, None), ("rerun", ["earlier stage"]))
+
+    def test_started_stage_resumes_with_same_inputs_only(self):
+        with tempfile.TemporaryDirectory() as d:
+            state = runstate.State(d)
+            state.start("calibrate", {"t": 1}, "x")
+            self.assertEqual(runstate.State(d).decide("calibrate", {"t": 1}, "x"), ("resume", []))
+            self.assertEqual(runstate.State(d).decide("calibrate", {"t": 2}, "x"), ("rerun", ["t"]))
+
+    def test_later_stage_removes_its_files_after_an_earlier_change(self):
+        # A new source in the same work directory: the files of prepare and calibrate are from the old model
+        with tempfile.TemporaryDirectory() as d:
+            state = runstate.State(d)
+            resets = []
+
+            def go(name, inputs, previous, foreign=None):
+                with unittest.mock.patch("sys.stdout", io.StringIO()) as out:
+                    fp, _ = qc.run_stage(state, name, inputs, previous, lambda: None, reset=lambda: resets.append(name),
+                                         foreign=foreign)
+                return fp, out.getvalue()
+            fp0, _ = go("convert", {"src": "a"}, None)
+            fp1, _ = go("prepare", {"m": "a"}, fp0)
+            go("calibrate", {"t": 1}, fp1)
+            self.assertEqual(resets, [])
+            fp0, _ = go("convert", {"src": "b"}, None)
+            fp1, _ = go("prepare", {"m": "b"}, fp0)
+            _, out = go("calibrate", {"t": 1}, fp1)
+            self.assertEqual(resets, ["convert", "prepare", "calibrate"])
+            self.assertIn("earlier stage", out)
+
+    def test_foreign_files_without_a_record_are_reset(self):
+        with tempfile.TemporaryDirectory() as d:
+            state = runstate.State(d)
+            resets = []
+            with unittest.mock.patch("sys.stdout", io.StringIO()) as out:
+                qc.run_stage(state, "prepare", {"m": 1}, None, lambda: None, reset=lambda: resets.append(1),
+                             foreign=lambda: "prepared.json is for other inputs")
+            self.assertEqual(resets, [1])
+            self.assertIn("prepared.json is for other inputs", out.getvalue())
+            with unittest.mock.patch("sys.stdout", io.StringIO()):
+                qc.run_stage(runstate.State(d), "calibrate", {"t": 1}, None, lambda: None, reset=lambda: resets.append(2),
+                             foreign=lambda: None)
+            self.assertEqual(resets, [1])
 
     def test_run_stage_chain_skips_finished_and_reruns_after_a_change(self):
         with tempfile.TemporaryDirectory() as d:
@@ -502,7 +547,7 @@ class ResumeState(unittest.TestCase):
             self.assertIn("skipping", out2)
             fp1, out = go("prepare", {"m": 2}, None)
             self.assertIn("input changed (m)", out)
-            self.assertNotIn("calibrate", state.stages)
+            self.assertTrue(state.stages["calibrate"]["stale"])
             go("calibrate", {"t": 1}, fp1)
             self.assertEqual(ran, ["prepare", "calibrate", "prepare", "calibrate"])
 

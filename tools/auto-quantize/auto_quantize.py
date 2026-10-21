@@ -209,8 +209,13 @@ def prepare(cfg, directory, timeout):
         raise QuantError("minimum-byte baseline exceeds a device budget")
     baseline = directory / "baseline.gguf"
     if baseline.exists():
-        verify_output(info, tensor_plan(info, baseline_choices), baseline)
-    else:
+        try:
+            verify_output(info, tensor_plan(info, baseline_choices), baseline)
+        except QuantError as exc:
+            # a baseline of other inputs (another model or candidate set): encode it again
+            print(f"Encoding {baseline} again: {exc}", flush=True)
+            baseline.unlink()
+    if not baseline.exists():
         encode(info, cfg, baseline_choices, imatrix, baseline)
     print("Profiling baseline short/long prefill and decode", flush=True)
     with progress.Watcher("prepare: profiling baseline", lambda: None):
