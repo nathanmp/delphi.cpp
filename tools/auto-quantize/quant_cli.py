@@ -787,7 +787,8 @@ def build_parser():
     p.add_argument("--scratch", type=Path, help="directory for temporary files; default WORK/scratch")
     p.add_argument("--keep-scratch", action="store_true", help="keep the scratch directory after the run")
     p.add_argument("--no-space-check", action="store_true")
-    p.add_argument("--measurement-seconds", type=float, default=600)
+    # a large MoE needs more than 10 minutes (GLM 5.3 on 3 CMP: about 13); the cap only stops a hung measurement
+    p.add_argument("--measurement-seconds", type=float, default=3600, help="cap of the operation measurement in prepare")
     p.add_argument("--converter-python", help="python that runs convert_hf_to_gguf.py (default: this one)")
     p.add_argument("--no-verify", action="store_true")
     p.add_argument("--verify-timeout", type=float, default=3600)

@@ -246,7 +246,7 @@ def measure_signatures(sigs, values, binary, cfg, directory, environment, identi
             continue
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise QuantError("operation measurement time cap reached; completed signatures were cached")
+            raise QuantError("operation measurement time cap reached; completed signatures were cached: run again (it continues), with a larger --measurement-seconds")
         shape = "x".join(str(x) for x in sig["shape"])
         spec = f"op={'MUL_MAT_ID' if sig['expert'] else 'MUL_MAT'},type={sig['dtype'].lower()},ne={shape},n={sig['tokens']},weights=zero"
         if sig["expert"]:
@@ -259,7 +259,7 @@ def measure_signatures(sigs, values, binary, cfg, directory, environment, identi
         try:
             run(command, log, environment, timeout=max(1, remaining))
         except subprocess.TimeoutExpired:
-            raise QuantError("operation measurement time cap reached; completed signatures were cached") from None
+            raise QuantError("operation measurement time cap reached; completed signatures were cached: run again (it continues), with a larger --measurement-seconds") from None
         measured = operation_times(log.read_text())
         values[key] = {"signature": sig, "ms": statistics.median(measured) / 1000 if measured else None,
                        "command": command, "log": str(log), "reason": None if measured else "backend did not run this signature"}
