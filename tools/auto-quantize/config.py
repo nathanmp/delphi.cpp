@@ -268,11 +268,15 @@ def load_config(path):
     return cfg
 
 
+# General text, code and math; used when the configuration names no calibration text
+DEFAULT_CALIBRATION_TEXT = ROOT / "tools/auto-quantize/ubergarm-imatrix-calibration-corpus-v02.txt"
+
+
 def calibration(c, absolute, cfg):
     """Calibration inputs: text (a path or weighted corpora), teacher, probe design and the devices of the probe sessions."""
     if not isinstance(c, dict):
         raise QuantError("calibration must be an object")
-    defaults = {"text": None, "teacher": None, "chunks": 64, "context": 512, "batch": 0, "threads": None,
+    defaults = {"text": str(DEFAULT_CALIBRATION_TEXT), "teacher": None, "chunks": 64, "context": 512, "batch": 0, "threads": None,
                 "probe_qtypes": None, "bands": 10, "recipes": 10, "seed": 1, "devices": None, "text_seed": 1,
                 "bytes_per_token": 4.0, "patch_mib": 8192, "uniform": "auto"}
     if set(c) - set(defaults):

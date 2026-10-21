@@ -896,6 +896,11 @@ class Quality(unittest.TestCase):
         parsed = load_config(path)
         self.assertEqual(parsed["calibration"]["text"], str(self.root / "eval.txt"))
         self.assertEqual(parsed["calibration"]["bands"], 10)
+        write_json(path, {**base, "calibration": {}})
+        default = Path(load_config(path)["calibration"]["text"])
+        self.assertEqual(default.name, "ubergarm-imatrix-calibration-corpus-v02.txt")
+        self.assertTrue(default.is_file())
+        write_json(path, base)
         for changed in ({**base, "bounds": {"max_damage": .09}}, {k: v for k, v in base.items() if k != "quality"},
                         {**base, "calibration": {"recipes": 1}}, {**base, "calibration": {"devices": ["RAM"]}},
                         {**base, "calibration": {"batch": 1000}}, {**base, "search": {"beam": 4}}):
