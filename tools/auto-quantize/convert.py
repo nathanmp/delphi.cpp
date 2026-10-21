@@ -124,11 +124,12 @@ def convert(source, directory, python=None, mmproj=None, env=None, check=lambda 
         folder = directory / "mmproj"
         found = sorted(folder.glob("mmproj-*.gguf"))
         if not found:
-            # written to a partial directory first: the converter names the file itself, so a partial file cannot be told apart
+            # written to a partial directory first, so that a partial file cannot be taken for a finished one. The converter
+            # adds the "mmproj-" prefix only when --outfile is a directory; a file name it keeps as it is
             partial = directory / "mmproj.partial"
             shutil.rmtree(partial, ignore_errors=True)
             partial.mkdir()
-            run_converter(python, source, partial / "model.gguf", ["--mmproj", "--outtype", "f16"],
+            run_converter(python, source, partial / "mmproj-model.gguf", ["--mmproj", "--outtype", "f16"],
                           directory / "convert-mmproj.log", env or {}, None)
             if not list(partial.glob("mmproj-*.gguf")):
                 raise QuantError(f"the converter wrote no mmproj file in {partial}; see {directory / 'convert-mmproj.log'}")

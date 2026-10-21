@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Offline checks of the quantization CLI conveniences: progress lines, scratch estimates, capacities, state. No inference."""
 import argparse
+import contextlib
 import io
 import json
 import struct
@@ -545,6 +546,26 @@ class Convert(unittest.TestCase):
                 cv.check_converter(sys.executable)
         with self.assertRaisesRegex(QuantError, "does not start"):
             cv.check_converter("/nonexistent/python")
+
+    def test_projector_is_found_where_the_converter_writes_it(self):
+        # like convert_hf_to_gguf.py, the fake converter writes exactly the --outfile name
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            fake = d / "python"
+            fake.write_text('#!/bin/sh\n[ "$1" = "-c" ] && exit 0\n'
+                            'while [ $# -gt 0 ]; do [ "$1" = "--outfile" ] && printf GGUF > "$2"; shift; done\n')
+            fake.chmod(0o755)
+            source = d / "ckpt"
+            source.mkdir()
+            self.write_safetensors(source / "a.safetensors", {"w": [64, 64]})
+            (source / "config.json").write_text('{"vision_config": {}}')
+            (d / "out").mkdir()
+            (d / "out" / "model-q8_0.gguf").write_bytes(b"GGUF")
+            with unittest.mock.patch.object(progress, "watch_file", lambda *a, **k: contextlib.nullcontext()):
+                gguf, projector = cv.convert(source, d / "out", str(fake))
+            self.assertEqual(gguf, d / "out" / "model-q8_0.gguf")
+            self.assertTrue(projector.name.startswith("mmproj-") and projector.is_file())
+            self.assertFalse((d / "out" / "mmproj.partial").exists())
 
     def test_missing_safetensors_is_an_error(self):
         with tempfile.TemporaryDirectory() as d:
