@@ -867,6 +867,75 @@ class Quality(unittest.TestCase):
         writer.patch_bytes = 1
         self.assertEqual(len(writer.chunks(tensors, members)), len(members))
 
+    def patch_writer(self):
+        """A PatchWriter whose quantizer writes zero Q8_0 tensors and counts its calls."""
+        import gguf
+        config = {**self.config, "bindir": "/nonexistent", "model": str(self.source), "runtime": {"threads": 1, "env": {}}}
+        writer = PatchWriter(config, self.model, None, self.root / "scratch", patch_mib=1024)
+        writer.calls = []
+
+        def quantize(tensors, path):
+            writer.calls.append(set(tensors))
+            out = GGUFWriter(str(path), "patch")
+            for n, q in sorted(tensors.items()):
+                data = np.zeros(tuple(reversed(writer.shapes[n])), dtype=np.float32)
+                out.add_tensor(n, gguf.quants.quantize(data, GGMLQuantizationType[q]), raw_dtype=GGMLQuantizationType[q])
+            out.write_header_to_file()
+            out.write_kv_data_to_file()
+            out.write_tensors_to_file()
+            out.close()
+        writer.quantize = quantize
+        groups = [g for g in self.model["groups"] if len(g["pool"]) > 1]
+        members = {g["name"]: g["members"] for g in groups}
+        bands = [{"label": f"band{i}", "choices": {g["name"]: "Q8_0"}} for i, g in enumerate(groups)]
+        uniform = {"label": "uniform", "choices": {g["name"]: "Q8_0" for g in groups}}
+        return writer, members, bands, uniform
+
+    def patch(self, writer, members, job, name):
+        tensors = {n: q for g, q in job["choices"].items() for n in members[g]}
+        path = writer.write(tensors, self.root / "scratch" / name)
+        self.assertEqual({t.name: t.tensor_type.name for t in GGUFReader(str(path)).tensors}, tensors)
+        path.unlink()
+        return tensors
+
+    def test_patch_cache_serves_the_uniform_recipe_from_the_band_chunks(self):
+        writer, members, bands, uniform = self.patch_writer()
+        writer.expect(bands + [uniform], self.floor, members)
+        for i, band in enumerate(bands):
+            self.patch(writer, members, band, f"band{i}.gguf")
+        self.assertEqual(len(writer.calls), len(bands))
+        self.assertEqual(len(list(writer.cache.glob("chunk-*.gguf"))), len(bands))
+        tensors = self.patch(writer, members, uniform, "uniform.gguf")
+        self.assertEqual(len(writer.calls), len(bands))  # nothing quantized again
+        self.assertEqual(writer.reused, len(tensors))
+        self.assertEqual(list(writer.cache.glob("chunk-*.gguf")), [])  # no job needs the chunks any more
+        writer.close()
+        self.assertFalse(writer.cache.exists())
+
+    def test_patch_cache_keeps_nothing_without_a_later_use_or_room(self):
+        writer, members, bands, uniform = self.patch_writer()
+        self.patch(writer, members, bands[0], "band0.gguf")  # not expected: written as before
+        self.assertEqual(list(writer.cache.glob("chunk-*.gguf")), [])
+        writer.expect(bands + [uniform], self.floor, members)
+        with mock.patch("calibrate.CACHE_MARGIN", 1 << 60):
+            for i, band in enumerate(bands):
+                self.patch(writer, members, band, f"band{i}.gguf")
+            self.assertEqual(list(writer.cache.glob("chunk-*.gguf")), [])
+            self.patch(writer, members, uniform, "uniform.gguf")
+        self.assertEqual(len(writer.calls), 2 + len(bands))
+        self.assertEqual(writer.reused, 0)
+
+    def test_patch_cache_survives_a_restart_with_the_same_inputs(self):
+        writer, members, bands, uniform = self.patch_writer()
+        writer.expect(bands + [uniform], self.floor, members)
+        self.patch(writer, members, bands[0], "band0.gguf")
+        again, members, bands, uniform = self.patch_writer()
+        self.assertEqual(set(again.entries), {(n, "Q8_0") for n in members[next(iter(bands[0]["choices"]))]})
+        again.expect([uniform], self.floor, members)
+        self.patch(again, members, uniform, "uniform.gguf")
+        self.assertEqual(len(again.calls), 1)
+        self.assertEqual(again.reused, len(members[next(iter(bands[0]["choices"]))]))
+
     def test_default_pools_reach_q8_0_and_fit_the_row_length(self):
         base = {"schema": "delphi.auto-quantize/1", "model": str(self.source), "devices": "ROCm1:16000,RAM:16000"}
         path = self.root / "config.json"

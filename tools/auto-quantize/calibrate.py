@@ -12,7 +12,8 @@ uniform recipes upgrade every modelled group. The cost is 2 x bands x roles + re
 number of candidate qtypes and of the layer count. The fit gives the table of quality.py.
 
 Patches are quantized from the source per job (llama-quantize --only-tensors) in chunks of at most patch_mib, so the
-temporary disk space is one chunk, not two probe models. A recipe larger than one chunk is applied chunk by chunk in
+temporary disk space is one chunk, not two probe models. A chunk stays in a cache while a later job needs one of its
+tensors (see PatchWriter), when the scratch disk has the room. A recipe larger than one chunk is applied chunk by chunk in
 the session. A uniform recipe whose RAM copy does not fit runs as a separate probe model, one at a time, deleted after
 its run.
 """
@@ -25,6 +26,7 @@ import math
 import os
 import random
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -53,11 +55,21 @@ def hotswap_module():
     return module
 
 
+# Free space that the patch cache leaves on the scratch file system (besides the two patch chunks in flight)
+CACHE_MARGIN = 32 << 30
+
+
 class PatchWriter:
     """Writes isolated tensor patches straight from the source with llama-quantize --only-tensors.
 
     A patch holds only the tensors of one job chunk, quantized with the same source, imatrix and options as encode, so
-    no full probe model is written. Patches stay at most patch_mib (a chunk with one larger group excepted)."""
+    no full probe model is written. Patches stay at most patch_mib (a chunk with one larger group excepted).
+
+    The quantized chunks also stay in a cache (scratch/patch-cache) while a later job of expect() needs one of their
+    tensors at the same qtype: the band probes quantize every expert at the probe qtypes, and the uniform recipes need
+    the same tensors again. A patch of cached tensors is a hard link to the chunk, or a copy of the tensors from the
+    chunks when it takes part of them. A chunk is deleted when no expected job needs it, and a new one is cached only
+    when CACHE_MARGIN stays free. The cache is valid for one source, imatrix, quantizer and set of libraries."""
 
     def __init__(self, cfg, info, imatrix, scratch, patch_mib):
         self.cfg, self.imatrix, self.scratch = cfg, imatrix, Path(scratch)
@@ -65,6 +77,40 @@ class PatchWriter:
         self.patch_bytes = int(patch_mib) << 20
         self.scratch.mkdir(parents=True, exist_ok=True)
         self.count, self.seconds, self.bytes = 0, 0.0, 0
+        self.reused, self.reused_bytes = 0, 0
+        self.lock = threading.Lock()
+        self.uses = defaultdict(int)  # (tensor, qtype) -> patches of expected jobs that still need it
+        self.entries = {}             # (tensor, qtype) -> cached chunk
+        self.cache = self.scratch / "patch-cache"
+        self.open_cache(info)
+
+    def open_cache(self, info):
+        key = {"model": info.get("identity"), "imatrix": file_identity(self.imatrix) if self.imatrix else None,
+               "allow_requantize": self.cfg.get("allow_requantize", False),
+               "quantize": file_identity(Path(self.cfg["bindir"]) / "llama-quantize") if (Path(self.cfg["bindir"]) / "llama-quantize").exists() else None,
+               "libraries": [file_identity(p) for p in sorted(Path(self.cfg["bindir"]).glob("lib*.so*")) if not p.is_symlink()]}
+        record = self.cache / "key.json"
+        if record.exists() and json.loads(record.read_text()) != key:
+            print(f"{self.cache} holds patches of other inputs; removing it", flush=True)
+            shutil.rmtree(self.cache)
+        self.cache.mkdir(parents=True, exist_ok=True)
+        write_json(record, key)
+        from gguf import GGUFReader
+        for chunk in sorted(self.cache.glob("chunk-*.gguf")):
+            try:
+                for t in GGUFReader(str(chunk)).tensors:
+                    self.entries[(t.name, t.tensor_type.name)] = chunk
+            except (OSError, ValueError):
+                chunk.unlink()
+
+    def expect(self, jobs, floor_choices, members):
+        """Count the patch tensors of jobs that will be written, so that their chunks stay cached until then."""
+        with self.lock:
+            for job in jobs:
+                for g, q in job["choices"].items():
+                    if q != floor_choices[g]:
+                        for n in members[g]:
+                            self.uses[(n, q.upper())] += 1
 
     def bytes_of(self, tensors):
         return sum(tensor_bytes(self.shapes[n], q) for n, q in tensors.items())
@@ -86,8 +132,7 @@ class PatchWriter:
             result.append(current)
         return result
 
-    def write(self, tensors, path):
-        from gguf import GGUFReader
+    def quantize(self, tensors, path):
         path = Path(path)
         path.unlink(missing_ok=True)
         types = path.with_suffix(".types.txt")
@@ -101,15 +146,88 @@ class PatchWriter:
         if self.cfg.get("allow_requantize", False):
             command += ["--allow-requantize"]
         command += [self.cfg["model"], str(path), "Q2_K", str(self.cfg["runtime"]["threads"])]
-        started = time.monotonic()
         run(command, path.with_suffix(".log"), self.cfg["runtime"]["env"])
+
+    def write(self, tensors, path):
+        from gguf import GGUFReader
+        path = Path(path)
+        path.unlink(missing_ok=True)
+        wanted = {(n, q.upper()) for n, q in tensors.items()}
+        with self.lock:
+            missing = {n: q for n, q in tensors.items() if (n, q.upper()) not in self.entries}
+            cache = bool(missing) and any(self.uses[(n, q.upper())] > 1 for n, q in missing.items()) and (
+                shutil.disk_usage(self.cache).free - self.bytes_of(missing) >= CACHE_MARGIN + 2 * self.patch_bytes)
+        fresh = None
+        if missing:
+            started = time.monotonic()
+            fresh = self.cache / f"chunk-{time.time_ns()}.gguf" if cache else path.with_suffix(".fresh.gguf")
+            try:
+                self.quantize(missing, fresh)
+            finally:
+                for suffix in (".types.txt", ".names.txt"):
+                    fresh.with_suffix(suffix).unlink(missing_ok=True)
+            self.count += 1
+            self.seconds += time.monotonic() - started
+            self.bytes += fresh.stat().st_size
+        with self.lock:
+            if cache:
+                for n, q in missing.items():
+                    self.entries[(n, q.upper())] = fresh
+            sources = defaultdict(set)
+            for key in wanted:
+                sources[self.entries.get(key, fresh)].add(key[0])
+            reused = {k for k in wanted if self.entries.get(k, fresh) != fresh}
+            self.reused += len(reused)
+            self.reused_bytes += self.bytes_of({n: q for n, q in reused})
+            if len(sources) == 1:
+                (source, names), = sources.items()
+                if {t.name for t in GGUFReader(str(source)).tensors} == names:
+                    if source == fresh and not cache:
+                        fresh.replace(path)
+                    else:
+                        os.link(source, path)
+                else:
+                    copy_tensors(sources, path)
+            else:
+                copy_tensors(sources, path)
+            if fresh is not None and not cache:
+                fresh.unlink(missing_ok=True)
+            for key in wanted:
+                self.uses[key] -= 1
+            self.evict()
         found = {t.name: t.tensor_type.name for t in GGUFReader(str(path)).tensors}
         if found != {n: q.upper() for n, q in tensors.items()}:
             raise QuantError(f"patch {path} does not hold the planned tensors and types")
-        self.count += 1
-        self.seconds += time.monotonic() - started
-        self.bytes += path.stat().st_size
         return path
+
+    def evict(self):
+        """Delete the cached chunks that no expected patch needs (callers hold the lock)."""
+        live = defaultdict(bool)
+        for key, chunk in self.entries.items():
+            live[chunk] |= self.uses[key] > 0
+        for chunk, needed in live.items():
+            if not needed:
+                chunk.unlink(missing_ok=True)
+                chunk.with_suffix(".log").unlink(missing_ok=True)
+                self.entries = {k: c for k, c in self.entries.items() if c != chunk}
+
+    def close(self):
+        shutil.rmtree(self.cache, ignore_errors=True)
+        self.entries.clear()
+
+
+def copy_tensors(sources, path):
+    """Write the named tensors of the GGUF files of sources ({file: names}) to path, with the qtypes as they are."""
+    from gguf import GGUFReader, GGUFWriter
+    writer = GGUFWriter(str(path), "patch")
+    for source, names in sources.items():
+        for t in GGUFReader(str(source)).tensors:
+            if t.name in names:
+                writer.add_tensor(t.name, t.data, raw_dtype=t.tensor_type)
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
 
 
 def per_chunk(path, chunks):
@@ -618,6 +736,9 @@ def calibrate(data, cfg, output, encode, verify, timeout=7200, text_dir=None, sc
         split_jobs = [j for j in hot if extra(j) <= split[1]]
         hot = [j for j in hot if j not in split_jobs]
     shares = {d: hot[i::len(devices)] for i, d in enumerate(devices)}
+    # the patch cache keeps a quantized chunk while a job that is not measured yet needs one of its tensors
+    measured = {f.stem for f in output.glob("session-*/*.f32")}
+    writer.expect([j for j in split_jobs + hot if j["label"] not in measured], floor_choices, members)
     teacher = teacher_logits(cfg, c, output, timeout)
     results, errors = {}, []
     env = measure_env(cfg)
@@ -699,9 +820,11 @@ def calibrate(data, cfg, output, encode, verify, timeout=7200, text_dir=None, sc
             results.setdefault(devices[0], {})[job["label"]] = per_chunk(target, c["chunks"])
     finally:
         signal.signal(signal.SIGTERM, previous)
-    if writer.count:
+    if writer.count or writer.reused:
         print(f"Patches: {writer.count} written from the source, {writer.bytes / 2**30:.1f} GiB in total, "
-              f"{writer.seconds / 60:.1f} min", flush=True)
+              f"{writer.seconds / 60:.1f} min; {writer.reused} tensors ({writer.reused_bytes / 2**30:.1f} GiB) "
+              "taken from the patch cache", flush=True)
+    writer.close()
     observations, probes, floors = [], [], {}
     for device, out in results.items():
         floor = per_chunk(output / f"session-{device}" / "floor.f32", c["chunks"])
