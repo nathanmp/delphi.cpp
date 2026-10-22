@@ -12546,7 +12546,7 @@ void ggml_compute_forward_kpool_expand(
 
     const int32_t * selected_data   = (const int32_t *) selected->data;
     const int32_t * pool_cells_data = (const int32_t *) pool_cells->data;
-    const float   * pool_bias_data  = (const float *) pool_bias->data;
+    const bool      pool_bias_f16   = pool_bias->type == GGML_TYPE_F16;
     const int32_t * tail_cells_data = (const int32_t *) tail_cells->data;
     const ggml_fp16_t * tail_mask_data = (const ggml_fp16_t *) tail_mask->data;
     int32_t * dst_data = (int32_t *) dst->data;
@@ -12555,15 +12555,16 @@ void ggml_compute_forward_kpool_expand(
         const int64_t stream = row/dst->ne[1];
         const int32_t * selected_row = selected_data + row*n_select;
         const int32_t * pool_cells_row = pool_cells_data + stream*n_pools*kpool;
-        const float * pool_bias_row = pool_bias_data + row*n_pools;
         const int32_t * tail_cells_row = tail_cells_data + row*n_tail;
         const ggml_fp16_t * tail_mask_row = tail_mask_data + row*n_tail;
         int32_t * dst_row = dst_data + row*n_compact;
 
         for (int64_t i = 0; i < n_select*kpool; ++i) {
             const int32_t pool = selected_row[i/kpool];
-            dst_row[i] = pool >= 0 && pool < n_pools && std::isfinite(pool_bias_row[pool]) ?
-                    pool_cells_row[(int64_t) pool*kpool + i%kpool] : -1;
+            const bool valid = pool >= 0 && pool < n_pools && std::isfinite(pool_bias_f16 ?
+                    GGML_CPU_FP16_TO_FP32(((const ggml_fp16_t *) pool_bias->data)[row*n_pools + pool]) :
+                    ((const float *) pool_bias->data)[row*n_pools + pool]);
+            dst_row[i] = valid ? pool_cells_row[(int64_t) pool*kpool + i%kpool] : -1;
         }
         for (int64_t i = 0; i < n_tail; ++i) {
             dst_row[n_select*kpool + i] = std::isfinite(GGML_CPU_FP16_TO_FP32(tail_mask_row[i])) ?

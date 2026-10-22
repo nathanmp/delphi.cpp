@@ -1,9 +1,19 @@
 #include "kpool-expand.cuh"
 
+static __device__ __forceinline__ bool kpool_bias_finite(const float x) {
+    return isfinite(x);
+}
+
+static __device__ __forceinline__ bool kpool_bias_finite(const half x) {
+    return isfinite(__half2float(x));
+}
+
+// pool_bias is F32 from the host or F16 when the device builds it next to the fused indexer
+template <typename bias_t>
 static __global__ void kpool_expand_kernel(
         const int32_t * __restrict__ selected,
         const int32_t * __restrict__ pool_cells,
-        const float   * __restrict__ pool_bias,
+        const bias_t  * __restrict__ pool_bias,
         const int32_t * __restrict__ tail_cells,
         const half    * __restrict__ tail_mask,
               int32_t * __restrict__ dst,
@@ -25,7 +35,7 @@ static __global__ void kpool_expand_kernel(
 
     if (i < n_select*kpool) {
         const int pool = selected[row*n_select + i/kpool];
-        const bool valid = pool >= 0 && pool < n_pools && isfinite(pool_bias[row*n_pools + pool]);
+        const bool valid = pool >= 0 && pool < n_pools && kpool_bias_finite(pool_bias[row*n_pools + pool]);
         dst[index] = valid ? pool_cells[(stream*n_pools + pool)*kpool + i%kpool] : -1;
         return;
     }
@@ -43,7 +53,7 @@ bool ggml_cuda_kpool_expand_supported(const ggml_tensor * dst) {
     const ggml_tensor * tail_mask  = dst->src[4];
 
     return dst->type == GGML_TYPE_I32 && selected->type == GGML_TYPE_I32 &&
-        pool_cells->type == GGML_TYPE_I32 && pool_bias->type == GGML_TYPE_F32 &&
+        pool_cells->type == GGML_TYPE_I32 && (pool_bias->type == GGML_TYPE_F32 || pool_bias->type == GGML_TYPE_F16) &&
         tail_cells->type == GGML_TYPE_I32 && tail_mask->type == GGML_TYPE_F16 &&
         ggml_is_contiguous(dst) && ggml_is_contiguous(selected) &&
         ggml_is_contiguous(pool_cells) && ggml_is_contiguous(pool_bias) &&
@@ -64,13 +74,20 @@ void ggml_cuda_kpool_expand(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     const int64_t n_elements = ggml_nelements(dst);
     const int blocks = (n_elements + threads - 1)/threads;
 
-    kpool_expand_kernel<<<blocks, threads, 0, ctx.stream()>>>(
-            (const int32_t *) selected->data,
-            (const int32_t *) pool_cells->data,
-            (const float   *) pool_bias->data,
-            (const int32_t *) tail_cells->data,
-            (const half    *) tail_mask->data,
-            (int32_t       *) dst->data,
-            kpool, selected->ne[0], pool_bias->ne[0], tail_cells->ne[0], dst->ne[0], dst->ne[1], n_elements);
+    auto launch = [&](const auto * bias) {
+        kpool_expand_kernel<<<blocks, threads, 0, ctx.stream()>>>(
+                (const int32_t *) selected->data,
+                (const int32_t *) pool_cells->data,
+                bias,
+                (const int32_t *) tail_cells->data,
+                (const half    *) tail_mask->data,
+                (int32_t       *) dst->data,
+                kpool, selected->ne[0], pool_bias->ne[0], tail_cells->ne[0], dst->ne[0], dst->ne[1], n_elements);
+    };
+    if (pool_bias->type == GGML_TYPE_F16) {
+        launch((const half *) pool_bias->data);
+    } else {
+        launch((const float *) pool_bias->data);
+    }
     CUDA_CHECK(cudaGetLastError());
 }

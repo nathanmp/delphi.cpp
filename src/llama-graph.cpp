@@ -4242,9 +4242,20 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
         ggml_set_input(inp->pool_cells);
         ggml_set_name(inp->pool_cells, "kpool_pool_cells");
 
-        inp->pool_bias = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_pools, n_tps, n_stream);
-        ggml_set_input(inp->pool_bias);
-        ggml_set_name(inp->pool_bias, "kpool_pool_bias");
+        if (llama_kpool_device_masks_enabled()) {
+            // the pool bias is built per device from these (see llm_graph_input_kpool)
+            inp->pool_iv_cells = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_pools, 2, 1, n_stream);
+            ggml_set_input(inp->pool_iv_cells);
+            ggml_set_name(inp->pool_iv_cells, "kpool_pool_iv_cells");
+
+            inp->pool_iv_queries = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_tps, 2, 1, n_stream);
+            ggml_set_input(inp->pool_iv_queries);
+            ggml_set_name(inp->pool_iv_queries, "kpool_pool_iv_queries");
+        } else {
+            inp->pool_bias = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_pools, n_tps, n_stream);
+            ggml_set_input(inp->pool_bias);
+            ggml_set_name(inp->pool_bias, "kpool_pool_bias");
+        }
 
         if (pool_cache != nullptr) {
             inp->pool_cache_slots = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_pools, n_stream);
@@ -4284,7 +4295,7 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
         }
 
         // the fused indexer wants f16; built once, shared by every indexer layer
-        if (cparams.fused_lid) {
+        if (cparams.fused_lid && inp->pool_bias != nullptr) {
             inp->pool_bias_f16 = ggml_cast(ctx0,
                     ggml_reshape_4d(ctx0, inp->pool_bias, n_pools, n_tps, 1, n_stream),
                     GGML_TYPE_F16);

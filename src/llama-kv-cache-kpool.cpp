@@ -559,7 +559,9 @@ void llama_kv_cache_set_input_kpool(
               bool             rebuild_pool_cache,
               uint32_t         stream0,
               ggml_tensor    * mask_cells,
-              ggml_tensor    * mask_queries) {
+              ggml_tensor    * mask_queries,
+              ggml_tensor    * pool_iv_cells,
+              ggml_tensor    * pool_iv_queries) {
     GGML_ASSERT(kv != nullptr);
     GGML_ASSERT(kpool > 0);
 
@@ -719,6 +721,17 @@ void llama_kv_cache_set_input_kpool(
     float * dst_mask_cells   = mask_cells   ? (float *) mask_cells  ->data : nullptr;
     float * dst_mask_queries = mask_queries ? (float *) mask_queries->data : nullptr;
 
+    GGML_ASSERT((pool_iv_cells == nullptr) == (pool_iv_queries == nullptr));
+    GGML_ASSERT(pool_iv_cells == nullptr || pool_bias == nullptr);
+    GGML_ASSERT(pool_iv_cells == nullptr || (pool_iv_cells->ne[0] == n_pools && pool_iv_cells->ne[1] == 2 &&
+            pool_iv_cells->ne[3] == n_ns && ggml_is_contiguous(pool_iv_cells)));
+    GGML_ASSERT(pool_iv_cells == nullptr || (pool_iv_queries->ne[0] == n_tps && pool_iv_queries->ne[1] == 2 &&
+            pool_iv_queries->ne[3] == n_ns && ggml_is_contiguous(pool_iv_queries)));
+    GGML_ASSERT(pool_iv_cells == nullptr ||
+            (ggml_backend_buffer_is_host(pool_iv_cells->buffer) && ggml_backend_buffer_is_host(pool_iv_queries->buffer)));
+    float * dst_iv_cells   = pool_iv_cells   ? (float *) pool_iv_cells  ->data : nullptr;
+    float * dst_iv_queries = pool_iv_queries ? (float *) pool_iv_queries->data : nullptr;
+
     int32_t * dst_tail_cells = compact_tail_cells ? (int32_t *) compact_tail_cells->data : nullptr;
     char    * dst_tail_mask  = compact_tail_mask  ? (char    *) compact_tail_mask ->data : nullptr;
 
@@ -759,6 +772,13 @@ void llama_kv_cache_set_input_kpool(
         std::fill(cur_pool_cells, cur_pool_cells + r*n_pools, 0);
         if (cur_pool_bias != nullptr) {
             std::fill(cur_pool_bias, cur_pool_bias + n_tps*n_pools, -INFINITY);
+        }
+
+        // every slot starts invalid: BIG fails the upper bound of every query
+        float * cur_iv_cells = dst_iv_cells ? dst_iv_cells + s*2*n_pools : nullptr;
+        for (int64_t g = 0; cur_iv_cells != nullptr && g < n_pools; ++g) {
+            cur_iv_cells[g]           = k_kpool_mask_big;
+            cur_iv_cells[n_pools + g] = (float) g;
         }
 
         // the token loop writes rows < n_tps in full; only the padding rows need clearing
@@ -897,6 +917,12 @@ void llama_kv_cache_set_input_kpool(
                 }
             }
 
+            for (int64_t p = 0; cur_iv_cells != nullptr && p < n_run; ++p) {
+                if (filled[p] == (int32_t) r) {
+                    cur_iv_cells[run_off[ps] + p] = (float) (run_off[ps] + p);
+                }
+            }
+
             if (pool_cache != nullptr) {
                 for (int64_t p = 0; p < n_run; ++p) {
                     if (filled[p] != (int32_t) r) {
@@ -944,6 +970,13 @@ void llama_kv_cache_set_input_kpool(
                     float * cur = dst_mask_queries + s*2*n_tps;
                     cur[ii]         = (float) q;
                     cur[n_tps + ii] = (float) tail_start;
+                }
+
+                // the slots [run_off, run_off + min(n_run, bo_vis)) of the pool_bias loop below
+                if (dst_iv_queries) {
+                    float * cur = dst_iv_queries + s*2*n_tps;
+                    cur[ii]         = (float) (run_off[ps] + std::min<int64_t>(n_run, bo_vis) - 1);
+                    cur[n_tps + ii] = (float) run_off[ps];
                 }
 
                 if (!cur_sel && !cur_cand && !cur_tail_cells) {
@@ -1115,7 +1148,9 @@ void llm_graph_input_kpool::set_input(const llama_ubatch * ubatch) {
             active_pool_cache ? rebuild_pool_cache : false,
             mctx_idx->get_stream_base(),
             mask_cells   && mask_cells  ->buffer ? mask_cells   : nullptr,
-            mask_queries && mask_queries->buffer ? mask_queries : nullptr);
+            mask_queries && mask_queries->buffer ? mask_queries : nullptr,
+            pool_iv_cells   && pool_iv_cells  ->buffer ? pool_iv_cells   : nullptr,
+            pool_iv_queries && pool_iv_queries->buffer ? pool_iv_queries : nullptr);
 }
 
 bool llm_graph_input_kpool::can_reuse(const llm_graph_params & params) {
@@ -1166,7 +1201,12 @@ bool llm_graph_input_kpool::can_reuse(const llm_graph_params & params) {
     };
 
     res &= shape(pool_cells, kpool*n_pools, n_stream, 1, 1);
-    res &= shape(pool_bias, n_pools, n_tps, n_stream, 1);
+    if (llama_kpool_device_masks_enabled()) {
+        res &= shape(pool_iv_cells, n_pools, 2, 1, n_stream);
+        res &= shape(pool_iv_queries, n_tps, 2, 1, n_stream);
+    } else {
+        res &= shape(pool_bias, n_pools, n_tps, n_stream, 1);
+    }
     res &= shape(compact_tail_cells, n_compact - n_selected, n_tps, n_stream, 1);
     res &= shape(compact_tail_mask, n_compact - n_selected, n_tps, n_stream, 1);
 

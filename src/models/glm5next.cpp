@@ -29,6 +29,17 @@ static bool glm5next_mtp_topk_share_enabled(const llama_hparams & hparams) {
     return hparams.indexer_index_share_mtp && (env == nullptr || std::atoi(env) != 0);
 }
 
+// Runs t on the backend of dev (the device of the layer that reads it), so that only its small inputs cross PCIe.
+static void glm5next_pin(ggml_backend_sched_t sched, ggml_tensor * t, ggml_backend_dev_t dev) {
+    for (int ib = 0; dev != nullptr && ib < ggml_backend_sched_get_n_backends(sched); ++ib) {
+        ggml_backend_t backend = ggml_backend_sched_get_backend(sched, ib);
+        if (ggml_backend_get_device(backend) == dev && ggml_backend_supports_op(backend, t)) {
+            ggml_backend_sched_set_tensor_backend(sched, t, backend);
+            break;
+        }
+    }
+}
+
 static bool glm5next_temporal_topk_enabled() {
     const char * env = std::getenv("GGML_CUDA_TOPK_TEMPORAL");
     return env == nullptr || std::atoi(env) != 0;
@@ -497,7 +508,12 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
         // The host still rebuilds these maps to obtain the new incomplete
         // tail. Keep them in the graph even though pool scoring is skipped.
         ggml_build_forward_expand(gf, ggml_cont(ctx0, inp_kp->pool_cells));
-        ggml_build_forward_expand(gf, ggml_cont(ctx0, inp_kp->pool_bias));
+        if (inp_kp->pool_bias != nullptr) {
+            ggml_build_forward_expand(gf, ggml_cont(ctx0, inp_kp->pool_bias));
+        } else {
+            ggml_build_forward_expand(gf, ggml_cont(ctx0, inp_kp->pool_iv_cells));
+            ggml_build_forward_expand(gf, ggml_cont(ctx0, inp_kp->pool_iv_queries));
+        }
 
         *top_k_mask = inp_kp->pool_cache->get_mtp_selection(ctx0, il, n_selected,
                 mctx_idx->get_stream_base(), n_stream, true);
@@ -542,6 +558,32 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
     const int64_t select_k = llama_kpool_select_k(n_pools, hparams.indexer_top_k, r);
     const int64_t n_selected = r*select_k;
     GGML_ASSERT(select_k > 0 && select_k <= n_pools);
+
+    // pool_valid & pool_visible: the host input, or one interval mask per device, so that no O(n_pools*n_tps)
+    // input is uploaded (and copied once per pipeline copy). The device mask is F16 for the fused indexer.
+    ggml_tensor * pool_bias     = inp_kp->pool_bias;     // F32 [n_pools, n_tps, n_stream]
+    ggml_tensor * pool_bias_f16 = inp_kp->pool_bias_f16; // F16 [n_pools, n_tps, 1, n_stream]
+    if (inp_kp->pool_iv_cells != nullptr) {
+        ggml_backend_dev_t dev = layer.wo->buffer ?
+                ggml_backend_buft_get_device(ggml_backend_buffer_get_type(layer.wo->buffer)) : nullptr;
+        auto it = inp_kp->dev_pool_bias.find(dev);
+        if (it == inp_kp->dev_pool_bias.end()) {
+            ggml_tensor * bias = ggml_interval_mask(ctx0, inp_kp->pool_iv_cells, inp_kp->pool_iv_queries,
+                    cparams.fused_lid ? GGML_TYPE_F16 : GGML_TYPE_F32);
+            cb(bias, "kpool_dev_pool_bias", il);
+            glm5next_pin(sched, bias, dev);
+            it = inp_kp->dev_pool_bias.emplace(dev, bias).first;
+        }
+        if (it->second->type == GGML_TYPE_F16) {
+            pool_bias_f16 = it->second;
+            pool_bias     = nullptr;
+        } else {
+            pool_bias     = ggml_reshape_3d(ctx0, it->second, n_pools, n_tps, n_stream);
+            pool_bias_f16 = nullptr;
+        }
+    }
+    // either type serves the validity tests below (0 or -INFINITY)
+    ggml_tensor * pool_bias_any = pool_bias ? pool_bias : ggml_reshape_3d(ctx0, pool_bias_f16, n_pools, n_tps, n_stream);
 
     ggml_tensor * kg_rows = ggml_view_3d(ctx0, kbuf, 2*d_idx, n_kv, n_stream,
             kbuf->nb[2], kbuf->nb[3], 0);
@@ -629,7 +671,7 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
         // pool_k stays f32 so the kernel takes its f32 path; f16 wmma would undo the prec
         ggml_tensor * pool_kf = ggml_reshape_4d(ctx0, pool_k, d_idx, 1, n_pools, n_stream);
 
-        pool_score = ggml_lightning_indexer(ctx0, iq, pool_kf, w, inp_kp->pool_bias_f16);
+        pool_score = ggml_lightning_indexer(ctx0, iq, pool_kf, w, pool_bias_f16);
         cb(pool_score, "indexer_pool_score", il);
 
         res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, pool_score, il});
@@ -647,7 +689,7 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
         pool_score = ggml_cont(ctx0, ggml_permute(ctx0, pool_score, 2, 1, 0, 3));
         pool_score = ggml_reshape_3d(ctx0, pool_score, n_pools, n_tps, n_stream);
 
-        pool_score = ggml_add(ctx0, pool_score, inp_kp->pool_bias);
+        pool_score = ggml_add(ctx0, pool_score, pool_bias);
         cb(pool_score, "indexer_pool_score", il);
     }
 
@@ -674,7 +716,7 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
     if (glm5next_kpool_expand_enabled() && cparams.fused_lid &&
             il < (int) hparams.n_layer() && direct_indexed) {
         ggml_tensor * top_k = ggml_kpool_expand(ctx0, sel, inp_kp->pool_cells,
-                inp_kp->pool_bias, inp_kp->compact_tail_cells, inp_kp->compact_tail_mask, (int32_t) r);
+                pool_bias_any, inp_kp->compact_tail_cells, inp_kp->compact_tail_mask, (int32_t) r);
         cb(top_k, "indexer_top_k_compact", il);
         *top_k_mask = nullptr;
         return top_k;
@@ -686,7 +728,7 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
     // naturally duplicate-free; direct compact attention needs this mask to make
     // every expanded member of a spilled pool inert.
     ggml_tensor * pool_valid = ggml_reshape_4d(
-            ctx0, inp_kp->pool_bias, 1, n_pools, n_tps, n_stream);
+            ctx0, pool_bias_any, 1, n_pools, n_tps, n_stream);
     ggml_tensor * selected_valid = ggml_get_rows(ctx0, pool_valid, sel);
     selected_valid = ggml_repeat_4d(
             ctx0, selected_valid, r, select_k, n_tps, n_stream);
@@ -816,14 +858,8 @@ ggml_tensor * llama_model_glm5next::graph::build_dsa_layer(
                 ggml_tensor * cand = ggml_interval_mask(ctx0, c_cand, qm, GGML_TYPE_F16);
                 cb(sel,  "kpool_dev_sel_mask",  il);
                 cb(cand, "kpool_dev_cand_mask", il);
-                for (int ib = 0; dev != nullptr && ib < ggml_backend_sched_get_n_backends(sched); ++ib) {
-                    ggml_backend_t backend = ggml_backend_sched_get_backend(sched, ib);
-                    if (ggml_backend_get_device(backend) == dev && ggml_backend_supports_op(backend, sel)) {
-                        ggml_backend_sched_set_tensor_backend(sched, sel,  backend);
-                        ggml_backend_sched_set_tensor_backend(sched, cand, backend);
-                        break;
-                    }
-                }
+                glm5next_pin(sched, sel,  dev);
+                glm5next_pin(sched, cand, dev);
                 it = inp_kp->dev_masks.emplace(dev, std::make_pair(sel, cand)).first;
             }
             sel_mask  = it->second.first;
