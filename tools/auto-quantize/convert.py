@@ -54,6 +54,17 @@ def q8_bytes(directory):
     return total
 
 
+def staging_bytes(directory):
+    """Scratch space that the converter needs while it runs: DeepSeek V4.1 engram tables are staged as Q8_0 in files
+    next to the output (V41_ENGRAM_TMPDIR) until the GGUF is written."""
+    total = 0
+    for f in safetensors_files(directory):
+        for name, t in header(f).items():
+            if name.endswith("engram.embed.weight"):
+                total += math.prod(t["shape"]) // 32 * 34
+    return total
+
+
 def source_bytes(directory):
     return sum(f.stat().st_size for f in safetensors_files(directory))
 
@@ -116,8 +127,11 @@ def convert(source, directory, python=None, mmproj=None, env=None, check=lambda 
     if not final.exists():
         partial = final.with_suffix(".partial.gguf")
         partial.unlink(missing_ok=True)
-        check([("Q8_0 source GGUF", "scratch", expected)])
-        run_converter(python, source, partial, ["--outtype", "q8_0"], directory / "convert.log", env or {}, expected)
+        staging = staging_bytes(source)
+        check([("Q8_0 source GGUF", "scratch", expected)] + ([("converter staging files", "scratch", staging)] if staging else []))
+        # the staging files go to the scratch disk, not to /tmp
+        env = {"V41_ENGRAM_TMPDIR": str(directory), **(env or {})}
+        run_converter(python, source, partial, ["--outtype", "q8_0"], directory / "convert.log", env, expected)
         partial.replace(final)
     projector = Path(mmproj) if mmproj else None
     if projector is None and has_vision(source):

@@ -1464,6 +1464,12 @@ class DeepseekV41Model(DeepseekV4Model):
             )
 
             out = _np.memmap(tmp_path, dtype=_np.uint8, mode="w+", shape=(n_rows, row_bytes))
+            # the mapping keeps the data until the writer is done; without a name the space comes back when the
+            # process ends, also after a failure (two tables stage about 208 GB)
+            try:
+                _os.unlink(tmp_path)
+            except OSError:
+                pass
             for ci, start in enumerate(range(0, n_rows, rows_per_chunk)):
                 stop = min(start + rows_per_chunk, n_rows)
                 chunk = wsl[start:stop, :].float()

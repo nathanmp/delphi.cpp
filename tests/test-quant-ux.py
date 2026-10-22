@@ -571,6 +571,11 @@ class Convert(unittest.TestCase):
             self.write_safetensors(Path(d) / "a.safetensors", {"w": [64, 64], "norm": [64], "odd": [10, 10]})
             self.assertEqual(cv.q8_bytes(d), 64 * 64 // 32 * 34 + 64 * 4 + 100 * 4)
 
+    def test_staging_counts_engram_tables(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.write_safetensors(Path(d) / "a.safetensors", {"layers.2.engram.embed.weight": [1000, 256], "w": [64, 64]})
+            self.assertEqual(cv.staging_bytes(d), 1000 * 256 // 32 * 34)
+
     def test_gguf_detection_and_vision(self):
         with tempfile.TemporaryDirectory() as d:
             gguf = Path(d) / "m.gguf"
