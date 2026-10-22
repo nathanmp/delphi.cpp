@@ -586,6 +586,26 @@ class ResumeState(unittest.TestCase):
             state.forget_from("prepare")
             self.assertEqual(state.decide("calibrate", {"t": 2}, "converted"), ("rerun", ["t"]))
 
+    def test_keep_calibration_after_a_rebuild(self):
+        with tempfile.TemporaryDirectory() as d:
+            state = runstate.State(d)
+            table = Path(d) / "quality.json"
+            table.write_text("{}")
+            state.mark("prepare", {"binaries": "old"}, None, 1)
+            state.mark("calibrate", {"t": 1}, "before", 5, [table])
+            state.forget_from("prepare")
+            with unittest.mock.patch("sys.stdout", io.StringIO()) as out:
+                qc.keep_calibration(state, {"t": 2}, "after", table, lambda: None)
+            self.assertIn("calibrate runs as usual", out.getvalue())
+            self.assertEqual(state.decide("calibrate", {"t": 1}, "after")[0], "rerun")
+            with unittest.mock.patch("sys.stdout", io.StringIO()) as out:
+                qc.keep_calibration(state, {"t": 1}, "after", table, lambda: "other model")
+            self.assertIn("other model", out.getvalue())
+            with unittest.mock.patch("sys.stdout", io.StringIO()) as out:
+                qc.keep_calibration(state, {"t": 1}, "after", table, lambda: None)
+            self.assertIn("keeping the finished calibration", out.getvalue())
+            self.assertEqual(state.decide("calibrate", {"t": 1}, "after"), ("skip", []))
+
     def test_calibration_ignores_timing_inputs(self):
         cfg = {"runtime": {"env": {}}}
         prepare = {"model": "m", "binaries": "b", "runtime": "r1", "timing": "t1", "inherited_environment": "e1"}

@@ -408,6 +408,22 @@ def calibration_previous(prepare_inputs, cfg, converted):
     return runstate.fingerprint(keys, converted)
 
 
+def keep_calibration(state, inputs, previous, table, foreign):
+    """--keep-calibration: record the finished calibration as one of the current inputs, for a rebuild of the
+    binaries that keeps the numbers. Its own inputs (calibration settings and text) and its model must be the same."""
+    record = state.stages.get("calibrate")
+    if not (record and "finished" in record and record.get("inputs") == inputs and table.exists()):
+        print("--keep-calibration: no finished calibration with the same settings; calibrate runs as usual", flush=True)
+        return
+    if (why := foreign()) is not None:
+        print(f"--keep-calibration: {why}; calibrate runs as usual", flush=True)
+        return
+    if record.get("fingerprint") != runstate.fingerprint(inputs, previous):
+        print("Stage calibrate: keeping the finished calibration although the binaries, libraries or environment "
+              "changed (--keep-calibration)", flush=True)
+    state.mark("calibrate", inputs, previous, record.get("seconds", 0), record.get("outputs", [str(table)]))
+
+
 def split_changed(row, used):
     split = row["recipe"]["memory"].get("layer_split")
     return bool(split) and split != used
@@ -639,7 +655,10 @@ def command_run(args):
     # The calibration passes measure KL, so they follow only the prepare inputs that change the probe models or their
     # numbers: a new -ub, timing setting or loader path runs prepare again but keeps the passes (GLM 5.3: 16 h).
     prepared = fp
-    fp = timed("calibrate", run_stage(state, "calibrate", calibration_inputs, calibration_previous(prepare_inputs, cfg, converted),
+    calibrated_on = calibration_previous(prepare_inputs, cfg, converted)
+    if args.keep_calibration:
+        keep_calibration(state, calibration_inputs, calibrated_on, p["quality"] / "quality.json", calibrate_foreign)
+    fp = timed("calibrate", run_stage(state, "calibrate", calibration_inputs, calibrated_on,
                                       lambda: stage_calibrate(cfg, p, args) and None,
                                       [p["quality"] / "quality.json"], calibrate_reset, calibrate_foreign))
     fp = runstate.fingerprint({"prepare": prepared}, fp)
@@ -815,6 +834,8 @@ def build_parser():
     p.add_argument("--rows", type=int, default=10, help="rows of the choice table, 5 to 15")
     p.add_argument("--scratch", type=Path, help="directory for temporary files; default WORK/scratch")
     p.add_argument("--keep-scratch", action="store_true", help="keep the scratch directory after the run")
+    p.add_argument("--keep-calibration", action="store_true",
+                   help="keep the finished calibration after a rebuild of the binaries that does not change the numbers")
     p.add_argument("--no-space-check", action="store_true")
     # a large MoE needs more than 10 minutes (GLM 5.3 on 3 CMP: about 13); the cap only stops a hung measurement
     p.add_argument("--measurement-seconds", type=float, default=3600, help="cap of the operation measurement in prepare")
