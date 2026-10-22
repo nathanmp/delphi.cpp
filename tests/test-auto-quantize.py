@@ -17,7 +17,7 @@ from model import classify, is_lazy, lazy_args, merge_imatrices, read_model, ten
 from search import dominates, llama_layer_devices, make_options, memory, pareto, search
 from quality import LossModel, damage_digest, load_quality, modelled_groups, role_of
 from calibrate import Fit, PatchWriter, anchor_qtypes, design, probe_qtypes
-from timing import Predictor, ProfileError, digest, operation_times, profile_model, regions, signature, token_counts
+from timing import Predictor, ProfileError, digest, measure_env, operation_times, profile_model, regions, signature, token_counts
 from auto_quantize import gpu_descriptions, require_identical_gpus, tensor_plan, verify_output, witness_choices
 from calibrate import OFFLOAD_BATCH, SPLIT_MARGIN, perplexity_command, split_session
 import numpy as np
@@ -1121,6 +1121,8 @@ class GpuOnly(unittest.TestCase):
             self.assertEqual(room, (60 * gib - 1000) / 3 - SPLIT_MARGIN)
             self.assertIsNone(split_session(fits, c | {"devices": [self.GPUS[0]]}, floor))
             self.assertIsNone(split_session(self.config([gib, gib, gib], bindir="/b", model="/m.gguf"), c | {"devices": None}, floor))
+        self.assertNotIn("GGML_CUDA_MOE_GROUPED", measure_env(self.config([1, 1, 1], bindir="/b", model="/m.gguf")))
+        self.assertEqual(measure_env(cfg(devices={"CUDA0": 1}, bindir="/b", model="/m.gguf"))["GGML_CUDA_MOE_GROUPED"], "grouped")
         seen = []
         with tempfile.TemporaryDirectory() as d, mock.patch("timing.lazy_args", return_value=[]), \
                 mock.patch("timing.run_recipe", side_effect=lambda recipe, out: seen.append(recipe.arms[0].command) or {}):

@@ -65,7 +65,12 @@ def measure_cmoe(cfg):
 def measure_env(cfg):
     """Quality and imatrix runs turn the expert cache off. Its default tier leaves the uncached experts of a prompt on the
     CPU, which takes hours for a BF16 source on a CPU without BF16 dot products; op offload streams them to the GPU."""
-    return dict(cfg["runtime"]["env"], LLAMA_MOE_CACHE_MIB="0")
+    env = dict(cfg["runtime"]["env"], LLAMA_MOE_CACHE_MIB="0")
+    if any(d.startswith("CUDA") for d in cfg["devices"]):
+        # The packed MoE weights of CUDA are a second copy of every expert tensor in a hotswap session (it turns packing in
+        # place off): 23 GiB more per CMP 170HX for GLM 5.3, so no band patch fitted. Grouped MMQ gives the same KL.
+        env.setdefault("GGML_CUDA_MOE_GROUPED", "grouped")
+    return env
 
 
 def requires_backend_signature(sig, cfg):

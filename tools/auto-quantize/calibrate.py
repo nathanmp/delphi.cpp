@@ -271,12 +271,13 @@ def run_session(command, jobs, writer, members, floor_choices, chunks, output, e
     tokens = output / "latest.f32"
     record_path = output / "run.json"
     old = json.loads(record_path.read_text())["jobs"] if record_path.exists() else []
-    if record_path.exists() and json.loads(record_path.read_text()).get("command") != command:
-        print(f"{output.name}: the command changed; measuring every job again", flush=True)
+    previous = json.loads(record_path.read_text()) if record_path.exists() else None
+    if previous and (previous.get("command") != command or previous.get("env", env) != env):
+        print(f"{output.name}: the command or environment changed; measuring every job again", flush=True)
         old = []
         for f in output.glob("*.f32"):
             f.unlink()
-    record = {"command": command, "jobs": [j for j in old if j["label"] not in ("floor", "recompute", "restore")
+    record = {"command": command, "env": env, "jobs": [j for j in old if j["label"] not in ("floor", "recompute", "restore")
                                            and (output / f"{j['label']}.f32").exists()]}
     done = {j["label"] for j in record["jobs"]}
     pending = [j for j in jobs if j["label"] not in done]
