@@ -19,7 +19,7 @@ from quality import LossModel, damage_digest, load_quality, modelled_groups, rol
 from calibrate import Fit, PatchWriter, anchor_qtypes, design, probe_qtypes
 from timing import Predictor, ProfileError, digest, operation_times, profile_model, regions, signature, token_counts
 from auto_quantize import gpu_descriptions, require_identical_gpus, tensor_plan, verify_output, witness_choices
-from calibrate import perplexity_command
+from calibrate import OFFLOAD_BATCH, SPLIT_MARGIN, perplexity_command, split_session
 import numpy as np
 from gguf import GGUFReader, GGUFWriter, GGMLQuantizationType
 
@@ -1105,6 +1105,22 @@ class GpuOnly(unittest.TestCase):
             self.assertIn("-cmoe", imatrix_command(config, {**c, "extra_args": []}, "/t.txt", "/o.gguf"))
             single = cfg(devices={"ROCm1": 1}, bindir="/b", model="/m.gguf")
             self.assertNotIn("-cmoe", perplexity_command(single, c, "/m.gguf", "ROCm1", "teacher"))
+            split = perplexity_command(config, c, "/m.gguf", ",".join(self.GPUS), "teacher")
+            self.assertNotIn("-cmoe", split)
+            self.assertEqual(split[split.index("-sm") + 1], "layer")
+            self.assertEqual(split[split.index("-ub") + 1], "512")
+            big = perplexity_command(config, {**c, "context": 512}, "/m.gguf", self.GPUS[0], "teacher")
+            self.assertEqual(big[big.index("-ub") + 1], str(OFFLOAD_BATCH))
+        with tempfile.TemporaryDirectory() as d:
+            floor = Path(d) / "floor.gguf"
+            floor.write_bytes(b"x" * 1000)
+            gib = 1 << 30
+            fits = self.config([20 * gib, 20 * gib, 20 * gib], bindir="/b", model="/m.gguf")
+            name, room = split_session(fits, c | {"devices": None}, floor)
+            self.assertEqual(name, ",".join(self.GPUS))
+            self.assertEqual(room, (60 * gib - 1000) / 3 - SPLIT_MARGIN)
+            self.assertIsNone(split_session(fits, c | {"devices": [self.GPUS[0]]}, floor))
+            self.assertIsNone(split_session(self.config([gib, gib, gib], bindir="/b", model="/m.gguf"), c | {"devices": None}, floor))
         seen = []
         with tempfile.TemporaryDirectory() as d, mock.patch("timing.lazy_args", return_value=[]), \
                 mock.patch("timing.run_recipe", side_effect=lambda recipe, out: seen.append(recipe.arms[0].command) or {}):

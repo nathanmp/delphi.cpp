@@ -40,7 +40,7 @@ from config import ROOT, QuantError, file_identity, imatrix_identities, write_js
 from corpus import calibration_text
 from model import lazy_args, tensor_bytes
 from quality import METHOD, METRIC, SCHEMA, damage_digest, damage_records, modelled_groups, sensitivity
-from timing import gpu, gpu_only, measure_cmoe, measure_env, run
+from timing import gpu, gpu_only, gpus, measure_cmoe, measure_env, run
 
 # Running hotswap sessions; SIGTERM ends them so that the session threads stop at once
 LIVE_SESSIONS = set()
@@ -205,17 +205,40 @@ def design(groups, mid, top, c, anchors=()):
 def perplexity_command(cfg, c, model, device, teacher, base=False):
     # No --numa tensors: op offload runs the experts on the GPU, so the node-local copy of every CPU expert only costs
     # RAM (the KL is bit-identical without it, and a big source plus probes in /dev/shm left no room for the copy).
-    ram = measure_cmoe(cfg) and (device == gpu(cfg) or gpu_only(cfg))
-    batch = c["batch"] or (16 * c["context"] if ram else c["context"])
+    # A device list ("CUDA0,CUDA1,CUDA2") is a layer-split session with every weight on the GPUs.
+    split = "," in device
+    ram = not split and measure_cmoe(cfg) and (device == gpu(cfg) or gpu_only(cfg))
+    batch = c["batch"] or (min(16 * c["context"], OFFLOAD_BATCH) if ram else 8 * c["context"] if split else c["context"])
     command = [str(Path(cfg["bindir"]) / "llama-perplexity"), "-m", str(model), "-f", c["text"], "--chunks", str(c["chunks"]),
                "--kl-divergence-base", str(teacher), "-c", str(c["context"]), "-b", str(batch), "-ub", str(batch),
                "-t", str(c["threads"]), "-tb", str(c["threads"]), "--device", device, "-ngl", "999"]
+    if split:
+        command += ["-sm", "layer"]
     if ram:
         command.append("-cmoe")
     command += lazy_args(cfg)
     if not base:
         command.append("--kl-divergence")
     return command
+
+
+# Op offload of CPU-resident IQ2_XXS experts gave NaN at -ub 4096 and garbage at 8192 (GLM 5.3 on a CMP 170HX,
+# 2026-10-21; the same model is correct on the GPUs at 4096 and with op offload at 2048).
+OFFLOAD_BATCH = 2048
+# A floor this far from the teacher is a broken computation, not a coarse quantization (the GLM case above: 5.8)
+FLOOR_KL_LIMIT = 4.0
+# Per GPU in a layer-split session: compute buffers at -ub 8*context, the KV of the context, the backend context
+SPLIT_MARGIN = 8 << 30
+
+
+def split_session(cfg, c, baseline):
+    """(device list, free bytes per GPU) for one layer-split session over the GPUs of a GPU-only deployment when the
+    floor fits on them with SPLIT_MARGIN per GPU; None otherwise (calibration.devices set, RAM routing, too large)."""
+    if c["devices"] or not gpu_only(cfg):
+        return None
+    names = gpus(cfg)
+    room = (sum(int(cfg["devices"][d]) for d in names) - Path(baseline).stat().st_size) / len(names) - SPLIT_MARGIN
+    return (",".join(names), room) if room > 0 else None
 
 
 def run_direct(command, tokens, log, env, timeout):
@@ -238,6 +261,11 @@ def run_session(command, jobs, writer, members, floor_choices, chunks, output, e
     tokens = output / "latest.f32"
     record_path = output / "run.json"
     old = json.loads(record_path.read_text())["jobs"] if record_path.exists() else []
+    if record_path.exists() and json.loads(record_path.read_text()).get("command") != command:
+        print(f"{output.name}: the command changed; measuring every job again", flush=True)
+        old = []
+        for f in output.glob("*.f32"):
+            f.unlink()
     record = {"command": command, "jobs": [j for j in old if j["label"] not in ("floor", "recompute", "restore")
                                            and (output / f"{j['label']}.f32").exists()]}
     done = {j["label"] for j in record["jobs"]}
@@ -267,6 +295,9 @@ def run_session(command, jobs, writer, members, floor_choices, chunks, output, e
     LIVE_SESSIONS.add(session)
     try:
         save("floor", session.start())
+        if results["floor"].mean() > FLOOR_KL_LIMIT:
+            raise QuantError(f"floor KL {results['floor'].mean():.2f} against the teacher: the floor model computes wrong "
+                             f"results with this command (see {output}); stop before measuring noise")
         if previous_floor is not None and (output / "floor.f32").read_bytes() != previous_floor:
             raise QuantError(f"floor differs from the earlier session in {output}; remove it to measure again")
         save("recompute", session.request("compute"))
@@ -545,6 +576,17 @@ def calibrate(data, cfg, output, encode, verify, timeout=7200, text_dir=None, sc
     direct = [j for j in jobs if "direct" in j and (separate(j) or ((dev0 / f"{j['label']}.f32").exists()
                                                                    and j["label"] not in recorded))]
     hot = [j for j in jobs if j not in direct]
+    # With the floor on the GPUs, a pass is about 10x faster than with the experts in RAM (no op-offload uploads).
+    # The jobs whose upgrade fits next to it run there; the others (mixed and uniform recipes, and jobs that the split
+    # session cannot apply) run in the sessions of `devices` as before.
+    split = split_session(cfg, c, data["baseline"]["path"])
+    split_jobs = []
+    if split:
+        def extra(job):
+            return (writer.bytes_of({n: q for g, q in job["choices"].items() for n in members[g]})
+                    - writer.bytes_of({n: floor_choices[g] for g in job["choices"] for n in members[g]}))
+        split_jobs = [j for j in hot if extra(j) <= split[1]]
+        hot = [j for j in hot if j not in split_jobs]
     shares = {d: hot[i::len(devices)] for i, d in enumerate(devices)}
     teacher = teacher_logits(cfg, c, output, timeout)
     results, errors = {}, []
@@ -566,17 +608,28 @@ def calibrate(data, cfg, output, encode, verify, timeout=7200, text_dir=None, sc
             results[device] = out
         except Exception as exc:  # reported after every session ends
             errors.append(f"{device}: {exc}")
-    print(f"Measuring {len(hot)} patch probes on {', '.join(devices)}"
-          + (f" and {len(direct)} uniform recipes as separate models" if direct else ""), flush=True)
     try:
-        threads = [threading.Thread(target=worker, args=(d,)) for d in devices]
+        failed = set()
+        if split_jobs:
+            print(f"Measuring {len(split_jobs)} patch probes on {split[0]} (layer split, every weight on the GPUs)", flush=True)
+            shares[split[0]] = split_jobs
+            worker(split[0])
+            if errors:
+                raise QuantError("calibration session failed: " + "; ".join(errors))
+            failed = set(results[split[0]].pop("failed", ()))
+            for i, job in enumerate(j for j in split_jobs if j["label"] in failed):
+                shares[devices[i % len(devices)]].append(job)
+        sessions = [d for d in devices if shares[d] or direct]
+        print(f"Measuring {sum(len(shares[d]) for d in sessions)} patch probes on {', '.join(sessions) or 'no device'}"
+              + (f" and {len(direct)} uniform recipes as separate models" if direct else ""), flush=True)
+        threads = [threading.Thread(target=worker, args=(d,)) for d in sessions]
         for t in threads:
             t.start()
         for t in threads:
             t.join()
         if errors:
             raise QuantError("calibration session failed: " + "; ".join(errors))
-        failed = {label for out in results.values() for label in out.pop("failed", ())}
+        failed = {label for d in sessions for label in results[d].pop("failed", ())}
         direct += [j for j in jobs if j["label"] in failed and j not in direct]
         for job in direct:
             target = dev0 / f"{job['label']}.f32"
@@ -626,11 +679,11 @@ def calibrate(data, cfg, output, encode, verify, timeout=7200, text_dir=None, sc
              "source_files": [file_identity(f["path"], content=True) for f in info["files"]],
              "imatrices": imatrix_identities(cfg),
              "damage": damage_digest(data["damage"]),
-             "floor": {"choices": floor_choices, "kl": floors[devices[0]], "kl_by_device": floors,
+             "floor": {"choices": floor_choices, "kl": floors.get(devices[0], next(iter(floors.values()))), "kl_by_device": floors,
                        **file_identity(data["baseline"]["path"])},
              "teacher": {**teacher_identity, "text": {**file_identity(c["text"], content=True), **({"corpora": corpora} if corpora else {})},
                          "chunks": c["chunks"], "context": c["context"]},
-             "execution": {"devices": devices, "ram_routed": measure_cmoe(cfg) and (devices == [gpu(cfg)] or gpu_only(cfg)),
+             "execution": {"devices": devices, "split_session": split[0] if split_jobs else None, "ram_routed": measure_cmoe(cfg) and (devices == [gpu(cfg)] or gpu_only(cfg)),
                            "numa": "off", "command": perplexity_command(cfg, c, "FLOOR", devices[0], "TEACHER"),
                            "env": env},
              "probe_qtypes": {"mid": mid, "top": top, "anchors": anchors}, "n_layer": n_layer, "roles": params,
