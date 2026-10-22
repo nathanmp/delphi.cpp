@@ -720,7 +720,7 @@ class DeepseekV4Model(TextModel):
 
     def _write_mxfp4_expert_tensor(self, bid: int, proj: str, tensor_key: gguf.MODEL_TENSOR) -> list[str]:
         n_experts = self.hparams["n_routed_experts"]
-        data: np.ndarray | None = None
+        loaders = []
         consumed: list[str] = []
 
         for eid in range(n_experts):
@@ -728,16 +728,10 @@ class DeepseekV4Model(TextModel):
             scale_name = f"layers.{bid}.ffn.experts.{eid}.{proj}.scale"
             if weight_name not in self.model_tensors or scale_name not in self.model_tensors:
                 raise KeyError(f"Missing routed expert tensors for {weight_name}")
-
-            weight = LazyTorchTensor.to_eager(self.model_tensors[weight_name]())
-            scale = LazyTorchTensor.to_eager(self.model_tensors[scale_name]())
-            packed = self.repack_mxfp4_blocks(weight, scale)
-            if data is None:
-                data = np.empty((n_experts, *packed.shape), dtype=packed.dtype)
-            data[eid] = packed
+            loaders.append((self.model_tensors[weight_name], self.model_tensors[scale_name]))
             consumed.extend((weight_name, scale_name))
 
-        assert data is not None
+        data = self.mxfp4_expert_tensor(loaders)
         new_name = self.format_tensor_name(tensor_key, bid)
         shape = gguf.quant_shape_from_byte_shape(data.shape, gguf.GGMLQuantizationType.MXFP4)
         logger.info(f"{new_name}: repacked routed experts to MXFP4, shape = {{{', '.join(str(n) for n in reversed(shape))}}}")
