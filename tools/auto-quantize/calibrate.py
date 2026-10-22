@@ -326,8 +326,17 @@ def run_session(command, jobs, writer, members, floor_choices, chunks, output, e
                     # A reload keeps the previous patch until it commits; free a large previous patch first.
                     if last and last + size > restore_bytes:
                         session.request("reset")
+                    try:
+                        result = session.request("reload", patch)
+                    except RuntimeError as exc:
+                        # out of memory: the session keeps its tensors; the job goes to another session
+                        print(f"{job['label']}: cannot apply in the session ({exc}); it runs elsewhere", flush=True)
+                        patch.unlink(missing_ok=True)
+                        failed.append(job["label"])
+                        session.request("reset")
+                        last, active = 0, False
+                        continue
                     last, active = size, True
-                    result = session.request("reload", patch)
                     patch.unlink(missing_ok=True)
                     if set(tensors) - applied(result):
                         raise QuantError(f"hotswap did not apply every tensor of {job['label']}")
@@ -603,8 +612,9 @@ def calibrate(data, cfg, output, encode, verify, timeout=7200, text_dir=None, sc
     def worker(device):
         try:
             command = perplexity_command(cfg, c, data["baseline"]["path"], device, teacher)
+            # The split session has less room per GPU: it frees the previous patch before every reload
             out = run_session(command, shares[device], writer, members, floor_choices, c["chunks"],
-                              output / f"session-{device}", env, timeout)
+                              output / f"session-{device}", env, timeout, **({"restore_bytes": 0} if "," in device else {}))
             results[device] = out
         except Exception as exc:  # reported after every session ends
             errors.append(f"{device}: {exc}")
