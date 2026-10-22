@@ -397,6 +397,8 @@ class Keys:
         IMAGE_SIZE            = "clip.vision.image_size"
         IMAGE_MIN_PIXELS      = "clip.vision.image_min_pixels"
         IMAGE_MAX_PIXELS      = "clip.vision.image_max_pixels"
+        IMAGE_MAX_TOKENS      = "clip.vision.image_max_tokens"   # deepseek41v, cap on the whole LLM token block
+        IMAGE_MAX_WH_RATIO    = "clip.vision.image_max_wh_ratio" # deepseek41v, 0 = no limit
         PREPROC_MIN_TILES     = "clip.vision.preproc_min_tiles"
         PREPROC_MAX_TILES     = "clip.vision.preproc_max_tiles"
         PREPROC_IMAGE_SIZE    = "clip.vision.preproc_image_size"
@@ -6072,6 +6074,7 @@ class VisionProjectorType:
     DEEPSEEKOCR = "deepseekocr"
     DEEPSEEKOCR2 = "deepseekocr2"
     DEEPSEEK4V = "deepseek4v"
+    DEEPSEEK41V = "deepseek41v"
     LFM2A = "lfm2a" # audio
     MUSIC_FLAMINGO = "musicflamingo" # audio
     GLM4V = "glm4v"
