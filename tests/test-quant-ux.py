@@ -576,6 +576,25 @@ class Convert(unittest.TestCase):
             self.write_safetensors(Path(d) / "a.safetensors", {"layers.2.engram.embed.weight": [1000, 256], "w": [64, 64]})
             self.assertEqual(cv.staging_bytes(d), 1000 * 256 // 32 * 34)
 
+    def test_unsupported_projector_is_skipped(self):
+        with tempfile.TemporaryDirectory() as d:
+            source, out = Path(d) / "src", Path(d) / "out"
+            source.mkdir()
+            (source / "config.json").write_text('{"vision_config": {}}')
+            self.write_safetensors(source / "a.safetensors", {"w": [64, 64]})
+            out.mkdir()
+            (out / "model-q8_0.gguf").write_bytes(b"GGUF")
+
+            def converter(python, src, outfile, extra, log, env, expected, text="ERROR:hf-to-gguf:Model X is not supported\n"):
+                Path(log).write_text(text)
+                raise cv.QuantError("conversion failed (1)")
+            with unittest.mock.patch.object(cv, "run_converter", converter), unittest.mock.patch("builtins.print"):
+                self.assertEqual(cv.convert(source, out), (out / "model-q8_0.gguf", None))
+            self.assertFalse((out / "mmproj.partial").exists())
+            with unittest.mock.patch.object(cv, "run_converter", lambda *a: converter(*a, text="Traceback\n")):
+                with self.assertRaises(cv.QuantError):
+                    cv.convert(source, out)
+
     def test_gguf_detection_and_vision(self):
         with tempfile.TemporaryDirectory() as d:
             gguf = Path(d) / "m.gguf"

@@ -143,8 +143,17 @@ def convert(source, directory, python=None, mmproj=None, env=None, check=lambda 
             partial = directory / "mmproj.partial"
             shutil.rmtree(partial, ignore_errors=True)
             partial.mkdir()
-            run_converter(python, source, partial / "mmproj-model.gguf", ["--mmproj", "--outtype", "f16"],
-                          directory / "convert-mmproj.log", env or {}, None)
+            log = directory / "convert-mmproj.log"
+            try:
+                run_converter(python, source, partial / "mmproj-model.gguf", ["--mmproj", "--outtype", "f16"], log, env or {}, None)
+            except QuantError:
+                if "is not supported" not in log.read_text(errors="replace"):
+                    raise
+                # the converter has no projector for this architecture (DeepSeek V4.1): the text model is still usable
+                shutil.rmtree(partial, ignore_errors=True)
+                print(f"warning: the checkpoint has a vision tower, but convert_hf_to_gguf.py cannot convert its projector "
+                      f"(see {log}); continuing without one", flush=True)
+                return final, None
             if not list(partial.glob("mmproj-*.gguf")):
                 raise QuantError(f"the converter wrote no mmproj file in {partial}; see {directory / 'convert-mmproj.log'}")
             shutil.rmtree(folder, ignore_errors=True)
