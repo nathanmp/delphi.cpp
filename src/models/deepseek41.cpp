@@ -363,8 +363,8 @@ void llm_graph_input_engram::set_input(const llama_ubatch * ubatch) {
     const uint64_t * prime = pmodel.engram_primes.data()  + (size_t) eg*n_cols;
     const uint64_t * offset = pmodel.engram_offsets.data() + (size_t) eg*n_cols;
 
-    // an image arrives as an embd batch, so ubatch->token is null; the reference gives those
-    // positions no engram contribution at all, which the padding token stands in for here
+    // an image arrives as an embd batch, so ubatch->token is null; the graph skips the engram for
+    // those batches, so the padding token here is only a safe default
     const int32_t pad = (int32_t) pmodel.engram_pad_id;
     auto map_of = [&](llama_token t) -> uint64_t {
         if (t < 0 || (size_t) t >= pmodel.engram_token_map.size()) {
@@ -1500,7 +1500,8 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
         }
 
         // the engram sits before the block and writes straight into the stream
-        if (pmodel.engram_index(il) >= 0) {
+        // an embd batch is an mtmd image span: the reference shuts the engram gate for those positions
+        if (pmodel.engram_index(il) >= 0 && ubatch.embd == nullptr) {
             inpL = build_engram(model, inpL, build_inp_engram(model, il), il);
             cb(inpL, "engram_out", il);
         }
