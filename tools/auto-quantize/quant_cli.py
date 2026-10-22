@@ -622,7 +622,14 @@ def command_run(args):
 
     def calibrate_reset():
         (p["quality"] / "quality.json").unlink(missing_ok=True)
-        shutil.rmtree(p["calibration"], ignore_errors=True)
+        # The passes take hours (GLM 5.3: 16 h), so the files of the earlier inputs stay beside the new ones until the
+        # next reset: a mistaken option or an edited state.json does not lose them.
+        if p["calibration"].exists():
+            kept = p["calibration"].with_name(p["calibration"].name + ".replaced")
+            shutil.rmtree(kept, ignore_errors=True)
+            p["calibration"].rename(kept)
+            print(f"Moved the calibration files of the earlier inputs to {kept}", flush=True)
+            p["quality"].mkdir(parents=True, exist_ok=True)
         # the measured/predicted KL ratio belongs to the old quality table
         (work / vf.RATIO_FILE).unlink(missing_ok=True)
     def calibrate_foreign():

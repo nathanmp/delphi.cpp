@@ -7,7 +7,7 @@ stage after it. The record also keeps the inputs, so the message can name what c
 A stage that starts gets a record without "finished": a run with the same inputs continues it, a run with other inputs
 first removes its files. A re-run stage marks the later stages stale (fingerprint None), so that they also remove their
 files from the earlier inputs when they run again. A stale stage whose fingerprint comes out the same as before (it does
-not chain on everything of the stage before it) is finished again."""
+not chain on everything of the stage before it) is finished again, or continues when it was interrupted."""
 from __future__ import annotations
 
 import json
@@ -71,7 +71,7 @@ class State:
             if later in self.stages:
                 record = self.stages[later]
                 self.stages[later] = {**record, "fingerprint": None, "stale": True,
-                                      **({"was": record["fingerprint"]} if "finished" in record and record["fingerprint"] else {})}
+                                      **({"was": record["fingerprint"]} if record.get("fingerprint") else {})}
         self.save()
 
     def save(self):

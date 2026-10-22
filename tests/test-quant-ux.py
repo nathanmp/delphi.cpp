@@ -576,6 +576,16 @@ class ResumeState(unittest.TestCase):
             _, out = go("calibrate", {"t": 2}, "converted")
             self.assertIn("input changed (t)", out)
 
+    def test_interrupted_stage_continues_after_an_earlier_stage_ran_again(self):
+        with tempfile.TemporaryDirectory() as d:
+            state = runstate.State(d)
+            state.mark("prepare", {"ub": 512}, None, 1)
+            state.start("calibrate", {"t": 1}, "converted")
+            state.forget_from("prepare")
+            self.assertEqual(state.decide("calibrate", {"t": 1}, "converted"), ("resume", []))
+            state.forget_from("prepare")
+            self.assertEqual(state.decide("calibrate", {"t": 2}, "converted"), ("rerun", ["t"]))
+
     def test_calibration_ignores_timing_inputs(self):
         cfg = {"runtime": {"env": {}}}
         prepare = {"model": "m", "binaries": "b", "runtime": "r1", "timing": "t1", "inherited_environment": "e1"}
