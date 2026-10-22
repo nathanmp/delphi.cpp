@@ -1244,6 +1244,109 @@ mtmd_image_preproc_out mtmd_image_preprocessor_deepseek4v::preprocess(const clip
     return out;
 }
 
+//
+// DeepSeek-V4.1-Flash vision (deepseek41v)
+//
+// the token block is [START] (n_llm_w tokens + NEWLINE) * n_llm_h [END], capped at max_n_token
+//
+
+// ref: solve_resize_ratio()
+void mtmd_image_preprocessor_deepseek41v::solve_resize_ratio(int height, int width, int p, int r, int max_n_token,
+                                                             int & best_height, int & best_width) {
+    const double ratio   = (double) height / width;
+    const double max_w_f = std::sqrt((max_n_token - 2) / ratio + 0.25) - 0.5;
+    const double max_h_f = max_w_f * ratio;
+    const int    cell    = p * r;
+    if (max_w_f < 1.0) {
+        // very tall: a single column
+        best_height = (max_n_token - 2) / 2 * cell;
+        best_width  = cell;
+    } else if (max_h_f < 1.0) {
+        // very wide: a single row
+        best_height = cell;
+        best_width  = (max_n_token - 3) * cell;
+    } else {
+        const double beta = std::min(
+            std::floor(max_w_f) * cell / width,
+            std::floor(max_h_f) * cell / height);
+        best_height = (int) std::floor(height * beta / p) * p;
+        best_width  = (int) std::floor(width  * beta / p) * p;
+    }
+}
+
+// ref: safe_resize()
+void mtmd_image_preprocessor_deepseek41v::safe_resize(int height, int width, int & best_height, int & best_width,
+                                                      int p, int r, int max_n_token) {
+    auto n_tokens = [&]() {
+        const int n_llm_h = ((best_height / p) + r - 1) / r;
+        const int n_llm_w = ((best_width  / p) + r - 1) / r;
+        return dsv41_get_block_n_out(n_llm_w, n_llm_h);
+    };
+    if (n_tokens() > max_n_token) {
+        solve_resize_ratio(height, width, p, r, max_n_token, best_height, best_width);
+        // the reference asserts here; shrink the budget in case rounding still overshoots
+        for (int budget = max_n_token - 1; n_tokens() > max_n_token && budget > 3; budget--) {
+            solve_resize_ratio(height, width, p, r, budget, best_height, best_width);
+        }
+    }
+}
+
+// ref: load_image()
+mtmd_image_preproc_out mtmd_image_preprocessor_deepseek41v::preprocess(const clip_image_u8 & img) const {
+    mtmd_image_preproc_out out;
+
+    const int p           = hparams.patch_size;
+    const int r           = hparams.n_merge;
+    const int max_n_token = hparams.dsv4_max_n_token;
+    const int max_wh      = hparams.dsv4_max_wh_ratio; // 0 = no limit
+
+    const clip_image_size orig = img.get_size();
+    int width  = orig.width;
+    int height = orig.height;
+    if (max_wh > 0 && width > height * max_wh) {
+        width = height * max_wh;
+    }
+    if (hparams.image_min_pixels > 0 && width * height > 0
+            && width * height < hparams.image_min_pixels) {
+        const double up = std::sqrt((double) hparams.image_min_pixels / ((double) width * height));
+        width  = (int) (width  * up);
+        height = (int) (height * up);
+    }
+    int best_width  = CLIP_ALIGN(width,  p);
+    int best_height = CLIP_ALIGN(height, p);
+    safe_resize(height, width, best_height, best_width, p, r, max_n_token);
+
+    clip_image_u8 resized;
+    if (max_wh > 0 && orig.width >= max_wh * orig.height) {
+        // extreme aspect ratio: plain stretch resize, no padding
+        img_tool::resize(img, resized, {best_width, best_height}, hparams.image_resize_algo, PAD_NONE);
+    } else {
+        // PIL ImageOps.pad: contain() rounds the free side and the paste offset rounds half to even
+        // PAD_NEAREST rounds half away from zero, which shifts the image by one pixel on a tie
+        int fit_w = best_width;
+        int fit_h = best_height;
+        if ((int64_t) orig.width * best_height > (int64_t) best_width * orig.height) {
+            fit_h = (int) std::nearbyint((double) orig.height / orig.width * best_width);
+        } else if ((int64_t) orig.width * best_height < (int64_t) best_width * orig.height) {
+            fit_w = (int) std::nearbyint((double) orig.width / orig.height * best_height);
+        }
+        clip_image_u8 fitted;
+        img_tool::resize(img, fitted, {fit_w, fit_h}, hparams.image_resize_algo, PAD_NONE);
+        if (fit_w == best_width && fit_h == best_height) {
+            resized = std::move(fitted);
+        } else {
+            resized.set_size({best_width, best_height}, img.is_placeholder());
+            img_tool::fill(resized, hparams.image_pad_color);
+            img_tool::composite(resized, fitted,
+                    (int) std::nearbyint((best_width  - fit_w) * 0.5),
+                    (int) std::nearbyint((best_height - fit_h) * 0.5));
+        }
+    }
+
+    out.append(hparams, resized);
+    return out;
+}
+
 mtmd_image_preproc_out mtmd_image_preprocessor_deepseekocr::preprocess(const clip_image_u8 & img) const {
     mtmd_image_preproc_out output;
     int grid_w = 0;

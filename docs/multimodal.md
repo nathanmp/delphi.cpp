@@ -41,6 +41,15 @@ llama-server -hf ggml-org/gemma-3-4b-it-GGUF --no-mmproj-offload
 > - Dots.OCR: https://github.com/ggml-org/llama.cpp/pull/17575
 > - HunyuanOCR: https://github.com/ggml-org/llama.cpp/pull/21395
 
+## DeepSeek V4 and V4.1 image input
+
+`DeepseekV4ForCausalLM` (DeepSeek-V4-Flash-Vision-Exp, projector type `deepseek4v`) and `DeepseekV41ForCausalLM` (DeepSeek V4.1 Flash, projector type `deepseek41v`) have a ViT with a 3x3 aligner. Make the projector from the original checkpoint with `convert_hf_to_gguf.py <checkpoint> --mmproj --outtype f16`. Use it with a text GGUF of the same model, which must contain the `exp_probs_b_vl` tensors.
+
+- V4.1 stores its image limits in the projector GGUF (`clip.vision.image_max_tokens` = 1024 and `clip.vision.image_max_wh_ratio` = 0, which means no limit). V4 files do not have these keys and use 384 and 8. `--image-max-tokens` and `--image-min-tokens` set the limits for both.
+- An image costs `rows * (columns + 1) + 2` tokens. V4.1 uses a plain row layout. V4 pairs rows and pads the block to a multiple of 4.
+- Image positions use the `exp_probs_b_vl` routing bias, and the V4.1 engram is off for them, as in the reference code.
+- Put the media marker where the image placeholder token of the DeepSeek prompt format goes: after the user text and a blank line, before the assistant tag.
+
 ## Pre-quantized models
 
 These are ready-to-use models, most of them come with `Q4_K_M` quantization by default. They can be found at the Hugging Face page of the ggml-org: https://huggingface.co/collections/ggml-org/multimodal-ggufs-68244e01ff1f39e5bebeeedc
