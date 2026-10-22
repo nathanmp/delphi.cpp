@@ -1108,7 +1108,7 @@ class GpuOnly(unittest.TestCase):
             split = perplexity_command(config, c, "/m.gguf", ",".join(self.GPUS), "teacher")
             self.assertNotIn("-cmoe", split)
             self.assertEqual(split[split.index("-sm") + 1], "layer")
-            self.assertEqual(split[split.index("-ub") + 1], "512")
+            self.assertEqual(split[split.index("-ub") + 1], "256")
             big = perplexity_command(config, {**c, "context": 512}, "/m.gguf", self.GPUS[0], "teacher")
             self.assertEqual(big[big.index("-ub") + 1], str(OFFLOAD_BATCH))
         with tempfile.TemporaryDirectory() as d:

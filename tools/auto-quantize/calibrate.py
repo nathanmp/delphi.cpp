@@ -208,7 +208,7 @@ def perplexity_command(cfg, c, model, device, teacher, base=False):
     # A device list ("CUDA0,CUDA1,CUDA2") is a layer-split session with every weight on the GPUs.
     split = "," in device
     ram = not split and measure_cmoe(cfg) and (device == gpu(cfg) or gpu_only(cfg))
-    batch = c["batch"] or (min(16 * c["context"], OFFLOAD_BATCH) if ram else 8 * c["context"] if split else c["context"])
+    batch = c["batch"] or (min(16 * c["context"], OFFLOAD_BATCH) if ram else 4 * c["context"] if split else c["context"])
     command = [str(Path(cfg["bindir"]) / "llama-perplexity"), "-m", str(model), "-f", c["text"], "--chunks", str(c["chunks"]),
                "--kl-divergence-base", str(teacher), "-c", str(c["context"]), "-b", str(batch), "-ub", str(batch),
                "-t", str(c["threads"]), "-tb", str(c["threads"]), "--device", device, "-ngl", "999"]
@@ -227,8 +227,18 @@ def perplexity_command(cfg, c, model, device, teacher, base=False):
 OFFLOAD_BATCH = 2048
 # A floor this far from the teacher is a broken computation, not a coarse quantization (the GLM case above: 5.8)
 FLOOR_KL_LIMIT = 4.0
-# Per GPU in a layer-split session: compute buffers at -ub 8*context, the KV of the context, the backend context
-SPLIT_MARGIN = 8 << 30
+# Per GPU in a layer-split session: compute buffers at -ub 4*context, the temporary buffers of the matrix products,
+# the KV of the context, the backend context (8 GiB was not enough for GLM 5.3 with an IQ6_K band on one CMP 170HX)
+SPLIT_MARGIN = 12 << 30
+# A split session that ends this many times gives its remaining jobs to the other sessions
+SPLIT_RESTARTS = 4
+
+
+class SessionCrashed(RuntimeError):
+    """The llama-perplexity process of a session ended during a job (for example out of memory in a pass)."""
+    def __init__(self, label, message):
+        super().__init__(f"{label}: {message}")
+        self.label = label
 
 
 def split_session(cfg, c, baseline):
@@ -329,6 +339,8 @@ def run_session(command, jobs, writer, members, floor_choices, chunks, output, e
                     try:
                         result = session.request("reload", patch)
                     except RuntimeError as exc:
+                        if session.process.poll() is not None:
+                            raise SessionCrashed(job["label"], str(exc)) from exc
                         # out of memory: the session keeps its tensors; the job goes to another session
                         print(f"{job['label']}: cannot apply in the session ({exc}); it runs elsewhere", flush=True)
                         patch.unlink(missing_ok=True)
@@ -349,6 +361,8 @@ def run_session(command, jobs, writer, members, floor_choices, chunks, output, e
                     try:
                         done |= applied(session.request("add", patch))
                     except RuntimeError as exc:
+                        if session.process.poll() is not None:
+                            raise SessionCrashed(job["label"], str(exc)) from exc
                         print(f"{job['label']}: cannot apply in the session ({exc}); it runs as a separate model", flush=True)
                         ok = False
                 patch.unlink(missing_ok=True)
@@ -357,7 +371,13 @@ def run_session(command, jobs, writer, members, floor_choices, chunks, output, e
                 if ok:
                     if set(tensors) - done:
                         raise QuantError(f"hotswap did not apply every tensor of {job['label']}")
-                    save(job["label"], session.request("compute"))
+                    try:
+                        result = session.request("compute")
+                    except RuntimeError as exc:
+                        if session.process.poll() is not None:
+                            raise SessionCrashed(job["label"], str(exc)) from exc
+                        raise
+                    save(job["label"], result)
                 else:
                     failed.append(job["label"])
                 session.request("reset")
@@ -612,21 +632,39 @@ def calibrate(data, cfg, output, encode, verify, timeout=7200, text_dir=None, sc
     def worker(device):
         try:
             command = perplexity_command(cfg, c, data["baseline"]["path"], device, teacher)
-            # The split session has less room per GPU: it frees the previous patch before every reload
             out = run_session(command, shares[device], writer, members, floor_choices, c["chunks"],
-                              output / f"session-{device}", env, timeout, **({"restore_bytes": 0} if "," in device else {}))
+                              output / f"session-{device}", env, timeout)
             results[device] = out
         except Exception as exc:  # reported after every session ends
             errors.append(f"{device}: {exc}")
+    def split_worker(device, share):
+        """Run the split session; a job that ends the process goes to the other sessions and the session starts again
+        (finished jobs are kept in run.json). Returns the labels of the jobs that the split session did not measure."""
+        command = perplexity_command(cfg, c, data["baseline"]["path"], device, teacher)
+        session_dir = output / f"session-{device}"
+        crashed = []
+        for _ in range(SPLIT_RESTARTS):
+            try:
+                # The split session has less room per GPU: it frees the previous patch before every reload
+                out = run_session(command, [j for j in share if j["label"] not in crashed], writer, members, floor_choices,
+                                  c["chunks"], session_dir, env, timeout, restore_bytes=0)
+                results[device] = out
+                return set(out.pop("failed", ())) | set(crashed)
+            except SessionCrashed as exc:
+                print(f"{exc.label}: the split session ended ({exc}); the job runs elsewhere, restarting the session", flush=True)
+                crashed.append(exc.label)
+        # too many restarts: keep the finished jobs, give the others to the -cmoe sessions
+        finished = {j["label"] for j in share if (session_dir / f"{j['label']}.f32").exists()}
+        print(f"The split session ended {SPLIT_RESTARTS} times; {len(share) - len(finished)} jobs run elsewhere", flush=True)
+        if (session_dir / "floor.f32").exists() and finished:
+            results[device] = {label: per_chunk(session_dir / f"{label}.f32", c["chunks"]) for label in finished}
+        return {j["label"] for j in share} - (finished if device in results else set())
+
     try:
         failed = set()
         if split_jobs:
             print(f"Measuring {len(split_jobs)} patch probes on {split[0]} (layer split, every weight on the GPUs)", flush=True)
-            shares[split[0]] = split_jobs
-            worker(split[0])
-            if errors:
-                raise QuantError("calibration session failed: " + "; ".join(errors))
-            failed = set(results[split[0]].pop("failed", ()))
+            failed = split_worker(split[0], split_jobs)
             for i, job in enumerate(j for j in split_jobs if j["label"] in failed):
                 shares[devices[i % len(devices)]].append(job)
         sessions = [d for d in devices if shares[d] or direct]
