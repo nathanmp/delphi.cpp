@@ -392,6 +392,22 @@ def build_config(args, gguf, rows, user_reserve, measured, override):
     return cfg
 
 
+# The prepare inputs that change what a calibration pass measures. The others (runtime, timing, machine settings, the
+# expert cache) only change the timing tables.
+CALIBRATION_PREPARE_KEYS = ("model", "imatrix", "sampling", "groups", "binaries", "libraries", "gpu", "ram_routed",
+                            "layer_split_gpus")
+
+
+def calibration_previous(prepare_inputs, cfg, converted):
+    """Fingerprint that the calibrate stage chains on, in place of the one of prepare. The libraries are identified by
+    their files, so LD_LIBRARY_PATH is left out of the inherited environment."""
+    keys = {k: prepare_inputs[k] for k in CALIBRATION_PREPARE_KEYS if k in prepare_inputs}
+    keys["environment"] = digest({"inherited": {name: value for name, value in os.environ.items()
+                                                if name.startswith(("GGML_", "LLAMA_", "CUDA_", "HIP_", "HSA_", "ROCR_", "OMP_"))},
+                                  "runtime": cfg["runtime"].get("env", {})})
+    return runstate.fingerprint(keys, converted)
+
+
 def split_changed(row, used):
     split = row["recipe"]["memory"].get("layer_split")
     return bool(split) and split != used
@@ -579,6 +595,7 @@ def command_run(args):
     # 3. prepare
     info = aq.configured_model(cfg)
     prepare_inputs = {k: digest(v) for k, v in aq.inputs(cfg, info).items()}
+    converted = fp
 
     def prepare_action():
         stage_prepare(cfg, p, args, args.measurement_seconds)
@@ -612,8 +629,13 @@ def command_run(args):
         record = p["calibration"] / "teacher.json"
         model = json.loads(record.read_text()).get("model") if record.exists() else None
         return f"{p['calibration']} holds teacher logits of another model" if model not in (None, file_identity(cfg["model"])) else None
-    fp = timed("calibrate", run_stage(state, "calibrate", calibration_inputs, fp, lambda: stage_calibrate(cfg, p, args) and None,
+    # The calibration passes measure KL, so they follow only the prepare inputs that change the probe models or their
+    # numbers: a new -ub, timing setting or loader path runs prepare again but keeps the passes (GLM 5.3: 16 h).
+    prepared = fp
+    fp = timed("calibrate", run_stage(state, "calibrate", calibration_inputs, calibration_previous(prepare_inputs, cfg, converted),
+                                      lambda: stage_calibrate(cfg, p, args) and None,
                                       [p["quality"] / "quality.json"], calibrate_reset, calibrate_foreign))
+    fp = runstate.fingerprint({"prepare": prepared}, fp)
     cfg["quality"] = {"table": str(p["quality"] / "quality.json")}
 
     # 5. plan and pick (with the check of the reserves of the chosen split)

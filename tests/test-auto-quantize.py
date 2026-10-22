@@ -873,6 +873,9 @@ class Quality(unittest.TestCase):
         config = {**self.config, "bindir": "/nonexistent", "model": str(self.source), "runtime": {"threads": 1, "env": {}}}
         writer = PatchWriter(config, self.model, None, self.root / "scratch", patch_mib=1024)
         writer.calls = []
+        margin = mock.patch("calibrate.CACHE_MARGIN", 0)  # the tests must not depend on the free space of the host
+        margin.start()
+        self.addCleanup(margin.stop)
 
         def quantize(tensors, path):
             writer.calls.append(set(tensors))

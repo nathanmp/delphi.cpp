@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import io
 import json
+import os
 import struct
 import sys
 import tempfile
@@ -485,7 +486,9 @@ class ResumeState(unittest.TestCase):
             stages = runstate.State(d).stages
             self.assertEqual(sorted(stages), ["convert", "encode", "plan", "prepare", "verify"])
             self.assertTrue(all(stages[n].get("stale") for n in ("plan", "encode", "verify")))
-            self.assertEqual(state.decide("plan", {"k": 1}, None), ("rerun", ["earlier stage"]))
+            self.assertEqual(state.decide("plan", {"k": 2}, None), ("rerun", ["k"]))
+            # the same fingerprint as before: the outputs of the stage are still the ones of its inputs
+            self.assertEqual(state.decide("plan", {"k": 1}, None), ("skip", []))
 
     def test_started_stage_resumes_with_same_inputs_only(self):
         with tempfile.TemporaryDirectory() as d:
@@ -551,6 +554,39 @@ class ResumeState(unittest.TestCase):
             go("calibrate", {"t": 1}, fp1)
             self.assertEqual(ran, ["prepare", "calibrate", "prepare", "calibrate"])
 
+
+    def test_stale_stage_with_the_same_fingerprint_is_kept(self):
+        with tempfile.TemporaryDirectory() as d:
+            state = runstate.State(d)
+            ran = []
+
+            def go(name, inputs, previous):
+                with unittest.mock.patch("sys.stdout", io.StringIO()) as out:
+                    fp, _ = qc.run_stage(state, name, inputs, previous, lambda: ran.append(name))
+                return fp, out.getvalue()
+            go("prepare", {"ub": 512}, None)
+            go("calibrate", {"t": 1}, "converted")
+            go("prepare", {"ub": 256}, None)
+            self.assertTrue(state.stages["calibrate"]["stale"])
+            _, out = go("calibrate", {"t": 1}, "converted")
+            self.assertIn("skipping", out)
+            self.assertEqual(ran, ["prepare", "calibrate", "prepare"])
+            self.assertNotIn("stale", runstate.State(d).stages["calibrate"])
+            go("prepare", {"ub": 128}, None)
+            _, out = go("calibrate", {"t": 2}, "converted")
+            self.assertIn("input changed (t)", out)
+
+    def test_calibration_ignores_timing_inputs(self):
+        cfg = {"runtime": {"env": {}}}
+        prepare = {"model": "m", "binaries": "b", "runtime": "r1", "timing": "t1", "inherited_environment": "e1"}
+        base = qc.calibration_previous(prepare, cfg, "c")
+        with unittest.mock.patch.dict(os.environ, {"LD_LIBRARY_PATH": "/elsewhere"}):
+            self.assertEqual(qc.calibration_previous({**prepare, "runtime": "r2", "timing": "t2", "inherited_environment": "e2"},
+                                                     cfg, "c"), base)
+        with unittest.mock.patch.dict(os.environ, {"GGML_CUDA_MOE_GROUPED": "packed"}):
+            self.assertNotEqual(qc.calibration_previous(prepare, cfg, "c"), base)
+        self.assertNotEqual(qc.calibration_previous({**prepare, "binaries": "b2"}, cfg, "c"), base)
+        self.assertNotEqual(qc.calibration_previous(prepare, {"runtime": {"env": {"X": "1"}}}, "c"), base)
 
 class Interrupt(unittest.TestCase):
     @unittest.skipUnless(Path("/proc/self/stat").exists(), "needs /proc")

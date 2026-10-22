@@ -6,7 +6,8 @@ stage after it. The record also keeps the inputs, so the message can name what c
 
 A stage that starts gets a record without "finished": a run with the same inputs continues it, a run with other inputs
 first removes its files. A re-run stage marks the later stages stale (fingerprint None), so that they also remove their
-files from the earlier inputs when they run again."""
+files from the earlier inputs when they run again. A stale stage whose fingerprint comes out the same as before (it does
+not chain on everything of the stage before it) is finished again."""
 from __future__ import annotations
 
 import json
@@ -40,6 +41,9 @@ class State:
         previous is the fingerprint of the stage before; when only it changed the key list is ['earlier stage']."""
         record = self.stages.get(name)
         fp = fingerprint(inputs, previous)
+        if record is not None and record.get("stale") and record.get("was") == fp:
+            record = self.stages[name] = {k: v for k, v in record.items() if k not in ("stale", "was")} | {"fingerprint": fp}
+            self.save()
         if record is None:
             return "run", []
         if record["fingerprint"] == fp and "finished" not in record:
@@ -65,7 +69,9 @@ class State:
         self.stages.pop(name, None)
         for later in STAGES[STAGES.index(name) + 1:]:
             if later in self.stages:
-                self.stages[later] = {"fingerprint": None, "inputs": self.stages[later].get("inputs", {}), "stale": True}
+                record = self.stages[later]
+                self.stages[later] = {**record, "fingerprint": None, "stale": True,
+                                      **({"was": record["fingerprint"]} if "finished" in record and record["fingerprint"] else {})}
         self.save()
 
     def save(self):
