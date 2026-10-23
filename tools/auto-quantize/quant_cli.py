@@ -233,6 +233,8 @@ def stage_verify(payload, row, output, args, work=None, scratch=None):
                                  scratch, args.verify_timeout)
     report["server"] = server
     print(f"Server loaded in {server['load_seconds']:.0f} s and answered: {server['answer'].strip()[:80]!r}")
+    if server.get("long"):
+        print(f"A {server['long']['tokens']}-token prompt prefilled at {server['long']['prefill_t_s'] or 0:.0f} t/s")
     print(vf.memory_text(server["memory"]))
     if not all(m["ok"] for m in server["memory"]):
         print("Warning: a GPU is below its keep-free amount; plan with a larger --keep-free or --ctx smaller")

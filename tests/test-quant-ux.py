@@ -424,6 +424,23 @@ class Verify(unittest.TestCase):
         self.assertEqual([m["ok"] for m in report], [False, False])
         self.assertIn("unknown", vf.memory_text(report))
 
+    def test_long_prompt_tokens(self):
+        with tempfile.TemporaryDirectory() as d:
+            text = Path(d) / "text.txt"
+            text.write_text("word " * 1000)
+            seen = []
+
+            def ask(url, payload=None, timeout=600):
+                seen.append(len(payload["content"]))
+                return {"tokens": list(range(len(payload["content"]) // 5))}
+            with unittest.mock.patch.object(vf, "ask", ask):
+                tokens = vf.long_prompt_tokens({"calibration": {"text": [{"path": str(text)}]}}, "http://x",
+                                               {"ctx": 256 + 100, "parallel": 1})
+                self.assertEqual(len(tokens), 100)
+                self.assertEqual(seen, [800])
+                self.assertIsNone(vf.long_prompt_tokens({"calibration": {"text": None}}, "http://x", {"ctx": 4096}))
+                self.assertIsNone(vf.long_prompt_tokens({"calibration": {"text": str(text)}}, "http://x", {"ctx": 200}))
+
 
 class Diversity(unittest.TestCase):
     def row(self, i, kld, size, decode, score):

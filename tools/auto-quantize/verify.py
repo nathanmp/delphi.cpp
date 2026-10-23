@@ -79,8 +79,39 @@ def ask(url, payload=None, timeout=600):
         return json.loads(response.read().decode())
 
 
+# A prompt past the GLM 5.3 indexed-attention crossover (32768 tokens): the CUDA pools and the staging buffers of
+# cross-device copies grow on the first long prompt (about 220 MiB per GPU at -ub 1024), after the server is ready.
+LONG_PROMPT_TOKENS = 40000
+
+
+def long_prompt_tokens(cfg, base, serve):
+    """Tokens of the calibration text for the long request (as many as the context of a slot allows), or None."""
+    text = cfg.get("calibration", {}).get("text")
+    paths = [e["path"] for e in text] if isinstance(text, list) else [text] if text else []
+    n = min(LONG_PROMPT_TOKENS, serve["ctx"] // max(1, serve.get("parallel") or 1) - 256)
+    if not paths or n <= 0:
+        return None
+    content = ""
+    for path in paths:
+        with open(path, encoding="utf-8", errors="replace") as stream:
+            content += stream.read(8 * n - len(content))
+        if len(content) >= 8 * n:
+            break
+    tokens = ask(base + "/tokenize", {"content": content}).get("tokens", [])
+    return tokens[:n] or None
+
+
+def wait_exit(process, seconds):
+    """The exit code of process once it exits within seconds, else None."""
+    try:
+        return process.wait(seconds)
+    except subprocess.TimeoutExpired:
+        return None
+
+
 def run_server_check(cfg, model, runtime_args, serve, rows, directory, timeout=3600):
-    """Launch the server, wait until it is ready, read the free memory per device, send one request, stop it.
+    """Launch the server, wait until it is ready, send a short and a long request, read the free memory per device,
+    stop it.
 
     rows is the capacity table (keep-free amounts). Returns the report; raises when the server exits or never gets ready."""
     directory = Path(directory)
@@ -110,12 +141,31 @@ def run_server_check(cfg, model, runtime_args, serve, rows, directory, timeout=3
         load_seconds = time.monotonic() - started
         answer = ask(base + "/completion", {"prompt": "The three primary colors are", "n_predict": 24, "temperature": 0})
         text = answer.get("content", "")
-        # after the request, so that buffers allocated on first use are counted
+        long = None
+        if (tokens := long_prompt_tokens(cfg, base, serve)) is not None:
+            timings = {}
+            try:
+                with progress.Watcher(f"verify: {len(tokens)}-token prompt", lambda: None):
+                    timings = ask(base + "/completion", {"prompt": tokens, "n_predict": 4, "temperature": 0},
+                                  timeout=timeout).get("timings", {})
+            except (urllib.error.URLError, OSError, ValueError) as exc:
+                # a crashing server can take a minute to write its backtrace and exit
+                if wait_exit(process, 120) is not None:
+                    raise QuantError(f"llama-server exited with {process.returncode} on a {len(tokens)}-token prompt "
+                                     f"(out of memory?); see {log}") from exc
+                # an error answer after the prompt: the continuation of the text in the middle of a word can fail
+                # the chat output parser; the buffers of the prompt are allocated all the same
+                if not isinstance(exc, urllib.error.HTTPError):
+                    raise
+            long = {"tokens": len(tokens), "prefill_t_s": timings.get("prompt_per_second")}
+        # after the requests, so that buffers allocated on first use are counted
         try:
             listed = cap.list_devices(cfg["bindir"], cfg["runtime"]["env"])
         except QuantError as exc:
             print(f"With the server up, {exc}", flush=True)
             listed = None
+        if process.poll() is not None:
+            raise QuantError(f"llama-server exited with {process.returncode} during the requests (out of memory?); see {log}")
         memory = keep_free_report(rows, listed)
         timings = answer.get("timings", {})
     finally:
@@ -127,7 +177,7 @@ def run_server_check(cfg, model, runtime_args, serve, rows, directory, timeout=3
             process.wait()
     if not text.strip():
         raise QuantError(f"the server answered with no text; see {log}")
-    return {"command": command_text(command, env), "load_seconds": load_seconds, "answer": text, "memory": memory,
+    return {"command": command_text(command, env), "load_seconds": load_seconds, "answer": text, "long": long, "memory": memory,
             "decode_t_s": timings.get("predicted_per_second"), "log": str(log)}
 
 
