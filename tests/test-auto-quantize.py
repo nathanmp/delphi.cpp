@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Offline advisor invariants; no inference or GPU is needed."""
+import contextlib
 import copy
+import io
 import itertools
 import json
 import sys
@@ -254,6 +256,73 @@ class Frontier(unittest.TestCase):
         result = search(model, cfg(devices={"ROCm1": 1 << 30, "RAM": floor + step}), predictor, baseline)
         self.assertTrue(result["frontier"])
         self.assertTrue(all(list(s["choices"].values()).count("Q4_0") <= 1 for s in result["frontier"]))
+
+    LOSS_ONLY = {"precision": 1, "decode": 0, "short": 0, "long": 0}
+
+    def test_search_without_timing_trades_loss_against_bytes(self):
+        model, _, baseline = self.fixture()
+        result = search(model, cfg(importance=self.LOSS_ONLY), None, baseline)
+        every = [(d, b) for d, b, _ in self.exhaustive(model)]
+        nondominated = {x for x in every if not any(dominates(y, x) for y in every)}
+        self.assertEqual({tuple(s["axes"]) for s in result["frontier"]}, nondominated)
+        self.assertTrue(all(s["predicted_ms"] is None for s in result["frontier"]))
+        self.assertEqual(result["frontier"][0]["damage"], min(d for d, _ in every))
+
+    def test_plan_without_timing_needs_loss_only_weights(self):
+        import auto_quantize as aq
+        model, _, baseline = self.fixture()
+        data = {"model": dict(model, identity={"files": []}), "baseline": {"choices": baseline}, "timing_qualified": False,
+                "timed": False}
+        with tempfile.TemporaryDirectory() as d, mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            with self.assertRaisesRegex(QuantError, "no timing"):
+                aq.plan(data, cfg(), d)
+            with self.assertRaisesRegex(QuantError, "no timing"):
+                aq.plan(data, cfg(importance=self.LOSS_ONLY, bounds={"min_decode_t_s": 10}), d)
+            with self.assertRaisesRegex(QuantError, "no timing"):
+                aq.validate(data, cfg(), "mixes.json", d)
+            payload = aq.plan(data, cfg(importance=self.LOSS_ONLY), d)
+        self.assertFalse(payload["timed"])
+        self.assertTrue(payload["recipes"])
+        self.assertIn("Speed was not measured", out.getvalue())
+
+    def test_prepare_skips_timing_with_loss_only_weights_and_measures_it_later(self):
+        import auto_quantize as aq
+        model, _, _ = self.fixture()
+        calls = []
+
+        def encode(info, config, choices, imatrix, output, quality=None):
+            calls.append("encode")
+            Path(output).write_text("gguf")
+        patches = [mock.patch.object(aq.subprocess, "check_output", return_value=b"ROCm1: GPU (1 MiB, 1 MiB free)"),
+                   mock.patch.object(aq, "configured_model", side_effect=lambda config: copy.deepcopy(model)),
+                   mock.patch.object(aq, "inputs", return_value={"k": 1}),
+                   mock.patch.object(aq, "merge_imatrices", return_value=None),
+                   mock.patch.object(aq, "get_damage", return_value=[]),
+                   mock.patch.object(aq, "make_options", return_value=[]),
+                   mock.patch.object(aq, "measure_ops", side_effect=lambda *a: calls.append("ops") or {}),
+                   mock.patch.object(aq, "profile_model", side_effect=lambda *a, **k: calls.append("profile") or {}),
+                   mock.patch.object(aq, "profile_times", return_value={"decode": 1, "short": 2, "long": 3}),
+                   mock.patch.object(aq, "encode", side_effect=encode),
+                   mock.patch.object(aq, "verify_output"),
+                   mock.patch("sys.stdout", new_callable=io.StringIO)]
+        lossy, weighted = cfg(bindir="/b", imatrix=[], importance=self.LOSS_ONLY), cfg(bindir="/b", imatrix=[])
+        with tempfile.TemporaryDirectory() as d, contextlib.ExitStack() as stack:
+            for patch in patches:
+                stack.enter_context(patch)
+            data = aq.prepare(lossy, d, 10)
+            # the floor GGUF is still encoded: calibration measures on it
+            self.assertEqual(calls, ["encode"])
+            self.assertFalse(data["timed"])
+            self.assertEqual(data["operations"], {})
+            self.assertIsNone(data["baseline"]["measured_ms"])
+            self.assertFalse(aq.prepare(lossy, d, 10)["timed"])
+            self.assertEqual(calls, ["encode"])
+            data = aq.prepare(weighted, d, 10)
+            self.assertEqual(calls, ["encode", "ops", "profile"])
+            self.assertTrue(data["timed"])
+            self.assertEqual(data["baseline"]["measured_ms"], {"decode": 1, "short": 2, "long": 3})
+            self.assertTrue(aq.prepare(lossy, d, 10)["timed"])
+            self.assertEqual(calls, ["encode", "ops", "profile"])
 
 
 class Knapsack(unittest.TestCase):

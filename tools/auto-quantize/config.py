@@ -16,6 +16,11 @@ class QuantError(ValueError):
     pass
 
 
+def loss_only(cfg):
+    """Whether only the loss counts: no time importance and no speed bound. Then nothing measures or predicts speed."""
+    return not any(cfg["importance"][axis] or cfg["bounds"].get(f"min_{axis}_t_s") for axis in AXES[1:])
+
+
 def number(value, name, minimum=0, positive=False):
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
         raise QuantError(f"{name} must be finite")

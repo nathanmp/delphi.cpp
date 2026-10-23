@@ -11,7 +11,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from config import AXES, SCHEMA, QuantError, digest, file_identity, imatrix_identities, imatrix_inputs, load_config, write_json
+from config import AXES, SCHEMA, QuantError, digest, file_identity, imatrix_identities, imatrix_inputs, load_config, loss_only, write_json
 import progress
 from model import classify, is_lazy, merge_imatrices, read_model, tensor_bytes
 from calibrate import calibrate, per_chunk, perplexity_command, run_direct
@@ -193,15 +193,25 @@ def prepare(cfg, directory, timeout):
     if gpu_only(cfg):
         require_identical_gpus(listed, gpus(cfg))
     key = digest(inputs(cfg, info))
+    # With loss-only weights the operation timings and the baseline profile are not measured. The floor GGUF is still
+    # encoded, because calibration measures on it.
+    timed = not loss_only(cfg)
     snapshot = directory / "prepared.json"
     if snapshot.exists():
         old = load_prepared(snapshot, cfg)
-        print(f"Reusing {snapshot}; timing reflects the recorded machine state", flush=True)
-        return old
+        if old.get("timed", True):
+            print(f"Reusing {snapshot}; timing reflects the recorded machine state", flush=True)
+            return old
+        if not timed:
+            print(f"Reusing {snapshot}; it has no timing (loss-only weights)", flush=True)
+            return old
+        print(f"{snapshot} has no timing (it was prepared with loss-only weights); preparing again with timing", flush=True)
     imatrix = merge_imatrices(cfg["imatrix"], directory / "merged-imatrix.gguf", cfg.get("imatrix_weights"))
     damage = get_damage(info, cfg, directory, imatrix)
-    print("Measuring bounded operation signatures", flush=True)
-    operations = measure_ops(info, cfg, directory / "calibration", timeout)
+    operations = {}
+    if timed:
+        print("Measuring bounded operation signatures", flush=True)
+        operations = measure_ops(info, cfg, directory / "calibration", timeout)
     excluded = make_options(info, damage, operations, cfg)
     baseline_choices = {group["name"]: min(group["options"], key=lambda o: (o["bytes"], o["damage"], o["qtype"]))["qtype"]
                         for group in info["groups"]}
@@ -222,14 +232,19 @@ def prepare(cfg, directory, timeout):
             print(f"Removing the partial baseline of an interrupted encode: {partial}", flush=True)
             partial.unlink()
         encode(info, cfg, baseline_choices, imatrix, baseline)
-    print("Profiling baseline short/long prefill and decode", flush=True)
-    with progress.Watcher("prepare: profiling baseline", lambda: None):
-        profile = profile_model(cfg, baseline, directory / "baseline-profile.json", placement=mem.get("layer_split"))
+    measured, profile_file = None, None
+    if timed:
+        print("Profiling baseline short/long prefill and decode", flush=True)
+        profile_file = directory / "baseline-profile.json"
+        with progress.Watcher("prepare: profiling baseline", lambda: None):
+            measured = profile_times(profile_model(cfg, baseline, profile_file, placement=mem.get("layer_split")), cfg)
+    else:
+        print("Loss-only weights: skipped the operation timing and the baseline profile", flush=True)
     result = {"schema": SCHEMA, "input_key": key, "config": cfg, "model": info, "damage": damage,
               "operations": operations, "excluded": excluded, "imatrix": imatrix,
-              "baseline": {"path": str(baseline), "choices": baseline_choices, "measured_ms": profile_times(profile, cfg),
-                           "memory": mem, "profile": str(directory / "baseline-profile.json")},
-              "slopes": {regime: 1.0 for regime in AXES[1:]}, "timing_qualified": False}
+              "baseline": {"path": str(baseline), "choices": baseline_choices, "measured_ms": measured,
+                           "memory": mem, "profile": str(profile_file) if profile_file else None},
+              "slopes": {regime: 1.0 for regime in AXES[1:]}, "timing_qualified": False, "timed": timed}
     write_json(snapshot, result)
     return result
 
@@ -271,7 +286,11 @@ def loss_model(data, cfg):
 
 def plan(data, cfg, output):
     model, table = loss_model(data, cfg)
-    predictor = predictor_for(data, cfg)
+    timed = data.get("timed", True)
+    if not timed and not loss_only(cfg):
+        raise QuantError("the prepared inputs have no timing (they were prepared with loss-only weights); prepare again "
+                         "with these weights or speed bounds to measure it")
+    predictor = predictor_for(data, cfg) if timed else None
     with progress.Watcher("plan: search", lambda: None):
         result = search(data["model"], cfg, predictor, data["baseline"]["choices"], model)
     outdir = Path(output).resolve()
@@ -288,28 +307,31 @@ def plan(data, cfg, output):
     projection = projected(cfg) and any(cfg["multi_gpu_speedup_percent"].values())
     qualified = data["timing_qualified"] and not projection
     payload = {"schema": SCHEMA, "config": cfg, "source": data["model"]["identity"], "prepared": data,
-               "search": result, "recipes": recipes, "timing_qualified": qualified,
+               "search": result, "recipes": recipes, "timing_qualified": qualified, "timed": timed,
                "single_gpu_timing_qualified": data["timing_qualified"], "user_gpu_projection": projection,
                "quality": quality_metadata(table),
-               "limitations": ["loss is the calibrated model's predicted KL against the teacher on the calibration text, not a bound" if table else "loss is a local source-relative proxy, not KLD or accuracy",
+               "limitations": ["loss is the calibrated model's predicted KL against the teacher on the calibration text, not a bound" if table else "loss is a local source-relative proxy, not KLD or accuracy"]
+               + (["speed was not measured (loss-only weights)"] if not timed else [
                                "uniform synthetic routing and fixed route frequencies",
                                "link bandwidth and handoff latency are priors unless supplied",
                                "cache hits use a uniform residency prior; cache policy replay is not calibrated",
                                "tail ubatches use interpolation; trace integrity has not been certified",
                                "the layers are split over the GPUs by memory (layer_split), with timings from operations measured on the first GPU and summed over the devices; pipeline overlap between GPUs is not modelled"
                                if gpu_only(cfg) else
-                               "multiple GPUs use user throughput factors, without pooled capacity or a runtime layout"]}
-    payload["effective_cpu_decode_gb_s"] = (predictor.cpu_bytes_per_ms or 0) / 1e6
+                               "multiple GPUs use user throughput factors, without pooled capacity or a runtime layout"])}
+    payload["effective_cpu_decode_gb_s"] = (predictor.cpu_bytes_per_ms or 0) / 1e6 if timed else None
     write_json(outdir / "frontier.json", payload)
     print(f"{result['status']}: {len(recipes)} nondominated recipes; {result['evaluated']} evaluations")
     print(f"recipe       {'pred. KL' if table else 'local R':>10s}  decode t/s  short t/s  long t/s  score")
     for state in recipes[:cfg["search"]["display"]]:
         times = state["predicted_ms"]
-        print(f"{state['id']}  {state['loss']:10.5g}  {1000/times['decode']:10.2f}  "
-              f"{1000*cfg['runtime']['short_tokens']/times['short']:9.2f}  "
-              f"{1000*cfg['runtime']['long_tokens']/times['long']:8.2f}  {state['score']:.4f}")
+        speeds = (f"{1000/times['decode']:10.2f}  {1000*cfg['runtime']['short_tokens']/times['short']:9.2f}  "
+                  f"{1000*cfg['runtime']['long_tokens']/times['long']:8.2f}" if times else f"{'-':>10s}  {'-':>9s}  {'-':>8s}")
+        print(f"{state['id']}  {state['loss']:10.5g}  {speeds}  {state['score']:.4f}")
+    if not timed:
+        print("Speed was not measured (loss-only weights)")
     status = "user GPU projection from the single-GPU baseline" if projection else "qualified on held-out witnesses" if qualified else "unqualified estimates"
-    print(f"Saved {outdir / 'frontier.json'}; timing predictions are {status}")
+    print(f"Saved {outdir / 'frontier.json'}" + (f"; timing predictions are {status}" if timed else ""))
     if table:
         print(f"Predicted KL is against the teacher on the calibration text (floor {table['floor']['kl']:.5f}); max_loss is a model ceiling, not a bound")
         beyond = [len(state["extrapolated_groups"]) for state in recipes if state["extrapolated_groups"]]
@@ -364,6 +386,9 @@ def witness_loss(cfg, table, model, directory, name, timeout=7200):
 
 
 def validate(data, cfg, specification, directory):
+    if not data.get("timed", True):
+        raise QuantError("validate qualifies the timing predictions, and the prepared inputs have no timing (loss-only "
+                         "weights); prepare again with a time importance")
     directory = Path(directory).resolve()
     directory.mkdir(parents=True, exist_ok=True)
     loss, table = loss_model(data, cfg)

@@ -8,17 +8,17 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools/auto-quantize"))
 import frontier as fr
-from config import QuantError
+from config import QuantError, loss_only
 from quant_cli import apply_query, build_parser, parse_weights
 
 GIB = 1 << 30
 
 
-def payload(n=40, quality=True):
+def payload(n=40, quality=True, timed=True):
     """Synthetic plan: more bytes -> lower KL; decode and prefill times vary independently of size."""
     recipes = []
     for i in range(n):
-        ms = {"decode": 20 + (i * 7) % 11, "short": 300 + (i * 13) % 17 * 5, "long": 4000 + (i * 29) % 23 * 40}
+        ms = {"decode": 20 + (i * 7) % 11, "short": 300 + (i * 13) % 17 * 5, "long": 4000 + (i * 29) % 23 * 40} if timed else None
         recipes.append({"id": f"recipe-{i:03d}", "loss": 0.1 / (1 + i), "predicted_ms": ms, "score": abs(i - 12) + 1,
                         "memory": {"used_bytes": {"ROCm1": 5 * GIB, "RAM": (20 + i) * GIB}},
                         "tensor_types": {"blk.0.ffn_down_exps.weight": "Q3_K" if i % 2 else "IQ4_XS",
@@ -79,6 +79,12 @@ class Query(unittest.TestCase):
         with self.assertRaises(QuantError):
             apply_query(c, args("--max-kld", "0.05"))
 
+    def test_loss_only_weights(self):
+        for argv in (["--weights", "loss=1"], ["--weights", "loss=5,decode=0"], ["--minimize", "kld"]):
+            self.assertTrue(loss_only(apply_query(cfg(), args(*argv))), argv)
+        for argv in (["--weights", "loss=1,decode=1"], ["--minimize", "kld", "--min-decode", "30"], []):
+            self.assertFalse(loss_only(apply_query(cfg(), args(*argv))), argv)
+
     def test_original_is_untouched(self):
         c = cfg()
         apply_query(c, args("--budget", "RAM=50GiB", "--max-kld", "0.1"))
@@ -129,6 +135,28 @@ class Frontier(unittest.TestCase):
         d = fr.detail(self.rows[1]["recipe"])
         self.assertEqual(d["ffn_down_exps"], "IQ4_XS x1, Q3_K x1")
         self.assertEqual(d["attn_q"], "Q8_0 x1")
+
+
+class LossOnlyFrontier(unittest.TestCase):
+    """A plan without timing (loss-only weights): no speed columns and no speed picks."""
+    def setUp(self):
+        self.rows = fr.rows(payload(timed=False))
+
+    def test_rows_thin_and_tables_have_no_speeds(self):
+        self.assertIsNone(self.rows[0]["decode"])
+        shown = fr.thin(self.rows, 8)
+        self.assertEqual(len(shown), 8)
+        ids = {r["id"] for r in shown}
+        for key in ("kld", "size", "score"):
+            self.assertIn(min(self.rows, key=lambda r: r[key])["id"], ids, key)
+        self.assertNotIn("dec t/s", fr.table(shown))
+        self.assertNotIn("decode", fr.run_table(fr.diverse(self.rows, 10)))
+        self.assertNotIn("decode", fr.selected_text(shown[0]))
+
+    def test_speed_picks_fail(self):
+        self.assertEqual(fr.pick([], self.rows, "min-kld")["id"], "recipe-039")
+        with self.assertRaisesRegex(ValueError, "loss-only"):
+            fr.pick([], self.rows, "fastest-decode")
 
 
 if __name__ == "__main__":

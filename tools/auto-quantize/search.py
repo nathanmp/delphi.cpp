@@ -231,7 +231,9 @@ def search(info, cfg, predictor, baseline_choices, model=None):
     For each loss multiplier theta, an exact multiple-choice knapsack per device minimizes
     theta * loss / loss_ref + sum_regime importance * time / time_ref; theta = the precision importance is the linearized
     score. A sweep of theta gives the supported points, walks between neighbouring solutions add the recipes between
-    them, and bisection finds the edges of the bounds. Every candidate is then evaluated exactly."""
+    them, and bisection finds the edges of the bounds. Every candidate is then evaluated exactly.
+
+    predictor None (loss-only weights without timing): the trade-off is loss against the total bytes instead of time."""
     groups = info["groups"]
     options = {g["name"]: {o["qtype"]: o for o in g["options"]} for g in groups}
     baseline_memory = memory(info, cfg, baseline_choices)
@@ -244,8 +246,9 @@ def search(info, cfg, predictor, baseline_choices, model=None):
         budgets = {d: baseline_memory["headroom_bytes"][d] + sum(options[n][baseline_choices[n]]["bytes"]
                                                                  for n, dev in placement.items() if dev == d)
                    for d in cfg["devices"]}
-    costs = predictor.group_costs()
-    scale = {r: predictor.slopes[r] / ((1 + cfg["multi_gpu_speedup_percent"][r] / 100) if projected(cfg) else 1) for r in AXES[1:]}
+    timed = predictor is not None
+    costs = predictor.group_costs() if timed else {}
+    scale = {r: predictor.slopes[r] / ((1 + cfg["multi_gpu_speedup_percent"][r] / 100) if projected(cfg) else 1) for r in AXES[1:]} if timed else {}
     weights = cfg["importance"]
 
     # MTP layers do not run in the main model; the local metric ignores them too, so they stay at the floor
@@ -261,7 +264,7 @@ def search(info, cfg, predictor, baseline_choices, model=None):
         return sum(local(n, q) for n, q in choices.items())
 
     loss_ref = loss_of(baseline_choices) or 1.0
-    reference = [loss_ref, *[predictor.measured[regime] for regime in AXES[1:]]]
+    reference = [loss_ref, *[predictor.measured[regime] for regime in AXES[1:]]] if timed else [loss_ref]
     time_terms = {n: {q: sum(weights[r] * scale[r] * costs[n][q][r] / predictor.measured[r] for r in AXES[1:])
                       if n in costs else 0.0 for q in options[n]} for n in options}
     bounds = cfg["bounds"]
@@ -295,17 +298,17 @@ def search(info, cfg, predictor, baseline_choices, model=None):
             if hard_cap is not None and mem["total_bytes"] > hard_cap:
                 rejected["total_bytes"] += 1
                 return None
-            times = predictor.predict(choices, mem["cache_hit_prior"])
+            times = predictor.predict(choices, mem["cache_hit_prior"]) if timed else None
         except QuantError as exc:
             rejected[str(exc)] += 1
             return None
         loss = loss_of(choices)
-        axes = [loss, *[times[regime] for regime in AXES[1:]]]
+        axes = [loss, *[times[regime] for regime in AXES[1:]]] if timed else [loss, mem["total_bytes"]]
         violation = 0.0
         if loss > bounds.get(loss_bound, math.inf):
             rejected["loss_bound" if model is not None else "damage_bound"] += 1
             violation += loss / max(bounds[loss_bound], 1e-12) - 1
-        for regime in AXES[1:]:
+        for regime in AXES[1:] if timed else ():
             rate = 1000 / times[regime] * (1 if regime == "decode" else cfg["runtime"][f"{regime}_tokens"])
             if rate < bounds.get(f"min_{regime}_t_s", 0):
                 rejected["speed_bound"] += 1
@@ -432,7 +435,7 @@ def search(info, cfg, predictor, baseline_choices, model=None):
         choices = solve_for(theta)
         states.append((theta, evaluate(choices) if choices is not None else None))
     # Sweep solutions are the supported points of the trade-off only. Walk from each solution to the next one group at
-    # a time, most loss reduction per unit of time first, so recipes between them are also evaluated.
+    # a time, most loss reduction per unit of time (without timing: per byte) first, so recipes between them are also evaluated.
     solved = [s for _, s in states if s is not None]
     for a, b in zip(solved, solved[1:]):
         marginal = model.marginal(model.predict(a["choices"])["u"]) if model is not None else 1.0
@@ -441,7 +444,7 @@ def search(info, cfg, predictor, baseline_choices, model=None):
             p = a["choices"][n]
             if p != q:
                 dl = separable(n, q, marginal) - separable(n, p, marginal)
-                dt = time_terms[n][q] - time_terms[n][p]
+                dt = time_terms[n][q] - time_terms[n][p] if timed else options[n][q]["bytes"] - options[n][p]["bytes"]
                 changes.append((dl / dt if dt > 1e-15 else -math.inf if dl < 0 else math.inf, n, q))
         current = dict(a["choices"])
         for _, n, q in sorted(changes)[:-1]:
