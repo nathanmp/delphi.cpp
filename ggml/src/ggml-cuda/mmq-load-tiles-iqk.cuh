@@ -393,12 +393,15 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         const block_iq4_ks * bxi = iqk_mmq_block_ptr<block_iq4_ks>(x, kbx0 + i*stride, stride, sizeof(float));
         const int ls = (bxi->scales[kqsx] & 254) - 127;
 
-        auto values = iq4k_values + ((bxi->scales[kqsx] & 1) << 4);
+        // the second iq4k_values table is the first plus 4 in each byte (no byte carries)
+        const int shift = (bxi->scales[kqsx] & 1)*0x04040404;
 
         #pragma unroll
         for (int j = 0; j < 4; ++j) {
             const int q4 = get_int_b4(bxi->qs, 4*kqsx+j);
-            const int2 v = get_int_from_table_16(q4, values);
+            int2 v = get_int_from_table_16(q4, iq4k_values);
+            v.x += shift;
+            v.y += shift;
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
             x_qs[i*sram_stride + 8*kqsx + j + 0] = v.x;
             x_qs[i*sram_stride + 8*kqsx + j + 4] = v.y;
@@ -503,10 +506,6 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     constexpr int qstep = 8;
     const int kqsx = threadIdx.x % qstep;
 
-    auto values = iq5nl_values;
-
-    uint32_t aux32[2];
-    const uint8_t * aux8 = (const uint8_t *)aux32;
 #pragma unroll
     for (int i0 = 0; i0 < I; i0 += nwarps * MMQ_TILE_NE_K/qstep) {
         int i = i0 + threadIdx.y*(MMQ_TILE_NE_K/qstep) + threadIdx.x/qstep;
@@ -524,22 +523,16 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         for (int l = 0; l < qstep/2; ++l) {
 
             const int ql = get_int_b4(bxi->qs, kqsx + qstep*l);
-            aux32[0] = ((ql >> 0) & 0x0f0f0f0f) | ((qh & 0x01010101) << 4) | ((extra & 1) * 0x20202020); // this is very slightly faster
-            aux32[1] = ((ql >> 4) & 0x0f0f0f0f) | ((qh & 0x02020202) << 3) | ((extra & 4) * 0x08080808); // then the version below
-            //aux32[0] = ((ql >> 0) & 0x0f0f0f0f) | ((qh & 0x01010101) << 4) | ((extra & 1) ? 0x20202020 : 0);
-            //aux32[1] = ((ql >> 4) & 0x0f0f0f0f) | ((qh & 0x02020202) << 3) | ((extra & 4) ? 0x20202020 : 0);
+            const int2 v = iqk_iq5_values(ql, qh, qh >> 1, extra & 1, (extra >> 2) & 1);
             qh    >>= 2;
             extra >>= 4;
 
-            const char4 val0  = make_char4(values[aux8[0]], values[aux8[1]], values[aux8[2]], values[aux8[3]]);
-            const char4 val1  = make_char4(values[aux8[4]], values[aux8[5]], values[aux8[6]], values[aux8[7]]);
-
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
-            x_qs[i*sram_stride + kqsx + 16*l + 0] = *(const int *)&val0;
-            x_qs[i*sram_stride + kqsx + 16*l + 8] = *(const int *)&val1;
+            x_qs[i*sram_stride + kqsx + 16*l + 0] = v.x;
+            x_qs[i*sram_stride + kqsx + 16*l + 8] = v.y;
 #else
-            x_qs[i*(2*MMQ_TILE_NE_K + 1)     + kqsx + 16*l + 0] = *(const int *)&val0;
-            x_qs[i*(2*MMQ_TILE_NE_K + 1)     + kqsx + 16*l + 8] = *(const int *)&val1;
+            x_qs[i*(2*MMQ_TILE_NE_K + 1)     + kqsx + 16*l + 0] = v.x;
+            x_qs[i*(2*MMQ_TILE_NE_K + 1)     + kqsx + 16*l + 8] = v.y;
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
         }
 
@@ -578,10 +571,6 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     constexpr int qstep = 8;
     const int kqsx = threadIdx.x % qstep;
 
-    auto values = iq5nl_values;
-
-    uint32_t aux32[2];
-    const uint8_t * aux8 = (const uint8_t *)aux32;
 #pragma unroll
     for (int i0 = 0; i0 < I; i0 += nwarps * MMQ_TILE_NE_K/qstep) {
         int i = i0 + threadIdx.y*(MMQ_TILE_NE_K/qstep) + threadIdx.x/qstep;
@@ -600,19 +589,15 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         for (int l = 0; l < qstep/2; ++l) {
 
             const int ql = get_int_b4(bxi->qs, kqsx + qstep*l);
-            aux32[0] = ((ql >> 0) & 0x0f0f0f0f) | ((qh & 0x01010101) << 4) | ((bxi->scales[2*l+0] & 1) * 0x20202020);
-            aux32[1] = ((ql >> 4) & 0x0f0f0f0f) | ((qh & 0x02020202) << 3) | ((bxi->scales[2*l+1] & 1) * 0x20202020);
+            const int2 v = iqk_iq5_values(ql, qh, qh >> 1, bxi->scales[2*l+0] & 1, bxi->scales[2*l+1] & 1);
             qh    >>= 2;
 
-            const char4 val0  = make_char4(values[aux8[0]], values[aux8[1]], values[aux8[2]], values[aux8[3]]);
-            const char4 val1  = make_char4(values[aux8[4]], values[aux8[5]], values[aux8[6]], values[aux8[7]]);
-
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
-            x_qs[i*sram_stride + kqsx + 16*l + 0] = *(const int *)&val0;
-            x_qs[i*sram_stride + kqsx + 16*l + 8] = *(const int *)&val1;
+            x_qs[i*sram_stride + kqsx + 16*l + 0] = v.x;
+            x_qs[i*sram_stride + kqsx + 16*l + 8] = v.y;
 #else
-            x_qs[i*(2*MMQ_TILE_NE_K + 1)     + kqsx + 16*l + 0] = *(const int *)&val0;
-            x_qs[i*(2*MMQ_TILE_NE_K + 1)     + kqsx + 16*l + 8] = *(const int *)&val1;
+            x_qs[i*(2*MMQ_TILE_NE_K + 1)     + kqsx + 16*l + 0] = v.x;
+            x_qs[i*(2*MMQ_TILE_NE_K + 1)     + kqsx + 16*l + 8] = v.y;
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
         }
 

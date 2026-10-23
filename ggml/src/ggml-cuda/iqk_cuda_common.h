@@ -7,6 +7,7 @@
 #pragma once
 
 #include "common.cuh"
+#include "vecdotq.cuh"
 
 static const __device__ uint32_t iq2k_table[512] = {
     0xe1e1e1e1, 0xe1e1e1f3, 0xe1e1e101, 0xe1e1e111, 0xe1e1f3e1, 0xe1e1f3f3, 0xe1e1f301, 0xe1e1f311,
@@ -141,3 +142,29 @@ static __device__ __forceinline__ int2 get_int_from_table_8(const int & q4, cons
     return make_int2(__byte_perm(v1, v2, 0x6420), __byte_perm(v1, v2, 0x7531));
 }
 #endif
+
+// Byte mask 0xFF where bit 0 of the byte of bits is set.
+static __device__ __forceinline__ uint32_t iqk_bit_mask(const uint32_t bits) {
+    return (bits & 0x01010101u) * 0xFFu;
+}
+
+static __device__ __forceinline__ uint32_t iqk_select(const uint32_t mask, const uint32_t a, const uint32_t b) {
+    return (a & ~mask) | (b & mask);
+}
+
+// Add shift (bytes below 0x80) to four int8 values without a carry from one byte into the next.
+static __device__ __forceinline__ uint32_t iqk_add_i8(const uint32_t v, const uint32_t shift) {
+    return ((v & 0x7f7f7f7fu) + shift) ^ (v & 0x80808080u);
+}
+
+// iq5nl_values for the 5 bit indices (4 bits in the nibbles of q4, the 5th bit in bit 0 of each byte of h0 for the low nibbles
+// and of h1 for the high nibbles). The second table is the first plus 2 in each byte and the first has a -1 value, so the shift
+// needs a carry safe add. Returns the values of the low nibbles in x and of the high nibbles in y.
+static __device__ __forceinline__ int2 iqk_iq5_values(const uint32_t q4, const uint32_t h0, const uint32_t h1, const uint32_t shift0,
+        const uint32_t shift1) {
+    const int2 a = get_int_from_table_16(q4, iq5nl_values);
+    const int2 b = get_int_from_table_16(q4, iq5nl_values + 16);
+    const uint32_t x = iqk_select(iqk_bit_mask(h0), a.x, b.x);
+    const uint32_t y = iqk_select(iqk_bit_mask(h1), a.y, b.y);
+    return make_int2(iqk_add_i8(x, shift0*0x02020202u), iqk_add_i8(y, shift1*0x02020202u));
+}
