@@ -151,7 +151,7 @@ def load_config(path):
     allowed = {"schema", "model", "devices", "reserve", "imatrix", "primary_qtypes", "other_qtypes", "importance",
                "preserve_below_mib", "tie_gate_up", "primary_regex", "pins", "preserve_regex", "allow_requantize",
                "bindir", "runtime", "sampling", "search", "bounds", "cache_mib", "multi_gpu_speedup_percent", "timing", "quality",
-               "calibration", "imatrix_collect"}
+               "calibration", "imatrix_collect", "mtp", "runtime_reserve"}
     unknown = set(cfg) - allowed
     if unknown:
         raise QuantError(f"unknown configuration keys: {sorted(unknown)}")
@@ -195,6 +195,11 @@ def load_config(path):
     for regex in cfg["preserve_regex"] + ([cfg["primary_regex"]] if cfg.get("primary_regex") else []):
         re.compile(regex)
     cfg["cache_mib"] = number(cfg.get("cache_mib", 0), "cache_mib")
+    # whether the MTP blocks are resident (served as the draft); without them the server does not load them
+    cfg.setdefault("mtp", True)
+    if not isinstance(cfg["mtp"], bool):
+        raise QuantError("mtp must be boolean")
+    cfg["runtime_reserve"] = {name: capacity(value) for name, value in cfg.get("runtime_reserve", {}).items()}
     speedups = cfg.get("multi_gpu_speedup_percent", {})
     if set(speedups) - {"decode", "short", "long"}:
         raise QuantError("multi_gpu_speedup_percent keys are decode, short, long")

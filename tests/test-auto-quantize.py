@@ -1072,6 +1072,19 @@ class GpuOnly(unittest.TestCase):
         self.assertEqual(plain["host_bytes"], 0)
         self.assertNotIn("layer_split", plain)
 
+    def test_mtp_blocks_are_resident_only_when_served(self):
+        rows = [10, 10, 10, 30]
+        model = self.model(rows)
+        for t in model["tensors"]:
+            t["mtp"] = t["layer"] == 3
+        model["mtp_layers"] = [3]
+        config = self.config([100_000] * 3)
+        served = memory(model, config, self.choices(model))
+        unserved = memory(model, {**config, "mtp": False}, self.choices(model))
+        self.assertEqual(sum(served["layer_split"]), 5)
+        self.assertEqual(sum(unserved["layer_split"]), 4)
+        self.assertEqual(served["total_bytes"] - unserved["total_bytes"], tensor_bytes([256, 30], "Q4_0"))
+
     def test_float32_assignment_reproduces_the_contiguous_blocks(self):
         rng = np.random.default_rng(3)
         for n in range(1, 121):

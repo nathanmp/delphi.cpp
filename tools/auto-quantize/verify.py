@@ -40,6 +40,8 @@ def server_command(cfg, model, runtime_args, serve, port):
         command += ["--mmproj", serve["mmproj"]]
     if serve.get("draft"):
         command += ["--spec-draft-model", serve["draft"], "--spec-type", serve.get("spec_type") or "draft-mtp"]
+    elif cap.serves_mtp(cfg, serve):
+        command += ["--spec-type", "draft-mtp"]
     return command + list(serve.get("server_args") or [])
 
 
@@ -179,6 +181,22 @@ def run_server_check(cfg, model, runtime_args, serve, rows, directory, timeout=3
         raise QuantError(f"the server answered with no text; see {log}")
     return {"command": command_text(command, env), "load_seconds": load_seconds, "answer": text, "long": long, "memory": memory,
             "decode_t_s": timings.get("predicted_per_second"), "log": str(log)}
+
+
+def measured_runtime(cfg, row, keep, memory):
+    """{device: bytes} of memory outside ggml buffers that the server used: the planned runtime reserve plus what the
+    device used beyond the plan (capacity + keep-free - free memory with the server up - planned use), rounded up to
+    64 MiB. None when the free memory is unknown or the plan is not GPU-only."""
+    used = row["recipe"]["memory"].get("used_bytes", {})
+    if any(m["free"] is None for m in memory) or "RAM" in cfg["devices"]:
+        return None
+    result = {}
+    for m in memory:
+        name = m["device"]
+        actual = cfg["devices"][name] + keep[name] - m["free"]
+        runtime = cfg.get("runtime_reserve", {}).get(name, 0) + actual - used[name]
+        result[name] = max(0, -(-runtime // (64 * MIB)) * 64 * MIB)
+    return result
 
 
 def memory_text(memory):

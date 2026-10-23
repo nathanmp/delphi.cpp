@@ -72,7 +72,12 @@ def memory(info, cfg, choices):
     lazy_bytes, host_bytes, tail, tied = 0, 0, 0, 0
     layer_bytes = [0] * (info["n_layer"] if only else 0)
     tied_output = only and not any(t["name"] == "output.weight" for t in info["tensors"])
+    if only and not cfg.get("mtp", True):
+        # the server does not load MTP blocks without an MTP draft; they are the last blocks
+        layer_bytes = layer_bytes[:info["n_layer"] - len(info.get("mtp_layers", ()))]
     for t in info["tensors"]:
+        if t.get("mtp") and not cfg.get("mtp", True):
+            continue
         dtype = types[t["name"]]
         size = tensor_bytes(t["shape"], dtype)
         if is_lazy(t["name"]):

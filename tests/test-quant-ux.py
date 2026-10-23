@@ -22,7 +22,7 @@ import quant_cli as qc
 import runstate
 import space
 import verify as vf
-from config import QuantError
+from config import QuantError, write_json
 
 GIB = 1 << 30
 
@@ -342,9 +342,11 @@ class Capacity(unittest.TestCase):
 
     def test_fit_print_and_serving_args(self):
         text = "ROCm3 29125 2351 2973 \nROCm0 30619 2926 3097 \nHost 28110 0 1563 \nmmproj ROCm3 1114\nmmproj CPU 25\n"
-        devices, mmproj = cap.parse_fit_print(text)
+        devices, mmproj, mtp = cap.parse_fit_print(text + "mtp ROCm3 0 0\nmtp ROCm0 317 454\n")
         self.assertEqual(devices["ROCm0"], (30619 << 20, 2926 << 20, 3097 << 20))
         self.assertEqual(mmproj, {"ROCm3": 1114 << 20, "CPU": 25 << 20})
+        self.assertEqual(mtp, {"ROCm3": 0, "ROCm0": (317 + 454) << 20})
+        self.assertEqual(set(devices), {"ROCm3", "ROCm0", "Host"})
         args = cap.serving_args({"ctx": 8192, "ub": 512, "parallel": 2, "ctk": "q8_0", "ctv": None})
         self.assertEqual(args, ["-c", "8192", "-ub", "512", "-np", "2", "-ctk", "q8_0"])
 
@@ -393,6 +395,7 @@ class Verify(unittest.TestCase):
     def serve(self, **kw):
         return {"ctx": 8192, "ub": 512, "parallel": 1, "ctk": None, "ctv": None, "mmproj": None, "draft": None, **kw}
 
+    @unittest.mock.patch("capacity.has_mtp", lambda model: False)
     def test_command_has_layout_context_and_mmproj(self):
         command = vf.server_command(self.cfg(), "/o.gguf", ["--device", "ROCm0,ROCm1", "-sm", "layer", "-ts", "9,8"],
                                     self.serve(mmproj="/p.gguf", ctk="q8_0"), 9000)
@@ -409,6 +412,30 @@ class Verify(unittest.TestCase):
         self.assertEqual(command[command.index("--device") + 1], "ROCm0")
         self.assertEqual(command[command.index("--spec-draft-model") + 1], "/d.gguf")
         self.assertEqual(command[command.index("--spec-type") + 1], "draft-mtp")
+
+    def test_mtp_is_served_unless_turned_off(self):
+        with unittest.mock.patch.object(cap, "has_mtp", lambda model: True):
+            command = vf.server_command(self.cfg(), "/o.gguf", None, self.serve(), 1)
+            self.assertEqual(command[command.index("--spec-type") + 1], "draft-mtp")
+            self.assertNotIn("--spec-type", vf.server_command(self.cfg(), "/o.gguf", None, self.serve(mtp=False), 1))
+        with unittest.mock.patch.object(cap, "has_mtp", lambda model: False):
+            self.assertNotIn("--spec-type", vf.server_command(self.cfg(), "/o.gguf", None, self.serve(), 1))
+
+    def test_runtime_memory_is_measured_and_read_back(self):
+        cfg = {**self.cfg(), "devices": {"ROCm0": 10 * GIB, "ROCm1": 10 * GIB}, "runtime_reserve": {"ROCm0": 256 << 20, "ROCm1": 256 << 20}}
+        row = {"recipe": {"memory": {"used_bytes": {"ROCm0": 9 * GIB, "ROCm1": 10 * GIB}}}}
+        keep = {"ROCm0": 512 << 20, "ROCm1": 512 << 20}
+        memory = [{"device": "ROCm0", "free": 1536 << 20}, {"device": "ROCm1", "free": 100 << 20}]
+        # ROCm0 used exactly its plan; ROCm1 used 412 MiB more than planned
+        measured = vf.measured_runtime(cfg, row, keep, memory)
+        self.assertEqual(measured, {"ROCm0": 256 << 20, "ROCm1": 704 << 20})
+        self.assertIsNone(vf.measured_runtime(cfg, row, keep, [{"device": "ROCm0", "free": None}]))
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(cap.runtime_reserves(d, ["ROCm0"], True, 1024), {"ROCm0": cap.RUNTIME_RESERVE_MTP})
+            write_json(Path(d) / cap.RUNTIME_FILE, {"mtp": True, "ub": 1024, "per_device": measured})
+            self.assertEqual(cap.runtime_reserves(d, ["ROCm0", "ROCm1"], True, 1024), measured)
+            self.assertEqual(cap.runtime_reserves(d, ["ROCm1"], False, 1024), {"ROCm1": cap.RUNTIME_RESERVE})
+            self.assertEqual(cap.runtime_reserves(d, ["ROCm1"], True, 512), {"ROCm1": cap.RUNTIME_RESERVE_MTP})
 
     def test_command_text_can_be_pasted(self):
         text = vf.command_text(["a", "b c"], {"X": "1"})

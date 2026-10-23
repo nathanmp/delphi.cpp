@@ -17,6 +17,12 @@ from space import ram_available
 
 MIB = 1 << 20
 KEEP_FREE_DEFAULT = 512 * MIB
+# Memory per GPU that no ggml buffer reports (streams, cuBLAS handles and pools, CUDA graphs, staging buffers of copies
+# between GPUs), most of it allocated on the first long prompt. Measured on three CMP 170HX with GLM 5.3 at -ub 1024:
+# about 300 MiB, 700 MiB with an MTP draft context. verify measures it; later runs with the same serving use that.
+RUNTIME_RESERVE = 320 * MIB
+RUNTIME_RESERVE_MTP = 768 * MIB
+RUNTIME_FILE = "runtime-reserve.json"
 DEVICE_NAME = r"RAM|(?:CUDA|ROCm)[0-9]+"
 
 
@@ -139,23 +145,59 @@ def serving_args(serve):
 
 
 def parse_fit_print(text):
-    """({device: (model, context, compute)}, {device: mmproj}) in bytes from `llama-fit-params --fit-print on`."""
-    devices, mmproj = {}, {}
+    """({device: (model, context, compute)}, {device: mmproj}, {device: mtp}) in bytes from `llama-fit-params
+    --fit-print on`; mtp is the KV cache and compute buffers of the MTP draft context (lines 'mtp DEV CONTEXT COMPUTE')."""
+    devices, mmproj, mtp = {}, {}, {}
     for line in text.splitlines():
         parts = line.split()
-        if len(parts) == 4 and parts[0] != "mmproj" and all(p.isdigit() for p in parts[1:]):
+        if len(parts) == 4 and parts[0] == "mtp" and all(p.isdigit() for p in parts[2:]):
+            mtp[parts[1]] = (int(parts[2]) + int(parts[3])) * MIB
+        elif len(parts) == 4 and parts[0] != "mmproj" and all(p.isdigit() for p in parts[1:]):
             devices[parts[0]] = tuple(int(p) * MIB for p in parts[1:])
         elif len(parts) == 3 and parts[0] == "mmproj" and parts[2].isdigit():
             mmproj[parts[1]] = int(parts[2]) * MIB
-    return devices, mmproj
+    return devices, mmproj, mtp
 
 
-def measure_reserves(cfg, serve, gpus, split, ram_routed):
+_mtp_models = {}
+
+
+def has_mtp(model):
+    """Whether the GGUF has multi-token-prediction blocks (nextn_predict_layers or blk.N.nextn.* tensors)."""
+    if model not in _mtp_models:
+        from model import mtp_layers, read_model
+        _mtp_models[model] = bool(mtp_layers(read_model(model)))
+    return _mtp_models[model]
+
+
+def serves_mtp(cfg, serve):
+    """Whether the server of the plan runs the MTP blocks of the model as its draft (the default; --no-mtp, a draft
+    model or a model without MTP blocks turn it off)."""
+    return bool(serve.get("mtp", True)) and not serve.get("draft") and has_mtp(cfg["model"])
+
+
+def runtime_reserves(work, gpus, mtp, ub):
+    """{device: bytes} of memory that no ggml buffer reports: what verify measured for the same serving (MTP, -ub),
+    else the defaults."""
+    import json
+    default = RUNTIME_RESERVE_MTP if mtp else RUNTIME_RESERVE
+    path = Path(work) / RUNTIME_FILE if work else None
+    if path and path.exists():
+        record = json.loads(path.read_text())
+        if record.get("mtp") == mtp and record.get("ub") == ub:
+            return {name: record["per_device"].get(name, default) for name in gpus}
+    return {name: default for name in gpus}
+
+
+def measure_reserves(cfg, serve, gpus, split, ram_routed, work=None):
     """Per-device reserve of the planned layout from llama-fit-params, without loading the weights.
 
-    Returns {"command", "per_device": {device: {"context", "compute", "mmproj", "draft", "total"}}}. The multimodal
-    projector goes to the first device, as the server does it. A draft file counts its size on its device (default the
-    first); fit-params cannot size a draft model alone, so its KV and compute buffers are not included."""
+    Returns {"command", "mtp", "per_device": {device: {"context", "compute", "mmproj", "draft", "runtime", "total"}}}.
+    The multimodal projector goes to the first device, as the server does it. With MTP (serves_mtp) the context includes
+    the recurrent states of the draft and "draft" is the MTP draft context; the MTP weights are part of the model. A draft
+    file counts its size on its device (default the first); fit-params cannot size a draft model alone, so its KV and
+    compute buffers are not included. "runtime" is the memory that no ggml buffer reports (runtime_reserves)."""
+    mtp = serves_mtp(cfg, serve)
     command = [str(Path(cfg["bindir"]) / "llama-fit-params"), "-m", cfg["model"], "-fitp", "on", "--device", ",".join(gpus),
                "-ngl", "999", *serving_args(serve), *lazy_args(cfg)]
     if len(gpus) > 1:
@@ -164,25 +206,42 @@ def measure_reserves(cfg, serve, gpus, split, ram_routed):
         command.append("-cmoe")
     if serve.get("mmproj"):
         command += ["--mmproj", serve["mmproj"]]
+    if mtp:
+        command += ["--spec-type", "draft-mtp", *spec_depth_args(serve)]
     completed = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env={**os.environ, **cfg["runtime"]["env"]})
-    devices, mmproj = parse_fit_print(completed.stdout.decode())
+    devices, mmproj, mtp_memory = parse_fit_print(completed.stdout.decode())
     if completed.returncode or not set(gpus) <= set(devices):
         tail = completed.stderr.decode().strip().splitlines()[-3:]
         raise QuantError(f"llama-fit-params failed ({completed.returncode}) on {cfg['model']}: " + " | ".join(tail))
-    result = {name: {"context": devices[name][1], "compute": devices[name][2], "mmproj": mmproj.get(name, 0), "draft": 0}
-              for name in gpus}
+    if mtp and not mtp_memory:
+        raise QuantError("llama-fit-params printed no MTP memory; build it from this tree (--spec-type support), "
+                         "or serve without MTP (--no-mtp)")
+    runtime = runtime_reserves(work, gpus, mtp, serve["ub"])
+    result = {name: {"context": devices[name][1], "compute": devices[name][2], "mmproj": mmproj.get(name, 0),
+                     "draft": mtp_memory.get(name, 0), "runtime": runtime[name]} for name in gpus}
     if serve.get("mmproj") and not any(mmproj.get(name) for name in gpus):
         raise QuantError("llama-fit-params printed no projector memory; build it from this tree (--mmproj support)")
     if serve.get("draft"):
         result[serve.get("draft_device") or gpus[0]]["draft"] = os.path.getsize(serve["draft"])
     for entry in result.values():
-        entry["total"] = entry["context"] + entry["compute"] + entry["mmproj"] + entry["draft"]
-    return {"command": command, "per_device": result}
+        entry["total"] = entry["context"] + entry["compute"] + entry["mmproj"] + entry["draft"] + entry["runtime"]
+    return {"command": command, "mtp": mtp, "per_device": result}
+
+
+def spec_depth_args(serve):
+    """The --spec-draft-n-max option of the server arguments: the draft depth sets the recurrent states of the draft."""
+    args = list(serve.get("server_args") or [])
+    for i, a in enumerate(args[:-1]):
+        if a in ("--spec-draft-n-max", "--draft-max", "--draft-n"):
+            return [a, args[i + 1]]
+    return []
 
 
 def reserves_text(measured, split=None, gpus=None):
-    lines = [f"{'device':<8s} {'layers':>6s} {'KV+state':>10s} {'compute':>10s} {'mmproj':>10s} {'draft':>10s} {'reserve':>10s}"]
+    lines = [f"{'device':<8s} {'layers':>6s} {'KV+state':>10s} {'compute':>10s} {'mmproj':>10s} {'draft':>10s} {'runtime':>10s} "
+             f"{'reserve':>10s}"]
     for i, (name, e) in enumerate(measured["per_device"].items()):
         lines.append(f"{name:<8s} {split[i] if split else '-':>6} {size_text(e['context']):>10s} {size_text(e['compute']):>10s} "
-                     f"{size_text(e['mmproj']):>10s} {size_text(e['draft']):>10s} {size_text(e['total']):>10s}")
+                     f"{size_text(e['mmproj']):>10s} {size_text(e['draft']):>10s} {size_text(e.get('runtime', 0)):>10s} "
+                     f"{size_text(e['total']):>10s}")
     return "\n".join(lines)

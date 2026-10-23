@@ -184,7 +184,8 @@ def serve_from_args(args):
     """The serving layout of the options: what the memory reserves and the launched server depend on."""
     return {"ctx": args.ctx, "ub": args.ub, "parallel": args.parallel, "ctk": args.ctk, "ctv": args.ctv,
             "mmproj": str(args.mmproj.resolve()) if args.mmproj else None, "draft": str(args.draft.resolve()) if args.draft else None,
-            "draft_device": args.draft_device, "spec_type": args.spec_type, "server_args": args.server_arg or []}
+            "draft_device": args.draft_device, "spec_type": args.spec_type, "server_args": args.server_arg or [],
+            "mtp": not args.no_mtp}
 
 
 def measured_capacities(args, bindir, env=None):
@@ -236,8 +237,15 @@ def stage_verify(payload, row, output, args, work=None, scratch=None):
     if server.get("long"):
         print(f"A {server['long']['tokens']}-token prompt prefilled at {server['long']['prefill_t_s'] or 0:.0f} t/s")
     print(vf.memory_text(server["memory"]))
+    runtime = vf.measured_runtime(cfg, row, keep, server["memory"])
+    if runtime and work:
+        write_json(work / cap.RUNTIME_FILE, {"mtp": cfg.get("mtp", False), "ub": serve_from_args(args)["ub"], "per_device": runtime})
+        print("Memory outside ggml buffers per GPU (planned -> measured): "
+              + ", ".join(f"{n} {cfg.get('runtime_reserve', {}).get(n, 0) // cap.MIB} -> {b // cap.MIB} MiB" for n, b in runtime.items())
+              + f"; stored in {work / cap.RUNTIME_FILE} for the next plans")
     if not all(m["ok"] for m in server["memory"]):
-        print("Warning: a GPU is below its keep-free amount; plan with a larger --keep-free or --ctx smaller")
+        print("Warning: a GPU is below its keep-free amount. Run again: the reserves use the measured runtime memory "
+              "now, and plan and encode run again (or use a larger --keep-free or a smaller --ctx)")
     if "quality" in cfg:
         table = json.loads(Path(cfg["quality"]["table"]).read_text())
         table = vf.ensure_teacher(cfg, table, scratch)
@@ -364,12 +372,13 @@ def build_config(args, gguf, rows, user_reserve, measured, override):
             raise QuantError(f"the config names device {name}, which is not in --devices {','.join(names)}")
         capacities[name] = amount
     reserve = {name: e["total"] + user_reserve.get(name, 0) for name, e in measured["per_device"].items()}
+    runtime = {name: e.get("runtime", 0) for name, e in measured["per_device"].items()}
     for name in user_reserve:
         if name not in capacities:
             raise QuantError(f"the config reserve names {name}, which is not in --devices")
     cfg = {"schema": SCHEMA, "model": str(gguf), "devices": capacities, "reserve": reserve, "imatrix": [str(x.resolve()) for x in args.imatrix],
            # the converted source is Q8_0; with an F16/BF16 source the option changes nothing
-           "allow_requantize": True}
+           "allow_requantize": True, "mtp": measured.get("mtp", False), "runtime_reserve": runtime}
     if args.bindir:
         cfg["bindir"] = str(args.bindir.resolve())
     if args.calibration_text:
@@ -461,7 +470,7 @@ def split_changed(row, used):
     return bool(split) and split != used
 
 
-def check_reserves(cfg, payload, row, serve, used_split, user_reserve, replan, spec):
+def check_reserves(cfg, payload, row, serve, used_split, user_reserve, replan, spec, work=None):
     """After the pick: measure the reserves of the chosen layer split. When they differ from the ones planned with, check
     that the recipe still fits, and re-plan once with the new reserves when it does not. Returns (payload, row, report)."""
     from search import memory
@@ -470,7 +479,7 @@ def check_reserves(cfg, payload, row, serve, used_split, user_reserve, replan, s
     split = row["recipe"]["memory"].get("layer_split")
     if not split_changed(row, used_split):
         return payload, row, {"split": used_split, "remeasured": False}
-    measured = cap.measure_reserves(cfg, serve, gpus, split, "RAM" in cfg["devices"])
+    measured = cap.measure_reserves(cfg, serve, gpus, split, "RAM" in cfg["devices"], work)
     fresh = {n: e["total"] + user_reserve.get(n, 0) for n, e in measured["per_device"].items()}
     print(f"Layer split of the pick {split} differs from {used_split} used for the reserves; measured again:")
     print(cap.reserves_text(measured, split))
@@ -623,8 +632,9 @@ def command_run(args):
     pre = {"bindir": str(bindir), "model": gguf, "runtime": {"env": override.get("runtime", {}).get("env", {})}}
     serve = serve_from_args(args)
     with progress.stage("reserves: llama-fit-params"):
-        measured = cap.measure_reserves(pre, serve, gpus, split0, "RAM" in [r["device"] for r in rows])
-    print(f"Reserves measured for the layer split {split0} at -c {args.ctx} (KV and recurrent state, compute buffers, projector, draft):")
+        measured = cap.measure_reserves(pre, serve, gpus, split0, "RAM" in [r["device"] for r in rows], work)
+    print(f"Reserves measured for the layer split {split0} at -c {args.ctx} (KV and recurrent state, compute buffers, projector, "
+          f"{'MTP draft context' if measured['mtp'] else 'draft'}, runtime memory outside ggml buffers):")
     print(cap.reserves_text(measured, split0))
     cfg_raw = build_config(args, gguf, rows, user_reserve, measured, override)
     for name, c in cfg_raw["devices"].items():
@@ -703,7 +713,7 @@ def command_run(args):
     ratio = vf.load_ratio(work)
     cfg = apply_query(cfg, args, ratio)
     default_pick = {"kld": "min-kld", "size": "min-size"}.get(args.minimize)
-    plan_inputs = {"importance": cfg["importance"], "bounds": cfg["bounds"], "search": cfg["search"],
+    plan_inputs = {"importance": cfg["importance"], "bounds": cfg["bounds"], "search": cfg["search"], "mtp": cfg["mtp"],
                    "devices": rounded(cfg["devices"]), "reserve": rounded(cfg["reserve"]), "kld_ratio": ratio,
                    "pick": args.pick or ("auto" if args.auto else None)}
     out = p["plans"] / "run"
@@ -718,7 +728,8 @@ def command_run(args):
         def replan(trial):
             shutil.rmtree(out, ignore_errors=True)
             return run_plan(trial, p, out)
-        payload, row, report = check_reserves(cfg, payload, row, serve, split0, user_reserve, replan, args.pick or default_pick or "best")
+        payload, row, report = check_reserves(cfg, payload, row, serve, split0, user_reserve, replan, args.pick or default_pick or "best",
+                                              work)
         write_json(work / "reserves.json", {**json.loads((work / "reserves.json").read_text()), "chosen": report})
         state_box.update(payload=payload)
         return {"pick": row["id"]}
@@ -793,6 +804,9 @@ def build_parser():
         p.add_argument("--draft", type=Path, help="draft model or MTP head file (counts its file size)")
         p.add_argument("--draft-device", help="device of the draft file (default: the first GPU)")
         p.add_argument("--spec-type", default="draft-mtp", help="llama-server --spec-type for --draft (default draft-mtp)")
+        p.add_argument("--no-mtp", action="store_true",
+                       help="serve without the MTP blocks of the model (default: they draft on the GPU, and the plan and "
+                            "verify count and run them)")
         p.add_argument("-ctk", "--cache-type-k", dest="ctk", help="K cache type (default f16)")
         p.add_argument("-ctv", "--cache-type-v", dest="ctv", help="V cache type (default f16)")
         p.add_argument("-ub", "--ubatch-size", dest="ub", type=int, default=512)
