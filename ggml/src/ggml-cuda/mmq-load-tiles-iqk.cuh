@@ -435,8 +435,6 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     constexpr int qstep = 8;
     const int kqsx = threadIdx.x % qstep;
 
-    uint32_t aux32[2];
-    const uint8_t * aux8 = (const uint8_t *)aux32;
 #pragma unroll
     for (int i0 = 0; i0 < I; i0 += nwarps * MMQ_TILE_NE_K/qstep) {
         int i = i0 + threadIdx.y*(MMQ_TILE_NE_K/qstep) + threadIdx.x/qstep;
@@ -448,19 +446,18 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         const block_iq4_k * bxi = (const block_iq4_k *) x + i*stride + kbx0;
         const uint16_t extra = bxi->extra >> 2*kqsx;
 
-        auto values_l = iq4k_table + ((extra & 1) << 8);
-        auto values_h = iq4k_table + ((extra & 2) << 7);
+        // the second iq4k_values table is the first plus 4 in each byte (no byte carries)
+        const int shift_l = (extra & 1)*0x04040404;
+        const int shift_h = ((extra >> 1) & 1)*0x04040404;
 
     #pragma unroll
         for (int l = 0; l < qstep/2; ++l) {
 
             const int q4 = get_int_b4(bxi->qs, (qstep/2)*kqsx + l);
+            const int2 v = get_int_from_table_16(q4, iq4k_values);
 
-            aux32[0] = (q4 >> 0) & 0x0f0f0f0f;
-            aux32[1] = (q4 >> 4) & 0x0f0f0f0f;
-
-            int val0 = int_from_table_x(aux8+0, values_l);
-            int val1 = int_from_table_x(aux8+4, values_h);
+            int val0 = v.x + shift_l;
+            int val1 = v.y + shift_h;
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
             x_qs[i*sram_stride + 8*kqsx + l + 0] = val0;

@@ -10,20 +10,13 @@
 #include "iqk_cuda_common.h"
 
 // CUDA dot products adapted from ik_llama.cpp commit 3e416d7f5a9d4cc3195e8171dbf891541ca59c6a.
+// all_values is iq4k_values: its second table is the first plus 4 in each byte (no byte carries), so bit 0 of shift adds 4 to
+// the values of the low nibbles and bit 1 adds 4 to the values of the high nibbles.
 __device__ __forceinline__ void get_int_from_table_16_shift(const uint32_t & q4, uint16_t shift, const uint8_t * all_values,
         int & val1, int & val2) {
-
-    uint32_t aux32; const uint8_t * q8 = (const uint8_t *)&aux32;
-    aux32 = q4 & 0x0f0f0f0f;
-    const uint8_t * values = all_values + 16*(shift & 1);
-    uint16_t v1 = values[q8[0]] | (values[q8[1]] << 8);
-    uint16_t v2 = values[q8[2]] | (values[q8[3]] << 8);
-    val1 = v1 | (v2 << 16);
-    aux32 = (q4 >> 4) & 0x0f0f0f0f;
-    values = all_values + 8*(shift & 2);
-    v1 = values[q8[0]] | (values[q8[1]] << 8);
-    v2 = values[q8[2]] | (values[q8[3]] << 8);
-    val2 = v1 | (v2 << 16);
+    const int2 v = get_int_from_table_16(q4, (const int8_t *) all_values);
+    val1 = v.x + (shift & 1)*0x04040404;
+    val2 = v.y + ((shift >> 1) & 1)*0x04040404;
 }
 
 #define VDR_IQ4_K_Q8_1_MMVQ 4

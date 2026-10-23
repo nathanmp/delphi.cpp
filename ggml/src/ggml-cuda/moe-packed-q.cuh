@@ -77,7 +77,7 @@
 #define MOE_PACKED_IQ3K_CHUNK   4096  // qs bytes [row], one source 128-value half
 #define MOE_PACKED_IQ3K_BLOCK   14080 // 2 chunks, d [128] f16, extra [128] u16, scales_h [128] u16, scales_l [128][8], qh [128][32]
 
-#define MOE_PACKED_IQ4K_CHUNK   8192  // qs bytes [row], one source 128-value half
+#define MOE_PACKED_IQ4K_CHUNK   8192  // qs words [mg][4 k steps][2 halves][32 lanes], as IQ4_KS
 #define MOE_PACKED_IQ4K_BLOCK   18432 // 2 chunks, d [128] f16, extra [128] u16, scales_h [128][4], scales_l [128][8]
 
 #define MOE_PACKED_IQ5K_CHUNK   8192  // qs bytes [row], one source 128-value half
@@ -3371,8 +3371,13 @@ template <> struct moe_packed_q<GGML_CUDA_MOE_PACKED_IQ3K> {
     }
 };
 
-// IQ4_K keeps the original four-bit qs bytes in each 128-value chunk. The two extra bits per 16-value half and the 6-bit scales
-// remain in row metadata, matching the q8_0_16 MMQ loader.
+// IQ4_K uses the IQ4_KS payload layout: qs words in m16n8k32 A-fragment order with the nibbles in value order. The two extra bits
+// per 32 values and the 6-bit scales remain in row metadata, matching the q8_0_16 MMQ loader. The second IQ4_K table is the first
+// plus 4 in each byte (no byte carries), so an extra bit adds moe_iq4k_shift to the IQ4_NL-style decode of the first table.
+static __device__ __forceinline__ uint32_t moe_iq4k_shift(const uint32_t extra, const int bit) {
+    return ((extra >> bit) & 1) * 0x04040404u;
+}
+
 template <> struct moe_packed_q<GGML_CUDA_MOE_PACKED_IQ4K> {
     using block_t = block_iq4_k;
     static constexpr ggml_type type      = GGML_TYPE_IQ4_K;
@@ -3385,45 +3390,55 @@ template <> struct moe_packed_q<GGML_CUDA_MOE_PACKED_IQ4K> {
     static constexpr int off_sl          = off_sh + MOE_PACKED_I*(QK_K/64);
 
     static __device__ __forceinline__ void pack(const block_t * b0, const block_t * b1, char * out, const int mg, const int lane) {
+        const block_t * b[2] = { b0, b1 };
         const int t = lane % 4;
 #pragma unroll
         for (int c = 0; c < 2; ++c) {
-            char * oc = out + c*MOE_PACKED_IQ4K_CHUNK;
-            const int r0 = mg*16 + lane/4;
-            const int r1 = r0 + 8;
 #pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                ((uint32_t *) (oc + r0*64 + 16*j + 4*t))[0] = get_int_b1(b0->qs + c*64, 4*j + t);
-                ((uint32_t *) (oc + r1*64 + 16*j + 4*t))[0] = get_int_b1(b1->qs + c*64, 4*j + t);
+            for (int ks = 0; ks < 4; ++ks) {
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    ((uint32_t *) (out + c*chunk_bytes))[((mg*4 + ks)*2 + h)*WARP_SIZE + lane] =
+                        moe_iq4xs_word(get_int_b4(b[h]->qs, 4*(4*c + ks) + t));
+                }
             }
         }
         if (t == 0) {
-            char * meta = out + 2*MOE_PACKED_IQ4K_CHUNK;
+            char * meta = out + 2*chunk_bytes;
 #pragma unroll
             for (int h = 0; h < 2; ++h) {
                 const int r = mg*16 + lane/4 + 8*h;
-                const block_t & b = h ? b1[0] : b0[0];
-                ((half *) meta)[r] = b.d;
-                ((uint16_t *) (meta + off_extra))[r] = b.extra;
+                ((half *) meta)[r] = b[h]->d;
+                ((uint16_t *) (meta + off_extra))[r] = b[h]->extra;
 #pragma unroll
                 for (int i = 0; i < QK_K/64; ++i) {
-                    ((uint8_t *) (meta + off_sh))[r*(QK_K/64) + i] = b.scales_h[i];
+                    ((uint8_t *) (meta + off_sh))[r*(QK_K/64) + i] = b[h]->scales_h[i];
                 }
 #pragma unroll
                 for (int i = 0; i < QK_K/32; ++i) {
-                    ((uint8_t *) (meta + off_sl))[r*(QK_K/32) + i] = b.scales_l[i];
+                    ((uint8_t *) (meta + off_sl))[r*(QK_K/32) + i] = b[h]->scales_l[i];
                 }
             }
         }
     }
 
     static __device__ __forceinline__ void unpack(const char * in, const int r, block_t & b) {
-        for (int c = 0; c < 2; ++c) {
-            const uint8_t * q = (const uint8_t *) (in + c*MOE_PACKED_IQ4K_CHUNK) + r*64;
+        const int mg = r / 16;
+        const int g  = r % 8;
+        const int h  = (r % 16) / 8;
 #pragma unroll
-            for (int i = 0; i < 64; ++i) b.qs[c*64 + i] = q[i];
+        for (int ib = 0; ib < QK_K/32; ++ib) {
+#pragma unroll
+            for (int t = 0; t < 4; ++t) {
+                const uint32_t w = ((const uint32_t *) (in + (ib/4)*chunk_bytes))[(mg*4 + ib%4)*2*WARP_SIZE + h*WARP_SIZE + 4*g + t];
+                const uint32_t q = moe_iq4xs_qs(w);
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    b.qs[16*ib + 4*t + i] = q >> (8*i);
+                }
+            }
         }
-        const char * meta = in + 2*MOE_PACKED_IQ4K_CHUNK;
+        const char * meta = in + 2*chunk_bytes;
         b.d = ((const half *) meta)[r];
         b.extra = ((const uint16_t *) (meta + off_extra))[r];
 #pragma unroll
@@ -3439,7 +3454,7 @@ template <> struct moe_packed_q<GGML_CUDA_MOE_PACKED_IQ4K> {
     static __device__ __forceinline__ frag_state load_state(const char * s, const int mg, const int lane, const int kc) {
         frag_state st;
         st.c = kc % 2;
-        const char * meta = s + MOE_PACKED_IQ4K_CHUNK;
+        const char * meta = s + chunk_bytes;
         const uint8_t * sh_all = (const uint8_t *) (meta + off_sh);
         const uint8_t * sl_all = (const uint8_t *) (meta + off_sl);
 #pragma unroll
@@ -3459,30 +3474,15 @@ template <> struct moe_packed_q<GGML_CUDA_MOE_PACKED_IQ4K> {
         return st;
     }
 
-    static __device__ __forceinline__ uint8_t code(const char * s, const frag_state & st, const int row, const int ks, const int v) {
-        const int c = st.c;
-        const int part = v/16;
-        const uint8_t q = ((const uint8_t *) s)[row*64 + 16*ks + v%16];
-        const int ib = 4*c + ks;
-        const int index = ((q >> 4*part) & 0x0F) | (((st.extra[(row % 16)/8] >> (2*ib + part)) & 1) << 4);
-        return (uint8_t) iq4k_values[index];
-    }
-
     static __device__ __forceinline__ uint4 fragment(const char * s, const uint32_t * tab, const frag_state & st, const int mg, const int ks,
             const int lane) {
         GGML_UNUSED(tab);
-        const int g = lane/4;
-        const int t = lane%4;
-        const int r0 = mg*16 + g;
-        const int r1 = r0 + 8;
-        return make_uint4(code(s, st, r0, ks, 4*t + 0) | code(s, st, r0, ks, 4*t + 1) << 8 |
-                code(s, st, r0, ks, 4*t + 2) << 16 | code(s, st, r0, ks, 4*t + 3) << 24,
-            code(s, st, r1, ks, 4*t + 0) | code(s, st, r1, ks, 4*t + 1) << 8 |
-                code(s, st, r1, ks, 4*t + 2) << 16 | code(s, st, r1, ks, 4*t + 3) << 24,
-            code(s, st, r0, ks, 16+4*t + 0) | code(s, st, r0, ks, 16+4*t + 1) << 8 |
-                code(s, st, r0, ks, 16+4*t + 2) << 16 | code(s, st, r0, ks, 16+4*t + 3) << 24,
-            code(s, st, r1, ks, 16+4*t + 0) | code(s, st, r1, ks, 16+4*t + 1) << 8 |
-                code(s, st, r1, ks, 16+4*t + 2) << 16 | code(s, st, r1, ks, 16+4*t + 3) << 24);
+        const int ib = 4*st.c + ks;
+        const uint32_t * w = (const uint32_t *) s + (mg*4 + ks)*2*WARP_SIZE + lane;
+        const int2 v0 = moe_iq4_decode(w[0], iq4k_values);
+        const int2 v1 = moe_iq4_decode(w[WARP_SIZE], iq4k_values);
+        return make_uint4(v0.x + moe_iq4k_shift(st.extra[0], 2*ib), v1.x + moe_iq4k_shift(st.extra[1], 2*ib),
+            v0.y + moe_iq4k_shift(st.extra[0], 2*ib + 1), v1.y + moe_iq4k_shift(st.extra[1], 2*ib + 1));
     }
 
     static __device__ __forceinline__ float2 scale(const frag_state & st, const int h, const int ks) {
@@ -3490,31 +3490,31 @@ template <> struct moe_packed_q<GGML_CUDA_MOE_PACKED_IQ4K> {
     }
 
     static __device__ __forceinline__ float2 vec_dot2(const char * sb, const int mg, const int g, const int p, const block_q8_1 * y) {
-        const int ib32 = p;
-        const char * ch = sb + (ib32/4)*MOE_PACKED_IQ4K_CHUNK;
-        const char * meta = sb + 2*MOE_PACKED_IQ4K_CHUNK;
-        const int q8i = ib32;
+        const int ib = p;
+        const int c  = ib/4;
+        const int ks = ib%4;
+        const char * meta = sb + 2*chunk_bytes;
+        const int * q8 = (const int *) (y + ib)->qs;
         float res[2];
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
             const int row = 16*mg + g + 8*h;
-            const uint8_t * q4 = (const uint8_t *) (ch + row*64 + 16*(ib32%4));
-            const uint16_t extra = ((const uint16_t *) (meta + off_extra))[row] >> 2*ib32;
-            const int * q8 = (const int *) (y + q8i)->qs;
+            const uint32_t * q = (const uint32_t *) (sb + c*chunk_bytes) + (mg*4 + ks)*2*WARP_SIZE + h*WARP_SIZE + 4*g;
+            const uint16_t extra = ((const uint16_t *) (meta + off_extra))[row];
+            const uint32_t s1 = moe_iq4k_shift(extra, 2*ib);
+            const uint32_t s2 = moe_iq4k_shift(extra, 2*ib + 1);
             int sumi1 = 0, sumi2 = 0;
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
-                const uint32_t q = get_int_b1(q4, j);
-                const int v1 = (int) moe_iq_lookup4(q & 0x0F0F0F0F, iq4k_values + 16*(extra & 1));
-                const int v2 = (int) moe_iq_lookup4((q >> 4) & 0x0F0F0F0F, iq4k_values + 16*((extra >> 1) & 1));
-                sumi1 = ggml_cuda_dp4a(v1, q8[j+0], sumi1);
-                sumi2 = ggml_cuda_dp4a(v2, q8[j+4], sumi2);
+                const int2 v = moe_iq4_decode(q[j], iq4k_values);
+                sumi1 = ggml_cuda_dp4a((int) (v.x + s1), q8[j+0], sumi1);
+                sumi2 = ggml_cuda_dp4a((int) (v.y + s2), q8[j+4], sumi2);
             }
-            const uint8_t sh = ((const uint8_t *) (meta + off_sh))[row*4 + ib32/2] >> 4*(ib32%2);
-            const uint8_t sl = ((const uint8_t *) (meta + off_sl))[row*8 + ib32];
+            const uint8_t sh = ((const uint8_t *) (meta + off_sh))[row*4 + ib/2] >> 4*(ib%2);
+            const uint8_t sl = ((const uint8_t *) (meta + off_sl))[row*8 + ib];
             const int ls1 = ((sl & 0x0F) | ((sh << 4) & 0x30)) - 32;
             const int ls2 = ((sl >> 4) | ((sh << 2) & 0x30)) - 32;
-            res[h] = __half2float(((const half *) meta)[row]) * __low2float((y + q8i)->ds) * (sumi1*ls1 + sumi2*ls2);
+            res[h] = __half2float(((const half *) meta)[row]) * __low2float((y + ib)->ds) * (sumi1*ls1 + sumi2*ls2);
         }
         return make_float2(res[0], res[1]);
     }
