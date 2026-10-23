@@ -6,7 +6,7 @@ import re
 import sys
 from pathlib import Path
 
-from config import ROOT, QuantError, digest, file_identity, normalized
+from config import ROOT, RUNTIME_NAMES, QuantError, digest, file_identity, normalized, runtime_allows
 
 sys.path.insert(0, str(ROOT / "gguf-py"))
 import numpy as np
@@ -180,6 +180,16 @@ def classify(info, cfg):
         groups.append({"name": t["name"], "members": [m["name"] for m in members], "pool": legal})
     info["groups"] = groups
     return info
+
+
+def check_runtime_source(info, cfg):
+    """Stop when a tensor that the encoder copies unchanged has a type that the target runtime cannot load. Such a tensor
+    is never quantized again (the encoder checks its payload), so the source of another type is the remedy."""
+    runtime = cfg.get("target_runtime", "delphi")
+    bad = [t for t in info["tensors"] if t["preserved"] and not runtime_allows(runtime, t["source_dtype"])]
+    if bad:
+        raise QuantError(f"the source has {len(bad)} preserved tensors with types that runtime {RUNTIME_NAMES[runtime]} cannot load "
+                         f"(first: {bad[0]['name']} is {bad[0]['source_dtype']}); use a BF16, F16 or Q8_0 source or another --runtime")
 
 
 def imatrix_tokens(path):

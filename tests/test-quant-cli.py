@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Offline checks of the quantization CLI wrapper: query parsing, frontier thinning, picks. No inference or numpy."""
 import argparse
+import contextlib
+import io
 import sys
 import unittest
 from pathlib import Path
@@ -90,6 +92,32 @@ class Query(unittest.TestCase):
         apply_query(c, args("--budget", "RAM=50GiB", "--max-kld", "0.1"))
         self.assertEqual(c["devices"]["RAM"], 100 * GIB)
         self.assertEqual(c["bounds"], {})
+
+    def test_runtime_option(self):
+        self.assertNotIn("target_runtime", apply_query(cfg(), args()))
+        for name, canonical in (("llama", "llama"), ("ik_llama.cpp", "ik_llama"), ("Delphi.cpp", "delphi")):
+            self.assertEqual(apply_query(cfg(), args("--runtime", name))["target_runtime"], canonical)
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            args("--runtime", "vllm")
+
+    def test_runtime_refuses_listed_types_it_cannot_load(self):
+        listed = {**cfg(), "primary_qtypes": ["Q4_K", "IQ4_K"], "other_qtypes": ["Q8_0"], "default_pools": []}
+        with self.assertRaisesRegex(QuantError, "primary_qtypes names IQ4_K, which runtime llama.cpp cannot load"):
+            apply_query(listed, args("--runtime", "llama"))
+        self.assertEqual(apply_query(listed, args("--runtime", "ik_llama"))["target_runtime"], "ik_llama")
+        pinned = {**cfg(), "pins": {"output.weight": "Q4_G128"}}
+        with self.assertRaisesRegex(QuantError, "pins of output.weight names Q4_G128.*ik_llama.cpp"):
+            apply_query(pinned, args("--runtime", "ik_llama"))
+        default = {**listed, "default_pools": ["primary_qtypes"]}  # default pools are filtered by the search instead
+        self.assertEqual(apply_query(default, args("--runtime", "llama"))["target_runtime"], "llama")
+
+    def test_runtime_is_shared_by_plan_and_run_only(self):
+        parser = build_parser()
+        run = ["run", "--source", "s", "--work", "w", "--devices", "ROCm0", "--ctx", "1", "--output", "o"]
+        self.assertEqual(parser.parse_args([*run, "--runtime", "llama.cpp"]).runtime, "llama.cpp")
+        self.assertIsNone(parser.parse_args(run).runtime)
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            parser.parse_args(["show", "--frontier", "f", "--runtime", "llama"])
 
 
 class Frontier(unittest.TestCase):

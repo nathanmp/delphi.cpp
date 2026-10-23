@@ -11,9 +11,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-from config import AXES, SCHEMA, QuantError, digest, file_identity, imatrix_identities, imatrix_inputs, load_config, loss_only, write_json
+from config import AXES, RUNTIME_NAMES, SCHEMA, QuantError, digest, file_identity, imatrix_identities, imatrix_inputs, load_config, loss_only, runtime_allows, write_json
 import progress
-from model import classify, is_lazy, merge_imatrices, read_model, tensor_bytes
+from model import check_runtime_source, classify, is_lazy, merge_imatrices, read_model, tensor_bytes
 from calibrate import calibrate, per_chunk, perplexity_command, run_direct
 from corpus import collect_imatrices
 from quality import LossModel, load_quality, quality_metadata
@@ -157,6 +157,10 @@ def encode_from_frontier(frontier, recipe_id, output):
     recipe = next((r for r in frontier["recipes"] if r["id"] == recipe_id), None)
     if recipe is None:
         raise QuantError(f"unknown recipe {recipe_id}")
+    runtime = cfg.get("target_runtime", "delphi")
+    for name, dtype in recipe["tensor_types"].items():
+        if not runtime_allows(runtime, dtype):
+            raise QuantError(f"the recipe gives {name} the type {dtype}, which runtime {RUNTIME_NAMES[runtime]} cannot load")
     return encode(info, cfg, recipe["choices"], frontier["prepared"]["imatrix"], output, frontier["quality"])
 
 
@@ -285,6 +289,8 @@ def loss_model(data, cfg):
 
 
 def plan(data, cfg, output):
+    # the runtime only narrows the candidates of the search, so the prepared inputs and the calibration stay valid
+    check_runtime_source(data["model"], cfg)
     model, table = loss_model(data, cfg)
     timed = data.get("timed", True)
     if not timed and not loss_only(cfg):
@@ -306,7 +312,8 @@ def plan(data, cfg, output):
         recipes.append(state)
     projection = projected(cfg) and any(cfg["multi_gpu_speedup_percent"].values())
     qualified = data["timing_qualified"] and not projection
-    payload = {"schema": SCHEMA, "config": cfg, "source": data["model"]["identity"], "prepared": data,
+    payload = {"schema": SCHEMA, "config": cfg, "target_runtime": cfg.get("target_runtime", "delphi"),
+               "source": data["model"]["identity"], "prepared": data,
                "search": result, "recipes": recipes, "timing_qualified": qualified, "timed": timed,
                "single_gpu_timing_qualified": data["timing_qualified"], "user_gpu_projection": projection,
                "quality": quality_metadata(table),
@@ -332,6 +339,7 @@ def plan(data, cfg, output):
         print("Speed was not measured (loss-only weights)")
     status = "user GPU projection from the single-GPU baseline" if projection else "qualified on held-out witnesses" if qualified else "unqualified estimates"
     print(f"Saved {outdir / 'frontier.json'}" + (f"; timing predictions are {status}" if timed else ""))
+    print(runtime_summary(cfg))
     if table:
         print(f"Predicted KL is against the teacher on the calibration text (floor {table['floor']['kl']:.5f}); max_loss is a model ceiling, not a bound")
         beyond = [len(state["extrapolated_groups"]) for state in recipes if state["extrapolated_groups"]]
@@ -340,6 +348,13 @@ def plan(data, cfg, output):
                   f"{table['probe_qtypes']['top']} in up to {max(beyond)} groups; their predicted KL is extrapolated "
                   "(calibrate with a more precise top probe, for example without calibration.probe_qtypes)")
     return payload
+
+
+def runtime_summary(cfg):
+    runtime = cfg.get("target_runtime", "delphi")
+    if runtime == "delphi":
+        return f"Runtime {RUNTIME_NAMES[runtime]}: every tensor type is allowed"
+    return f"Runtime {RUNTIME_NAMES[runtime]}: only tensor types that it loads are used; speeds are Delphi estimates"
 
 
 def witness_choices(info, baseline, spec):

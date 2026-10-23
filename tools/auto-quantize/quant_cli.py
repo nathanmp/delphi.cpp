@@ -19,7 +19,8 @@ import sys
 import time
 from pathlib import Path
 
-from config import AXES, ROOT, SCHEMA, QuantError, capacity, digest, file_identity, load_config, loss_only, write_json
+from config import (AXES, ROOT, RUNTIME_ALIASES, RUNTIME_NAMES, SCHEMA, QuantError, capacity, check_runtime_choices, digest,
+                    file_identity, load_config, loss_only, runtime_name, write_json)
 import capacity as cap
 import frontier as fr
 import progress
@@ -102,6 +103,9 @@ def apply_query(cfg, args, ratio=None):
             cfg["bounds"]["max_loss"] = vf.corrected_ceiling(args.max_kld, ratio)
             print(f"KL correction: measured/predicted ratio {ratio:.3f} from the last verified encode; "
                   f"--max-kld {args.max_kld:g} -> model ceiling {cfg['bounds']['max_loss']:.5g} (--kld-correction none turns it off)")
+    if getattr(args, "runtime", None):
+        cfg["target_runtime"] = runtime_name(args.runtime)
+        check_runtime_choices(cfg)
     return cfg
 
 
@@ -236,6 +240,9 @@ def stage_verify(payload, row, output, args, work=None, scratch=None):
     keep = cap.parse_keep_free(args.keep_free, names)
     rows = [{"device": n, "keep_free": keep[n]} for n in names]
     report = {"output": str(output), "recipe": row["id"]}
+    if cfg.get("target_runtime", "delphi") != "delphi":
+        print(f"The GGUF is for {RUNTIME_NAMES[cfg['target_runtime']]} but was not loaded in it: this check runs the Delphi "
+              "binaries, and the speeds are Delphi estimates")
     server = vf.run_server_check(cfg, output, row["recipe"]["memory"].get("runtime_args"), serve_from_args(args), rows,
                                  scratch, args.verify_timeout)
     report["server"] = server
@@ -275,7 +282,7 @@ def run_plan(cfg, p, out):
     with contextlib.redirect_stdout(log):
         aq.plan(data, cfg, out)
     lines = log.getvalue().splitlines()
-    print("\n".join(lines[:1] + [line for line in lines[1:] if line.startswith(("Saved", "Predicted KL"))]))
+    print("\n".join(lines[:1] + [line for line in lines[1:] if line.startswith(("Saved", "Runtime", "Predicted KL"))]))
     return json.loads((Path(out) / "frontier.json").read_text())
 
 
@@ -408,6 +415,8 @@ def build_config(args, gguf, rows, user_reserve, measured, override):
             cfg[key] = merged
         else:
             cfg[key] = value
+    if getattr(args, "runtime", None):
+        cfg["target_runtime"] = runtime_name(args.runtime)  # the option wins over the file
     return cfg
 
 
@@ -675,6 +684,7 @@ def command_run(args):
 
     # 3. prepare
     info = aq.configured_model(cfg)
+    mdl.check_runtime_source(info, cfg)
     prepare_inputs = prepare_stage_inputs(state, cfg, {k: digest(v) for k, v in aq.inputs(cfg, info).items()})
     converted = fp
 
@@ -738,6 +748,7 @@ def command_run(args):
     default_pick = {"kld": "min-kld", "size": "min-size"}.get(args.minimize)
     plan_inputs = {"importance": cfg["importance"], "bounds": cfg["bounds"], "search": cfg["search"], "mtp": cfg["mtp"],
                    "devices": rounded(cfg["devices"]), "reserve": rounded(cfg["reserve"]), "kld_ratio": ratio,
+                   "target_runtime": cfg["target_runtime"],
                    "pick": args.pick or ("auto" if args.auto else None)}
     out = p["plans"] / "run"
     state_box = {}
@@ -836,6 +847,11 @@ def build_parser():
         p.add_argument("--parallel", type=int, default=1)
         p.add_argument("--server-arg", action="append", help="one more llama-server argument (repeat per word)")
 
+    def runtime_option(p):
+        p.add_argument("--runtime", type=str.lower, choices=list(RUNTIME_ALIASES), metavar="RUNTIME",
+                       help="inference runtime that loads the GGUF: delphi (default), llama or ik_llama (with .cpp as an alias); "
+                            "a runtime never gets a tensor type that it cannot load (config key: target_runtime)")
+
     def capacity_options(p):
         p.add_argument("--devices", required=True, help="GPUs in layer order, optional sizes: ROCm3,ROCm0,ROCm2=24GiB,RAM=200GiB")
         p.add_argument("--keep-free", help="memory left free per GPU: SIZE or ROCm2=2GiB,ROCm0=1GiB (default 512MiB)")
@@ -872,6 +888,7 @@ def build_parser():
                    help="none: use --max-kld as the ceiling on the predicted KL, without the stored ratio")
     for option in RATE_BOUNDS:
         p.add_argument("--" + option.replace("_", "-"), dest=option, type=float, help="minimum predicted t/s")
+    runtime_option(p)
     p.add_argument("--name", help="plan directory name under WORK/plans")
     display(p)
     p = sub.add_parser("show", help="show a saved frontier")
@@ -899,6 +916,7 @@ def build_parser():
     p.add_argument("--max-kld", type=float, help="ceiling on the KL; divided by the stored measured/predicted ratio")
     p.add_argument("--kld-correction", choices=("ratio", "none"), default="ratio")
     p.add_argument("--budget", help=argparse.SUPPRESS)
+    runtime_option(p)
     for option in RATE_BOUNDS:
         p.add_argument("--" + option.replace("_", "-"), dest=option, type=float, help="minimum predicted t/s")
     p.add_argument("--output", type=Path, required=True, help="encoded GGUF")

@@ -13,9 +13,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools/auto-quantize"))
-from config import QuantError, capacity, devices, file_identity, imatrix_identities, imatrix_inputs, load_config, normalized, write_json
+from config import QuantError, RUNTIME_QTYPES, capacity, devices, file_identity, imatrix_identities, imatrix_inputs, load_config, normalized, write_json
 from corpus import calibration_text, collect_imatrices, compose_text, imatrix_command, shares
-from model import classify, is_lazy, lazy_args, merge_imatrices, read_model, tensor_bytes
+from model import check_runtime_source, classify, is_lazy, lazy_args, merge_imatrices, read_model, tensor_bytes
 from search import dominates, llama_layer_devices, make_options, memory, pareto, search
 from quality import LossModel, damage_digest, load_quality, modelled_groups, role_of
 from calibrate import Fit, PatchWriter, anchor_qtypes, design, probe_qtypes
@@ -1322,6 +1322,94 @@ class GpuOnly(unittest.TestCase):
             require_identical_gpus(listed, ["ROCm0", "ROCm1", "ROCm2"])
         with self.assertRaisesRegex(QuantError, "could not read"):
             require_identical_gpus(listed, ["ROCm0", "ROCm5"])
+
+
+class TargetRuntime(unittest.TestCase):
+    """--runtime: a type that the runtime cannot load is never chosen; the prepared groups do not depend on it."""
+    BASE = {"schema": "delphi.auto-quantize/1", "model": "/tmp/a.gguf", "devices": "ROCm1:16000,RAM:16000"}
+
+    def load(self, **change):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "c.json"
+            path.write_text(json.dumps({**self.BASE, **change}))
+            return load_config(path)
+
+    def test_names_and_allow_lists(self):
+        self.assertEqual(self.load()["target_runtime"], "delphi")
+        for name, canonical in (("llama.cpp", "llama"), ("LLAMA", "llama"), ("ik_llama.cpp", "ik_llama"), ("delphi.cpp", "delphi")):
+            self.assertEqual(self.load(target_runtime=name)["target_runtime"], canonical)
+        with self.assertRaisesRegex(QuantError, "unknown runtime"):
+            self.load(target_runtime="vllm")
+        mainline, ik = RUNTIME_QTYPES["llama"], RUNTIME_QTYPES["ik_llama"]
+        self.assertIsNone(RUNTIME_QTYPES["delphi"])
+        self.assertTrue({"Q8_0", "Q4_K", "IQ2_XXS", "IQ4_NL", "MXFP4", "BF16", "F32"} <= mainline & ik)
+        self.assertTrue({"IQ2_KS", "IQ2_K", "IQ3_KS", "IQ3_K", "IQ4_KS", "IQ4_K", "IQ5_KS", "IQ5_K", "IQ6_K"} <= ik)
+        self.assertFalse(mainline & {"IQ2_KS", "IQ4_K", "IQ6_K", "Q4_G128"})
+        self.assertFalse(ik & {"Q4_G128", "Q2_0"})
+
+    def test_default_pools_are_filtered_by_the_search_and_explicit_ones_are_checked(self):
+        self.assertIn("IQ4_K", self.load(target_runtime="llama")["primary_qtypes"])  # filtered at plan time, not here
+        self.load(target_runtime="llama", primary_qtypes=["Q2_K", "Q4_K"], other_qtypes=["Q8_0"])
+        self.load(target_runtime="ik_llama", primary_qtypes=["IQ4_K", "Q4_K"])
+        for change in ({"primary_qtypes": ["Q2_K", "iq4_k"]}, {"other_qtypes": ["Q4_G128"]}, {"pins": {"output.weight": "IQ6_K"}}):
+            with self.assertRaisesRegex(QuantError, r"names (?i:IQ4_K|Q4_G128|IQ6_K), which runtime llama.cpp cannot load"):
+                self.load(target_runtime="llama", **change)
+        with self.assertRaisesRegex(QuantError, "Q4_G128.*ik_llama.cpp"):
+            self.load(target_runtime="ik_llama", primary_qtypes=["Q4_G128"])
+        self.load(primary_qtypes=["Q4_G128", "IQ4_K"])
+
+    def test_the_prepared_groups_do_not_depend_on_the_runtime(self):
+        pools = {"primary_qtypes": ["Q2_K", "IQ4_K", "Q4_0"]}
+        plain = classify(info(), cfg(**pools))
+        for runtime in ("llama", "ik_llama"):
+            self.assertEqual(classify(info(), cfg(target_runtime=runtime, default_pools=["primary_qtypes"], **pools))["groups"], plain["groups"])
+
+    def fixture(self):
+        model = classify(info(), cfg(primary_qtypes=["Q2_K", "IQ4_K", "Q4_0"]))
+        damage = {"Q2_K": 2, "Q4_0": 1, "IQ4_K": 0}
+        for g in model["groups"]:
+            g["options"] = [{"qtype": q, "damage": damage.get(q, 0), "sampling_se": 0,
+                             "bytes": sum(tensor_bytes(next(t["shape"] for t in model["tensors"] if t["name"] == n), q) for n in g["members"])}
+                            for q in g["pool"]]
+        class Fake:
+            measured = {"decode": 3, "short": 4, "long": 5}
+            slopes = {"decode": 1, "short": 1, "long": 1}
+            def predict(self, choices, hit_fraction):
+                n = list(choices.values()).count("Q4_0")
+                return {"decode": 3 + n, "short": 4 + n, "long": 5 + n}
+            def group_costs(self):
+                return {g["name"]: {q: {r: float(q == "Q4_0") for r in self.measured} for q in g["pool"]} for g in model["groups"]}
+        # the floor recipe holds a type that llama.cpp cannot load: it only anchors the budget and the timing
+        return model, Fake(), {g["name"]: "IQ4_K" if "IQ4_K" in g["pool"] else g["pool"][0] for g in model["groups"]}
+
+    def test_search_never_picks_a_type_the_runtime_cannot_load(self):
+        model, predictor, baseline = self.fixture()
+        used = {}
+        for runtime in ("delphi", "llama", "ik_llama"):
+            result = search(model, cfg(target_runtime=runtime), predictor, baseline)
+            used[runtime] = {q for s in result["frontier"] for q in s["choices"].values()}
+            self.assertTrue(result["frontier"], runtime)
+        self.assertIn("IQ4_K", used["delphi"])
+        self.assertIn("IQ4_K", used["ik_llama"])
+        self.assertEqual(used["llama"] & {"IQ4_K"}, set())
+        self.assertTrue(used["llama"] & {"Q2_K", "Q4_0"})
+
+    def test_a_group_without_a_loadable_type_stops_the_search(self):
+        model, predictor, baseline = self.fixture()
+        for g in model["groups"]:
+            g["options"] = [o for o in g["options"] if o["qtype"] == "IQ4_K"] or g["options"]
+        with self.assertRaisesRegex(QuantError, "no candidate type .* llama.cpp"):
+            search(model, cfg(target_runtime="llama"), predictor, baseline)
+
+    def test_preserved_tensors_must_load_in_the_runtime(self):
+        source = info()
+        source["tensors"][3]["source_dtype"] = "IQ4_K"  # ffn_gate_inp.weight is preserved
+        model = classify(source, cfg(allow_requantize=True))
+        check_runtime_source(model, cfg(target_runtime="ik_llama"))
+        check_runtime_source(model, cfg())
+        with self.assertRaisesRegex(QuantError, "llama.cpp.*ffn_gate_inp.*IQ4_K"):
+            check_runtime_source(model, cfg(target_runtime="llama"))
+        check_runtime_source(classify(info(), cfg()), cfg(target_runtime="llama"))  # BF16 loads everywhere
 
 
 if __name__ == "__main__":

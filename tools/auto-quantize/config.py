@@ -148,6 +148,48 @@ DEFAULT_PRIMARY_QTYPES = ("IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ2_KS", "IQ2_K", "Q2_K
                           "IQ5_K", "Q5_K", "IQ6_K", "Q6_K", "Q8_0")
 
 
+# Tensor types that each inference runtime loads: an allow-list per runtime, so that a type that a fork adds stays out
+# until it is listed here. delphi loads every type (None). The integer types and F64 only occur in preserved tensors.
+MAINLINE_QTYPES = frozenset(("F32", "F16", "BF16", "F64", "I8", "I16", "I32", "I64", "Q4_0", "Q4_1", "Q5_0", "Q5_1", "Q8_0",
+                             "Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "IQ1_S", "IQ1_M", "IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ3_XXS",
+                             "IQ3_S", "IQ4_NL", "IQ4_XS", "TQ1_0", "TQ2_0", "MXFP4"))
+# ported from ik_llama.cpp with its type ids (ggml.h)
+IK_QTYPES = frozenset(("IQ2_KS", "IQ2_K", "IQ3_KS", "IQ3_K", "IQ4_KS", "IQ4_K", "IQ5_KS", "IQ5_K", "IQ6_K"))
+# mainline additions of 2026 that ik_llama.cpp is not known to carry
+NEW_MAINLINE_QTYPES = frozenset(("NVFP4", "Q1_0", "Q2_0"))
+# not in ik_llama.cpp or mainline: Q4_G128 is a Delphi type (ggml.h)
+RUNTIME_QTYPES = {"delphi": None, "llama": MAINLINE_QTYPES | NEW_MAINLINE_QTYPES, "ik_llama": MAINLINE_QTYPES | IK_QTYPES}
+RUNTIME_ALIASES = {"delphi": "delphi", "delphi.cpp": "delphi", "llama": "llama", "llama.cpp": "llama",
+                   "ik_llama": "ik_llama", "ik_llama.cpp": "ik_llama"}
+RUNTIME_NAMES = {"delphi": "delphi.cpp", "llama": "llama.cpp", "ik_llama": "ik_llama.cpp"}
+
+
+def runtime_name(value):
+    """The runtime of a name or alias (delphi, llama, ik_llama; a .cpp suffix is accepted)."""
+    try:
+        return RUNTIME_ALIASES[str(value).lower()]
+    except KeyError:
+        raise QuantError(f"unknown runtime {value!r}; use delphi, llama or ik_llama") from None
+
+
+def runtime_allows(runtime, qtype):
+    allowed = RUNTIME_QTYPES[runtime]
+    return allowed is None or str(qtype).upper() in allowed
+
+
+def check_runtime_choices(cfg):
+    """Stop when a pool or pin that the user wrote names a type that the target runtime cannot load. The default pools
+    are not checked: the search leaves their unloadable types out."""
+    runtime = cfg.get("target_runtime", "delphi")
+    explicit = [(name, cfg[name]) for name in ("primary_qtypes", "other_qtypes") if name in cfg and name not in cfg.get("default_pools", ())]
+    explicit += [(f"pins of {name}", [q]) for name, q in cfg.get("pins", {}).items()]
+    for where, qtypes in explicit:
+        bad = [q for q in qtypes if not runtime_allows(runtime, q)]
+        if bad:
+            raise QuantError(f"{where} names {bad[0]}, which runtime {RUNTIME_NAMES[runtime]} cannot load; "
+                             "pick another type or another --runtime")
+
+
 def load_config(path):
     path = Path(path).resolve()
     cfg = json.loads(path.read_text())
@@ -156,7 +198,7 @@ def load_config(path):
     allowed = {"schema", "model", "devices", "reserve", "imatrix", "primary_qtypes", "other_qtypes", "importance",
                "preserve_below_mib", "tie_gate_up", "primary_regex", "pins", "preserve_regex", "allow_requantize",
                "bindir", "runtime", "sampling", "search", "bounds", "cache_mib", "multi_gpu_speedup_percent", "timing", "quality",
-               "calibration", "imatrix_collect", "mtp", "runtime_reserve"}
+               "calibration", "imatrix_collect", "mtp", "runtime_reserve", "target_runtime"}
     unknown = set(cfg) - allowed
     if unknown:
         raise QuantError(f"unknown configuration keys: {sorted(unknown)}")
@@ -196,6 +238,9 @@ def load_config(path):
         if field in cfg and not isinstance(cfg[field], bool):
             raise QuantError(f"{field} must be boolean")
     cfg.setdefault("pins", {})
+    # the inference runtime that loads the encoded GGUF; "runtime" below holds the settings of the measurement runs
+    cfg["target_runtime"] = runtime_name(cfg.get("target_runtime", "delphi"))
+    check_runtime_choices(cfg)
     cfg.setdefault("preserve_regex", [])
     for regex in cfg["preserve_regex"] + ([cfg["primary_regex"]] if cfg.get("primary_regex") else []):
         re.compile(regex)

@@ -846,6 +846,20 @@ class RunConfig(unittest.TestCase):
         self.assertEqual(cfg["runtime"]["threads"], 8)
         self.assertEqual(cfg["runtime"]["extra_args"], ["-ctv", "q8_0", "-fa", "on"])
 
+    def test_runtime_option_wins_over_the_file_and_reaches_the_config(self):
+        cfg = qc.build_config(self.args(runtime="llama.cpp"), "/m.gguf", self.rows(), {}, self.measured(), {"target_runtime": "ik_llama"})
+        self.assertEqual(cfg["target_runtime"], "llama")
+        cfg = qc.build_config(self.args(), "/m.gguf", self.rows(), {}, self.measured(), {"target_runtime": "ik_llama"})
+        self.assertEqual(cfg["target_runtime"], "ik_llama")
+        self.assertNotIn("target_runtime", qc.build_config(self.args(), "/m.gguf", self.rows(), {}, self.measured(), {}))
+
+    def test_a_runtime_switch_keeps_the_prepare_and_calibration_inputs(self):
+        prepared = {"model": "m", "imatrix": [], "sampling": {}, "groups": [], "binaries": {}, "libraries": [], "gpu": "g",
+                    "ram_routed": True, "runtime": {"env": {}}}
+        fingerprints = {qc.calibration_previous(prepared, {"runtime": {"env": {}}, "target_runtime": runtime}, "converted")
+                        for runtime in ("delphi", "llama", "ik_llama")}
+        self.assertEqual(len(fingerprints), 1)
+
     def test_bad_overrides_are_refused(self):
         for override in ({"devices": {"ROCm5": "1GiB"}}, {"model": "/other.gguf"}):
             with self.assertRaises(QuantError):

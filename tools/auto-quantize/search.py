@@ -5,7 +5,7 @@ import math
 from bisect import bisect_right
 from collections import defaultdict
 
-from config import AXES, QuantError
+from config import AXES, RUNTIME_NAMES, QuantError, runtime_allows
 from knapsack import solve
 from model import is_lazy, tensor_bytes
 from timing import gpu, gpu_only, gpus, projected, requires_backend_signature
@@ -236,6 +236,13 @@ def search(info, cfg, predictor, baseline_choices, model=None):
     predictor None (loss-only weights without timing): the trade-off is loss against the total bytes instead of time."""
     groups = info["groups"]
     options = {g["name"]: {o["qtype"]: o for o in g["options"]} for g in groups}
+    # the prepared options hold every type of the pool; the baseline may use types that the target runtime cannot load
+    prepared = options
+    runtime = cfg.get("target_runtime", "delphi")
+    options = {n: {q: o for q, o in opts.items() if runtime_allows(runtime, q)} for n, opts in prepared.items()}
+    for n, opts in options.items():
+        if not opts:
+            raise QuantError(f"no candidate type of {n} loads in runtime {RUNTIME_NAMES[runtime]}")
     baseline_memory = memory(info, cfg, baseline_choices)
     placement = {g["name"]: device_of(info, cfg, g) for g in groups}
     only = gpu_only(cfg)
@@ -243,7 +250,7 @@ def search(info, cfg, predictor, baseline_choices, model=None):
         # the layers move between the GPUs with the recipe, so a device budget is its capacity less the reserve
         budgets = {d: cfg["devices"][d] - cfg["reserve"].get(d, 0) for d in gpus(cfg)}
     else:
-        budgets = {d: baseline_memory["headroom_bytes"][d] + sum(options[n][baseline_choices[n]]["bytes"]
+        budgets = {d: baseline_memory["headroom_bytes"][d] + sum(prepared[n][baseline_choices[n]]["bytes"]
                                                                  for n, dev in placement.items() if dev == d)
                    for d in cfg["devices"]}
     timed = predictor is not None
@@ -256,7 +263,7 @@ def search(info, cfg, predictor, baseline_choices, model=None):
     mtp = {g["name"] for g in groups if any(by_name[n].get("mtp") for n in g["members"])}
 
     def local(n, q):
-        return 0.0 if n in mtp else options[n][q]["damage"]
+        return 0.0 if n in mtp else prepared[n][q]["damage"]
 
     def loss_of(choices):
         if model is not None:
