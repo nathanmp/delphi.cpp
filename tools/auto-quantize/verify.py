@@ -62,7 +62,12 @@ def free_port():
 
 
 def keep_free_report(rows, listed):
-    """[{device, free, keep_free, ok}] for the GPUs of the capacity table, from the memory ggml reports with the server up."""
+    """[{device, free, keep_free, ok}] for the GPUs of the capacity table, from the memory ggml reports with the server up.
+    listed None: the device list failed, because a GPU had too little free memory for the context of another process
+    (about 300 MiB on CUDA); free is then None and every GPU fails, since it is not known which one is full."""
+    if listed is None:
+        return [{"device": r["device"], "free": None, "keep_free": r["keep_free"], "ok": False}
+                for r in rows if r["device"] != "RAM"]
     return [{"device": r["device"], "free": listed[r["device"]]["free"], "keep_free": r["keep_free"],
              "ok": listed[r["device"]]["free"] >= r["keep_free"]} for r in rows if r["device"] != "RAM"]
 
@@ -106,7 +111,11 @@ def run_server_check(cfg, model, runtime_args, serve, rows, directory, timeout=3
         answer = ask(base + "/completion", {"prompt": "The three primary colors are", "n_predict": 24, "temperature": 0})
         text = answer.get("content", "")
         # after the request, so that buffers allocated on first use are counted
-        listed = cap.list_devices(cfg["bindir"], cfg["runtime"]["env"])
+        try:
+            listed = cap.list_devices(cfg["bindir"], cfg["runtime"]["env"])
+        except QuantError as exc:
+            print(f"With the server up, {exc}", flush=True)
+            listed = None
         memory = keep_free_report(rows, listed)
         timings = answer.get("timings", {})
     finally:
@@ -125,8 +134,10 @@ def run_server_check(cfg, model, runtime_args, serve, rows, directory, timeout=3
 def memory_text(memory):
     lines = [f"{'device':<8s} {'free MiB':>9s} {'keep-free MiB':>14s}  status"]
     for m in memory:
-        lines.append(f"{m['device']:<8s} {m['free'] // MIB:>9d} {m['keep_free'] // MIB:>14d}  "
-                     + ("keeps its keep-free" if m["ok"] else "BELOW keep-free"))
+        free = f"{m['free'] // MIB:>9d}" if m["free"] is not None else f"{'?':>9s}"
+        lines.append(f"{m['device']:<8s} {free} {m['keep_free'] // MIB:>14d}  "
+                     + ("keeps its keep-free" if m["ok"] else "BELOW keep-free" if m["free"] is not None
+                        else "unknown: no room for another process on some GPU"))
     return "\n".join(lines)
 
 

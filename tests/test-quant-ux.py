@@ -419,6 +419,10 @@ class Verify(unittest.TestCase):
         report = vf.keep_free_report(rows, {"ROCm0": {"free": 600 << 20}, "ROCm1": {"free": 100 << 20}})
         self.assertEqual([m["ok"] for m in report], [True, False])
         self.assertIn("BELOW keep-free", vf.memory_text(report))
+        # the device list fails when a GPU has no room for the context of another process
+        report = vf.keep_free_report(rows, None)
+        self.assertEqual([m["ok"] for m in report], [False, False])
+        self.assertIn("unknown", vf.memory_text(report))
 
 
 class Diversity(unittest.TestCase):
