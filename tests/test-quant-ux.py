@@ -431,11 +431,12 @@ class Verify(unittest.TestCase):
         self.assertEqual(measured, {"ROCm0": 256 << 20, "ROCm1": 704 << 20})
         self.assertIsNone(vf.measured_runtime(cfg, row, keep, [{"device": "ROCm0", "free": None}]))
         with tempfile.TemporaryDirectory() as d:
-            self.assertEqual(cap.runtime_reserves(d, ["ROCm0"], True, 1024), {"ROCm0": cap.RUNTIME_RESERVE_MTP})
+            self.assertEqual(cap.runtime_reserves(d, ["ROCm0", "ROCm1"], True, 1024),
+                             {"ROCm0": cap.RUNTIME_RESERVE_MTP, "ROCm1": cap.RUNTIME_RESERVE_MTP_BLOCK})
             write_json(Path(d) / cap.RUNTIME_FILE, {"mtp": True, "ub": 1024, "per_device": measured})
             self.assertEqual(cap.runtime_reserves(d, ["ROCm0", "ROCm1"], True, 1024), measured)
             self.assertEqual(cap.runtime_reserves(d, ["ROCm1"], False, 1024), {"ROCm1": cap.RUNTIME_RESERVE})
-            self.assertEqual(cap.runtime_reserves(d, ["ROCm1"], True, 512), {"ROCm1": cap.RUNTIME_RESERVE_MTP})
+            self.assertEqual(cap.runtime_reserves(d, ["ROCm1"], True, 512), {"ROCm1": cap.RUNTIME_RESERVE_MTP_BLOCK})
 
     def test_command_text_can_be_pasted(self):
         text = vf.command_text(["a", "b c"], {"X": "1"})

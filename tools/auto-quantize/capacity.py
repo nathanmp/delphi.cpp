@@ -18,10 +18,12 @@ from space import ram_available
 MIB = 1 << 20
 KEEP_FREE_DEFAULT = 512 * MIB
 # Memory per GPU that no ggml buffer reports (streams, cuBLAS handles and pools, CUDA graphs, staging buffers of copies
-# between GPUs), most of it allocated on the first long prompt. Measured on three CMP 170HX with GLM 5.3 at -ub 1024:
-# about 300 MiB, 700 MiB with an MTP draft context. verify measures it; later runs with the same serving use that.
-RUNTIME_RESERVE = 320 * MIB
-RUNTIME_RESERVE_MTP = 768 * MIB
+# between GPUs), most of it allocated on the first long prompt. Measured by verify on three CMP 170HX with GLM 5.3 at
+# -ub 1024: 370-720 MiB (the middle GPU most); with the MTP draft about 970 MiB, and more than 1.5 GiB on the GPU of
+# the MTP block. verify measures it; later runs with the same serving use the measured amounts.
+RUNTIME_RESERVE = 768 * MIB
+RUNTIME_RESERVE_MTP = 1024 * MIB
+RUNTIME_RESERVE_MTP_BLOCK = 1792 * MIB
 RUNTIME_FILE = "runtime-reserve.json"
 DEVICE_NAME = r"RAM|(?:CUDA|ROCm)[0-9]+"
 
@@ -178,15 +180,16 @@ def serves_mtp(cfg, serve):
 
 def runtime_reserves(work, gpus, mtp, ub):
     """{device: bytes} of memory that no ggml buffer reports: what verify measured for the same serving (MTP, -ub),
-    else the defaults."""
+    else the defaults. The MTP blocks are the last blocks, so with MTP the last GPU holds the draft context."""
     import json
-    default = RUNTIME_RESERVE_MTP if mtp else RUNTIME_RESERVE
+    default = {name: (RUNTIME_RESERVE_MTP_BLOCK if name == gpus[-1] else RUNTIME_RESERVE_MTP) if mtp else RUNTIME_RESERVE
+               for name in gpus}
     path = Path(work) / RUNTIME_FILE if work else None
     if path and path.exists():
         record = json.loads(path.read_text())
         if record.get("mtp") == mtp and record.get("ub") == ub:
-            return {name: record["per_device"].get(name, default) for name in gpus}
-    return {name: default for name in gpus}
+            return {name: record["per_device"].get(name, default[name]) for name in gpus}
+    return default
 
 
 def measure_reserves(cfg, serve, gpus, split, ram_routed, work=None):
