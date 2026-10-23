@@ -2348,7 +2348,6 @@ static bool moe_down_q_reduction_packed_fmt_supported(const int fmt) {
         case GGML_CUDA_MOE_PACKED_Q5K:
         case GGML_CUDA_MOE_PACKED_IQ2KS:
         case GGML_CUDA_MOE_PACKED_IQ3KS:
-        case GGML_CUDA_MOE_PACKED_IQ4K:
         case GGML_CUDA_MOE_PACKED_IQ4KS:
         case GGML_CUDA_MOE_PACKED_IQ5KS:
         case GGML_CUDA_MOE_PACKED_IQ4XS:
@@ -2378,10 +2377,6 @@ static void moe_down_q_reduction_packed_switch_fmt(
             break;
         case GGML_CUDA_MOE_PACKED_IQ3KS:
             moe_down_q_reduction_packed<GGML_CUDA_MOE_PACKED_IQ3KS><<<blocks, threads, 0, stream>>>
-                (vx, vy, ids, weights, dst, ncols_x, nrows_x, stride_channel_x, stride_channel_y);
-            break;
-        case GGML_CUDA_MOE_PACKED_IQ4K:
-            moe_down_q_reduction_packed<GGML_CUDA_MOE_PACKED_IQ4K><<<blocks, threads, 0, stream>>>
                 (vx, vy, ids, weights, dst, ncols_x, nrows_x, stride_channel_x, stride_channel_y);
             break;
         case GGML_CUDA_MOE_PACKED_IQ4KS:
