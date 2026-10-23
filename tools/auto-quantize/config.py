@@ -198,7 +198,7 @@ def load_config(path):
     allowed = {"schema", "model", "devices", "reserve", "imatrix", "primary_qtypes", "other_qtypes", "importance",
                "preserve_below_mib", "tie_gate_up", "primary_regex", "pins", "preserve_regex", "allow_requantize",
                "bindir", "runtime", "sampling", "search", "bounds", "cache_mib", "multi_gpu_speedup_percent", "timing", "quality",
-               "calibration", "imatrix_collect", "mtp", "runtime_reserve", "target_runtime"}
+               "calibration", "imatrix_collect", "mtp", "runtime_reserve", "target_runtime", "lazy_type"}
     unknown = set(cfg) - allowed
     if unknown:
         raise QuantError(f"unknown configuration keys: {sorted(unknown)}")
@@ -238,6 +238,11 @@ def load_config(path):
         if field in cfg and not isinstance(cfg[field], bool):
             raise QuantError(f"{field} must be boolean")
     cfg.setdefault("pins", {})
+    # type of every lazy table that has no pin of its own (model.lazy_pins); None keeps the source types
+    cfg["lazy_type"] = cfg.get("lazy_type")
+    if cfg["lazy_type"] is not None:
+        from model import qtype
+        cfg["lazy_type"] = qtype(cfg["lazy_type"])
     # the inference runtime that loads the encoded GGUF; "runtime" below holds the settings of the measurement runs
     cfg["target_runtime"] = runtime_name(cfg.get("target_runtime", "delphi"))
     check_runtime_choices(cfg)

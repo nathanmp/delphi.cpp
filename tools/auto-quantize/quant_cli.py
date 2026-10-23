@@ -223,6 +223,37 @@ def command_capacity(args):
     print(cap.reserves_text(measured, split))
 
 
+def lazy_kl(bindir, source, base_first, text, chunks, device, directory, runtime):
+    """Measure the KL of the base against its source on a few chunks and print and record it (base.measure_lazy_kl)."""
+    import base as bs
+    from config import DEFAULT_CALIBRATION_TEXT
+    result = bs.measure_lazy_kl(bindir, source, base_first, text or DEFAULT_CALIBRATION_TEXT, chunks, 512, device,
+                                Path(directory) / "lazy-kl.json", runtime.get("threads", 32), runtime.get("env"))
+    print(f"KL of the base against its source (the error of the lazy tables alone): {result['kl']:.5f} +- {result['se']:.5f} "
+          f"on {chunks} chunks of 512 tokens, same top token {result['same_top_p_percent']} %; saved in {Path(directory) / 'lazy-kl.json'}", flush=True)
+    return result
+
+
+def command_base(args):
+    """Write the base of a GGUF: its lazy tables at --lazy-type, in the last shard of a split (base.py)."""
+    import base as bs
+    import model as mdl
+    bindir = (args.bindir or ROOT / "build-auto-quantizer/bin").resolve()
+    out = Path(args.output).resolve()
+    info = mdl.read_model(args.source.resolve())
+    if bs.already_base(info, args.lazy_type):
+        raise QuantError(f"{args.source} is a base of {args.lazy_type.upper()} already")
+    first = bs.make_base(args.source, args.lazy_type, out, bindir, args.threads, args.lazy_dir,
+                         check=lambda rows: space.check("base", rows, {"output": out.parent, "lazy": args.lazy_dir or out.parent},
+                                                        not args.no_space_check))
+    if args.measure_kl:
+        from config import weighted_entries
+        text = weighted_entries(args.calibration_text[:1], "--calibration-text")[0]["path"] if args.calibration_text else None
+        lazy_kl(bindir, args.source.resolve(), first, text, args.measure_kl, args.kl_device, out.parent,
+                {"threads": args.threads})
+    print(f"Base: {first}\nUse it as --source of run or as the model of a configuration; its KL values are relative to the base.")
+
+
 def work_of(frontier_path):
     """WORK of WORK/plans/plan-N/frontier.json, else None."""
     plan = Path(frontier_path).resolve().parent
@@ -344,10 +375,10 @@ def choose(payload, path, args, default_pick=None):
         space.check("encode", [("encoded GGUF", "output", space.recipe_bytes(info, row["recipe"]["tensor_types"]))],
                     {"output": out}, not args.no_space_check)
         print(f"Encoding to {args.output}")
-        aq.encode_from_frontier(payload, row["id"], args.output)
+        written = aq.encode_from_frontier(payload, row["id"], args.output)
         if not args.no_verify:
             work = work_of(path)
-            stage_verify(payload, row, args.output, args, work, getattr(args, "scratch", None))
+            stage_verify(payload, row, written, args, work, getattr(args, "scratch", None))
     else:
         print(f"Encode with: python {sys.argv[0]} encode --frontier {path} --pick {row['id']} --output OUT.gguf")
 
@@ -650,6 +681,43 @@ def command_run(args):
     if mmproj:
         args.mmproj = Path(mmproj)
 
+    # 1b. base: the source with its lazy tables at --lazy-type, in a split whose last shard holds only those tables. Every
+    # later stage uses it as the source, so their KL values are relative to it (base.py).
+    if args.lazy_type:
+        import base as bs
+        gpus = [name for name, _ in cap.parse_devices(args.devices) if name != "RAM"]
+        base_dir = (args.base_dir or work / "base").resolve()
+        base_inputs = {"source": file_identity(gguf), "lazy_type": args.lazy_type.upper(),
+                       "lazy_dir": str(args.lazy_dir.resolve()) if args.lazy_dir else None}
+
+        def base_action():
+            source_info = mdl.read_model(gguf)
+            if bs.already_base(source_info, args.lazy_type):
+                print(f"The source is a base of {args.lazy_type.upper()} already", flush=True)
+                return {"gguf": gguf}
+            out = bs.make_base(gguf, args.lazy_type, base_dir / "base.gguf", bindir, override.get("runtime", {}).get("threads", 32),
+                               args.lazy_dir, override.get("runtime", {}).get("env"),
+                               check=lambda rows: space.check("base", rows, {"output": base_dir, "lazy": args.lazy_dir or base_dir}, enabled))
+            if args.lazy_kl_chunks:
+                from config import weighted_entries
+                text = weighted_entries(args.calibration_text[:1], "--calibration-text")[0]["path"] if args.calibration_text else None
+                lazy_kl(bindir, gguf, out, text, args.lazy_kl_chunks, gpus[0], base_dir, override.get("runtime", {}))
+            
+            return {"gguf": str(out)}
+
+        def base_reset():
+            for record in sorted(base_dir.glob("*.base.json")):
+                target = json.loads(record.read_text()).get("lazy_target")
+                if target:
+                    Path(target).unlink(missing_ok=True)
+            mdl.unlink_model(base_dir / "base.gguf")
+
+        fp = timed("base", run_stage(state, "base", base_inputs, fp, base_action,
+                                     lambda: [state.stages["base"]["gguf"]] if state.stages.get("base", {}).get("gguf") != gguf else [],
+                                     base_reset))
+        gguf = state.stages["base"]["gguf"]
+        print(f"Source of the run: {gguf} (lazy tables at {args.lazy_type.upper()}; the KL values are relative to this base)", flush=True)
+
     # 2. capacities and reserves (measured at every start)
     rows = measured_capacities(args, bindir, override.get("runtime", {}).get("env"))
     print("Device capacities (free memory reported by ggml at start, minus keep-free):")
@@ -774,14 +842,14 @@ def command_run(args):
         print("Planned layout: " + " ".join(row["recipe"]["memory"]["runtime_args"]))
 
     # 6. encode
-    output = args.output.resolve()
+    output = aq.encoded_path(payload["prepared"]["model"], args.output.resolve())
     encode_inputs = {"output": str(output), "recipe": digest(row["recipe"]["tensor_types"])}
 
     def encode_action():
-        partial = output.with_suffix(".partial" + output.suffix)
+        partial = aq.encoded_path(payload["prepared"]["model"], mdl.unsharded(output).with_suffix(".partial.gguf"))
         if partial.exists():
             print(f"Removing the partial output of an interrupted encode: {partial}", flush=True)
-            partial.unlink()
+            mdl.unlink_model(partial)
         space.check("encode", [("encoded GGUF", "output", space.recipe_bytes(payload["prepared"]["model"], row["recipe"]["tensor_types"]))],
                     {"output": output.parent}, enabled)
         aq.encode_from_frontier(payload, row["id"], output)
@@ -805,6 +873,9 @@ def command_run(args):
         freed = sum(f.stat().st_size for f in p["scratch"].rglob("*") if f.is_file())
         shutil.rmtree(p["scratch"], ignore_errors=True)
         print(f"Removed the scratch directory {p['scratch']} ({progress.size_text(freed)}); --keep-scratch keeps it")
+    if payload["prepared"]["model"].get("lazy_separate"):
+        lazy_shard = mdl.shard_name(output, 1, 2)
+        print(f"Lazy tables: {lazy_shard.resolve()} (shared with the base; move it with its link intact, the server finds it by the name {lazy_shard.name})")
     print(f"Done: {output}")
 
 
@@ -869,6 +940,18 @@ def build_parser():
     p.add_argument("--model", type=Path, required=True, help="GGUF of the model (the source or any quant of it)")
     capacity_options(p)
     serving_options(p)
+    p = sub.add_parser("base", help="write a GGUF whose lazy tables (engram, per-layer embeddings) have another type, in a shard of their own")
+    p.add_argument("--source", type=Path, required=True, help="GGUF of the model")
+    p.add_argument("--lazy-type", required=True, help="type of the lazy tables, e.g. Q4_K (Q4_0, Q4_K, IQ4_NL: 4.5 bit)")
+    p.add_argument("--output", type=Path, required=True, help="X.gguf: writes X-00001-of-00002.gguf and X-00002-of-00002.gguf")
+    p.add_argument("--lazy-dir", type=Path, help="directory of the lazy shard (the name next to shard 1 is a link to it)")
+    p.add_argument("--bindir", type=Path)
+    p.add_argument("--threads", type=int, default=32)
+    p.add_argument("--no-space-check", action="store_true")
+    p.add_argument("--measure-kl", type=int, default=0, metavar="CHUNKS",
+                   help="then measure the KL of the base against the source on this many chunks of 512 tokens (needs a GPU)")
+    p.add_argument("--kl-device", default="ROCm0", help="GPU of --measure-kl")
+    p.add_argument("--calibration-text", action="append", default=[], help="text of --measure-kl (default: the corpus of the tool)")
     p = sub.add_parser("setup", help="prepare and calibrate once per model and machine state")
     common(p)
     p.add_argument("--weights", help="as for plan; loss=1 alone skips the timing measurement (plans then weigh only the loss)")
@@ -908,6 +991,12 @@ def build_parser():
                    "calibration, explicit device sizes, extra reserve)")
     p.add_argument("--imatrix", type=Path, action="append", default=[], help="activation statistics file (repeat for several)")
     p.add_argument("--calibration-text", action="append", default=[], help="calibration text PATH or PATH:WEIGHT (repeat)")
+    p.add_argument("--lazy-type", help="write a base first (base.py): the lazy tables (engram) at this type, in a shard of their own; "
+                   "calibration, the teacher and the encode use the base, so the KL is relative to it")
+    p.add_argument("--lazy-dir", type=Path, help="with --lazy-type: directory of the lazy shard (for example on a fast disk)")
+    p.add_argument("--base-dir", type=Path, help="with --lazy-type: directory of the base (default WORK/base)")
+    p.add_argument("--lazy-kl-chunks", type=int, default=0, metavar="CHUNKS",
+                   help="with --lazy-type: measure the KL of the base against the source on this many chunks of 512 tokens")
     capacity_options(p)
     serving_options(p)
     p.add_argument("--weights", help="loss=.4,decode=.3,short=.2,long=.1 (relative; omitted axes count 0)")
@@ -939,7 +1028,8 @@ def build_parser():
 def main(argv=None):
     args = build_parser().parse_args(argv)
     try:
-        {"capacity": command_capacity, "setup": command_setup, "plan": command_plan, "show": command_show, "encode": command_encode, "run": command_run}[args.command](args)
+        {"capacity": command_capacity, "setup": command_setup, "plan": command_plan, "show": command_show, "encode": command_encode, "run": command_run,
+         "base": command_base}[args.command](args)
     except (QuantError, ValueError, OSError, KeyError) as exc:
         sys.exit(f"error: {exc}")
 

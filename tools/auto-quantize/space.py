@@ -1,7 +1,8 @@
 """Disk space of the stages: one estimate function with one row per artifact, and the free-space check.
 
 Every full GGUF that the tool writes holds the lazy tables (engram, per-layer embeddings) at their stored size, so the
-rows include them. The probe model row is an upper bound (the largest qtype of every group)."""
+rows include them. When the source keeps them in a shard of their own (a base, base.py), the models that the tool writes
+link that shard, so the rows leave them out. The probe model row is an upper bound (the largest qtype of every group)."""
 from __future__ import annotations
 
 import os
@@ -55,16 +56,21 @@ def model_sizes(info):
 
 
 def recipe_bytes(info, tensor_types):
-    """Bytes of the tensor payloads of a GGUF with the given type per tensor name (lazy tables included)."""
-    return sum(tensor_bytes(t["shape"], tensor_types[t["name"]]) for t in info["tensors"])
+    """Bytes of the tensor payloads of the GGUF that encode() writes for the given type per tensor name: the lazy tables
+    are included, except in the model with a lazy shard of its own, where the shard is a link."""
+    return sum(tensor_bytes(t["shape"], tensor_types[t["name"]]) for t in info["tensors"]
+               if not (info.get("lazy_separate") and is_lazy(t["name"])))
 
 
-def artifacts(stage, sizes, calibration=None, vocab=None, source_bytes=0, mmproj_bytes=0, output_bytes=None, ram=None):
+def artifacts(stage, sizes, calibration=None, vocab=None, source_bytes=0, mmproj_bytes=0, output_bytes=None, ram=None,
+              linked_lazy=False):
     """[(artifact, directory key, bytes)] that a stage holds at its peak.
 
     sizes is model_sizes(info); calibration is the calibration section of the configuration. Directory keys: work
     (durable results), scratch (temporary files), output (the directory of the final GGUF)."""
     low, high, lazy = sizes
+    if linked_lazy:
+        low, high = low - lazy, high - lazy
     if stage == "convert":
         return [("Q8_0 source GGUF", "scratch", source_bytes), ("mmproj GGUF", "scratch", mmproj_bytes)]
     if stage == "prepare":
@@ -127,6 +133,7 @@ def ram_available():
 
 def preflight(stage, info, cfg, directories, enabled=True, **extra):
     """Estimate and check one stage for a classified model (config.py configuration cfg)."""
-    rows = artifacts(stage, model_sizes(info), cfg.get("calibration"), ram=ram_available(), **extra)
+    rows = artifacts(stage, model_sizes(info), cfg.get("calibration"), ram=ram_available(),
+                     linked_lazy=bool(info.get("lazy_separate")), **extra)
     check(stage, rows, directories, enabled)
     return rows

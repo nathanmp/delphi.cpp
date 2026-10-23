@@ -16,7 +16,7 @@ from pathlib import Path
 
 from config import digest, write_json
 
-STAGES = ("convert", "prepare", "calibrate", "plan", "encode", "verify")
+STAGES = ("convert", "base", "prepare", "calibrate", "plan", "encode", "verify")
 
 
 def fingerprint(inputs, previous):

@@ -31,6 +31,39 @@ def tensor_bytes(shape, dtype):
     return math.prod(shape[1:]) * (shape[0] // block * size + GGML_ROW_META_SIZES.get(dtype, 0))
 
 
+SHARD = re.compile(r"(.*)-([0-9]{5})-of-([0-9]{5})\.gguf")
+
+
+def unsharded(path):
+    """X.gguf of X-00001-of-00002.gguf (a path that is not a shard name stays as it is)."""
+    match = SHARD.fullmatch(str(path))
+    return Path(match[1] + ".gguf") if match else Path(path)
+
+
+def shard_name(path, index, count):
+    """The name of shard INDEX (0 based) of COUNT shards of the model that X.gguf (or one of its shards) names."""
+    return Path(f"{str(unsharded(path))[:-5]}-{index + 1:05d}-of-{count:05d}.gguf")
+
+
+def model_files(path):
+    """Every file of a model by its first file: the shards of a split GGUF, else the file itself."""
+    match = SHARD.fullmatch(str(path))
+    if not match:
+        return [Path(path)]
+    return [shard_name(path, i, int(match[3])) for i in range(int(match[3]))]
+
+
+def unlink_model(path):
+    """Delete the files of a model, written as X.gguf or as shards, and the links among them. A missing file is skipped."""
+    stem = unsharded(path)
+    for candidate in [stem, *sorted(stem.parent.glob(glob_escape(stem.stem) + "-[0-9][0-9][0-9][0-9][0-9]-of-[0-9][0-9][0-9][0-9][0-9].gguf"))]:
+        candidate.unlink(missing_ok=True)
+
+
+def glob_escape(text):
+    return re.sub(r"([\[\]*?])", r"[\1]", text)
+
+
 def read_model(path):
     first = GGUFReader(path)
     def field(name, default=None):
@@ -58,6 +91,11 @@ def read_model(path):
             info["tensors"].append({"name": t.name, "shape": [int(x) for x in t.shape], "source_dtype": t.tensor_type.name,
                                     "source_bytes": t.n_bytes, "offset": t.data_offset, "file": str(p), "split": index})
     info["identity"] = digest({"files": info["files"], "tensors": info["tensors"]})
+    # The last shard holds all lazy tables and nothing else: a file that can sit on a fast disk of its own, and that every
+    # model written from this one shares (see auto_quantize.encode)
+    last = len(paths) - 1
+    lazy = [t for t in info["tensors"] if is_lazy(t["name"])]
+    info["lazy_separate"] = bool(last and lazy and all((t["split"] == last) == is_lazy(t["name"]) for t in info["tensors"]))
     return info
 
 
@@ -103,6 +141,18 @@ GLM_PRESERVE = ("hc_", "indexer_compressor_ape", "indexer_compressor_gate", "ind
                 "attn_k_b", "attn_v_b")
 
 
+def lazy_pins(info, cfg):
+    """The pins of the configuration, and the type lazy_type (config key; --lazy-type) for every lazy table that has
+    another type and no pin of its own."""
+    pins = dict(cfg["pins"])
+    if cfg.get("lazy_type"):
+        wanted = qtype(cfg["lazy_type"])
+        for t in info["tensors"]:
+            if is_lazy(t["name"]) and len(t["shape"]) >= 2 and t["name"].endswith("weight") and t["source_dtype"] != wanted:
+                pins.setdefault(t["name"], wanted)
+    return pins
+
+
 def classify(info, cfg):
     pools = {category: [qtype(q) for q in cfg[f"{category}_qtypes"]] for category in ("primary", "other")}
     if any(not pool for pool in pools.values()):
@@ -111,6 +161,7 @@ def classify(info, cfg):
     names = {t["name"] for t in info["tensors"]}
     if set(cfg["pins"]) - names:
         raise QuantError(f"pins name missing tensors: {sorted(set(cfg['pins']) - names)}")
+    pins = lazy_pins(info, cfg)
     for t in info["tensors"]:
         name, shape = t["name"], t["shape"]
         primary = bool(re.search(cfg["primary_regex"], name)) if cfg.get("primary_regex") else (
@@ -123,17 +174,17 @@ def classify(info, cfg):
         preserve = (len(shape) < 2 or not name.endswith("weight") or t["source_bytes"] < cfg["preserve_below_mib"] * (1 << 20)
                     or any(part in name for part in PRESERVE)
                     # a pin can store a lazy table below the source precision (a BF16 table can be ~100 GB)
-                    or (is_lazy(name) and name not in cfg["pins"])
+                    or (is_lazy(name) and name not in pins)
                     or (info["architecture"] == "glm5next" and any(part in name for part in GLM_PRESERVE))
                     or any(re.search(pattern, name) for pattern in cfg["preserve_regex"])
                     or t["source_dtype"].startswith("I") and t["source_dtype"] in ("I8", "I16", "I32", "I64"))
-        if preserve and name in cfg["pins"] and qtype(cfg["pins"][name]) != t["source_dtype"]:
+        if preserve and name in pins and qtype(pins[name]) != t["source_dtype"]:
             raise QuantError(f"pin conflicts with preservation: {name}")
         if not preserve and t["source_dtype"] not in ("F16", "BF16", "F32") and not cfg.get("allow_requantize", False):
             raise QuantError("source is quantized; set allow_requantize for source-relative damage")
         t["preserved"] = preserve
-        t["pool"] = [t["source_dtype"]] if preserve else ([qtype(cfg["pins"][name])] if name in cfg["pins"] else pools[t["category"]])
-        if t["category"] + "_qtypes" in cfg.get("default_pools", ()) and not preserve and name not in cfg["pins"]:
+        t["pool"] = [t["source_dtype"]] if preserve else ([qtype(pins[name])] if name in pins else pools[t["category"]])
+        if t["category"] + "_qtypes" in cfg.get("default_pools", ()) and not preserve and name not in pins:
             # default pools: only the types whose block fits the row length of this tensor
             t["pool"] = [q for q in t["pool"] if shape[0] % GGML_QUANT_SIZES[GGMLQuantizationType[q]][0] == 0]
         t["pool"] = sorted(set(t["pool"]))
@@ -156,7 +207,7 @@ def classify(info, cfg):
             pool &= set(member["pool"])
         if not pool:
             # A preserved/pinned member constrains its partner even if the type is outside the category allowlist.
-            fixed = [m for m in members if m["preserved"] or m["name"] in cfg["pins"]]
+            fixed = [m for m in members if m["preserved"] or m["name"] in pins]
             if fixed and len({m["pool"][0] for m in fixed}) == 1:
                 pool = {fixed[0]["pool"][0]}
             else:
@@ -171,7 +222,7 @@ def classify(info, cfg):
                 pass
         if not legal:
             raise QuantError(f"no row-compatible qtype for {t['name']}")
-        if any(m["mtp"] for m in members) and not any(m["preserved"] or m["name"] in cfg["pins"] for m in members):
+        if any(m["mtp"] for m in members) and not any(m["preserved"] or m["name"] in pins for m in members):
             # The KL measurement cannot see the draft quality, so MTP groups take the ceiling: the most bytes of the pool.
             legal = [max(legal, key=lambda q: (sum(tensor_bytes(m["shape"], q) for m in members), q))]
         for member in members:

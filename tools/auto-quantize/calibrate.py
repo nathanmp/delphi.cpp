@@ -40,7 +40,7 @@ import numpy as np
 
 from config import ROOT, QuantError, file_identity, imatrix_identities, write_json
 from corpus import calibration_text
-from model import lazy_args, tensor_bytes
+from model import lazy_args, tensor_bytes, unlink_model
 from quality import METHOD, METRIC, SCHEMA, damage_digest, damage_records, modelled_groups, sensitivity
 from timing import gpu, gpu_only, gpus, measure_cmoe, measure_env, run
 
@@ -808,14 +808,15 @@ def calibrate(data, cfg, output, encode, verify, timeout=7200, text_dir=None, sc
                 choices = dict(floor_choices)
                 choices.update(job["choices"])
                 path = writer.scratch / f"probe-{job['label']}.gguf"
-                path.unlink(missing_ok=True)
-                encode(info, cfg, choices, data["imatrix"], path)
+                unlink_model(path)
+                model_path = encode(info, cfg, choices, data["imatrix"], path)
                 try:
-                    command = perplexity_command(cfg, c, path, devices[0], teacher)
+                    command = perplexity_command(cfg, c, model_path, devices[0], teacher)
                     run_direct(command, dev0 / "latest.f32", dev0 / f"{job['label']}.log", env, timeout)
                     (dev0 / "latest.f32").replace(target)
                 finally:
-                    for suffix in (".gguf", ".encode.json", ".encode.log", ".tensor-types.txt"):
+                    unlink_model(path)
+                    for suffix in (".encode.json", ".encode.log", ".tensor-types.txt"):
                         path.with_suffix(suffix).unlink(missing_ok=True)
             results.setdefault(devices[0], {})[job["label"]] = per_chunk(target, c["chunks"])
     finally:

@@ -15,7 +15,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools/auto-quantize"))
 from config import QuantError, RUNTIME_QTYPES, capacity, devices, file_identity, imatrix_identities, imatrix_inputs, load_config, normalized, write_json
 from corpus import calibration_text, collect_imatrices, compose_text, imatrix_command, shares
-from model import check_runtime_source, classify, is_lazy, lazy_args, merge_imatrices, read_model, tensor_bytes
+from model import (check_runtime_source, classify, is_lazy, lazy_args, merge_imatrices, read_model, shard_name, tensor_bytes,
+                   unlink_model, unsharded)
 from search import dominates, llama_layer_devices, make_options, memory, pareto, search
 from quality import LossModel, damage_digest, load_quality, modelled_groups, role_of
 from calibrate import Fit, PatchWriter, anchor_qtypes, design, probe_qtypes
@@ -83,6 +84,62 @@ class LazyTables(unittest.TestCase):
         self.assertFalse(any(m["name"] == lazy["name"] for _, members, _ in regions(model) for m in members))
         result = memory(model, cfg(), {g["name"]: g["pool"][0] for g in model["groups"]})
         self.assertEqual(result["lazy_bytes"], tensor_bytes(lazy["shape"], "Q8_0"))
+
+    def test_lazy_type_pins_the_lazy_tables_that_have_another_type(self):
+        model = classify(self.info(), cfg(lazy_type="Q4_K"))
+        lazy = next(t for t in model["tensors"] if t["name"] == "per_layer_token_embd.weight")
+        self.assertFalse(lazy["preserved"])
+        self.assertEqual(lazy["pool"], ["Q4_K"])
+        # an explicit pin wins, and a table that has the type already stays a preserved copy
+        model = classify(self.info(), cfg(lazy_type="Q4_K", pins={"per_layer_token_embd.weight": "q8_0"}))
+        self.assertEqual(next(t for t in model["tensors"] if t["name"] == "per_layer_token_embd.weight")["pool"], ["Q8_0"])
+        source = self.info()
+        source["tensors"][-1]["source_dtype"] = "Q4_K"
+        self.assertTrue(next(t for t in classify(source, cfg(lazy_type="Q4_K"))["tensors"]
+                             if t["name"] == "per_layer_token_embd.weight")["preserved"])
+
+    def write(self, path, tensors, extra=lambda w: None):
+        writer = GGUFWriter(str(path), "olmoe")
+        extra(writer)
+        for t in tensors:
+            writer.add_tensor(t, np.ones(256, dtype=np.float32))
+        writer.write_header_to_file()
+        writer.write_kv_data_to_file()
+        writer.write_tensors_to_file()
+        writer.close()
+
+    def test_a_lazy_shard_of_its_own_is_found_and_the_files_follow_the_first_shard(self):
+        with tempfile.TemporaryDirectory() as d:
+            first, last = shard_name(Path(d) / "m.gguf", 0, 2), shard_name(Path(d) / "m.gguf", 1, 2)
+            self.assertEqual(first.name, "m-00001-of-00002.gguf")
+            self.assertEqual(unsharded(first), Path(d) / "m.gguf")
+            for path, names, no in ((first, ["blk.0.attn_norm.weight", "blk.1.attn_norm.weight"], 0), (last, ["blk.1.engram_embd.weight"], 1)):
+                def split(w, no=no):
+                    w.add_uint16("split.no", no)
+                    w.add_uint16("split.count", 2)
+                    w.add_int32("split.tensors.count", 3)
+                self.write(path, names, split)
+            info_ = read_model(str(first))
+            self.assertTrue(info_["lazy_separate"])
+            self.assertEqual(lazy_args({"model": str(first)}), ["-lm", "mmap", "-lzm", "on", "-ot", "engram_embd=CPU"])
+            # the lazy shard is shared with the models written from this one, so they do not count it
+            from space import recipe_bytes
+            types = {t["name"]: "F32" for t in info_["tensors"]}
+            self.assertEqual(recipe_bytes(info_, types), 2 * 256 * 4)
+            self.assertEqual(recipe_bytes({**info_, "lazy_separate": False}, types), 3 * 256 * 4)
+            unlink_model(first)
+            self.assertFalse(first.exists() or last.exists())
+
+    def test_a_lazy_table_in_the_first_shard_is_not_a_lazy_shard(self):
+        with tempfile.TemporaryDirectory() as d:
+            first, last = shard_name(Path(d) / "m.gguf", 0, 2), shard_name(Path(d) / "m.gguf", 1, 2)
+            for path, names, no in ((first, ["blk.0.attn_norm.weight", "blk.1.engram_embd.weight"], 0), (last, ["blk.1.attn_norm.weight"], 1)):
+                def split(w, no=no):
+                    w.add_uint16("split.no", no)
+                    w.add_uint16("split.count", 2)
+                    w.add_int32("split.tensors.count", 3)
+                self.write(path, names, split)
+            self.assertFalse(read_model(str(first))["lazy_separate"])
 
     def test_load_options_follow_the_model_tensors(self):
         with tempfile.TemporaryDirectory() as d:

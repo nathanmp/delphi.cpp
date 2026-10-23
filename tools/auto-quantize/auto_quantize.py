@@ -13,7 +13,8 @@ from pathlib import Path
 
 from config import AXES, RUNTIME_NAMES, SCHEMA, QuantError, digest, file_identity, imatrix_identities, imatrix_inputs, load_config, loss_only, runtime_allows, write_json
 import progress
-from model import check_runtime_source, classify, is_lazy, merge_imatrices, read_model, tensor_bytes
+from model import (check_runtime_source, classify, is_lazy, merge_imatrices, read_model, shard_name, tensor_bytes, unlink_model,
+                   unsharded)
 from calibrate import calibrate, per_chunk, perplexity_command, run_direct
 from corpus import collect_imatrices
 from quality import LossModel, load_quality, quality_metadata
@@ -100,6 +101,8 @@ def verify_output(info, types, output, check_preserved=True):
         if check_preserved and source["preserved"]:
             if source["source_bytes"] != t["source_bytes"]:
                 raise QuantError(f"preserved tensor size changed: {name}")
+            if source["offset"] == t["offset"] and os.path.samefile(source["file"], t["file"]):
+                continue  # the same bytes of the same file (a shared lazy shard)
             with open(source["file"], "rb") as before, open(t["file"], "rb") as after:
                 before.seek(source["offset"])
                 after.seek(t["offset"])
@@ -112,16 +115,39 @@ def verify_output(info, types, output, check_preserved=True):
     return actual
 
 
+def encoded_path(info, output):
+    """The path that encode() writes for output: X.gguf, or shard 1 of X when the source keeps its lazy tables in a shard
+    of their own (the encoded model then has the same layout and shares that shard)."""
+    return shard_name(output, 0, 2) if info.get("lazy_separate") else Path(output)
+
+
+def link_lazy_shard(source, name):
+    """name becomes a hard link of the lazy shard source when both are on one file system, else a symbolic link."""
+    name = Path(name)
+    name.unlink(missing_ok=True)
+    try:
+        os.link(source, name)
+    except OSError:
+        os.symlink(Path(source).resolve(), name)
+
+
 def encode(info, cfg, choices, imatrix, output, quality=None):
-    """Write the recipe with llama-quantize and verify every planned type; quality is metadata for the record."""
-    output = Path(output).resolve()
+    """Write the recipe with llama-quantize and verify every planned type; quality is metadata for the record.
+
+    When the source keeps its lazy tables in a shard of their own (a base, see base.py), the encoded model gets the same
+    layout: shard 1 holds the other tensors and the lazy shard is a link to the source's (the lazy tables are not
+    changed, so the file is the same). Returns the path of the model: output, or its shard 1."""
+    stem = unsharded(Path(output).resolve())
+    output = encoded_path(info, stem)
+    split = bool(info.get("lazy_separate"))
     if output.exists():
         raise QuantError(f"output already exists: {output}")
     output.parent.mkdir(parents=True, exist_ok=True)
     types = tensor_plan(info, choices)
-    plan_file = output.with_suffix(".tensor-types.txt")
+    plan_file = stem.with_suffix(".tensor-types.txt")
     plan_file.write_text("".join(f"^{re.escape(name)}$={dtype.lower()}\n" for name, dtype in types.items()))
-    partial = output.with_suffix(".partial.gguf")
+    partial_stem = stem.with_suffix(".partial.gguf")
+    partial = encoded_path(info, partial_stem)
     if partial.exists():
         raise QuantError(f"partial output exists; inspect it before retrying: {partial}")
     command = [str(Path(cfg["bindir"]) / "llama-quantize"), "--pure", "--tensor-type-file", str(plan_file)]
@@ -129,17 +155,41 @@ def encode(info, cfg, choices, imatrix, output, quality=None):
         command += ["--imatrix", str(imatrix)]
     if cfg.get("allow_requantize", False):
         command += ["--allow-requantize"]
-    command += [cfg["model"], str(partial), "Q2_K", str(cfg["runtime"]["threads"])]
+    lazy_source = None
+    if split:
+        lazy = [t["name"] for t in info["tensors"] if is_lazy(t["name"])]
+        lazy_file, main_file = stem.with_suffix(".lazy-tensors.txt"), stem.with_suffix(".main-tensors.txt")
+        lazy_file.write_text("".join(f"{n}\n" for n in lazy))
+        command += ["--split-tensors", str(lazy_file)]
+        if all(types[n] == t["source_dtype"] for t in info["tensors"] for n in [t["name"]] if is_lazy(n)):
+            # only the first shard is written: the lazy shard is the one of the source
+            main_file.write_text("".join(f"{t['name']}\n" for t in info["tensors"] if not is_lazy(t["name"])))
+            command += ["--only-tensors", str(main_file)]
+            lazy_source = Path(info["files"][-1]["path"])
+    command += [cfg["model"], str(partial_stem), "Q2_K", str(cfg["runtime"]["threads"])]
     print(f"Encoding {output.name}", flush=True)
-    expected = sum(tensor_bytes(t["shape"], types[t["name"]]) for t in info["tensors"])
-    with progress.watch_file(f"encode {output.name}", partial, expected):
-        # no time limit: a large model with slow types (IQ2_XXS) takes hours
-        run(command, output.with_suffix(".encode.log"), cfg["runtime"]["env"], timeout=None)
-    verify_output(info, types, partial)
+    expected = sum(tensor_bytes(t["shape"], types[t["name"]]) for t in info["tensors"] if not (split and is_lazy(t["name"])))
+    try:
+        with progress.watch_file(f"encode {output.name}", partial, expected):
+            # no time limit: a large model with slow types (IQ2_XXS) takes hours
+            run(command, stem.with_suffix(".encode.log"), cfg["runtime"]["env"], timeout=None)
+        if split and lazy_source:
+            link_lazy_shard(lazy_source, shard_name(partial_stem, 1, 2))
+        verify_output(info, types, partial)
+    finally:
+        for name in ("lazy-tensors", "main-tensors"):
+            stem.with_suffix(f".{name}.txt").unlink(missing_ok=True)
     partial.replace(output)
-    write_json(output.with_suffix(".encode.json"), {"command": command, "types": types, "source": info["identity"],
-                                                  "output": file_identity(output), "verified_preserved_payloads": True,
-                                                  "quality": quality})
+    if split:
+        lazy_name = shard_name(stem, 1, 2)
+        if lazy_source:
+            link_lazy_shard(lazy_source, lazy_name)
+            shard_name(partial_stem, 1, 2).unlink()
+        else:
+            shard_name(partial_stem, 1, 2).replace(lazy_name)
+    write_json(stem.with_suffix(".encode.json"), {"command": command, "types": types, "source": info["identity"],
+                                                "output": file_identity(output), "verified_preserved_payloads": True,
+                                                "quality": quality})
     return str(output)
 
 
@@ -222,20 +272,20 @@ def prepare(cfg, directory, timeout):
     mem = memory(info, cfg, baseline_choices)
     if any(value < 0 for value in mem["headroom_bytes"].values()):
         raise QuantError("minimum-byte baseline exceeds a device budget")
-    baseline = directory / "baseline.gguf"
+    baseline = encoded_path(info, directory / "baseline.gguf")
     if baseline.exists():
         try:
             verify_output(info, tensor_plan(info, baseline_choices), baseline)
         except QuantError as exc:
             # a baseline of other inputs (another model or candidate set): encode it again
             print(f"Encoding {baseline} again: {exc}", flush=True)
-            baseline.unlink()
+            unlink_model(baseline)
     if not baseline.exists():
-        partial = baseline.with_suffix(".partial.gguf")
+        partial = encoded_path(info, directory / "baseline.partial.gguf")
         if partial.exists():
             print(f"Removing the partial baseline of an interrupted encode: {partial}", flush=True)
-            partial.unlink()
-        encode(info, cfg, baseline_choices, imatrix, baseline)
+            unlink_model(partial)
+        encode(info, cfg, baseline_choices, imatrix, directory / "baseline.gguf")
     measured, profile_file = None, None
     if timed:
         print("Profiling baseline short/long prefill and decode", flush=True)
@@ -423,11 +473,11 @@ def validate(data, cfg, specification, directory):
         seen_mixes.add(mix_key)
         if any(value < 0 for value in mem["headroom_bytes"].values()):
             raise QuantError(f"witness {name} exceeds budget")
-        model = directory / f"{name}.gguf"
+        model = encoded_path(data["model"], directory / f"{name}.gguf")
         if model.exists():
             verify_output(data["model"], tensor_plan(data["model"], choices), model)
         else:
-            encode(data["model"], cfg, choices, data["imatrix"], model, quality_metadata(table))
+            encode(data["model"], cfg, choices, data["imatrix"], directory / f"{name}.gguf", quality_metadata(table))
         profile_file = directory / f"{name}-profile.json"
         if profile_file.exists():
             profile = json.loads(profile_file.read_text())
