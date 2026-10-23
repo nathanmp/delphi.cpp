@@ -477,8 +477,12 @@ ggml_tensor * llama_kpool_cache::store_topk_hint(
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_kpool_cache::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> result;
-    for (const auto & [_, buf] : pimpl->ctxs_bufs) {
-        result[ggml_backend_buffer_get_type(buf.get())] += ggml_backend_buffer_get_size(buf.get());
+    for (const auto & [ctx, buf] : pimpl->ctxs_bufs) {
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf.get());
+        // with no_alloc (fit-params) the buffer is a dummy of size 0: count the size the tensors will take
+        result[buft] += ggml_backend_buffer_get_base(buf.get()) == nullptr && ggml_backend_buffer_get_size(buf.get()) == 0
+                ? ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft)
+                : ggml_backend_buffer_get_size(buf.get());
     }
     return result;
 }
