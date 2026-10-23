@@ -225,7 +225,9 @@ def measure_ops(info, cfg, directory, timeout=600):
                     sigs[digest(sig)] = sig
     values = {}
     environment = cfg["runtime"]["env"]
+    # with GGML_BACKEND_DL the kernels are in the backend libraries, which change without a relink of the binary
     identity = {"binary": file_identity(binary),
+                "libraries": [file_identity(p) for p in sorted(Path(binary).parent.glob("lib*.so*")) if not p.is_symlink()],
                 "devices": cfg["devices"], "threads": cfg["runtime"]["threads"], "env": environment, "numa": "tensors",
                 "machine_settings": machine_settings()}
     cache_path = directory / "operations.json"
