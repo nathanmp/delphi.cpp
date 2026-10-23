@@ -698,6 +698,36 @@ class ResumeState(unittest.TestCase):
             self.assertNotEqual(qc.calibration_previous(prepare, cfg, "c"), base)
         self.assertNotEqual(qc.calibration_previous({**prepare, "binaries": "b2"}, cfg, "c"), base)
         self.assertNotEqual(qc.calibration_previous(prepare, {"runtime": {"env": {"X": "1"}}}, "c"), base)
+    def test_loss_only_prepare_measures_timing_when_a_later_run_needs_it(self):
+        weighted = {"importance": {"precision": .5, "decode": .5, "short": 0, "long": 0}, "bounds": {}}
+        lossy = {"importance": {"precision": 1, "decode": 0, "short": 0, "long": 0}, "bounds": {}}
+        bounded = {**lossy, "bounds": {"min_decode_t_s": 20}}
+        base = {"model": "m", "binaries": "b", "runtime": "r"}
+        # a time importance or a speed bound needs the timing that the loss-only prepare skipped
+        for timed in (weighted, bounded):
+            with tempfile.TemporaryDirectory() as d:
+                state = runstate.State(d)
+                ran = []
+
+                def go(cfg):
+                    inputs = qc.prepare_stage_inputs(state, cfg, base)
+                    with unittest.mock.patch("sys.stdout", io.StringIO()) as out:
+                        qc.run_stage(state, "prepare", inputs, None, lambda: ran.append(inputs.get("loss_only", False)))
+                    return inputs, out.getvalue()
+                inputs, _ = go(lossy)
+                self.assertEqual(ran, [True])
+                self.assertEqual(qc.calibration_previous(inputs, {"runtime": {"env": {}}}, "c"),
+                                 qc.calibration_previous(base, {"runtime": {"env": {}}}, "c"))
+                _, out = go(lossy)
+                self.assertIn("skipping", out)
+                _, out = go(timed)
+                self.assertIn("input changed (loss_only)", out)
+                self.assertEqual(ran, [True, False])
+                # the prepare with timing serves loss-only weights as it is
+                _, out = go(lossy)
+                self.assertIn("skipping", out)
+                self.assertEqual(ran, [True, False])
+
 
 class Interrupt(unittest.TestCase):
     @unittest.skipUnless(Path("/proc/self/stat").exists(), "needs /proc")

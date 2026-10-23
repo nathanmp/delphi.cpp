@@ -19,7 +19,7 @@ import sys
 import time
 from pathlib import Path
 
-from config import AXES, ROOT, SCHEMA, QuantError, capacity, digest, file_identity, load_config, write_json
+from config import AXES, ROOT, SCHEMA, QuantError, capacity, digest, file_identity, load_config, loss_only, write_json
 import capacity as cap
 import frontier as fr
 import progress
@@ -58,26 +58,35 @@ def parse_weights(text):
     return result
 
 
+def apply_preferences(cfg, args):
+    """The weights and speed bounds of the query, applied to cfg in place. They also decide whether prepare measures
+    timing: with loss-only weights and no speed bound it does not (config.loss_only)."""
+    weights = parse_weights(args.weights) if args.weights else None
+    if getattr(args, "minimize", None) in ("kld", "size"):
+        if weights:
+            raise QuantError(f"--minimize {args.minimize} and --weights are exclusive")
+        weights = {axis: float(axis == "precision") for axis in AXES}
+    if weights:
+        total = sum(weights.values())
+        cfg["importance"] = {axis: v / total for axis, v in weights.items()}
+    for option, name in RATE_BOUNDS.items():
+        if getattr(args, option, None) is not None:
+            cfg["bounds"][name] = getattr(args, option)
+    return cfg
+
+
 def apply_query(cfg, args, ratio=None):
     """A copy of the loaded configuration with the query applied. Only planning inputs change, never the prepared ones.
 
     ratio is the stored measured/predicted KL ratio of an earlier verified encode: --max-kld is divided by it unless
     --kld-correction none is given."""
-    cfg = copy.deepcopy(cfg)
-    weights = parse_weights(args.weights) if args.weights else None
-    if args.minimize in ("kld", "size"):
-        if weights:
-            raise QuantError(f"--minimize {args.minimize} and --weights are exclusive")
-        weights = {axis: float(axis == "precision") for axis in AXES}
+    cfg = apply_preferences(copy.deepcopy(cfg), args)
     if args.minimize == "size":
         if args.max_kld is None:
             raise QuantError("--minimize size needs --max-kld")
         cfg["search"]["minimize"] = "size"
     if args.max_size is not None:
         cfg["bounds"]["max_total_bytes"] = capacity(args.max_size)
-    if weights:
-        total = sum(weights.values())
-        cfg["importance"] = {axis: v / total for axis, v in weights.items()}
     if args.budget:
         for device, amount in parse_pairs(args.budget, "--budget").items():
             if device not in cfg["devices"]:
@@ -93,9 +102,6 @@ def apply_query(cfg, args, ratio=None):
             cfg["bounds"]["max_loss"] = vf.corrected_ceiling(args.max_kld, ratio)
             print(f"KL correction: measured/predicted ratio {ratio:.3f} from the last verified encode; "
                   f"--max-kld {args.max_kld:g} -> model ceiling {cfg['bounds']['max_loss']:.5g} (--kld-correction none turns it off)")
-    for option, name in RATE_BOUNDS.items():
-        if getattr(args, option) is not None:
-            cfg["bounds"][name] = getattr(args, option)
     return cfg
 
 
@@ -165,7 +171,7 @@ def stage_calibrate(cfg, p, args):
 
 
 def command_setup(args):
-    cfg = load_config(args.config)
+    cfg = apply_preferences(load_config(args.config), args)
     p = paths(args.work, args.scratch)
     stage_prepare(cfg, p, args, args.measurement_seconds)
     table = p["quality"] / "quality.json"
@@ -307,7 +313,9 @@ def choose(payload, path, args, default_pick=None):
     shown = fr.thin(all_rows, args.rows)
     print(f"{len(all_rows)} nondominated recipes; showing {len(shown)}. * marks the best score; dKL is relative to it.")
     print(fr.table(shown, "pred KL" if payload.get("quality") else "local R"))
-    if not payload.get("timing_qualified"):
+    if not payload.get("timed", True):
+        print("Speed was not measured (loss-only weights).")
+    elif not payload.get("timing_qualified"):
         print("Speeds are unqualified estimates (run validate to qualify them).")
     spec = getattr(args, "pick", None) or default_pick
     if getattr(args, "detail", None):
@@ -319,7 +327,7 @@ def choose(payload, path, args, default_pick=None):
     if spec is None:
         return
     row = fr.pick(shown, all_rows, spec)
-    print(f"Selected {row['id']}: {row['size'] / fr.GIB:.2f} GiB, KL {row['kld']:.4g}, decode {row['decode']:.2f} t/s")
+    print(f"Selected {row['id']}: {fr.selected_text(row)}")
     if row["recipe"]["memory"].get("runtime_args"):
         print("Run with: " + " ".join(row["recipe"]["memory"]["runtime_args"]))
     if getattr(args, "output", None):
@@ -407,6 +415,17 @@ def build_config(args, gguf, rows, user_reserve, measured, override):
 # expert cache) only change the timing tables.
 CALIBRATION_PREPARE_KEYS = ("model", "imatrix", "sampling", "groups", "binaries", "libraries", "gpu", "ram_routed",
                             "layer_split_gpus")
+
+
+def prepare_stage_inputs(state, cfg, inputs):
+    """The inputs of the prepare stage. With loss-only weights a finished prepare with timing serves as it is; otherwise the
+    key loss_only marks a prepare without timing, so a later run with a time importance or a speed bound runs prepare
+    again and measures the timing. Calibration does not follow the key (CALIBRATION_PREPARE_KEYS)."""
+    if loss_only(cfg):
+        recorded = state.stages.get("prepare", {})
+        if not ("finished" in recorded and recorded.get("inputs") == inputs):
+            return {**inputs, "loss_only": True}
+    return inputs
 
 
 def calibration_previous(prepare_inputs, cfg, converted):
@@ -514,7 +533,9 @@ def pick_row(payload, args, default_pick):
     label = "pred KL" if payload.get("quality") else "local R"
     print(f"{len(all_rows)} nondominated recipes; showing {len(shown)} (best score marked *).")
     print(fr.run_table(shown, label))
-    if not payload.get("timing_qualified"):
+    if not payload.get("timed", True):
+        print("Speed was not measured (loss-only weights).")
+    elif not payload.get("timing_qualified"):
         print("Speeds are unqualified estimates.")
     if args.pick:
         return fr.pick(shown, all_rows, args.pick)
@@ -649,10 +670,12 @@ def command_run(args):
         raise QuantError("run needs --imatrix: without activation statistics the local error misranks groups")
     if not cfg["calibration"]["text"]:
         raise QuantError("run needs --calibration-text (or calibration.text in --config)")
+    # the weights and speed bounds decide whether prepare measures timing
+    apply_preferences(cfg, args)
 
     # 3. prepare
     info = aq.configured_model(cfg)
-    prepare_inputs = {k: digest(v) for k, v in aq.inputs(cfg, info).items()}
+    prepare_inputs = prepare_stage_inputs(state, cfg, {k: digest(v) for k, v in aq.inputs(cfg, info).items()})
     converted = fp
 
     def prepare_action():
@@ -723,7 +746,7 @@ def command_run(args):
         shutil.rmtree(out, ignore_errors=True)
         payload = run_plan(cfg, p, out)
         row = pick_row(payload, args, default_pick)
-        print(f"Selected {row['id']}: {row['size'] / fr.GIB:.2f} GiB, KL {row['kld']:.4g}, decode {row['decode']:.2f} t/s")
+        print(f"Selected {row['id']}: {fr.selected_text(row)}")
 
         def replan(trial):
             shutil.rmtree(out, ignore_errors=True)
@@ -832,6 +855,7 @@ def build_parser():
     serving_options(p)
     p = sub.add_parser("setup", help="prepare and calibrate once per model and machine state")
     common(p)
+    p.add_argument("--weights", help="as for plan; loss=1 alone skips the timing measurement (plans then weigh only the loss)")
     p.add_argument("--measurement-seconds", type=float, default=600)
     p.add_argument("--skip-calibrate", action="store_true")
     space_options(p)
