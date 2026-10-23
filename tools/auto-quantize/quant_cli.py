@@ -408,11 +408,15 @@ def calibration_previous(prepare_inputs, cfg, converted):
     return runstate.fingerprint(keys, converted)
 
 
-def keep_calibration(state, inputs, previous, table, foreign):
+def keep_calibration(state, inputs, previous, p, foreign):
     """--keep-calibration: record the finished calibration as one of the current inputs, for a rebuild of the
-    binaries that keeps the numbers. Its own inputs (calibration settings and text) and its model must be the same."""
+    binaries that keeps the numbers. Its own inputs (calibration settings and text) and its model must be the same.
+    When a run without the option already moved it to SCRATCH/calibration.replaced, it is moved back."""
+    table = p["quality"] / "quality.json"
     record = state.stages.get("calibrate")
     if not (record and "finished" in record and record.get("inputs") == inputs and table.exists()):
+        record = restore_replaced_calibration(inputs, p, foreign)
+    if record is None:
         print("--keep-calibration: no finished calibration with the same settings; calibrate runs as usual", flush=True)
         return
     if (why := foreign()) is not None:
@@ -422,6 +426,32 @@ def keep_calibration(state, inputs, previous, table, foreign):
         print("Stage calibrate: keeping the finished calibration although the binaries, libraries or environment "
               "changed (--keep-calibration)", flush=True)
     state.mark("calibrate", inputs, previous, record.get("seconds", 0), record.get("outputs", [str(table)]))
+
+
+def restore_replaced_calibration(inputs, p, foreign):
+    """The record of a finished calibration in SCRATCH/calibration.replaced with the same inputs and model, after its
+    files are moved back to SCRATCH/calibration (the files there go to calibration.replaced). None if there is none."""
+    kept = p["calibration"].with_name(p["calibration"].name + ".replaced")
+    saved = kept / "record.json"
+    if not (saved.exists() and (kept / "quality.json").exists()):
+        return None
+    record = json.loads(saved.read_text())
+    if "finished" not in record or record.get("inputs") != inputs or foreign(kept) is not None:
+        return None
+    swap = p["calibration"].with_name(p["calibration"].name + ".swap")
+    shutil.rmtree(swap, ignore_errors=True)
+    if p["calibration"].exists():
+        p["calibration"].rename(swap)
+    kept.rename(p["calibration"])
+    if swap.exists():
+        swap.rename(kept)
+    (p["calibration"] / "record.json").unlink()
+    if p["calibration"] != p["quality"]:
+        p["quality"].mkdir(parents=True, exist_ok=True)
+        shutil.copy2(p["calibration"] / "quality.json", p["quality"] / "quality.json")
+    print(f"--keep-calibration: moved the finished calibration from {kept} back to {p['calibration']}"
+          + (f"; the files of the later run are now in {kept}" if kept.exists() else ""), flush=True)
+    return record
 
 
 def split_changed(row, used):
@@ -644,20 +674,23 @@ def command_run(args):
             kept = p["calibration"].with_name(p["calibration"].name + ".replaced")
             shutil.rmtree(kept, ignore_errors=True)
             p["calibration"].rename(kept)
+            if calibrate_before and "finished" in calibrate_before:
+                write_json(kept / "record.json", calibrate_before)  # for --keep-calibration
             print(f"Moved the calibration files of the earlier inputs to {kept}", flush=True)
             p["quality"].mkdir(parents=True, exist_ok=True)
         # the measured/predicted KL ratio belongs to the old quality table
         (work / vf.RATIO_FILE).unlink(missing_ok=True)
-    def calibrate_foreign():
-        record = p["calibration"] / "teacher.json"
+    def calibrate_foreign(directory=p["calibration"]):
+        record = directory / "teacher.json"
         model = json.loads(record.read_text()).get("model") if record.exists() else None
-        return f"{p['calibration']} holds teacher logits of another model" if model not in (None, file_identity(cfg["model"])) else None
+        return f"{directory} holds teacher logits of another model" if model not in (None, file_identity(cfg["model"])) else None
     # The calibration passes measure KL, so they follow only the prepare inputs that change the probe models or their
     # numbers: a new -ub, timing setting or loader path runs prepare again but keeps the passes (GLM 5.3: 16 h).
     prepared = fp
     calibrated_on = calibration_previous(prepare_inputs, cfg, converted)
     if args.keep_calibration:
-        keep_calibration(state, calibration_inputs, calibrated_on, p["quality"] / "quality.json", calibrate_foreign)
+        keep_calibration(state, calibration_inputs, calibrated_on, p, calibrate_foreign)
+    calibrate_before = state.stages.get("calibrate")
     fp = timed("calibrate", run_stage(state, "calibrate", calibration_inputs, calibrated_on,
                                       lambda: stage_calibrate(cfg, p, args) and None,
                                       [p["quality"] / "quality.json"], calibrate_reset, calibrate_foreign))

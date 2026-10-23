@@ -589,22 +589,54 @@ class ResumeState(unittest.TestCase):
     def test_keep_calibration_after_a_rebuild(self):
         with tempfile.TemporaryDirectory() as d:
             state = runstate.State(d)
-            table = Path(d) / "quality.json"
+            p = {"quality": Path(d) / "quality", "calibration": Path(d) / "calibration"}
+            p["quality"].mkdir()
+            table = p["quality"] / "quality.json"
             table.write_text("{}")
             state.mark("prepare", {"binaries": "old"}, None, 1)
             state.mark("calibrate", {"t": 1}, "before", 5, [table])
             state.forget_from("prepare")
             with unittest.mock.patch("sys.stdout", io.StringIO()) as out:
-                qc.keep_calibration(state, {"t": 2}, "after", table, lambda: None)
+                qc.keep_calibration(state, {"t": 2}, "after", p, lambda directory=None: None)
             self.assertIn("calibrate runs as usual", out.getvalue())
             self.assertEqual(state.decide("calibrate", {"t": 1}, "after")[0], "rerun")
             with unittest.mock.patch("sys.stdout", io.StringIO()) as out:
-                qc.keep_calibration(state, {"t": 1}, "after", table, lambda: "other model")
+                qc.keep_calibration(state, {"t": 1}, "after", p, lambda directory=None: "other model")
             self.assertIn("other model", out.getvalue())
             with unittest.mock.patch("sys.stdout", io.StringIO()) as out:
-                qc.keep_calibration(state, {"t": 1}, "after", table, lambda: None)
+                qc.keep_calibration(state, {"t": 1}, "after", p, lambda directory=None: None)
             self.assertIn("keeping the finished calibration", out.getvalue())
             self.assertEqual(state.decide("calibrate", {"t": 1}, "after"), ("skip", []))
+
+    def test_keep_calibration_moves_a_replaced_calibration_back(self):
+        # a run without --keep-calibration moved the finished calibration aside and started a new one
+        with tempfile.TemporaryDirectory() as d:
+            state = runstate.State(d)
+            p = {"quality": Path(d) / "quality", "calibration": Path(d) / "calibration"}
+            kept = Path(d) / "calibration.replaced"
+            kept.mkdir()
+            (kept / "quality.json").write_text('{"old": 1}')
+            (kept / "record.json").write_text(json.dumps({"inputs": {"t": 1}, "finished": "x", "seconds": 7,
+                                                          "outputs": [str(p["quality"] / "quality.json")]}))
+            p["calibration"].mkdir()
+            (p["calibration"] / "teacher.log").write_text("new")
+            state.start("calibrate", {"t": 1}, "after")
+            foreign = lambda directory=None: None
+            with unittest.mock.patch("sys.stdout", io.StringIO()) as out:
+                qc.keep_calibration(state, {"t": 2}, "after", p, foreign)
+            self.assertIn("calibrate runs as usual", out.getvalue())
+            self.assertFalse((p["calibration"] / "quality.json").exists())
+            with unittest.mock.patch("sys.stdout", io.StringIO()) as out:
+                qc.keep_calibration(state, {"t": 1}, "after", p, lambda directory=None: "other model" if directory else None)
+            self.assertIn("calibrate runs as usual", out.getvalue())
+            with unittest.mock.patch("sys.stdout", io.StringIO()) as out:
+                qc.keep_calibration(state, {"t": 1}, "after", p, foreign)
+            self.assertIn("moved the finished calibration", out.getvalue())
+            self.assertEqual(json.loads((p["quality"] / "quality.json").read_text()), {"old": 1})
+            self.assertFalse((p["calibration"] / "record.json").exists())
+            self.assertEqual((kept / "teacher.log").read_text(), "new")
+            self.assertEqual(state.decide("calibrate", {"t": 1}, "after"), ("skip", []))
+            self.assertEqual(state.stages["calibrate"]["seconds"], 7)
 
     def test_calibration_ignores_timing_inputs(self):
         cfg = {"runtime": {"env": {}}}
