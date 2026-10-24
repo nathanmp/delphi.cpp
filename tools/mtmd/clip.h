@@ -58,6 +58,7 @@ struct clip_context_params {
     bool no_alloc;
     mtmd_progress_callback progress_callback;
     void * progress_callback_user_data;
+    bool phase_default = false;
 };
 
 struct clip_init_result {

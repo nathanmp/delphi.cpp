@@ -168,6 +168,7 @@ struct clip_ctx {
         void * extra;
     };
     bool phase = false;
+    bool phase_default = false;
     ggml_backend_t phase_backend = nullptr;
     ggml_backend_buffer_ptr phase_host;
     std::vector<phase_binding> phase_bindings;
@@ -196,6 +197,7 @@ struct clip_ctx {
     clip_ctx(clip_context_params & ctx_params) {
         flash_attn_type = ctx_params.flash_attn_type;
         no_alloc = ctx_params.no_alloc;
+        phase_default = ctx_params.phase_default;
         backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
         if (!backend_cpu) {
             throw std::runtime_error("failed to initialize CPU backend");
@@ -2227,13 +2229,18 @@ struct clip_model_loader {
         auto & model = ctx_clip.model;
         auto & hparams = model.hparams;
         const char * phase_env = std::getenv("LLAMA_MMPROJ_PHASE");
-        ctx_clip.phase = phase_env && std::atoi(phase_env) != 0 && model.modality == CLIP_MODALITY_VISION &&
+        const bool phase_requested = phase_env ? std::atoi(phase_env) != 0 : ctx_clip.phase_default;
+        ctx_clip.phase = phase_requested && model.modality == CLIP_MODALITY_VISION &&
             ctx_clip.backend != ctx_clip.backend_cpu;
         if (ctx_clip.phase) {
-            ctx_clip.phase_backend = ctx_clip.backend;
             auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(ctx_clip.backend));
             if (!reg || !ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_trim")) {
-                throw std::runtime_error("phase vision requires a CUDA or HIP backend with scratch release support");
+                if (phase_env) {
+                    throw std::runtime_error("phase vision requires a CUDA or HIP backend with scratch release support");
+                }
+                ctx_clip.phase = false;
+            } else {
+                ctx_clip.phase_backend = ctx_clip.backend;
             }
         }
         std::map<std::string, size_t> tensor_offset;

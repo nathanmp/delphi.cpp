@@ -5090,6 +5090,33 @@ bool llama_share_has_expert_cache(const llama_context * ctx) {
     return ctx->share_expert_cache() != nullptr;
 }
 
+bool llama_share_has_cache_on_device(const llama_context * ctx, const char * dev) {
+    const auto * cache = ctx->share_expert_cache();
+    const auto d = llama_share_find_dev(dev);
+    if (!cache || !d) {
+        return false;
+    }
+    if (cache->auto_size) {
+        if (cache->is_home(d)) {
+            return true;
+        }
+        const char * remote = getenv("LLAMA_MOE_CACHE_AUTO_REMOTE");
+        if (remote && atoi(remote) != 0 && ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            for (const auto & device : ctx->get_model().devices) {
+                if (device.dev == d) {
+                    return true;
+                }
+            }
+        }
+    }
+    for (const auto & tier : cache->tier_list()) {
+        if (ggml_backend_get_device(tier.second) == d) {
+            return true;
+        }
+    }
+    return false;
+}
+
 const char * llama_share_home_device(const llama_context * ctx) {
     const auto * cache = ctx->share_expert_cache();
     return cache ? ggml_backend_dev_name(ggml_backend_get_device(cache->backend())) : nullptr;

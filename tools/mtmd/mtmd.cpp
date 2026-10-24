@@ -531,7 +531,8 @@ struct mtmd_context {
     mtmd_context(const char * mmproj_fname,
                    const llama_model * text_model,
                    const mtmd_context_params & ctx_params,
-                   bool no_alloc = false) :
+                   bool no_alloc = false,
+                   bool phase_default = false) :
         print_timings   (ctx_params.print_timings),
         n_threads       (ctx_params.n_threads),
         media_marker    (ctx_params.media_marker),
@@ -578,6 +579,7 @@ struct mtmd_context {
             /* no_alloc          */ no_alloc,
             /* progress_callback */ ctx_params.progress_callback,
             /* progress_callback_user_data */ ctx_params.progress_callback_user_data,
+            /* phase_default */ phase_default,
         };
 
         auto res = clip_init(mmproj_fname, ctx_clip_params);
@@ -1104,8 +1106,13 @@ private:
 mtmd_context * mtmd_init_from_file(const char * mmproj_fname,
         const struct llama_model * text_model,
         const struct mtmd_context_params ctx_params) {
+    return mtmd_init_from_file_phase(mmproj_fname, text_model, ctx_params, false);
+}
+
+mtmd_context * mtmd_init_from_file_phase(const char * mmproj_fname, const llama_model * text_model,
+        mtmd_context_params ctx_params, bool phase_default) {
     try {
-        return new mtmd_context(mmproj_fname, text_model, ctx_params);
+        return new mtmd_context(mmproj_fname, text_model, ctx_params, false, phase_default);
     } catch (const std::exception & e) {
         LOG_ERR("%s: error: %s\n", __func__, e.what());
         return nullptr;

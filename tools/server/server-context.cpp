@@ -1347,12 +1347,23 @@ private:
                 mtmd_helper_log_set(common_log_default_callback, nullptr);
             }
 
-            mctx = mtmd_init_from_file(mmproj_path.c_str(), model_tgt, mparams);
+            auto * vision_dev = mparams.device;
+            if (mparams.use_gpu && !vision_dev) {
+                vision_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+                if (!vision_dev) {
+                    vision_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU);
+                }
+            }
+            const bool phase_default = mparams.use_gpu && vision_dev &&
+                llama_share_has_cache_on_device(ctx_tgt, ggml_backend_dev_name(vision_dev));
+            mctx = mtmd_init_from_file_phase(mmproj_path.c_str(), model_tgt, mparams, phase_default);
             if (mctx == nullptr) {
                 SRV_ERR("failed to load multimodal model, '%s'\n", mmproj_path.c_str());
                 return false;
             }
             SRV_INF("loaded multimodal model, '%s'\n", mmproj_path.c_str());
+            SRV_INF("vision memory: %s (LLAMA_MMPROJ_PHASE=0/1 overrides the cache-based default)\n",
+                mtmd_phase_device(mctx) ? "phase" : "resident");
 
             init_opt.video_params.fps_target = params_base.video_fps;
             init_opt.video_params.timestamp_interval_ms = params_base.video_timestamp_interval_ms;
