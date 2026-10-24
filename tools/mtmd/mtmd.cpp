@@ -1,6 +1,7 @@
 #include "clip.h"
 #include "clip-impl.h"
 #include "mtmd.h"
+#include "mtmd-memory.h"
 #include "mtmd-internal.h"
 #include "mtmd-audio.h"
 #include "mtmd-image.h"
@@ -1113,6 +1114,10 @@ mtmd_context * mtmd_init_from_file(const char * mmproj_fname,
 
 void mtmd_free(mtmd_context * ctx) {
     delete ctx;
+}
+
+ggml_backend_dev_t mtmd_phase_device(const mtmd_context * ctx) {
+    return ctx ? clip_phase_device(ctx->ctx_v) : nullptr;
 }
 
 std::vector<std::vector<const mtmd_bitmap *>> mtmd_group_mergeable_bitmaps(std::vector<mtmd_internal_part> & parts, int n_merge) {

@@ -23,6 +23,7 @@
 #include "sampling.h"
 #include "speculative.h"
 #include "mtmd.h"
+#include "mtmd-memory.h"
 #include "mtmd-helper.h"
 #include "../../src/llama-ext.h" // llama_expert_cache_auto
 
@@ -897,6 +898,18 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
 
     // TODO @ngxson : move this log line to debug when it become more stable
     SLT_TRC(slot, "encoding mtmd batch from idx = %zu, n_chunks = %d\n", idx, n_added);
+
+    if (auto * dev = mtmd_phase_device(mctx); dev && mtmd_input_chunk_get_type(chunk.get()) == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+        // The asynchronous drafter can still read target compute storage. Drain it before either context gives up scratch.
+        common_speculative_wait_ctx(slot.ctx_dft);
+        const char * name = ggml_backend_dev_name(dev);
+        if (llama_share_device_usage(slot.ctx_tgt, name).compute) {
+            llama_share_release_compute(slot.ctx_tgt);
+        }
+        if (slot.ctx_dft && slot.ctx_dft != slot.ctx_tgt && llama_share_device_usage(slot.ctx_dft, name).compute) {
+            llama_share_release_compute(slot.ctx_dft);
+        }
+    }
 
     res = mtmd_batch_encode(mbatch.get());
     if (res != 0) {

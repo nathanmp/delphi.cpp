@@ -396,6 +396,10 @@ unset(LLAMA_TEST_NAME)
 llama_build_and_test(test-mtmd-impl.cpp)
 target_link_libraries(test-mtmd-impl PRIVATE mtmd)
 
+# Requires a local vision projector and an explicit test GPU.
+llama_build(test-mtmd-memory.cpp)
+target_link_libraries(test-mtmd-memory PRIVATE mtmd)
+
 # GGUF model data fetcher library for tests that need real model metadata
 # Only compile when cpp-httplib has SSL support (CPPHTTPLIB_OPENSSL_SUPPORT)
 if (TARGET cpp-httplib)

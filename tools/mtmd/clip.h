@@ -70,6 +70,8 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
 
 void clip_free(struct clip_ctx * ctx);
 
+ggml_backend_dev_t clip_phase_device(const struct clip_ctx * ctx);
+
 // TODO: should be enum, not string
 const char * clip_patch_merge_type(const struct clip_ctx * ctx);
 
