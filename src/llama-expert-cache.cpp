@@ -1054,8 +1054,8 @@ bool llama_expert_cache::needs_refresh(int64_t n_tokens, bool is_warmup) {
 bool llama_expert_cache::lend(void * user_data, ggml_backend_t backend, int n_slots, size_t slot_size, void ** slots) {
     auto & c = *static_cast<llama_expert_cache *>(user_data);
     if (n_slots <= 0) { return false; }
-    // A group of the tiers on this backend lends the top of its banks: the one that evicts the fewest experts (a tier leased for
-    // this prompt is still empty), then the largest. Ring slot j uses the top of bank j % 3, so lending evicts the same slots in
+    // A group of the tiers on this backend lends the top of its banks: a rotating tier before a static one, then the one that
+    // evicts the fewest experts (a tier leased for this prompt is still empty), then the largest. Ring slot j uses the top of bank j % 3, so lending evicts the same slots in
     // all three banks; a ring slot spans the slots of the smallest of them.
     const int64_t per_bank = (n_slots + 2) / 3;
     auto top = [&](const group & g) {
@@ -1075,7 +1075,9 @@ bool llama_expert_cache::lend(void * user_data, ggml_backend_t backend, int n_sl
         for (auto & g : t.groups) {
             if (top(g) <= 0) { continue; }
             const int64_t evict = resident_above(g, top(g));
-            if (!lg || evict < best_evict || (evict == best_evict && g.n * g.banks[0]->nb[2] > lg->n * lg->banks[0]->nb[2])) {
+            const bool better = !lg || (!t.fixed && lt->fixed) || (t.fixed == lt->fixed && (evict < best_evict ||
+                    (evict == best_evict && g.n * g.banks[0]->nb[2] > lg->n * lg->banks[0]->nb[2])));
+            if (better) {
                 lt = &t; lg = &g; best_evict = evict;
             }
         }
