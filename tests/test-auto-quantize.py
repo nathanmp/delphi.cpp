@@ -23,7 +23,7 @@ from calibrate import Fit, PatchWriter, anchor_qtypes, design, probe_qtypes
 from timing import Predictor, ProfileError, digest, measure_env, operation_times, profile_model, regions, signature, token_counts
 from auto_quantize import gpu_descriptions, require_identical_gpus, tensor_plan, verify_output, witness_choices
 import routing
-from calibrate import OFFLOAD_BATCH, SPLIT_MARGIN, perplexity_command, split_session
+from calibrate import OFFLOAD_BATCH, SPLIT_MARGIN, full_offload_devices, perplexity_command, split_session
 import numpy as np
 from gguf import GGUFReader, GGUFWriter, GGMLQuantizationType
 
@@ -1307,6 +1307,18 @@ class GpuOnly(unittest.TestCase):
                 else:
                     with self.assertRaisesRegex(QuantError, "GPU-only"):
                         load_config(path)
+
+    def test_extra_calibration_devices_need_room_for_the_floor(self):
+        # DeepSeek V4.1 Flash on three CMP 170HX next to RAM: the floor (139 GiB) fits on none of them, so only the
+        # first GPU runs a session (with the experts in RAM); a device with room keeps its full-offload session
+        gib = 1 << 30
+        config = cfg(devices={"CUDA0": 63 * gib, "CUDA1": 63 * gib, "CUDA2": 63 * gib, "RAM": 250 * gib})
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(full_offload_devices(config, ["CUDA0", "CUDA1", "CUDA2"], 139 * gib), ["CUDA0"])
+            self.assertEqual(full_offload_devices(config, ["CUDA1", "CUDA2"], 139 * gib), ["CUDA0"])
+        self.assertIn("CUDA1, CUDA2 skipped", out.getvalue())
+        self.assertEqual(full_offload_devices(config, ["CUDA0", "CUDA1"], 40 * gib), ["CUDA0", "CUDA1"])
+        self.assertEqual(full_offload_devices(config, ["CUDA0", "ROCm0"], 139 * gib), ["CUDA0", "ROCm0"])  # size unknown
 
     def test_measurement_commands_keep_experts_in_ram_and_profiling_uses_the_split(self):
         config = self.config([1, 1, 1], bindir="/b", model="/m.gguf", cache_mib=0,

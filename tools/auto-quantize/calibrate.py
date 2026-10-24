@@ -320,12 +320,33 @@ def design(groups, mid, top, c, anchors=()):
     return jobs
 
 
+def ram_session(cfg, device):
+    """A session on this device keeps the routed experts in RAM (-cmoe); the other devices hold every weight."""
+    return "," not in device and measure_cmoe(cfg) and (device == gpu(cfg) or gpu_only(cfg))
+
+
+def full_offload_devices(cfg, devices, floor_bytes):
+    """The calibration devices that can run a session: a device that holds every weight (calibration.devices past the
+    first GPU) needs the floor to fit with SPLIT_MARGIN to spare. A second session with the experts in RAM is not an
+    option: it holds its own copy of the floor and the patches (DeepSeek V4.1 Flash: 236 GiB of 503 GiB)."""
+    def fits(device):
+        size = cfg["devices"].get(device)
+        return size is None or int(size) - floor_bytes >= SPLIT_MARGIN
+    kept = [d for d in devices if ram_session(cfg, d) or fits(d)]
+    dropped = [d for d in devices if d not in kept]
+    if dropped:
+        kept = kept or [gpu(cfg)]
+        print(f"Calibration devices {', '.join(dropped)} skipped: the floor ({floor_bytes / 2**30:.1f} GiB) does not fit "
+              f"on them with {SPLIT_MARGIN >> 30} GiB to spare; sessions on {', '.join(kept)}", flush=True)
+    return kept
+
+
 def perplexity_command(cfg, c, model, device, teacher, base=False):
     # No --numa tensors: op offload runs the experts on the GPU, so the node-local copy of every CPU expert only costs
     # RAM (the KL is bit-identical without it, and a big source plus probes in /dev/shm left no room for the copy).
     # A device list ("CUDA0,CUDA1,CUDA2") is a layer-split session with every weight on the GPUs.
     split = "," in device
-    ram = not split and measure_cmoe(cfg) and (device == gpu(cfg) or gpu_only(cfg))
+    ram = ram_session(cfg, device)
     batch = c["batch"] or (min(16 * c["context"], OFFLOAD_BATCH) if ram else 4 * c["context"] if split else c["context"])
     command = [str(Path(cfg["bindir"]) / "llama-perplexity"), "-m", str(model), "-f", c["text"], "--chunks", str(c["chunks"]),
                "--kl-divergence-base", str(teacher), "-c", str(c["context"]), "-b", str(batch), "-ub", str(batch),
@@ -704,7 +725,7 @@ def calibrate(data, cfg, output, encode, verify, timeout=7200, text_dir=None, sc
     if anchors:
         print(f"Anchor qtypes: {', '.join(anchors)}", flush=True)
     jobs = design(groups, mid, top, c, anchors)
-    devices = c["devices"] or [gpu(cfg)]
+    devices = full_offload_devices(cfg, c["devices"] or [gpu(cfg)], Path(data["baseline"]["path"]).stat().st_size)
     members = {g["name"]: g["members"] for g in info["groups"]}
     writer = PatchWriter(cfg, info, data["imatrix"], Path(scratch or output), c["patch_mib"])
     # A uniform recipe holds every modelled tensor at the probe qtype next to the floor in the session. With routed
