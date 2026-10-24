@@ -4380,9 +4380,18 @@ private:
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
                         if (do_checkpoint) {
                             static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
+                            // LLAMA_SERVER_CKPT_TAIL_UBATCH=0 drops the 4 + n_ubatch break: with DeepSeek V4.1 CED, each prompt
+                            // batch that ends with a full ubatch runs the decoder window again, which the next batch then discards
+                            static const bool tail_ubatch = [] {
+                                const char * env = getenv("LLAMA_SERVER_CKPT_TAIL_UBATCH");
+                                return env == nullptr || atoi(env) != 0;
+                            }();
 
                             bool should_break = false;
                             for (int offset : checkpoint_offsets) {
+                                if (!tail_ubatch && offset != 4) {
+                                    continue;
+                                }
                                 const int n_last = std::min(n_batch, offset);
                                 if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
                                     should_break = true;
