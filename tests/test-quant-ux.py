@@ -237,6 +237,18 @@ class Space(unittest.TestCase):
         # a uniform recipe that does not fit in RAM adds a probe model of the largest qtypes
         rows = space.artifacts("calibrate", sizes, c, vocab=1000, ram=sizes[1] // 2)
         self.assertEqual(rows[0], ("probe model (uniform recipe)", "scratch", sizes[1]))
+        # with the top probe qtype known, the row is that recipe and appears only when its experts do not fit in RAM
+        probe = space.probe_sizes(info(), "Q4_0")
+        block = 2048 * 1024 * 8
+        self.assertEqual(probe[1], 2 * block // 32 * 18)
+        self.assertEqual(probe[0], probe[1] + 2048 * 2048 // 32 * 34 + 2048 * 4 + 4096 * 1000 // 32 * 18)
+        roomy = probe[1] + space.UNIFORM_RAM_MARGIN
+        self.assertNotIn("probe model (uniform recipe)",
+                         [n for n, _, _ in space.artifacts("calibrate", sizes, c, vocab=1000, ram=roomy, probe=probe)])
+        rows = space.artifacts("calibrate", sizes, c, vocab=1000, ram=roomy - 1, probe=probe)
+        self.assertEqual(rows[0], ("probe model (uniform recipe)", "scratch", probe[0]))
+        rows = space.artifacts("calibrate", sizes, c, vocab=1000, ram=roomy - 1, probe=probe, linked_lazy=True)
+        self.assertEqual(rows[0][2], probe[0] - sizes[2])
         self.assertEqual(space.artifacts("prepare", sizes)[0], ("baseline GGUF", "work", sizes[0]))
         self.assertEqual(space.artifacts("encode", sizes)[0][1:], ("output", sizes[1]))
         self.assertEqual(space.artifacts("encode", sizes, output_bytes=5)[0][2], 5)

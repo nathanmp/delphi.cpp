@@ -2,7 +2,8 @@
 
 Every full GGUF that the tool writes holds the lazy tables (engram, per-layer embeddings) at their stored size, so the
 rows include them. When the source keeps them in a shard of their own (a base, base.py), the models that the tool writes
-link that shard, so the rows leave them out. The probe model row is an upper bound (the largest qtype of every group)."""
+link that shard, so the rows leave them out. The probe model row is an upper bound (the largest qtype of every group)
+unless calibration.probe_qtypes names the top probe qtype."""
 from __future__ import annotations
 
 import os
@@ -18,6 +19,8 @@ from progress import size_text
 PATCH_MIB_DEFAULT = 8192
 # Small files of every stage: JSON records, logs, per-chunk KL values
 RECORDS = 256 << 20
+# RAM that calibrate keeps free next to the RAM copy of a uniform recipe (calibrate.calibrate, separate())
+UNIFORM_RAM_MARGIN = 16 << 30
 
 
 def teacher_bytes(n_vocab, chunks, context):
@@ -55,6 +58,21 @@ def model_sizes(info):
     return low, high, lazy
 
 
+def probe_sizes(info, qtype):
+    """(model, routed experts) bytes of the uniform recipe at qtype: every group at qtype where the pool has it, else at
+    its largest pool qtype. The lazy tables are included in the model bytes."""
+    by_name = {t["name"]: t for t in info["tensors"]}
+    model = experts = 0
+    for group in info["groups"]:
+        members = [by_name[n] for n in group["members"]]
+        sizes = {q: sum(tensor_bytes(m["shape"], q) for m in members) for q in group["pool"]}
+        size = sizes[qtype] if qtype in sizes else max(sizes.values())
+        model += size
+        if any("_exps" in m["name"] for m in members):
+            experts += size
+    return model, experts
+
+
 def recipe_bytes(info, tensor_types):
     """Bytes of the tensor payloads of the GGUF that encode() writes for the given type per tensor name: the lazy tables
     are included, except in the model with a lazy shard of its own, where the shard is a link."""
@@ -63,11 +81,12 @@ def recipe_bytes(info, tensor_types):
 
 
 def artifacts(stage, sizes, calibration=None, vocab=None, source_bytes=0, mmproj_bytes=0, output_bytes=None, ram=None,
-              linked_lazy=False):
+              linked_lazy=False, probe=None):
     """[(artifact, directory key, bytes)] that a stage holds at its peak.
 
-    sizes is model_sizes(info); calibration is the calibration section of the configuration. Directory keys: work
-    (durable results), scratch (temporary files), output (the directory of the final GGUF)."""
+    sizes is model_sizes(info); calibration is the calibration section of the configuration; probe is probe_sizes() at
+    the top probe qtype when it is known. Directory keys: work (durable results), scratch (temporary files), output
+    (the directory of the final GGUF)."""
     low, high, lazy = sizes
     if linked_lazy:
         low, high = low - lazy, high - lazy
@@ -79,9 +98,15 @@ def artifacts(stage, sizes, calibration=None, vocab=None, source_bytes=0, mmproj
         teacher = teacher_bytes(vocab, calibration["chunks"], calibration["context"]) if vocab else 0
         patch = 2 * calibration.get("patch_mib", PATCH_MIB_DEFAULT) * (1 << 20)
         rows = [("patch files", "scratch", patch), ("teacher logits", "scratch", teacher), ("records and logs", "scratch", RECORDS)]
-        # a uniform recipe that does not fit in RAM runs as one separate probe model at the top probe qtype
-        if calibration.get("uniform") == "direct" or (ram is not None and high > ram):
-            rows.insert(0, ("probe model (uniform recipe)", "scratch", high))
+        # a uniform recipe that does not fit in RAM runs as one separate probe model at the top probe qtype; with that
+        # qtype known, the test is the one of calibrate (the routed experts against the available RAM less a margin)
+        if probe is None:
+            separate, size = ram is not None and high > ram, high
+        else:
+            separate = ram is not None and probe[1] > ram - UNIFORM_RAM_MARGIN
+            size = probe[0] - (lazy if linked_lazy else 0)
+        if calibration.get("uniform") == "direct" or separate:
+            rows.insert(0, ("probe model (uniform recipe)", "scratch", size))
         return rows
     if stage == "encode":
         return [("encoded GGUF", "output", high if output_bytes is None else output_bytes)]
@@ -133,6 +158,9 @@ def ram_available():
 
 def preflight(stage, info, cfg, directories, enabled=True, **extra):
     """Estimate and check one stage for a classified model (config.py configuration cfg)."""
+    calibration = cfg.get("calibration") or {}
+    if stage == "calibrate" and calibration.get("probe_qtypes") and "probe" not in extra:
+        extra["probe"] = probe_sizes(info, calibration["probe_qtypes"][-1].upper())
     rows = artifacts(stage, model_sizes(info), cfg.get("calibration"), ram=ram_available(),
                      linked_lazy=bool(info.get("lazy_separate")), **extra)
     check(stage, rows, directories, enabled)
