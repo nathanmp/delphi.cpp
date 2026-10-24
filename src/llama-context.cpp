@@ -598,6 +598,12 @@ llama_context::llama_context(
             if (allow_embedding_overrides && !model.has_non_embedding_tensor_overrides()) {
                 pp_blocked_by_overrides = false;
             }
+            // LLAMA_PP_ALLOW_OVERRIDES=1: keep pipeline parallelism with any override, e.g. some layers' experts on the CPU
+            // and the rest of a layer split over GPUs, where each ubatch otherwise runs the GPUs in series
+            const char * LLAMA_PP_ALLOW_OVERRIDES = getenv("LLAMA_PP_ALLOW_OVERRIDES");
+            if (LLAMA_PP_ALLOW_OVERRIDES && atoi(LLAMA_PP_ALLOW_OVERRIDES) != 0) {
+                pp_blocked_by_overrides = false;
+            }
         }
 
         // tensor split runs every layer on all GPUs at once, so there is no pipeline across devices, but

@@ -150,7 +150,9 @@ public:
     llama_kv_cache_iswa * get_raw_dec() const;
     uint32_t              get_n_split_raw() const;
     uint32_t              get_ced_skip(const llama_ubatch & ubatch) const;
+    uint32_t              get_ced_skip(const std::vector<llama_ubatch> & ubatches, size_t i) const;
     llama_ubatch          decoder_ubatch(const llama_ubatch & ubatch) const;
+    llama_ubatch          decoder_ubatch(const llama_ubatch & ubatch, uint32_t skip) const;
     llama_kv_cache      * get_csa() const;
     llama_kv_cache      * get_hca() const;
     llama_kv_cache      * get_lid() const;
@@ -237,6 +239,7 @@ public:
     bool has_dec() const;
     bool is_dec(int32_t il) const;
     llama_ubatch decoder_ubatch(const llama_ubatch & ubatch) const;
+    uint32_t     ced_skip(const llama_ubatch & ubatch) const;
 
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;

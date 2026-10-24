@@ -1515,7 +1515,7 @@ llama_memory_context_ptr llama_kv_cache_dsv4::init_batch(
             std::vector<llama_ubatch> ubatches_dec_read;
 
             for (uint32_t i = 0; i < ubatches.size(); ++i) {
-                auto ubatch_dec = decoder_ubatch(ubatches[i]);
+                auto ubatch_dec = decoder_ubatch(ubatches[i], get_ced_skip(ubatches, i));
                 ubatches_dec_write.push_back(dsv4_build_raw_write_ubatch(ubatch_dec));
                 ubatches_dec_read.push_back(std::move(ubatch_dec));
             }
@@ -1914,8 +1914,38 @@ uint32_t llama_kv_cache_dsv4::get_ced_skip(const llama_ubatch & ubatch) const {
     return skip;
 }
 
+uint32_t llama_kv_cache_dsv4::get_ced_skip(const std::vector<llama_ubatch> & ubatches, size_t i) const {
+    const llama_ubatch & ubatch = ubatches[i];
+    const uint32_t skip = get_ced_skip(ubatch);
+    if (!compact_prefill || skip == 0) {
+        return skip;
+    }
+
+    // A later compacted ubatch of the same sequence clears the decoder window (see apply()), so the decoder rows of
+    // this ubatch are never read: keep one row instead of the window. Without this, each ubatch of a long prompt runs
+    // n_keep_dec rows through every decoder layer, which touches nearly all decoder experts.
+    for (size_t j = i + 1; j < ubatches.size(); ++j) {
+        if (ubatches[j].seq_id_unq[0] == ubatch.seq_id_unq[0] && get_ced_skip(ubatches[j]) > 0) {
+            for (uint32_t k = skip; k + 1 < ubatch.n_tokens; ++k) {
+                if (ubatch.output && ubatch.output[k]) {
+                    return skip;
+                }
+            }
+            return ubatch.n_tokens - 1;
+        }
+    }
+
+    return skip;
+}
+
 llama_ubatch llama_kv_cache_dsv4::decoder_ubatch(const llama_ubatch & ubatch) const {
-    const uint32_t skip = compact_prefill ? get_ced_skip(ubatch) : 0;
+    return decoder_ubatch(ubatch, get_ced_skip(ubatch));
+}
+
+llama_ubatch llama_kv_cache_dsv4::decoder_ubatch(const llama_ubatch & ubatch, uint32_t skip) const {
+    if (!compact_prefill) {
+        skip = 0;
+    }
     if (skip == 0) {
         return ubatch;
     }
@@ -2200,8 +2230,16 @@ bool llama_kv_cache_dsv4_raw_context::is_dec(int32_t il) const {
     return kv_swa_dec != nullptr && il > (int32_t) n_split;
 }
 
+uint32_t llama_kv_cache_dsv4_raw_context::ced_skip(const llama_ubatch & ubatch) const {
+    // the current ubatch uses the skip that prepare() gave its decoder slots; other ubatches (graph reserve) the plain one
+    if (i_next < ubatches.size() && ubatch.token == ubatches[i_next].token && ubatch.n_tokens == ubatches[i_next].n_tokens) {
+        return cache->get_ced_skip(ubatches, i_next);
+    }
+    return cache->get_ced_skip(ubatch);
+}
+
 llama_ubatch llama_kv_cache_dsv4_raw_context::decoder_ubatch(const llama_ubatch & ubatch) const {
-    return cache->decoder_ubatch(ubatch);
+    return cache->decoder_ubatch(ubatch, ced_skip(ubatch));
 }
 
 ggml_tensor * llama_kv_cache_dsv4_raw_context::get_k(ggml_context * ctx, int32_t il) const {
@@ -2291,7 +2329,7 @@ void llama_kv_cache_dsv4_raw_context::set_input_kq_mask_dec(ggml_tensor * dst, c
     const auto ubatch_dec = decoder_ubatch(*ubatch);
     kv_swa_dec->set_input_kq_mask(dst, &ubatch_dec, causal_attn);
 
-    const uint32_t skip = cache->get_ced_skip(*ubatch);
+    const uint32_t skip = ced_skip(*ubatch);
     if (skip == 0) {
         return;
     }
