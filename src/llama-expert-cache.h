@@ -49,6 +49,8 @@ struct llama_expert_cache {
         std::vector<uint16_t> ring;      // window rows, top_k ids each
         size_t head = 0;
         int64_t rows = 0;
+        std::vector<float> heat;         // selections of every recorded row (halved now and then), for the static tiers
+        int64_t heat_rows = 0;
     };
 
     static std::unique_ptr<llama_expert_cache> create(const llama_model & model, const std::vector<ggml_backend_ptr> & backends,
@@ -63,8 +65,14 @@ struct llama_expert_cache {
     const entry * layer(int il) const;
     // true if any tier holds slots: the graph then uses the cache for small batches
     bool active() const { return !tiers.empty(); }
-    // the layer GPU
+    // the GPU of the first cached layer (prefill sharing and the LLAMA_MOE_CACHE_MIB tier use it)
     ggml_backend_t backend() const { return gpu; }
+    // the GPU of layer il, where its tiers are local
+    ggml_backend_t backend(int il) const { return il >= 0 && il < (int) layer_gpu.size() && layer_gpu[il] ? layer_gpu[il] : gpu; }
+    // a tier on b serves a layer on another GPU (its splits then need a scheduler worker)
+    bool serves_remote(ggml_backend_t b) const;
+    // a cached layer is on dev
+    bool is_home(ggml_backend_dev_t dev) const;
 
     int n_tiers() const { return (int) tiers.size(); }
     ggml_backend_t tier_backend(int t) const { return tiers[t].backend; }
@@ -124,11 +132,25 @@ private:
         ggml_backend_buffer_ptr buffer;
         std::vector<group> groups;          // per type group
         std::vector<ggml_tensor *> hot_ids; // per layer, null for layers without routed experts
+        bool fixed = false;                 // static tier (LLAMA_MOE_CACHE_STATIC): the hottest experts by heat
     };
     struct candidate { double score; int il, e; };
     struct async_refresh;
-    // the resident set refresh() would choose now, best first
-    std::vector<candidate> select() const;
+    double window_score(const entry & l, int e) const;
+    double heat_score(const entry & l, int e) const;
+    // The membership change toward the top sets: the static tiers take the experts of most heat, the other tiers the best
+    // window scores of the rest. Entering experts, best first, take free slots and then the slots of members that left the
+    // set, weakest first. At most max_jobs uploads, of which at most max_swaps replace static members. jobs[i] evicts
+    // evict[i] (or (-1, -1)); an expert that moves into a static tier leaves its slot in the other tier.
+    void plan(int64_t max_jobs, int64_t max_swaps, std::vector<upload_job> & jobs, std::vector<std::pair<int, int>> & evict) const;
+    // apply one planned job to the maps (the slot data is written apart)
+    void apply_job(const upload_job & j, std::pair<int, int> evicted, std::vector<bool> & changed);
+    bool slot_usable(int64_t s) const;
+    // slot pools: one per group, or with local_only one per group and GPU
+    int pool_of_slot(int64_t s) const;
+    int pool_of_layer(int il) const;
+    int n_pools() const { return (int) group_types.size() * (local_only ? (int) homes.size() + 1 : 1); }
+    void sync_homes() const;
     size_t max_slab() const;
     bool any_lent() const;
     // tier index and group of a global slot
@@ -155,6 +177,9 @@ private:
 
     const llama_model * model = nullptr;
     ggml_backend_t gpu = nullptr;
+    std::vector<ggml_backend_t> layer_gpu; // per layer, null for layers that are not cached
+    std::vector<ggml_backend_t> homes;     // the GPUs of the cached layers
+    bool local_only = false;               // LLAMA_MOE_CACHE_LOCAL=1: a layer takes slots in the tiers on its GPU only
     std::vector<tier> tiers;
     int next_tier_id = 0;
     uint64_t gen = 0;
@@ -178,6 +203,10 @@ private:
     int64_t prompt_rows = 0;   // LLAMA_MOE_CACHE_PROMPT_ROWS, see graph_rows()
     int64_t prompt_hit_sel = 0, prompt_all_sel = 0;
     double hysteresis = 1.0;   // score bonus of a resident expert
+    int64_t static_swaps = 8;  // LLAMA_MOE_CACHE_STATIC_SWAPS: static members replaced per prompt
+    int64_t refresh_max = -1;  // LLAMA_MOE_CACHE_REFRESH_MAX: uploads of the refresh after a prompt (-1: all); the rest
+                               // fill free slots at the next small batches
+    bool fill_idle = false;    // a planned fill found nothing for the free slots: wait for the next `every`
     int64_t every = 8;         // small batches between decode-time refreshes; 0 refreshes only after prompts
     int64_t max_async = 32;    // experts per decode-time refresh (device scratch and pinned buffer: 3 slabs each)
     int64_t n_small = 0;

@@ -2599,7 +2599,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn_cache(
         cb(t, (std::string(cpu ? "ffn_cache_cpu_" : "ffn_cache_gpu_") + label).c_str(), il);
     };
     auto name_tier = [&](ggml_tensor * t, int tier, const char * label) {
-        if (expert_cache->tier_backend(tier) == expert_cache->backend()) {
+        if (expert_cache->tier_backend(tier) == expert_cache->backend(il)) {
             name(t, label, false);
         } else {
             cb(t, (std::string("ffn_cache_x") + std::to_string(tier) + "_" + label).c_str(), il);
@@ -2610,7 +2610,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn_cache(
     auto gather = [&](bool local) {
         for (int t = 0; t < expert_cache->n_tiers(); ++t) {
             auto * map = expert_cache->hot_ids(t, il);
-            if (map && (expert_cache->tier_backend(t) == expert_cache->backend()) == local) {
+            if (map && (expert_cache->tier_backend(t) == expert_cache->backend(il)) == local) {
                 auto * hot = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, map, flat), ids->ne[0], ids->ne[1]);
                 name_tier(hot, t, "hot");
                 ggml_build_forward_expand(gf, hot);
@@ -2621,7 +2621,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn_cache(
     gather(true);
     bool any_remote = false;
     for (int t = 0; t < expert_cache->n_tiers(); ++t) {
-        any_remote |= expert_cache->hot_ids(t, il) && expert_cache->tier_backend(t) != expert_cache->backend();
+        any_remote |= expert_cache->hot_ids(t, il) && expert_cache->tier_backend(t) != expert_cache->backend(il);
     }
 
     // One CPU transfer before GPU expert work. Expert IDs are exactly representable as F32. The CPU maps the original IDs to
@@ -2726,7 +2726,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn_cache(
     }
     for (int t = 0; t < expert_cache->n_tiers(); ++t) {
         auto * map = expert_cache->hot_ids(t, il);
-        if (!map || expert_cache->tier_backend(t) == expert_cache->backend()) {
+        if (!map || expert_cache->tier_backend(t) == expert_cache->backend(il)) {
             continue;
         }
         const labeler label = [&, t](ggml_tensor * x, const char * l) { name_tier(x, t, l); };

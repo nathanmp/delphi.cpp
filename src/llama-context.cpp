@@ -3501,7 +3501,7 @@ void llama_context::sched_set_workers(ggml_backend_sched_t s) {
         }
         bool remote = false;
         for (int t = 0; enabled && expert_cache && t < expert_cache->n_tiers(); ++t) {
-            remote |= expert_cache->tier_backend(t) == b.get() && b.get() != expert_cache->backend();
+            remote |= expert_cache->tier_backend(t) == b.get() && expert_cache->serves_remote(b.get());
         }
         const bool prefill = expert_cache && expert_cache->prefill_overlap() && b.get() == expert_cache->backend();
         const bool worker = remote || (enabled && prefill);
@@ -3539,8 +3539,11 @@ void llama_context::expert_cache_auto() {
             ggml_backend_sched_stage_release(slot.sched.get());
         }
     }
+    // tiers on the GPUs of the cached layers only, unless LLAMA_MOE_CACHE_AUTO_REMOTE=1 (a tier on another GPU costs a copy to it
+    // and back per layer)
+    const bool remote = [] { const char * e = getenv("LLAMA_MOE_CACHE_AUTO_REMOTE"); return e && atoi(e) != 0; }();
     for (const auto & d : model.devices) {
-        if (ggml_backend_dev_type(d.dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+        if (ggml_backend_dev_type(d.dev) != GGML_BACKEND_DEVICE_TYPE_GPU || (!remote && !expert_cache->is_home(d.dev))) {
             continue;
         }
         size_t free = 0, total = 0;
@@ -4043,11 +4046,11 @@ llm_graph_cb llama_context::graph_get_cb() const {
                 strcmp(name, "ffn_moe_weighted") == 0 || strcmp(name, "ffn_moe_out") == 0;
         // Model builders can rename the returned MoE tensor. Keep an explicitly placed cache merge on its GPU.
         const bool cache_merge = expert_cache && strcmp(name, "ffn_moe_out") == 0 &&
-                ggml_backend_sched_get_tensor_backend(sched.get(), cur) == expert_cache->backend();
+                ggml_backend_sched_get_tensor_backend(sched.get(), cur) == expert_cache->backend(il);
         if (cache_cpu || (cpu_experts && ubatch.n_tokens > 16 && routed && !cache_merge)) {
             ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend_cpu);
         } else if (cache_gpu && expert_cache) {
-            ggml_backend_sched_set_tensor_backend(sched.get(), cur, expert_cache->backend());
+            ggml_backend_sched_set_tensor_backend(sched.get(), cur, expert_cache->backend(il));
         } else if (expert_cache && strncmp(name, "ffn_cache_x", 11) == 0) {
             // an expert cache tier on another GPU
             const int tier = atoi(name + 11);
