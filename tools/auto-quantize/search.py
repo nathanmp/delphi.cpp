@@ -5,6 +5,7 @@ import math
 from bisect import bisect_right
 from collections import defaultdict
 
+import routing
 from config import AXES, RUNTIME_NAMES, QuantError, runtime_allows
 from knapsack import solve
 from model import is_lazy, tensor_bytes
@@ -57,6 +58,30 @@ def llama_layer_devices(counts):
         splits.append(running)
     splits = [f32(x / running) for x in splits]
     return [next((d for d, x in enumerate(splits) if f32(f32(il) / f32(total)) < x), len(splits)) for il in range(total)]
+
+
+AUTO_MARGIN_MIB = 1536  # LLAMA_MOE_CACHE_AUTO_MARGIN_MIB default
+
+
+def curve_for(info, cfg, n_layers):
+    """The measured hit curve of cfg["routing_curve"] when it belongs to this model (expert count, MoE layers), else None."""
+    curve = cfg.get("routing_curve")
+    if curve and curve.get("n_expert") == info["n_expert"] and curve.get("layers") == n_layers:
+        return curve
+    return None
+
+
+def hit_prior(info, cfg, slots, n_layers):
+    """Share of the routed-expert selections of small batches that a cache of `slots` slots serves: read off the measured
+    curve of the model (routing.py, slot units), else the uniform prior slots / (experts x layers)."""
+    curve = curve_for(info, cfg, n_layers)
+    if curve is not None:
+        return min(1.0, max(0.0, routing.hit_at(curve["points"], slots)))
+    return min(1.0, slots / max(1, info["n_expert"] * n_layers))
+
+
+def hit_source(info, cfg, n_layers):
+    return "measured routing curve" if curve_for(info, cfg, n_layers) is not None else "uniform prior"
 
 
 def memory(info, cfg, choices):
@@ -126,29 +151,40 @@ def memory(info, cfg, choices):
             if key not in groups:
                 groups[key] = {"layers": [], "expert_bytes": sum(ws[p][1] for p in ("gate", "up", "down")), "slots": 0}
             groups[key]["layers"].append(layer)
-        budget = int(cfg["cache_mib"] * (1 << 20))
-        layer_bytes = sum(g["expert_bytes"] * len(g["layers"]) for g in groups.values())
-        per_layer = budget // layer_bytes
-        if per_layer == 0:
-            raise QuantError("cache allowance cannot hold an expert per layer")
-        left = budget - per_layer * layer_bytes
-        for g in groups.values():
-            g["slots"] = per_layer * len(g["layers"]) + left // g["expert_bytes"]
-            left %= g["expert_bytes"]
-            cache_bytes += g["slots"] * g["expert_bytes"]
-            slots += g["slots"]
         largest_slab = max(ws[p][1] for ws in experts.values() for p in ws)
         # Device scratch and pinned refill buffer each hold three slabs per async replacement.
         async_experts = int(cfg["runtime"]["env"].get("LLAMA_MOE_CACHE_ASYNC_EXPERTS", 32))
         scratch = 3 * largest_slab * max(1, async_experts)
-        used[gpu(cfg)] += cache_bytes + scratch + sum(ws["gate"][2][2] * 4 for ws in experts.values())
-        used["RAM"] += scratch
+        maps = sum(ws["gate"][2][2] * 4 for ws in experts.values())
+        layer_bytes = sum(g["expert_bytes"] * len(g["layers"]) for g in groups.values())
+        if cfg["cache_mib"] == "auto":
+            # what the server does in auto mode: the memory that the dense weights, the reserves (context, compute buffers,
+            # projector, draft model) and the staging buffers leave on the GPU, less the margin for buffers that grow later
+            margin = int(cfg["runtime"]["env"].get("LLAMA_MOE_CACHE_AUTO_MARGIN_MIB", AUTO_MARGIN_MIB)) * (1 << 20)
+            budget = max(0, cfg["devices"][gpu(cfg)] - used[gpu(cfg)] - scratch - maps - margin)
+        else:
+            budget = int(cfg["cache_mib"] * (1 << 20))
+        per_layer = budget // layer_bytes
+        if per_layer == 0:
+            if cfg["cache_mib"] != "auto":
+                raise QuantError("cache allowance cannot hold an expert per layer")
+            groups, scratch = {}, 0  # no room: the server allocates no tier
+        else:
+            left = budget - per_layer * layer_bytes
+            for g in groups.values():
+                g["slots"] = per_layer * len(g["layers"]) + left // g["expert_bytes"]
+                left %= g["expert_bytes"]
+                cache_bytes += g["slots"] * g["expert_bytes"]
+                slots += g["slots"]
+            used[gpu(cfg)] += cache_bytes + scratch + maps
+            used["RAM"] += scratch
     return {"used_bytes": used, "headroom_bytes": {name: cfg["devices"][name] - value for name, value in used.items()},
             "lazy_bytes": lazy_bytes, "host_bytes": host_bytes,
             "total_bytes": sum(used.values()) - sum(cfg["reserve"].get(name, 0) for name in cfg["devices"]) + host_bytes,
             "cache_bytes": cache_bytes, "cache_slots": slots,
             "cache_groups": [{"types": list(key), **value} for key, value in groups.items()],
-            "cache_hit_prior": min(1.0, slots / max(1, info["n_expert"] * len(experts))),
+            "cache_hit_prior": hit_prior(info, cfg, slots, len(experts)),
+            "cache_hit_source": hit_source(info, cfg, len(experts)),
             "allocation_scope": "tensor payloads without lazy tables, cache banks/maps/scratch and supplied reserves; allocator/repack overhead needs witness validation; lazy tables sit on disk and use page cache as the system allows",
             "secondary_gpus": "unassigned; percentages change speed predictions only" if not only else
             "layers split contiguously over the GPUs in order (layer_split, last count includes the output); the input embedding stays on the host",

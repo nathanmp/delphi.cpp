@@ -19,7 +19,7 @@ import sys
 import time
 from pathlib import Path
 
-from config import (AXES, ROOT, RUNTIME_ALIASES, RUNTIME_NAMES, SCHEMA, QuantError, capacity, check_runtime_choices, digest,
+from config import (AXES, ROOT, RUNTIME_ALIASES, RUNTIME_NAMES, SCHEMA, QuantError, cache_size, capacity, check_runtime_choices, digest,
                     file_identity, load_config, loss_only, runtime_name, write_json)
 import capacity as cap
 import frontier as fr
@@ -106,6 +106,8 @@ def apply_query(cfg, args, ratio=None):
     if getattr(args, "runtime", None):
         cfg["target_runtime"] = runtime_name(args.runtime)
         check_runtime_choices(cfg)
+    if getattr(args, "cache_mib", None) is not None:
+        cfg["cache_mib"] = cache_size(args.cache_mib, "--cache-mib")
     return cfg
 
 
@@ -130,7 +132,32 @@ def stage_prepare(cfg, p, args, measurement_seconds=600):
     import auto_quantize as aq
     if not (p["prepared"] / "prepared.json").exists():
         space.preflight("prepare", aq.configured_model(cfg), cfg, directories(p), not args.no_space_check)
-    return aq.prepare(cfg, p["prepared"], measurement_seconds)
+    data = aq.prepare(cfg, p["prepared"], measurement_seconds)
+    stage_routing(cfg, p, args, data)
+    return data
+
+
+def stage_routing(cfg, p, args, data):
+    """The routing trace and the hit curve of the model, once (routing.ensure): the speed model reads the measured share of
+    expert selections that a cache of N slots serves instead of the uniform prior. Skipped without a cache."""
+    if not cfg["cache_mib"] or "RAM" not in cfg["devices"] or cfg.get("routing_curve") or not data.get("timed", True):
+        return None
+    import routing
+    tokens = getattr(args, "routing_tokens", routing.TOKENS)
+    # setup has no serving options: a small context and no projector or draft
+    serve = serve_from_args(args) if hasattr(args, "ctx") else {
+        "ctx": 4096, "ub": cfg["runtime"].get("ubatch", 512), "parallel": 1, "ctk": None, "ctv": None, "mmproj": None, "draft": None,
+        "draft_device": None, "spec_type": None, "server_args": [], "mtp": cfg.get("mtp", True)}
+    return routing.ensure(cfg, data["model"], data["baseline"]["path"], serve, p["prepared"], tokens)
+
+
+def routing_cfg(cfg, p):
+    """cfg with the measured hit curve of the prepared directory (unless the configuration names one)."""
+    path = p["prepared"] / "routing-curve.json"
+    if cfg["cache_mib"] and not cfg.get("routing_curve") and path.exists():
+        import routing
+        return {**cfg, "routing_curve": routing.load_curve(path)}
+    return cfg
 
 
 def terminate_children():
@@ -308,6 +335,7 @@ def stage_verify(payload, row, output, args, work=None, scratch=None):
 def run_plan(cfg, p, out):
     """Plan into `out` on the prepared inputs (quiet), print the summary lines and return the frontier payload."""
     import auto_quantize as aq
+    cfg = routing_cfg(cfg, p)
     data = aq.load_prepared(p["prepared"] / "prepared.json", cfg)
     log = io.StringIO()
     with contextlib.redirect_stdout(log):
@@ -448,6 +476,8 @@ def build_config(args, gguf, rows, user_reserve, measured, override):
             cfg[key] = value
     if getattr(args, "runtime", None):
         cfg["target_runtime"] = runtime_name(args.runtime)  # the option wins over the file
+    if getattr(args, "cache_mib", None) is not None:
+        cfg["cache_mib"] = cache_size(args.cache_mib, "--cache-mib")
     return cfg
 
 
@@ -918,6 +948,19 @@ def build_parser():
         p.add_argument("--parallel", type=int, default=1)
         p.add_argument("--server-arg", action="append", help="one more llama-server argument (repeat per word)")
 
+    def cache_option(p):
+        p.add_argument("--cache-mib", metavar="MIB|auto",
+                       help="GPU expert cache of the plan, in MiB (routed experts in RAM): its slots count in the first GPU's "
+                            "memory and its hit share, read off the measured routing curve, speeds up the predicted decode; "
+                            "a plan may use another size than the prepared one; auto: what the first GPU has left after the dense weights, "
+                            "the reserves (context, compute buffers, projector, draft model) and the staging buffers, less the server's "
+                            "margin (config key: cache_mib)")
+
+    def routing_option(p):
+        p.add_argument("--routing-tokens", type=int, default=4000, metavar="N",
+                       help="with an expert cache (cache_mib): generated tokens of the routing trace that gives the hit curve of "
+                            "the cache (a server run with the planned draft and projector, once per model; 0: uniform prior)")
+
     def runtime_option(p):
         p.add_argument("--runtime", type=str.lower, choices=list(RUNTIME_ALIASES), metavar="RUNTIME",
                        help="inference runtime that loads the GGUF: delphi (default), llama or ik_llama (with .cpp as an alias); "
@@ -957,6 +1000,7 @@ def build_parser():
     p.add_argument("--weights", help="as for plan; loss=1 alone skips the timing measurement (plans then weigh only the loss)")
     p.add_argument("--measurement-seconds", type=float, default=600)
     p.add_argument("--skip-calibrate", action="store_true")
+    routing_option(p)
     space_options(p)
     p = sub.add_parser("plan", help="plan for a query and choose from the frontier")
     common(p)
@@ -972,6 +1016,7 @@ def build_parser():
     for option in RATE_BOUNDS:
         p.add_argument("--" + option.replace("_", "-"), dest=option, type=float, help="minimum predicted t/s")
     runtime_option(p)
+    cache_option(p)
     p.add_argument("--name", help="plan directory name under WORK/plans")
     display(p)
     p = sub.add_parser("show", help="show a saved frontier")
@@ -1008,6 +1053,8 @@ def build_parser():
     runtime_option(p)
     for option in RATE_BOUNDS:
         p.add_argument("--" + option.replace("_", "-"), dest=option, type=float, help="minimum predicted t/s")
+    cache_option(p)
+    routing_option(p)
     p.add_argument("--output", type=Path, required=True, help="encoded GGUF")
     p.add_argument("--auto", action="store_true", help="encode the best pick without asking")
     p.add_argument("--pick", help="encode this row number or recipe id (or best, min-kld ...) without asking")

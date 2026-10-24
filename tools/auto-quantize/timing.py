@@ -10,7 +10,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from config import ROOT, QuantError, digest, file_identity, write_json
+from config import ROOT, QuantError, cache_env, digest, file_identity, write_json
 import progress
 from model import is_lazy, lazy_args, tensor_bytes
 
@@ -98,7 +98,7 @@ def profile_model(cfg, model, output, trace=True, placement=None):
     if "RAM" in cfg["devices"]:
         command += ["-ncmoe", "999"]
     environment = dict(r["env"])
-    environment["LLAMA_MOE_CACHE_MIB"] = str(int(cfg["cache_mib"]))
+    environment["LLAMA_MOE_CACHE_MIB"] = cache_env(cfg["cache_mib"])
     artifacts = Path(output).with_suffix(".artifacts")
     events = max(r["trace_max_events"], TRACE_EVENTS[0])
     for attempt in range(2):

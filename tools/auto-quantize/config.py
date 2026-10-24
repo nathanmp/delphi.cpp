@@ -29,6 +29,23 @@ def number(value, name, minimum=0, positive=False):
     return value
 
 
+def cache_size(value, name):
+    """MiB of the GPU expert cache: a number, or "auto" (the memory that the plan leaves on the GPU less the server's margin)."""
+    if isinstance(value, str) and value.strip().lower() == "auto":
+        return "auto"
+    if isinstance(value, str):
+        try:
+            value = float(value)
+        except ValueError:
+            raise QuantError(f"{name} must be a number of MiB or auto") from None
+    return number(value, name)
+
+
+def cache_env(value):
+    """The LLAMA_MOE_CACHE_MIB value of a cache_mib setting."""
+    return "auto" if value == "auto" else str(int(value))
+
+
 def capacity(value):
     if isinstance(value, int) and not isinstance(value, bool):
         return int(number(value, "capacity"))
@@ -198,7 +215,7 @@ def load_config(path):
     allowed = {"schema", "model", "devices", "reserve", "imatrix", "primary_qtypes", "other_qtypes", "importance",
                "preserve_below_mib", "tie_gate_up", "primary_regex", "pins", "preserve_regex", "allow_requantize",
                "bindir", "runtime", "sampling", "search", "bounds", "cache_mib", "multi_gpu_speedup_percent", "timing", "quality",
-               "calibration", "imatrix_collect", "mtp", "runtime_reserve", "target_runtime", "lazy_type"}
+               "calibration", "imatrix_collect", "mtp", "runtime_reserve", "target_runtime", "lazy_type", "routing_curve"}
     unknown = set(cfg) - allowed
     if unknown:
         raise QuantError(f"unknown configuration keys: {sorted(unknown)}")
@@ -249,7 +266,10 @@ def load_config(path):
     cfg.setdefault("preserve_regex", [])
     for regex in cfg["preserve_regex"] + ([cfg["primary_regex"]] if cfg.get("primary_regex") else []):
         re.compile(regex)
-    cfg["cache_mib"] = number(cfg.get("cache_mib", 0), "cache_mib")
+    cfg["cache_mib"] = cache_size(cfg.get("cache_mib", 0), "cache_mib")
+    if cfg.get("routing_curve"):
+        from routing import load_curve  # routing imports this module
+        cfg["routing_curve"] = load_curve(absolute(cfg["routing_curve"]))
     # whether the MTP blocks are resident (served as the draft); without them the server does not load them
     cfg.setdefault("mtp", True)
     if not isinstance(cfg["mtp"], bool):

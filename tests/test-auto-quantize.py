@@ -22,6 +22,7 @@ from quality import LossModel, damage_digest, load_quality, modelled_groups, rol
 from calibrate import Fit, PatchWriter, anchor_qtypes, design, probe_qtypes
 from timing import Predictor, ProfileError, digest, measure_env, operation_times, profile_model, regions, signature, token_counts
 from auto_quantize import gpu_descriptions, require_identical_gpus, tensor_plan, verify_output, witness_choices
+import routing
 from calibrate import OFFLOAD_BATCH, SPLIT_MARGIN, perplexity_command, split_session
 import numpy as np
 from gguf import GGUFReader, GGUFWriter, GGMLQuantizationType
@@ -854,8 +855,8 @@ class Quality(unittest.TestCase):
                       dict(self.table, schema="delphi.floor-quality/2"), dict(self.table, composition={"kappa_inf": .05, "u0": .3})):
             with self.assertRaises(QuantError):
                 self.load(table)
-        with self.assertRaises(QuantError):
-            self.load(config={**self.config, "cache_mib": 1})
+        # the quality runs turn the cache off, so a plan with a cache reads the same table
+        self.load(config={**self.config, "cache_mib": 1})
         with self.source.open("r+b") as stream:
             stream.seek(read_model(str(self.source))["tensors"][0]["offset"])
             stream.write(b"\x01")
@@ -1467,6 +1468,164 @@ class TargetRuntime(unittest.TestCase):
         with self.assertRaisesRegex(QuantError, "llama.cpp.*ffn_gate_inp.*IQ4_K"):
             check_runtime_source(model, cfg(target_runtime="llama"))
         check_runtime_source(classify(info(), cfg()), cfg(target_runtime="llama"))  # BF16 loads everywhere
+
+
+class Routing(unittest.TestCase):
+    """The hit curve: a replay of the expert-cache policy on a routing trace."""
+    L, E, K = 6, 32, 4
+
+    def trace(self, steps=240, seed=0):
+        rng = np.random.default_rng(seed)
+        p = 1.0 / (np.arange(self.E) + 1)
+        p /= p.sum()
+        def rows(n):
+            return np.stack([np.stack([rng.choice(self.E, size=self.K, replace=False, p=p) for _ in range(n)])
+                             for _ in range(self.L)]).astype(np.int16)
+        return [rows(40)] + [rows(1) for _ in range(steps)] + [rows(70)] + [rows(1) for _ in range(steps)]
+
+    def test_window_counts_are_the_last_rows(self):
+        batches = self.trace()
+        r = routing.Replay(self.L, self.E, self.K, 20, window=100)
+        for b in batches:
+            r.record(b)
+        last = np.concatenate(batches, axis=1)[:, -100:]
+        expected = np.zeros((self.L, self.E), int)
+        for layer in range(self.L):
+            for e in last[layer].ravel():
+                expected[layer, e] += 1
+        self.assertTrue((expected == r.count).all())
+        self.assertTrue((r.rows == 100).all())
+
+    def test_prompt_batch_with_fewer_rows_in_later_layers(self):
+        # DeepSeek V4.1 runs fewer rows in the layers after n_layer_prefill: the batch is a list with one array per layer
+        rng = np.random.default_rng(3)
+        rows = [300 if layer < 3 else 120 for layer in range(self.L)]
+        batch = [rng.integers(0, self.E, size=(n, self.K)).astype(np.int16) for n in rows]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "t.bin"
+            with open(path, "wb") as stream:
+                for layer, ids in enumerate(batch):
+                    np.array([layer, ids.shape[0], self.K], dtype=np.int32).tofile(stream)
+                    ids.astype(np.int32).tofile(stream)
+                small = self.trace(steps=1)[1]
+                for layer in range(self.L):
+                    np.array([layer, 1, self.K], dtype=np.int32).tofile(stream)
+                    small[layer].astype(np.int32).tofile(stream)
+            layers, read = routing.read_trace(path)
+        self.assertEqual(len(read), 2)
+        self.assertIsInstance(read[0], list)
+        self.assertEqual([a.shape[0] for a in read[0]], rows)
+        self.assertEqual(routing.batch_rows(read[0]), 300)
+        r = routing.Replay(self.L, self.E, self.K, 10, window=100)
+        r.record(read[0])
+        self.assertTrue((r.rows == 100).all())
+        self.assertTrue((r.count.sum(axis=1) == 100 * self.K).all())
+        last = batch[0][-100:]
+        self.assertEqual(int(r.count[0].sum()), 100 * self.K)
+        self.assertEqual(int(r.count[0][last[0, 0]] >= 1), 1)
+        out = routing.replay(layers, read, self.E, 10)
+        self.assertEqual(out["segments"][-1][1], self.L * self.K)
+
+    def test_curve_rises_and_beats_uniform_on_skewed_routing(self):
+        batches = self.trace()
+        points = routing.curve(list(range(self.L)), batches, self.E)
+        self.assertEqual(points[0], [0, 0.0])
+        self.assertEqual(points[-1], [self.L * self.E, 1.0])
+        self.assertTrue(all(b[0] > a[0] and b[1] >= a[1] for a, b in zip(points, points[1:])))
+        slots = int(0.1 * self.L * self.E)
+        self.assertGreater(routing.hit_at(points, slots), 2 * slots / (self.L * self.E))
+        self.assertAlmostEqual(routing.hit_at(points, 0), 0.0)
+
+    def test_a_cache_that_holds_everything_hits_after_its_first_refresh(self):
+        batches = self.trace()
+        out = routing.replay(list(range(self.L)), batches, self.E, self.L * self.E)
+        self.assertGreater(out["steady_hit_fraction"], 0.95)
+        self.assertEqual(out["segments"][0][0], 0)  # the span before the first refresh runs with an empty cache
+
+    def test_trace_file_round_trip_and_batches(self):
+        batches = self.trace(steps=3)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "t.bin"
+            with open(path, "wb") as stream:
+                for ids in batches:
+                    for layer in range(self.L):
+                        np.array([layer * 2, ids.shape[1], self.K], dtype=np.int32).tofile(stream)  # layers 0, 2, 4 ...
+                        ids[layer].astype(np.int32).tofile(stream)
+                        if ids.shape[1] <= routing.MAX_ROWS:
+                            # a batch of the cache graph logs a layer twice more: again, and as one reshaped row
+                            np.array([layer * 2, ids.shape[1], self.K], dtype=np.int32).tofile(stream)
+                            ids[layer].astype(np.int32).tofile(stream)
+                            np.array([layer * 2, 1, ids.shape[1] * self.K], dtype=np.int32).tofile(stream)
+                            ids[layer].astype(np.int32).tofile(stream)
+            layers, read = routing.read_trace(path)
+            self.assertEqual(layers, [0, 2, 4, 6, 8, 10])
+            self.assertEqual(len(read), len(batches))
+            for a, b in zip(read, batches):
+                self.assertTrue((a == b).all())
+            summary = routing.trace_summary(layers, read)
+            self.assertEqual((summary["decode_rows"], summary["prompts"]), (6, 2))
+            path.write_bytes(path.read_bytes()[:-5])
+            with self.assertRaises(QuantError):
+                routing.read_trace(path)
+
+    def test_server_lines_are_compared_per_span(self):
+        batches = self.trace()
+        line = ("expert-cache: refresh {i}: {n} resident, 10 uploaded (0 slots reclaimed) in 1.0 ms (memcpy 1, gpu wait 1), "
+                "window covers 100.0%; previous decode hits {v}% selections, 1.0% distinct\n")
+        log = line.format(i=0, n=0, v=0.0) + line.format(i=1, n=30, v=50.0) + (
+            "expert-cache: 2 refreshes, 30 experts uploaded, 1.0 ms; 3 decode-time refreshes, 9 experts, 1.0 ms applying; "
+            "decode hits since last refresh: 60.5% selections, 20.0% distinct\n")
+        result = routing.compare(log, list(range(self.L)), batches, self.E, 30)
+        # the startup refresh without rows is dropped: spans are the one before refresh 1 and the final one
+        self.assertEqual((result["server_spans"], len(result["spans"])), (2, 2))
+        self.assertEqual([r["server_percent"] for r in result["spans"]], [50.0, 60.5])
+
+    def test_memory_reads_the_curve_in_slot_units(self):
+        model = classify(info(), cfg())
+        choices = {g["name"]: g["pool"][0] for g in model["groups"]}
+        base = dict(cfg(cache_mib=2), devices={"ROCm1": 1 << 30, "RAM": 1 << 30})
+        uniform = memory(model, base, choices)
+        self.assertEqual(uniform["cache_hit_source"], "uniform prior")
+        slots = uniform["cache_slots"]
+        curve = {"schema": routing.SCHEMA, "n_expert": 8, "layers": 1, "points": [[0, 0.0], [1, 0.5], [8, 1.0]]}
+        measured = memory(model, dict(base, routing_curve=curve), choices)
+        self.assertEqual(measured["cache_hit_source"], "measured routing curve")
+        self.assertAlmostEqual(measured["cache_hit_prior"], routing.hit_at(curve["points"], slots))
+        self.assertGreater(measured["cache_hit_prior"], uniform["cache_hit_prior"] - 1e-12)
+        # a curve of another model (expert count or layer count) is not used
+        other = memory(model, dict(base, routing_curve=dict(curve, n_expert=16)), choices)
+        self.assertEqual(other["cache_hit_source"], "uniform prior")
+        # more cache, more hits
+        bigger = memory(model, dict(base, cache_mib=4, routing_curve=curve), choices)
+        self.assertGreaterEqual(bigger["cache_hit_prior"], measured["cache_hit_prior"])
+
+    def test_auto_cache_takes_what_the_reserves_and_the_margin_leave(self):
+        model = classify(info(), cfg())
+        choices = {g["name"]: g["pool"][0] for g in model["groups"]}
+        mib = 1 << 20
+        base = cfg(cache_mib="auto", devices={"ROCm1": 40 * mib, "RAM": 1 << 30}, runtime={"env": {"LLAMA_MOE_CACHE_AUTO_MARGIN_MIB": "2"}, "short_tokens": 8, "long_tokens": 128, "ubatch": 128})
+        free = memory(model, base, choices)
+        self.assertGreater(free["cache_slots"], 0)
+        self.assertLessEqual(free["used_bytes"]["ROCm1"] + 2 * mib, 40 * mib)
+        # a projector or a draft model that takes memory on the GPU is a reserve, and the cache gets that much less
+        reserved = memory(model, dict(base, reserve={"ROCm1": 6 * mib}), choices)
+        self.assertLess(reserved["cache_bytes"], free["cache_bytes"])
+        self.assertLessEqual(free["cache_bytes"] - reserved["cache_bytes"], 6 * mib)
+        self.assertGreaterEqual(free["cache_bytes"] - reserved["cache_bytes"], 6 * mib - 2 * free["cache_groups"][0]["expert_bytes"])
+        # no room for an expert of every layer: no cache (the server allocates no tier), but a fixed size is an error
+        none = memory(model, dict(base, reserve={"ROCm1": 40 * mib}), choices)
+        self.assertEqual((none["cache_slots"], none["cache_bytes"]), (0, 0))
+        with self.assertRaises(QuantError):
+            memory(model, dict(base, cache_mib=0.001), choices)
+
+    def test_load_curve_checks_the_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "c.json"
+            path.write_text(json.dumps({"schema": routing.SCHEMA, "points": [[0, 0], [5, 0.4], [9, 0.3]]}))
+            with self.assertRaises(QuantError):
+                routing.load_curve(path)
+            path.write_text(json.dumps({"schema": routing.SCHEMA, "n_expert": 8, "layers": 1, "points": [[0, 0], [5, 0.4], [9, 1]]}))
+            self.assertEqual(routing.load_curve(path)["points"][1], [5, 0.4])
 
 
 if __name__ == "__main__":

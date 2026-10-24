@@ -29,7 +29,9 @@ def inputs(cfg, info):
                          ("llama-quant-damage", "llama-quantize", "test-backend-ops", "llama-bench")},
             "libraries": [file_identity(p) for p in sorted(Path(cfg["bindir"]).glob("lib*.so*")) if not p.is_symlink()],
             "runtime": cfg["runtime"], "timing": cfg["timing"], "timing_model_revision": MODEL_REVISION,
-            "gpu": gpu(cfg), "ram_routed": "RAM" in cfg["devices"], "cache_mib": cfg["cache_mib"],
+            "gpu": gpu(cfg), "ram_routed": "RAM" in cfg["devices"],
+            # whether a cache runs decides which operations are measured; its size is a planning input (the baseline records its own)
+            "cache_mib": cfg["cache_mib"] and 1,
             "machine_settings": machine_settings(),
             "inherited_environment": {name: value for name, value in os.environ.items()
                                       if name.startswith(("GGML_", "LLAMA_", "CUDA_", "HIP_", "HSA_", "ROCR_", "OMP_", "LD_LIBRARY_PATH"))}}
@@ -291,7 +293,9 @@ def prepare(cfg, directory, timeout):
         print("Profiling baseline short/long prefill and decode", flush=True)
         profile_file = directory / "baseline-profile.json"
         with progress.Watcher("prepare: profiling baseline", lambda: None):
-            measured = profile_times(profile_model(cfg, baseline, profile_file, placement=mem.get("layer_split")), cfg)
+            # an auto-sized cache is measured at the size that the plan gives the baseline
+            profiled = {**cfg, "cache_mib": mem["cache_bytes"] // (1 << 20)} if cfg["cache_mib"] == "auto" else cfg
+            measured = profile_times(profile_model(profiled, baseline, profile_file, placement=mem.get("layer_split")), cfg)
     else:
         print("Loss-only weights: skipped the operation timing and the baseline profile", flush=True)
     result = {"schema": SCHEMA, "input_key": key, "config": cfg, "model": info, "damage": damage,
@@ -313,7 +317,11 @@ def load_prepared(path, cfg):
         # Early V1 snapshots omitted the cost-model settings from their key. Upgrade only equivalent inputs.
         legacy = dict(facts)
         legacy.pop("timing")
-        if data["input_key"] == digest(legacy) and cfg["timing"] == data["config"].get("timing", {}):
+        # snapshots made when the key held the cache size itself: the same prepared cache size is the same input
+        sized = dict(facts, cache_mib=data["config"].get("cache_mib", 0))
+        if data["input_key"] == digest(sized) and bool(data["config"].get("cache_mib", 0)) == bool(facts["cache_mib"]):
+            data["input_key"] = digest(facts)
+        elif data["input_key"] == digest(legacy) and cfg["timing"] == data["config"].get("timing", {}):
             data["input_key"] = digest(facts)
         else:
             raise QuantError("model, imatrix, candidates, binary, cost model or runtime changed; prepare again")
@@ -329,7 +337,10 @@ def predictor_for(data, cfg):
                                       .get("decode", {}).get("cpu_compute_ms", {}).get("median"))
     predictor = Predictor(data["model"], cfg, data["operations"], data["baseline"]["choices"],
                           data["baseline"]["measured_ms"], data["slopes"], baseline["cpu_compute_ms"])
-    predictor.baseline_cost = predictor.cost(data["baseline"]["choices"], data["baseline"]["memory"]["cache_hit_prior"])
+    # the baseline was measured with the cache size of the prepared inputs, whatever size the plan asks for
+    prepared_cache = data["config"].get("cache_mib", 0)
+    base = memory(data["model"], {**cfg, "cache_mib": prepared_cache}, data["baseline"]["choices"]) if prepared_cache else None
+    predictor.baseline_cost = predictor.cost(data["baseline"]["choices"], base["cache_hit_prior"] if base else 0.0)
     return predictor
 
 
@@ -371,7 +382,10 @@ def plan(data, cfg, output):
                + (["speed was not measured (loss-only weights)"] if not timed else [
                                "uniform synthetic routing and fixed route frequencies",
                                "link bandwidth and handoff latency are priors unless supplied",
-                               "cache hits use a uniform residency prior; cache policy replay is not calibrated",
+                               *(["cache hits come from the measured routing curve (an offline replay of the cache policy on a routing trace)"
+                                  if cfg.get("routing_curve") else
+                                  "cache hits use a uniform residency prior; no routing curve was measured for this model"]
+                                 if cfg["cache_mib"] else []),
                                "tail ubatches use interpolation; trace integrity has not been certified",
                                "the layers are split over the GPUs by memory (layer_split), with timings from operations measured on the first GPU and summed over the devices; pipeline overlap between GPUs is not modelled"
                                if gpu_only(cfg) else
@@ -390,6 +404,10 @@ def plan(data, cfg, output):
     status = "user GPU projection from the single-GPU baseline" if projection else "qualified on held-out witnesses" if qualified else "unqualified estimates"
     print(f"Saved {outdir / 'frontier.json'}" + (f"; timing predictions are {status}" if timed else ""))
     print(runtime_summary(cfg))
+    if cfg["cache_mib"] and recipes:
+        mem = recipes[0]["memory"]
+        print(f"Expert cache of the best recipe: {mem['cache_slots']} slots, {mem['cache_bytes'] / (1 << 20):.0f} MiB, "
+              f"predicted hit share {100 * mem['cache_hit_prior']:.1f} % ({mem['cache_hit_source']})")
     if table:
         print(f"Predicted KL is against the teacher on the calibration text (floor {table['floor']['kl']:.5f}); max_loss is a model ceiling, not a bound")
         beyond = [len(state["extrapolated_groups"]) for state in recipes if state["extrapolated_groups"]]

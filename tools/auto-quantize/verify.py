@@ -17,7 +17,7 @@ from pathlib import Path
 
 import capacity as cap
 import progress
-from config import QuantError, write_json
+from config import QuantError, cache_env, write_json
 from model import lazy_args
 
 MIB = 1 << 20
@@ -47,7 +47,7 @@ def server_command(cfg, model, runtime_args, serve, port):
 
 def server_env(cfg):
     env = dict(cfg["runtime"]["env"])
-    env["LLAMA_MOE_CACHE_MIB"] = str(int(cfg["cache_mib"]))
+    env["LLAMA_MOE_CACHE_MIB"] = cache_env(cfg["cache_mib"])
     return env
 
 

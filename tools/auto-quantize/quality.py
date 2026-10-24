@@ -207,8 +207,6 @@ def load_quality(info, cfg, prepared):
         raise QuantError("quality table was fitted to different sampled damage; calibrate with this prepared directory")
     if table["floor"]["choices"] != prepared["baseline"]["choices"]:
         raise QuantError("quality table floor differs from the prepared minimum-byte baseline")
-    if cfg["cache_mib"]:
-        raise QuantError("quality tables with an expert cache need separate calibration and are not implemented")
     for role, entry in table["roles"].items():
         knots, values = entry["knots"], entry["log_s"]
         if not knots or len(knots) != len(values) or any(b <= a for a, b in zip(knots, knots[1:])):

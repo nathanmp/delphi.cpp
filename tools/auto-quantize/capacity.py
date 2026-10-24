@@ -25,6 +25,9 @@ RUNTIME_RESERVE = 768 * MIB
 RUNTIME_RESERVE_MTP = 1024 * MIB
 RUNTIME_RESERVE_MTP_BLOCK = 1792 * MIB
 RUNTIME_FILE = "runtime-reserve.json"
+# KV cache and compute buffers of a draft model that sits next to the target (llama-fit-params cannot size it): the DSpark
+# draft of DeepSeek V4.1 Flash (7603 MiB of weights) took 7746 MiB of the expert cache's auto size on ROCm1, 143 MiB more
+DRAFT_CONTEXT = 192 * MIB
 DEVICE_NAME = r"RAM|(?:CUDA|ROCm)[0-9]+"
 
 
@@ -198,8 +201,8 @@ def measure_reserves(cfg, serve, gpus, split, ram_routed, work=None):
     Returns {"command", "mtp", "per_device": {device: {"context", "compute", "mmproj", "draft", "runtime", "total"}}}.
     The multimodal projector goes to the first device, as the server does it. With MTP (serves_mtp) the context includes
     the recurrent states of the draft and "draft" is the MTP draft context; the MTP weights are part of the model. A draft
-    file counts its size on its device (default the first); fit-params cannot size a draft model alone, so its KV and
-    compute buffers are not included. "runtime" is the memory that no ggml buffer reports (runtime_reserves)."""
+    file counts its size on its device (default the first) and DRAFT_CONTEXT for its KV and compute buffers, which
+    fit-params cannot size. "runtime" is the memory that no ggml buffer reports (runtime_reserves)."""
     mtp = serves_mtp(cfg, serve)
     command = [str(Path(cfg["bindir"]) / "llama-fit-params"), "-m", cfg["model"], "-fitp", "on", "--device", ",".join(gpus),
                "-ngl", "999", *serving_args(serve), *lazy_args(cfg)]
@@ -225,7 +228,7 @@ def measure_reserves(cfg, serve, gpus, split, ram_routed, work=None):
     if serve.get("mmproj") and not any(mmproj.get(name) for name in gpus):
         raise QuantError("llama-fit-params printed no projector memory; build it from this tree (--mmproj support)")
     if serve.get("draft"):
-        result[serve.get("draft_device") or gpus[0]]["draft"] = os.path.getsize(serve["draft"])
+        result[serve.get("draft_device") or gpus[0]]["draft"] = os.path.getsize(serve["draft"]) + DRAFT_CONTEXT
     for entry in result.values():
         entry["total"] = entry["context"] + entry["compute"] + entry["mmproj"] + entry["draft"] + entry["runtime"]
     return {"command": command, "mtp": mtp, "per_device": result}
