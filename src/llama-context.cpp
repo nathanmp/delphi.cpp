@@ -782,6 +782,16 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
             // but is still wrong for cases like --no-kv-offload.
             ggml_backend_dev_t device_layer = model.dev_layer(node.il);
 
+            // The scheduler can place a fused node that has no weights of its own on the device of its inputs, which
+            // at a layer split is the previous layer's device. That is not missing support: only disable the op when
+            // the layer's device cannot run it.
+            if (device_fused != device_layer && device_layer && ggml_backend_dev_supports_op(device_layer, node.tensor)) {
+                LLAMA_LOG_DEBUG("%s: layer %d: %s is on device %s, layer on %s, which supports it\n", func, node.il,
+                        probe.name, device_fused ? ggml_backend_dev_name(device_fused) : "none",
+                        ggml_backend_dev_name(device_layer));
+                continue;
+            }
+
             if (device_fused != device_layer) {
                 LLAMA_LOG_WARN("%s: layer %d is assigned to device %s but %s "
                         "is assigned to device %s (usually due to missing support)\n",
