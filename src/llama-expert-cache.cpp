@@ -313,7 +313,7 @@ const llama_expert_cache::entry * llama_expert_cache::layer(int il) const {
 
 ggml_tensor * llama_expert_cache::hot_ids(int t, int il) const {
     const auto & l = layers[il];
-    return l.owner && tiers[t].groups[l.group].n > 0 && (!local_only || tiers[t].backend == backend(il)) ? tiers[t].hot_ids[il] : nullptr;
+    return l.owner && tiers[t].groups[l.group].n > 0 && (!local_only || tiers[t].pinned || tiers[t].backend == backend(il)) ? tiers[t].hot_ids[il] : nullptr;
 }
 
 // Global slots run over the tiers in order, then over their groups; refresh() fills the lowest free slots first, so the best
@@ -356,13 +356,15 @@ bool llama_expert_cache::make_tier(tier & t, ggml_backend_t backend, size_t byte
     if (role != llama_expert_device_role::automatic) {
         t.fixed = role == llama_expert_device_role::fixed || role == llama_expert_device_role::pinned;
         t.pinned = role == llama_expert_device_role::pinned;
+        LLAMA_LOG_INFO("expert-cache: %s role %s\n", ggml_backend_name(backend),
+                t.pinned ? "pinned" : t.fixed ? "static" : "rotate");
     }
     // The same number of slots for every layer that the tier serves (with local_only, the layers on its GPU): a group's share
     // of the budget follows its layers and its expert size.
     std::vector<int64_t> served(group_types.size(), 0);
     size_t served_bytes = 0;
     for (const auto & l : layers) {
-        if (l.owner && (!local_only || this->backend(l.il) == backend)) {
+        if (l.owner && (!local_only || t.pinned || this->backend(l.il) == backend)) {
             served[l.group]++;
             served_bytes += group_bytes[l.group];
         }
@@ -519,6 +521,7 @@ std::unique_ptr<llama_expert_cache> llama_expert_cache::create(
     if (sharing && c.homes.size() > 1) { throw std::runtime_error("LLAMA_MOE_PREFILL_SHARE requires the cached layers on one GPU"); }
     // With the cached layers on several GPUs, each layer uses the tiers on its own GPU: a tier on another GPU adds a copy to
     // that GPU and back per layer (and the scheduler worker cannot make it without peer access between CUDA devices).
+    // An explicit pinned tier can serve every layer, so that a slow-link device can hold the global hot set without fills.
     c.local_only = c.homes.size() > 1;
     if (const char * env = getenv("LLAMA_MOE_CACHE_LOCAL")) { c.local_only = atoi(env) != 0; }
     if (n_gpu_layers > 0) {
@@ -630,6 +633,10 @@ std::unique_ptr<llama_expert_cache> llama_expert_cache::create(
 }
 
 int llama_expert_cache::add_tier(ggml_backend_t backend, size_t bytes) {
+    if (device_policy.role(ggml_backend_dev_name(ggml_backend_get_device(backend))) == llama_expert_device_role::off) {
+        LLAMA_LOG_INFO("expert-cache: tier disabled by device policy on %s\n", ggml_backend_name(backend));
+        return -1;
+    }
     if ((int) tiers.size() >= max_tiers) {
         LLAMA_LOG_WARN("expert-cache: cannot add a tier: %d tiers already\n", max_tiers);
         return -1;
@@ -1414,7 +1421,9 @@ bool llama_expert_cache::auto_device(ggml_backend_dev_t dev) const {
 }
 
 bool llama_expert_cache::serves_remote(ggml_backend_t b) const {
-    if (local_only) { return false; }
+    if (local_only && std::none_of(tiers.begin(), tiers.end(), [&](const tier & t) { return t.backend == b && t.pinned; })) {
+        return false;
+    }
     for (const auto & l : layers) {
         if (l.owner && backend(l.il) != b) { return true; }
     }
@@ -1437,17 +1446,24 @@ void llama_expert_cache::plan(int64_t max_jobs, int64_t max_swaps, std::vector<u
         return a.score != b.score ? a.score > b.score : std::tie(a.il, a.e) < std::tie(b.il, b.e);
     };
     const auto weakest = [&](const candidate & a, const candidate & b) { return by_score(b, a); };
-    std::vector<std::vector<bool>> stat(layers.size()); // static members after the plan
-    for (const auto & l : layers) { if (l.owner) { stat[l.il].assign(n_expert, false); } }
+    std::vector<std::vector<bool>> stat(layers.size()), pin(layers.size()); // static and pinned members after the plan
+    for (const auto & l : layers) {
+        if (l.owner) { stat[l.il].assign(n_expert, false); pin[l.il].assign(n_expert, false); }
+    }
     std::vector<int64_t> n_fixed(n_groups, 0), n_rot(n_groups, 0);
     std::vector<std::vector<int64_t>> free_fixed(n_groups), free_rot(n_groups);
+    std::vector<std::vector<int64_t>> free_pin(group_types.size());
     for (int64_t s = (int64_t) owner_of.size() - 1; s >= 0; --s) { // lowest free slot at the back
         if (!slot_usable(s)) { continue; }
-        const int g = pool_of_slot(s);
         const auto [il, e] = owner_of[s];
+        if (pinned(s)) {
+            if (il < 0) { free_pin[where[s].second].push_back(s); }
+            else { stat[il][e] = pin[il][e] = true; }
+            continue;
+        }
+        const int g = pool_of_slot(s);
         if (fixed(s)) {
-            // Pinned members keep their slots even when the hottest set changes. Empty slots can still be populated.
-            n_fixed[g] += il < 0 || !pinned(s);
+            n_fixed[g]++;
             if (il < 0) { free_fixed[g].push_back(s); } else { stat[il][e] = true; }
         } else {
             n_rot[g]++;
@@ -1455,8 +1471,28 @@ void llama_expert_cache::plan(int64_t max_jobs, int64_t max_swaps, std::vector<u
         }
     }
 
-    for (auto & slots : free_fixed) {
-        std::stable_partition(slots.begin(), slots.end(), [&](int64_t s) { return !pinned(s); });
+    // Pinned slots span layer domains. Populate them first, but never replace an existing member.
+    if (std::any_of(free_pin.begin(), free_pin.end(), [](const std::vector<int64_t> & slots) { return !slots.empty(); })) {
+        std::vector<candidate> hot;
+        for (const auto & l : layers) {
+            if (!l.owner) { continue; }
+            for (int e = 0; e < n_expert; ++e) {
+                const double score = heat_score(l, e);
+                if (!pin[l.il][e] && score > 0) { hot.push_back({score, l.il, e}); }
+            }
+        }
+        std::sort(hot.begin(), hot.end(), by_score);
+        for (const auto & c : hot) {
+            if (!room()) { break; }
+            auto & slots = free_pin[layers[c.il].group];
+            if (slots.empty()) { continue; }
+            jobs.push_back({c.il, c.e, (int) slots.back()});
+            evict.push_back({-1, -1});
+            slots.pop_back();
+            stat[c.il][c.e] = pin[c.il][c.e] = true;
+            const int64_t old = layers[c.il].slot[c.e];
+            if (old >= 0 && fixed(old)) { free_fixed[pool_of_slot(old)].push_back(old); }
+        }
     }
 
     // static tiers: the experts of most heat in each group
@@ -1465,7 +1501,7 @@ void llama_expert_cache::plan(int64_t max_jobs, int64_t max_swaps, std::vector<u
         for (const auto & l : layers) {
             if (!l.owner) { continue; }
             for (int e = 0; e < n_expert; ++e) {
-                if (l.slot[e] >= 0 && pinned(l.slot[e])) { continue; }
+                if (pin[l.il][e]) { continue; }
                 const double score = heat_score(l, e);
                 if (score > 0) { hot.push_back({score, l.il, e}); }
             }
@@ -1483,7 +1519,7 @@ void llama_expert_cache::plan(int64_t max_jobs, int64_t max_swaps, std::vector<u
         }
         for (int64_t s = 0; s < (int64_t) owner_of.size(); ++s) {
             const auto [il, e] = owner_of[s];
-            if (il >= 0 && fixed(s) && !pinned(s) && slot_usable(s) && (want[il].empty() || !want[il][e])) {
+            if (il >= 0 && fixed(s) && !pin[il][e] && slot_usable(s) && (want[il].empty() || !want[il][e])) {
                 leave[pool_of_slot(s)].push_back({heat_score(layers[il], e), il, e});
             }
         }

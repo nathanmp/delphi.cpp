@@ -79,7 +79,7 @@ struct llama_expert_cache {
     int n_tiers() const { return (int) tiers.size(); }
     ggml_backend_t tier_backend(int t) const { return tiers[t].backend; }
     // GPU I32 [1, n_expert] of tier t for layer il: expert -> slot in the tier's bank, or -1. Null if the tier has no slots for
-    // the layer's group.
+    // the layer's group. Pinned tiers also serve layers outside their device's domain.
     ggml_tensor * hot_ids(int t, int il) const;
     // gate (0), up (1) or down (2) bank of tier t for the layer's group
     ggml_tensor * bank(int t, int il, int p) const { return tiers[t].groups[layers[il].group].banks[p]; }
