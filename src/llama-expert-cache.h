@@ -2,6 +2,7 @@
 
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
+#include "llama-expert-device.h"
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -54,7 +55,7 @@ struct llama_expert_cache {
     };
 
     static std::unique_ptr<llama_expert_cache> create(const llama_model & model, const std::vector<ggml_backend_ptr> & backends,
-            bool allow_prefill_overlap);
+            bool allow_prefill_overlap, const llama_expert_device_policy & device_policy = {});
     // LLAMA_MOE_CACHE_MIB unset or "auto" (and no LLAMA_MOE_CACHE_SHARED): the cache is on when the model allows it, and its
     // tiers are sized from the free memory of the GPUs at the first decode (llama_context::expert_cache_auto). An unsupported
     // model then gets no cache instead of an error.
@@ -73,6 +74,7 @@ struct llama_expert_cache {
     bool serves_remote(ggml_backend_t b) const;
     // a cached layer is on dev
     bool is_home(ggml_backend_dev_t dev) const;
+    bool auto_device(ggml_backend_dev_t dev) const;
 
     int n_tiers() const { return (int) tiers.size(); }
     ggml_backend_t tier_backend(int t) const { return tiers[t].backend; }
@@ -133,6 +135,7 @@ private:
         std::vector<group> groups;          // per type group
         std::vector<ggml_tensor *> hot_ids; // per layer, null for layers without routed experts
         bool fixed = false;                 // static tier (LLAMA_MOE_CACHE_STATIC): the hottest experts by heat
+        bool pinned = false;                // populated members cannot be replaced or lent to staging
     };
     struct candidate { double score; int il, e; };
     struct async_refresh;
@@ -176,6 +179,7 @@ private:
     void init_prefill(uint32_t min_reuse, bool gpu_only, bool allow_overlap);
 
     const llama_model * model = nullptr;
+    llama_expert_device_policy device_policy;
     ggml_backend_t gpu = nullptr;
     std::vector<ggml_backend_t> layer_gpu; // per layer, null for layers that are not cached
     std::vector<ggml_backend_t> homes;     // the GPUs of the cached layers

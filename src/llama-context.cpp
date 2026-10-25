@@ -114,6 +114,14 @@ llama_context::llama_context(
     balloc(std::make_unique<llama_batch_allocr>(model.hparams.n_pos_per_embd())) {
     ggml_exec_trace_init();
 
+    expert_device_policy = llama_expert_device_policy::from_env();
+    std::vector<std::string> gpu_names;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        auto * dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) { gpu_names.emplace_back(ggml_backend_dev_name(dev)); }
+    }
+    expert_device_policy.validate(gpu_names);
+
     // TODO warning when creating llama_context with awkward ctx size that is not a power of 2,
     //     may need to be backend-dependent
     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
@@ -648,7 +656,7 @@ llama_context::llama_context(
         if (params.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && params.ctx_other == nullptr) {
             try {
                 // Eval callbacks execute subgraphs. Preserve their original CPU readiness boundary.
-                expert_cache = llama_expert_cache::create(model, backends, cparams.cb_eval == nullptr);
+                expert_cache = llama_expert_cache::create(model, backends, cparams.cb_eval == nullptr, expert_device_policy);
             } catch (const std::exception & e) {
                 if (!llama_expert_cache::auto_requested()) {
                     throw;
@@ -3537,10 +3545,6 @@ void llama_context::expert_cache_auto() {
         return;
     }
     expert_cache->auto_size = false;
-    const size_t margin = [] {
-        const char * e = getenv("LLAMA_MOE_CACHE_AUTO_MARGIN_MIB");
-        return size_t(e ? std::max(0LL, atoll(e)) : 1536LL) << 20;
-    }();
     synchronize();
     // staging slots of their own go back, so that the rings borrow from the tiers instead
     ggml_backend_sched_stage_release(sched.get());
@@ -3551,21 +3555,22 @@ void llama_context::expert_cache_auto() {
     }
     // tiers on the GPUs of the cached layers only, unless LLAMA_MOE_CACHE_AUTO_REMOTE=1 (a tier on another GPU costs a copy to it
     // and back per layer)
-    const bool remote = [] { const char * e = getenv("LLAMA_MOE_CACHE_AUTO_REMOTE"); return e && atoi(e) != 0; }();
     for (const auto & d : model.devices) {
-        if (ggml_backend_dev_type(d.dev) != GGML_BACKEND_DEVICE_TYPE_GPU || (!remote && !expert_cache->is_home(d.dev))) {
+        const std::string name = ggml_backend_dev_name(d.dev);
+        if (!expert_cache->auto_device(d.dev)) {
             continue;
         }
         size_t free = 0, total = 0;
         ggml_backend_dev_memory(d.dev, &free, &total);
-        if (free <= margin) {
+        const size_t budget = expert_device_policy.auto_budget(name, free);
+        if (!budget) {
             LLAMA_LOG_INFO("%s: expert cache auto: %s has %.0f MiB free, no tier\n", __func__, ggml_backend_dev_name(d.dev),
                     free / 1048576.0);
             continue;
         }
-        const int id = share_add_tier(d.dev, free - margin);
-        LLAMA_LOG_INFO("%s: expert cache auto: %s %.0f MiB free, tier %d of up to %.0f MiB\n", __func__,
-                ggml_backend_dev_name(d.dev), free / 1048576.0, id, (free - margin) / 1048576.0);
+        const int id = share_add_tier(d.dev, budget);
+        LLAMA_LOG_INFO("%s: expert cache auto: %s %.0f MiB free, %.0f MiB reserve, tier %d of up to %.0f MiB\n", __func__,
+                name.c_str(), free / 1048576.0, expert_device_policy.margin(name) / 1048576.0, id, budget / 1048576.0);
     }
 }
 
@@ -3575,7 +3580,9 @@ void llama_context::sched_set_stage_lender() {
         ggml_backend_sched_set_stage_lender(sched.get(), llama_expert_cache::lend, expert_cache.get());
     }
     for (auto & b : backends) {
-        if (std::find(stage_blocked.begin(), stage_blocked.end(), ggml_backend_get_device(b.get())) != stage_blocked.end()) {
+        auto * dev = ggml_backend_get_device(b.get());
+        if (dev && (!expert_device_policy.stage_allowed(ggml_backend_dev_name(dev)) ||
+                std::find(stage_blocked.begin(), stage_blocked.end(), dev) != stage_blocked.end())) {
             ggml_backend_sched_stage_allow(sched.get(), b.get(), false);
         }
     }
@@ -3780,10 +3787,11 @@ void llama_context::share_stage_allow(ggml_backend_dev_t dev, bool allow) {
         if (ggml_backend_get_device(b.get()) != dev) {
             continue;
         }
-        ggml_backend_sched_stage_allow(sched.get(), b.get(), allow);
+        const bool permitted = allow && expert_device_policy.stage_allowed(ggml_backend_dev_name(dev));
+        ggml_backend_sched_stage_allow(sched.get(), b.get(), permitted);
         for (auto & slot : graph_slots) {
             if (slot.sched) {
-                ggml_backend_sched_stage_allow(slot.sched.get(), b.get(), allow);
+                ggml_backend_sched_stage_allow(slot.sched.get(), b.get(), permitted);
             }
         }
     }
@@ -5106,16 +5114,10 @@ bool llama_share_has_cache_on_device(const llama_context * ctx, const char * dev
     if (!cache || !d) {
         return false;
     }
-    if (cache->auto_size) {
-        if (cache->is_home(d)) {
-            return true;
-        }
-        const char * remote = getenv("LLAMA_MOE_CACHE_AUTO_REMOTE");
-        if (remote && atoi(remote) != 0 && ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU) {
-            for (const auto & device : ctx->get_model().devices) {
-                if (device.dev == d) {
-                    return true;
-                }
+    if (cache->auto_size && cache->auto_device(d)) {
+        for (const auto & device : ctx->get_model().devices) {
+            if (device.dev == d) {
+                return true;
             }
         }
     }

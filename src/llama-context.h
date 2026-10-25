@@ -4,6 +4,7 @@
 #include "llama-ext.h"
 #include "llama-cparams.h"
 #include "llama-expert-cache.h"
+#include "llama-expert-device.h"
 #include "llama-graph.h"
 #include "llama-adapter.h"
 #include "llama-impl.h"
@@ -415,6 +416,7 @@ private:
     ggml_backend_buffer_ptr  attn_split_buf;
     std::vector<ggml_backend_ptr> backends;
     std::unique_ptr<llama_expert_cache> expert_cache;
+    llama_expert_device_policy expert_device_policy;
 
     // delphi: VRAM sharing. share_gen changes the graphs (graph reuse); mem_params create the memory module again after a release.
     uint64_t            share_gen = 0;

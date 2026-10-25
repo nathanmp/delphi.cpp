@@ -333,6 +333,8 @@ void llama_expert_cache::renumber() {
 }
 
 bool llama_expert_cache::make_tier(tier & t, ggml_backend_t backend, size_t bytes) {
+    const auto role = device_policy.role(ggml_backend_dev_name(ggml_backend_get_device(backend)));
+    if (role == llama_expert_device_role::off) { return false; }
     // the hot experts run as MUL_MAT_ID on the GPU banks
     ggml_context_ptr probe(ggml_init({12 * group_types.size() * ggml_tensor_overhead(), nullptr, true}));
     for (const auto & types : group_types) {
@@ -350,6 +352,10 @@ bool llama_expert_cache::make_tier(tier & t, ggml_backend_t backend, size_t byte
     if (const char * env = getenv("LLAMA_MOE_CACHE_STATIC")) {
         const std::string list = std::string(",") + env + ",";
         t.fixed = list.find(std::string(",") + ggml_backend_dev_name(ggml_backend_get_device(backend)) + ",") != std::string::npos;
+    }
+    if (role != llama_expert_device_role::automatic) {
+        t.fixed = role == llama_expert_device_role::fixed || role == llama_expert_device_role::pinned;
+        t.pinned = role == llama_expert_device_role::pinned;
     }
     // The same number of slots for every layer that the tier serves (with local_only, the layers on its GPU): a group's share
     // of the budget follows its layers and its expert size.
@@ -407,7 +413,8 @@ bool llama_expert_cache::auto_requested() {
 }
 
 std::unique_ptr<llama_expert_cache> llama_expert_cache::create(
-        const llama_model & model, const std::vector<ggml_backend_ptr> & backends, bool allow_prefill_overlap) {
+        const llama_model & model, const std::vector<ggml_backend_ptr> & backends, bool allow_prefill_overlap,
+        const llama_expert_device_policy & device_policy) {
     // LLAMA_MOE_CACHE_SHARED=1: a cache without a static tier, for tiers leased at run time (VRAM sharing)
     const char * budget_env = getenv("LLAMA_MOE_CACHE_MIB");
     const char * shared_env = getenv("LLAMA_MOE_CACHE_SHARED");
@@ -420,6 +427,7 @@ std::unique_ptr<llama_expert_cache> llama_expert_cache::create(
     if (model.hparams.no_alloc) { return nullptr; }
     auto result = std::unique_ptr<llama_expert_cache>(new llama_expert_cache);
     result->model = &model;
+    result->device_policy = device_policy;
     result->auto_size = auto_size;
     if (const char * env = getenv("LLAMA_MOE_CACHE_WINDOW")) { result->window = atoll(env); }
     if (const char * env = getenv("LLAMA_MOE_CACHE_PREFILL")) { result->record_prompts = atoi(env) != 0; }
@@ -569,7 +577,11 @@ std::unique_ptr<llama_expert_cache> llama_expert_cache::create(
         c.prefill_min_rows = std::max<int64_t>(max_rows + 1, min_env ? atoll(min_env) : 512);
         c.prefill_max_rows = std::max<int64_t>(max_rows, max_env ? atoll(max_env) : 2047);
         if (c.prefill_min_rows > c.prefill_max_rows) { throw std::runtime_error("moe-prefill minimum rows exceeds maximum rows"); }
-        c.init_prefill(reuse, gpu_only, allow_prefill_overlap);
+        if (device_policy.stage_allowed(ggml_backend_dev_name(ggml_backend_get_device(c.gpu)))) {
+            c.init_prefill(reuse, gpu_only, allow_prefill_overlap);
+        } else {
+            LLAMA_LOG_INFO("%s: selected-expert prefill staging disabled by device policy on %s\n", __func__, ggml_backend_name(c.gpu));
+        }
     }
 
     std::string desc;
@@ -577,7 +589,7 @@ std::unique_ptr<llama_expert_cache> llama_expert_cache::create(
         desc += format("%s%s/%s/%s x %lld layers", g ? ", " : "", ggml_type_name(c.group_types[g][0]), ggml_type_name(c.group_types[g][1]),
                 ggml_type_name(c.group_types[g][2]), (long long) c.group_layers[g]);
     }
-    if (budget_mib <= 0) {
+    if (budget_mib <= 0 || device_policy.role(ggml_backend_dev_name(ggml_backend_get_device(c.gpu))) == llama_expert_device_role::off) {
         LLAMA_LOG_WARN("%s: no static tier (%s); %s; window %lld rows, prompts %s, hysteresis %.2f, decode-time refresh every %lld small batches (up to %lld experts)\n", __func__,
                 auto_size ? "auto: tiers at the first decode" : sharing ? "prefill only" : "LLAMA_MOE_CACHE_SHARED", desc.c_str(), (long long) c.window,
                 c.record_prompts ? "on" : "off", c.hysteresis, (long long) c.every, (long long) c.max_async);
@@ -638,7 +650,7 @@ int llama_expert_cache::add_tier(ggml_backend_t backend, size_t bytes) {
     gen++;
     pending = true; // filled at the next small batch
     LLAMA_LOG_WARN("expert-cache: tier %d: %lld slots, %.1f MiB on %s%s (%zu tiers)\n", tiers.back().id, (long long) n,
-            size / 1048576.0, ggml_backend_name(backend), tiers.back().fixed ? ", static" : "", tiers.size());
+            size / 1048576.0, ggml_backend_name(backend), tiers.back().pinned ? ", pinned" : tiers.back().fixed ? ", static" : "", tiers.size());
     return tiers.back().id;
 }
 
@@ -1071,7 +1083,7 @@ bool llama_expert_cache::lend(void * user_data, ggml_backend_t backend, int n_sl
     group * lg = nullptr;
     int64_t best_evict = 0;
     for (auto & t : c.tiers) {
-        if (t.backend != backend) { continue; }
+        if (t.backend != backend || t.pinned) { continue; }
         for (auto & g : t.groups) {
             if (top(g) <= 0) { continue; }
             const int64_t evict = resident_above(g, top(g));
@@ -1393,6 +1405,14 @@ bool llama_expert_cache::is_home(ggml_backend_dev_t dev) const {
     return std::any_of(homes.begin(), homes.end(), [&](ggml_backend_t b) { return ggml_backend_get_device(b) == dev; });
 }
 
+bool llama_expert_cache::auto_device(ggml_backend_dev_t dev) const {
+    if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) { return false; }
+    const auto role = device_policy.role(ggml_backend_dev_name(dev));
+    const char * remote = getenv("LLAMA_MOE_CACHE_AUTO_REMOTE");
+    return role != llama_expert_device_role::off &&
+        (is_home(dev) || role != llama_expert_device_role::automatic || (remote && atoi(remote) != 0));
+}
+
 bool llama_expert_cache::serves_remote(ggml_backend_t b) const {
     if (local_only) { return false; }
     for (const auto & l : layers) {
@@ -1412,6 +1432,7 @@ void llama_expert_cache::plan(int64_t max_jobs, int64_t max_swaps, std::vector<u
     const size_t n_groups = n_pools(); // slot pools
     const auto room = [&] { return max_jobs < 0 || (int64_t) jobs.size() < max_jobs; };
     const auto fixed = [&](int64_t s) { return tiers[where[s].first].fixed; };
+    const auto pinned = [&](int64_t s) { return tiers[where[s].first].pinned; };
     const auto by_score = [](const candidate & a, const candidate & b) {
         return a.score != b.score ? a.score > b.score : std::tie(a.il, a.e) < std::tie(b.il, b.e);
     };
@@ -1425,12 +1446,17 @@ void llama_expert_cache::plan(int64_t max_jobs, int64_t max_swaps, std::vector<u
         const int g = pool_of_slot(s);
         const auto [il, e] = owner_of[s];
         if (fixed(s)) {
-            n_fixed[g]++;
+            // Pinned members keep their slots even when the hottest set changes. Empty slots can still be populated.
+            n_fixed[g] += il < 0 || !pinned(s);
             if (il < 0) { free_fixed[g].push_back(s); } else { stat[il][e] = true; }
         } else {
             n_rot[g]++;
             if (il < 0) { free_rot[g].push_back(s); }
         }
+    }
+
+    for (auto & slots : free_fixed) {
+        std::stable_partition(slots.begin(), slots.end(), [&](int64_t s) { return !pinned(s); });
     }
 
     // static tiers: the experts of most heat in each group
@@ -1439,6 +1465,7 @@ void llama_expert_cache::plan(int64_t max_jobs, int64_t max_swaps, std::vector<u
         for (const auto & l : layers) {
             if (!l.owner) { continue; }
             for (int e = 0; e < n_expert; ++e) {
+                if (l.slot[e] >= 0 && pinned(l.slot[e])) { continue; }
                 const double score = heat_score(l, e);
                 if (score > 0) { hot.push_back({score, l.il, e}); }
             }
@@ -1456,7 +1483,7 @@ void llama_expert_cache::plan(int64_t max_jobs, int64_t max_swaps, std::vector<u
         }
         for (int64_t s = 0; s < (int64_t) owner_of.size(); ++s) {
             const auto [il, e] = owner_of[s];
-            if (il >= 0 && fixed(s) && slot_usable(s) && (want[il].empty() || !want[il][e])) {
+            if (il >= 0 && fixed(s) && !pinned(s) && slot_usable(s) && (want[il].empty() || !want[il][e])) {
                 leave[pool_of_slot(s)].push_back({heat_score(layers[il], e), il, e});
             }
         }
