@@ -2,10 +2,12 @@
 #include "../src/llama-model.h"
 #include "../src/llama-model-saver.h"
 #include "llama-cpp.h"
+#include "ggml-cpu.h"
 
 #undef NDEBUG
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -13,6 +15,7 @@
 #include <random>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 static void env(const char * name, const std::string & value) {
@@ -35,6 +38,7 @@ static void fill(ggml_tensor * tensor, void *) {
 }
 
 static llama_model_ptr make_model(const std::vector<ggml_backend_dev_t> & devices, bool layer_split = false) {
+    const int n_layers = layer_split ? 4 : 3;
     gguf_context_ptr metadata(gguf_init_empty());
     llama_model_saver ms(LLM_ARCH_QWEN2MOE, metadata.get());
     ms.add_kv(LLM_KV_GENERAL_ARCHITECTURE, "qwen2moe");
@@ -42,7 +46,7 @@ static llama_model_ptr make_model(const std::vector<ggml_backend_dev_t> & device
     ms.add_kv(LLM_KV_VOCAB_SIZE, uint32_t(128));
     ms.add_kv(LLM_KV_CONTEXT_LENGTH, uint32_t(2048));
     ms.add_kv(LLM_KV_EMBEDDING_LENGTH, uint32_t(128));
-    ms.add_kv(LLM_KV_BLOCK_COUNT, uint32_t(3));
+    ms.add_kv(LLM_KV_BLOCK_COUNT, uint32_t(n_layers));
     ms.add_kv(LLM_KV_FEED_FORWARD_LENGTH, uint32_t(256));
     ms.add_kv(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, uint32_t(256));
     ms.add_kv(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, uint32_t(128));
@@ -51,7 +55,7 @@ static llama_model_ptr make_model(const std::vector<ggml_backend_dev_t> & device
     ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT, uint32_t(2));
     ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, uint32_t(2));
     ms.add_kv(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, 1e-5f);
-    for (int il = 0; il < 3; ++il) {
+    for (int il = 0; il < n_layers; ++il) {
         for (const char * projection : {"gate", "up", "down"}) {
             ggml_tensor tensor = {};
             tensor.type = GGML_TYPE_Q4_0;
@@ -61,7 +65,7 @@ static llama_model_ptr make_model(const std::vector<ggml_backend_dev_t> & device
     }
     auto params = llama_model_default_params();
     const float split_single[] = {0, 0, 0, 1};
-    const float split_layers[] = {1, 1, 1, 1};
+    const float split_layers[] = {1, 1, 1, 2}; // four dense layers plus the output layer
     const llama_model_tensor_buft_override overrides[] = {
         {"ffn_(gate|up|down)_exps", ggml_backend_dev_buffer_type(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU))},
         {nullptr, nullptr},
@@ -73,28 +77,38 @@ static llama_model_ptr make_model(const std::vector<ggml_backend_dev_t> & device
     params.tensor_buft_overrides = overrides;
     params.n_gpu_layers = 999;
     params.split_mode = LLAMA_SPLIT_MODE_LAYER;
-    return llama_model_ptr(llama_model_init_from_user(metadata.get(), fill, nullptr, params));
+    llama_model_ptr model(llama_model_init_from_user(metadata.get(), fill, nullptr, params));
+    // User-data loading creates optional scales too. The fixture uses ordinary unscaled Q4_0 expert banks.
+    if (model) {
+        for (auto & layer : model->layers) {
+            layer.ffn_gate_exps_s = layer.ffn_up_exps_s = layer.ffn_down_exps_s = nullptr;
+            layer.ffn_gate_exps_in_s = layer.ffn_up_exps_in_s = layer.ffn_down_exps_in_s = nullptr;
+        }
+    }
+    return model;
 }
 
-static void record(llama_expert_cache & cache, ggml_backend_t cpu, int first) {
+static void record(llama_expert_cache & cache, ggml_backend_t cpu, int first, bool refresh = true) {
     ggml_context_ptr ctx(ggml_init({size_t(1) << 20, nullptr, true}));
     auto * ids = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 2, 256);
     auto * graph = ggml_new_graph_custom(ctx.get(), 64, false);
-    for (int il = 0; il < 3; ++il) { ggml_build_forward_expand(graph, cache.build_record(ctx.get(), ids, il)); }
+    for (int il = 0; cache.layer(il); ++il) { ggml_build_forward_expand(graph, cache.build_record(ctx.get(), ids, il)); }
     ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), cpu));
     assert(buffer);
     std::vector<int32_t> route(512);
-    for (size_t i = 0; i < route.size(); ++i) { route[i] = first + i % 32; }
+    for (size_t i = 0; i < route.size(); ++i) { route[i] = first + i % (i < 128 ? 2 : 32); }
     ggml_backend_tensor_set(ids, route.data(), 0, route.size() * sizeof(int32_t));
     assert(ggml_backend_graph_compute(cpu, graph) == GGML_STATUS_SUCCESS);
+    if (!refresh) { return; }
     cache.needs_refresh(256, false);
     assert(cache.needs_refresh(1, false));
     cache.refresh();
 }
 
 static std::vector<int32_t> routes(const llama_expert_cache & cache, int tier) {
-    std::vector<int32_t> result(3 * 64);
-    for (int il = 0; il < 3; ++il) {
+    std::vector<int32_t> result;
+    for (int il = 0; cache.layer(il); ++il) {
+        result.resize((il + 1) * 64);
         auto * ids = cache.hot_ids(tier, il);
         assert(ids);
         ggml_backend_tensor_get(ids, result.data() + il * 64, 0, 64 * sizeof(int32_t));
@@ -114,7 +128,7 @@ static std::vector<uint8_t> bank_bytes(const llama_expert_cache & cache, int tie
 }
 
 static void check_partition(const llama_expert_cache & cache) {
-    for (int il = 0; il < 3; ++il) {
+    for (int il = 0; cache.layer(il); ++il) {
         std::vector<int> owners(64, 0);
         for (int t = 0; t < cache.n_tiers(); ++t) {
             auto * ids = cache.hot_ids(t, il);
@@ -131,7 +145,7 @@ static void check_partition(const llama_expert_cache & cache) {
     }
 }
 
-static void decode(llama_context * ctx, int n) {
+static std::vector<float> decode(llama_context * ctx, int n) {
     llama_memory_clear(llama_get_memory(ctx), true);
     std::vector<llama_token> tokens(n);
     for (int i = 0; i < n; ++i) { tokens[i] = i % 128; }
@@ -141,6 +155,19 @@ static void decode(llama_context * ctx, int n) {
     assert(llama_decode(ctx, batch) == 0);
     const auto * logits = llama_get_logits_ith(ctx, -1);
     for (int i = 0; i < 128; ++i) { assert(std::isfinite(logits[i])); }
+    return std::vector<float>(logits, logits + 128);
+}
+
+static void compare(const std::vector<float> & actual, const std::vector<float> & expected) {
+    double error = 0, norm = 0;
+    for (size_t i = 0; i < actual.size(); ++i) {
+        const double delta = actual[i] - expected[i];
+        error += delta * delta;
+        norm += double(expected[i]) * expected[i];
+    }
+    const double nmse = error / std::max(norm, 1e-30);
+    printf("global pinned decode versus ordinary experts: NMSE %.9g\n", nmse);
+    assert(nmse < 1e-5);
 }
 
 int main(int argc, char ** argv) {
@@ -186,6 +213,21 @@ int main(int argc, char ** argv) {
     assert(ggml_backend_get_device(cache->tier_backend(0)) == devices[3]);
     assert(!llama_share_has_cache_on_device(ctx.get(), names[2].c_str()));
     ggml_backend_ptr cpu(ggml_backend_dev_init(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU), nullptr));
+    auto set_threads = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(
+            ggml_backend_dev_backend_reg(ggml_backend_get_device(cpu.get())), "ggml_backend_set_n_threads");
+    assert(set_threads);
+    set_threads(cpu.get(), 4);
+    auto * cpu_reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(cpu.get()));
+    auto new_pool = (decltype(ggml_threadpool_new) *) ggml_backend_reg_get_proc_address(cpu_reg, "ggml_threadpool_new");
+    auto free_pool = (decltype(ggml_threadpool_free) *) ggml_backend_reg_get_proc_address(cpu_reg, "ggml_threadpool_free");
+    auto set_pool = (decltype(ggml_backend_cpu_set_threadpool) *) ggml_backend_reg_get_proc_address(cpu_reg, "ggml_backend_cpu_set_threadpool");
+    assert(new_pool && free_pool && set_pool);
+    auto pool_params = ggml_threadpool_params_default(4);
+    auto pool = std::unique_ptr<ggml_threadpool, decltype(free_pool)>(new_pool(&pool_params), free_pool);
+    assert(pool);
+    // The route-only graph has one task; retain a pool with workers on both tensor-NUMA nodes.
+    set_pool(cpu.get(), pool.get());
+    llama_attach_threadpool(ctx.get(), pool.get(), pool.get());
     record(*cache, cpu.get(), 0);
     check_partition(*cache);
     const auto pinned = routes(*cache, 0);
@@ -202,6 +244,17 @@ int main(int argc, char ** argv) {
     check_partition(*cache);
     assert(routes(*cache, 0) == pinned && bank_bytes(*cache, 0) == weights);
     assert(routes(*cache, 1) != rotating);
+    const auto before_async = routes(*cache, 1);
+    record(*cache, cpu.get(), 0, false);
+    bool applied = false;
+    for (int i = 0; i < 100 && !applied; ++i) {
+        assert(!cache->needs_refresh(4, false));
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        applied = routes(*cache, 1) != before_async;
+    }
+    assert(applied);
+    check_partition(*cache);
+    assert(routes(*cache, 0) == pinned && bank_bytes(*cache, 0) == weights);
 
     int excluded = -1;
     for (int i = 0; i < ggml_backend_sched_get_n_backends(ctx->get_sched()); ++i) {
@@ -223,6 +276,19 @@ int main(int argc, char ** argv) {
     int64_t a, b, c, d;
     while (trace >> backend >> index >> bytes >> a >> b >> c >> d) { staged.insert(backend); }
     assert(staged.size() == 3 && !staged.count(excluded));
+
+    // Explicit tier release can remove pins. Repopulation must safely promote experts already held by a static tier.
+    const int old_pin = cache->tier_list().front().first;
+    assert(llama_share_drop_tier(ctx.get(), old_pin) > 0);
+    record(*cache, cpu.get(), 32);
+    record(*cache, cpu.get(), 32);
+    assert(llama_share_add_tier(ctx.get(), names[3].c_str(), size_t(1) << 20) >= 0);
+    record(*cache, cpu.get(), 32);
+    check_partition(*cache);
+    const auto new_pins = routes(*cache, cache->n_tiers() - 1);
+    record(*cache, cpu.get(), 0);
+    check_partition(*cache);
+    assert(routes(*cache, cache->n_tiers() - 1) == new_pins);
     ctx.reset();
 
     // Keep the real auto-sizing test bounded. Sample free memory after the first context has released its buffers.
@@ -239,6 +305,7 @@ int main(int argc, char ** argv) {
     unsetenv("LLAMA_MOE_CACHE_TIERS");
     llama_context_ptr automatic(llama_init_from_model(model.get(), params));
     assert(automatic);
+    llama_attach_threadpool(automatic.get(), pool.get(), pool.get());
     assert(llama_share_has_cache_on_device(automatic.get(), names[0].c_str()));
     assert(!llama_share_has_cache_on_device(automatic.get(), names[2].c_str()));
     llama_expert_cache_auto(automatic.get());
@@ -263,6 +330,7 @@ int main(int argc, char ** argv) {
     assert(split_model);
     llama_context_ptr split_ctx(llama_init_from_model(split_model.get(), params));
     assert(split_ctx);
+    llama_attach_threadpool(split_ctx.get(), pool.get(), pool.get());
     auto * split_cache = split_ctx->share_expert_cache();
     assert(split_cache && split_cache->n_tiers() == 3);
     int pinned_tier = -1;
@@ -275,17 +343,28 @@ int main(int argc, char ** argv) {
     check_partition(*split_cache);
     const auto global_pins = routes(*split_cache, pinned_tier);
     assert(std::any_of(global_pins.begin(), global_pins.begin() + 64, [](int32_t slot) { return slot >= 0; }));
+    assert(split_cache->backend(3) == split_cache->tier_backend(pinned_tier));
+    assert(global_pins[3 * 64] >= 0); // the pinned GPU also executes its own dense layer and local hot experts
     assert(split_cache->serves_remote(split_cache->tier_backend(pinned_tier)));
     for (int t = 0; t < split_cache->n_tiers(); ++t) {
         if (t == pinned_tier) { continue; }
-        for (int il = 0; il < 3; ++il) {
+        for (int il = 0; split_cache->layer(il); ++il) {
             if (split_cache->tier_backend(t) != split_cache->backend(il)) { assert(!split_cache->hot_ids(t, il)); }
         }
     }
-    decode(split_ctx.get(), 4);
+    const auto before_change = decode(split_ctx.get(), 4);
     record(*split_cache, cpu.get(), 32);
     check_partition(*split_cache);
     assert(routes(*split_cache, pinned_tier) == global_pins);
-    decode(split_ctx.get(), 4);
+    const auto after_change = decode(split_ctx.get(), 4);
+    env("LLAMA_MOE_CACHE_MIB", "0");
+    unsetenv("LLAMA_MOE_CACHE_TIERS");
+    llama_context_ptr reference(llama_init_from_model(split_model.get(), params));
+    assert(reference);
+    llama_attach_threadpool(reference.get(), pool.get(), pool.get());
+    const auto expected = decode(reference.get(), 4);
+    compare(before_change, expected);
+    compare(after_change, expected);
+    set_pool(cpu.get(), nullptr);
     puts("expert device GPU lifecycle: pinned weights/maps stable; rotating cache changed; three staging devices; recreated scheduler excluded pinned GPU");
 }
