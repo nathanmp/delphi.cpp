@@ -117,6 +117,7 @@ struct llama_expert_cache {
 
     // ggml_backend_sched_stage_lend_t: evict the experts in the top of the largest tier on `backend` and lend it as staging slots
     static bool lend(void * user_data, ggml_backend_t backend, int n_slots, size_t slot_size, void ** slots);
+    static bool lend_span(llama_expert_cache & c, ggml_backend_t backend, int n_slots, size_t slot_size, void ** slots);
 
 private:
     struct upload_job { int il, e, s; }; // s: global slot

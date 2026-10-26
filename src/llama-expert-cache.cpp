@@ -1070,6 +1070,82 @@ bool llama_expert_cache::needs_refresh(int64_t n_tokens, bool is_warmup) {
     return true;
 }
 
+// The banks of a tier are in one buffer, in the order of their creation. When no bank can hold a slot (the groups of a model
+// with several expert types are smaller), the slots take the top of the bank memory of the tier across banks and groups. Every
+// expert with a slab in that memory leaves its group.
+bool llama_expert_cache::lend_span(llama_expert_cache & c, ggml_backend_t backend, int n_slots, size_t slot_size, void ** slots) {
+    const size_t align = ggml_backend_buft_get_alignment(ggml_backend_get_default_buffer_type(backend));
+    const size_t step  = GGML_PAD(slot_size, align);
+    tier * lt = nullptr;
+    uintptr_t lt_lo = 0, lt_hi = 0;
+    for (auto & t : c.tiers) {
+        if (t.backend != backend || t.pinned) { continue; }
+        std::vector<std::pair<uintptr_t, uintptr_t>> spans;
+        for (const auto & g : t.groups) {
+            if (g.n == 0) { continue; }
+            for (auto * b : g.banks) { spans.push_back({ (uintptr_t) b->data, (uintptr_t) b->data + ggml_nbytes(b) }); }
+        }
+        if (spans.empty()) { continue; }
+        std::sort(spans.begin(), spans.end());
+        bool inside = true;
+        for (size_t i = 1; i < spans.size(); ++i) { inside &= spans[i].first >= spans[i-1].second && spans[i].first - spans[i-1].second < align; }
+        const uintptr_t lo = spans.front().first, hi = spans.back().second;
+        // a split buffer (larger than the maximum allocation of the device) is not contiguous
+        if (!inside || hi <= lo) { continue; }
+        if (!lt || hi - lo > lt_hi - lt_lo) {
+            lt = &t; lt_lo = lo; lt_hi = hi;
+        }
+    }
+    if (!lt || lt_hi - lt_lo < (uintptr_t) n_slots * step + align) { return false; }
+    // a slot at a bank base would share the bank's packing state
+    auto at_base = [&](uintptr_t a) {
+        for (const auto & g : lt->groups) {
+            for (auto * b : g.banks) {
+                for (int j = 0; j < n_slots; ++j) {
+                    if (a + j * step == (uintptr_t) b->data) { return true; }
+                }
+            }
+        }
+        return false;
+    };
+    uintptr_t a = (lt_hi & ~(uintptr_t) (align - 1)) - (uintptr_t) n_slots * step;
+    while (a >= lt_lo && at_base(a)) { a -= align; }
+    if (a < lt_lo) { return false; }
+    c.cancel_async();
+    c.sync_homes();
+    ggml_backend_synchronize(backend);
+    std::vector<bool> changed(c.layers.size(), false);
+    int64_t evicted = 0, lent = 0, total = 0;
+    for (auto & g : lt->groups) {
+        int64_t lo = g.n;
+        for (auto * b : g.banks) {
+            const uintptr_t d = (uintptr_t) b->data;
+            if (g.n == 0 || d + ggml_nbytes(b) <= a) { continue; }
+            lo = std::min<int64_t>(lo, a <= d ? 0 : int64_t((a - d) / b->nb[2]));
+        }
+        total += g.n;
+        lent += g.n - std::min(lo, g.lent_lo);
+        if (lo >= g.lent_lo) { continue; }
+        for (int64_t s = g.base + lo; s < g.base + g.lent_lo; ++s) {
+            const auto [il, e] = c.owner_of[s];
+            if (il < 0) { continue; }
+            c.layers[il].slot[e] = -1;
+            c.layers[il].cold[e] = e;
+            c.owner_of[s] = {-1, -1};
+            changed[il] = true;
+            evicted++;
+        }
+        g.lent_lo = lo;
+    }
+    c.push_maps(changed);
+    for (int j = 0; j < n_slots; ++j) {
+        slots[j] = (void *) (a + j * step);
+    }
+    LLAMA_LOG_WARN("expert-cache: lent %lld of %lld slots of tier %d on %s across banks as %d staging slots of %.1f MiB, evicted %lld experts\n",
+            (long long) lent, (long long) total, lt->id, ggml_backend_name(backend), n_slots, slot_size / 1048576.0, (long long) evicted);
+    return true;
+}
+
 bool llama_expert_cache::lend(void * user_data, ggml_backend_t backend, int n_slots, size_t slot_size, void ** slots) {
     auto & c = *static_cast<llama_expert_cache *>(user_data);
     if (n_slots <= 0) { return false; }
@@ -1104,6 +1180,9 @@ bool llama_expert_cache::lend(void * user_data, ggml_backend_t backend, int n_sl
     if (!lg) {
         bool any = false;
         for (const auto & t : c.tiers) { any |= t.backend == backend; }
+        if (any && lend_span(c, backend, n_slots, slot_size, slots)) {
+            return true;
+        }
         if (any) {
             LLAMA_LOG_WARN("expert-cache: cannot lend %d staging slots of %.1f MiB: the tiers on %s are too small\n", n_slots,
                     slot_size / 1048576.0, ggml_backend_name(backend));
