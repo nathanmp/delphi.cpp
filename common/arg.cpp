@@ -4308,6 +4308,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_FIT_PARAMS}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX"));
     add_opt(common_arg(
+        {"--spec-draft-block"}, "N",
+        "draft-dspark: tokens in the drafted block; the first --spec-draft-n-max are verified, the rest only condition "
+        "them (default: 0 = the trained block size)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.speculative.draft.n_block = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_BLOCK"));
+    add_opt(common_arg(
         {"--spec-draft-ubatch-size", "-ubd"}, "N",
         string_format("physical batch size of the draft context, 0 = same as -ub (default: %d); a draft rarely gains "
         "from a large ubatch, and its compute buffer grows with it", params.speculative.draft.n_ubatch),
