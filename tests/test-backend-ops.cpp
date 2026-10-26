@@ -11403,6 +11403,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 8, 4, false, 64, 64, 512));
     }
 
+    for (int n = 1; n <= 8; ++n) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_KS, GGML_TYPE_F32, 32, n, 2304, {1, 1}, {1, 1}));
+    }
+
     // MMQ must only select tile widths J that have a config entry (fewer with the m % 128 != 0 fallback):
     // a Q8_1-layout type, a Q8_0_16-layout type and a type that borrows another type's config.
     for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q3_K, GGML_TYPE_IQ2_K}) {
@@ -11451,6 +11455,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_partial_ffn(rows, 1, type, type, type, limit, false, rows == 6));
             }
         }
+    }
+    for (int64_t rows : {2, 3, 4, 5, 7, 8}) {
+        test_cases.emplace_back(new test_partial_ffn(rows, 3, GGML_TYPE_IQ4_KS, GGML_TYPE_IQ4_KS, GGML_TYPE_IQ4_KS));
     }
     for (float limit : {0.0f, 2.0f}) {
         test_cases.emplace_back(new test_partial_ffn(6, 3, GGML_TYPE_IQ3_K, GGML_TYPE_IQ4_KS, GGML_TYPE_IQ3_KS, limit));

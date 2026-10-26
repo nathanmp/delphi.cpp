@@ -550,6 +550,49 @@ static void mul_mat_qX_K_q8_K_T(int n, const void * vx, size_t bx, const DataInf
     }
 }
 
+// Two decoded groups leave more registers for the activation rows at small speculative widths.
+template <int nrc_y>
+static void mul_mat_iq4_ks_q8_K_pairs(int n, const void * vx, size_t bx, const DataInfo & info, int nrc_x) {
+    assert(n % QK_K == 0);
+    const int nb = n / QK_K;
+    Q8<nrc_y> q8(info);
+    DequantizerIQ4KS deq(vx, bx);
+
+    for (int ix = 0; ix < nrc_x; ++ix) {
+        deq.new_row(ix);
+        __m256 accd[nrc_y];
+        for (int iy = 0; iy < nrc_y; ++iy) accd[iy] = _mm256_setzero_ps();
+
+        for (int i = 0; i < nb; ++i) {
+            const auto all_scales = deq.new_block(i, q8, accd);
+            __m256i sumi[nrc_y];
+
+            for (int j = 0; j < QK_K/64; ++j) {
+                __m256i values[2], scales[2];
+                for (int k = 0; k < 2; ++k) {
+                    const int group = 2*j + k;
+                    const auto bits = deq.bits.dequant16(deq.x[i].qs + 16*group);
+                    values[k] = _mm256_shuffle_epi8(deq.values[deq.x[i].scales[group] & 1], bits);
+                    scales[k] = _mm256_shuffle_epi8(all_scales, get_scale_shuffle_8(group));
+                }
+                for (int iy = 0; iy < nrc_y; ++iy) {
+                    __m256i prod[2];
+                    for (int k = 0; k < 2; ++k) {
+                        prod[k] = _mm256_madd_epi16(scales[k], _mm256_maddubs_epi16(
+                            _mm256_abs_epi8(values[k]), _mm256_sign_epi8(q8.load_quants(iy, i, 2*j + k), values[k])));
+                    }
+                    const auto sum = _mm256_add_epi32(prod[0], prod[1]);
+                    sumi[iy] = j == 0 ? sum : _mm256_add_epi32(sumi[iy], sum);
+                }
+            }
+            for (int iy = 0; iy < nrc_y; ++iy) {
+                accd[iy] = _mm256_fmadd_ps(_mm256_set1_ps(deq.d*q8.scale(iy, i)), _mm256_cvtepi32_ps(sumi[iy]), accd[iy]);
+            }
+        }
+        for (int iy = 0; iy < nrc_y; ++iy) info.store(ix, iy, hsum_float_8(accd[iy]));
+    }
+}
+
 void iqk_convert_iq2_k_q8_k_r8(int n, const void * vx, size_t bx, void * vy, int nrc_x) {
 #ifdef HAVE_FANCY_SIMD
     constexpr int k_nr = 16;
@@ -1477,7 +1520,19 @@ bool iqk_set_kernels_iqk_quants(
         case GGML_TYPE_IQ6_K: set_functions<DequantizerIQ6K>(kernels); break;
         case GGML_TYPE_IQ2_KS: set_functions_ks<DequantizerIQ2KS>(kernels); break;
         case GGML_TYPE_IQ3_KS: set_functions_ks<DequantizerIQ3KS>(kernels); break;
-        case GGML_TYPE_IQ4_KS: set_functions_ks<DequantizerIQ4KS>(kernels); break;
+        case GGML_TYPE_IQ4_KS: {
+            set_functions_ks<DequantizerIQ4KS>(kernels);
+            static const bool pairs = [] {
+                const char * value = getenv("GGML_IQ4_KS_KERNEL");
+                return !value || strcmp(value, "base") != 0;
+            }();
+            if (pairs) {
+                kernels[1] = mul_mat_iq4_ks_q8_K_pairs<2>;
+                kernels[2] = mul_mat_iq4_ks_q8_K_pairs<3>;
+                kernels[3] = mul_mat_iq4_ks_q8_K_pairs<4>;
+            }
+            break;
+        }
         case GGML_TYPE_IQ5_KS: set_functions_ks<DequantizerIQ5KS>(kernels); break;
         default: return false;
     }
