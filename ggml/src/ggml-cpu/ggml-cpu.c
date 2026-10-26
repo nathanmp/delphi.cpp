@@ -1966,6 +1966,11 @@ static bool ggml_cpu_g128_rows_enabled(void) {
     return enabled != 0;
 }
 
+static bool ggml_cpu_numa_quant_flat_enabled(void) {
+    const char * env = getenv("GGML_NUMA_QUANT_FLAT");
+    return !env || atoi(env) != 0;
+}
+
 // GGML_CPU_G128_PANEL=0 recomputes the activation correction and scale per weight row (A/B).
 static bool ggml_cpu_g128_panel_enabled(void) {
     static int enabled = -1;
@@ -2465,6 +2470,23 @@ static void ggml_compute_forward_mul_mat_id_impl(
                 void * q = wdata + i13*nbw3 + i12*nbw2 + i11*nbw1;
                 from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11), q, ne10);
                 ggml_q4_g128_gemm_panel(ne10, q, gemm_panels + ir*gemm_panel_size);
+            }
+        } else if (numa_tensors && vec_dot_type == GGML_TYPE_Q8_K && ggml_cpu_numa_quant_flat_enabled()) {
+            // Split blocks across all rows. A short row can have fewer blocks than this node has workers.
+            const int64_t bs = ggml_blck_size(vec_dot_type);
+            const int64_t blocks_per_row = ne10 / bs;
+            const int64_t blocks = blocks_per_row * ne11 * ne12 * ne13;
+            const int64_t end = blocks * (work_ith + 1) / work_nth;
+            for (int64_t block = blocks * work_ith / work_nth; block < end;) {
+                const int64_t row = block / blocks_per_row;
+                const int64_t first = block % blocks_per_row;
+                const int64_t count = MIN(blocks_per_row - first, end - block);
+                const int64_t i11 = row % ne11;
+                const int64_t i12 = (row / ne11) % ne12;
+                const int64_t i13 = row / (ne11 * ne12);
+                from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + first*bs*nb10),
+                           wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + first*nbw0, count * bs);
+                block += count;
             }
         } else
 
