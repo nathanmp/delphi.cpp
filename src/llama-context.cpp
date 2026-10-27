@@ -656,8 +656,11 @@ llama_context::llama_context(
 
         if (model.arch == LLM_ARCH_DEEPSEEK41 && cparams.cb_eval == nullptr) {
             const char * env = getenv("LLAMA_ENGRAM_PREFETCH");
-            const int n_readers = env ? std::min(32, std::max(0, atoi(env))) : 0;
-            if (n_readers > 0 && !model.hparams.no_alloc) {
+            const int n_readers = env ? std::min(32, std::max(0, atoi(env))) : 8;
+            const auto host_engram = [](const llama_layer & layer) {
+                return llama_engram_reader::supports(layer.engram_embd);
+            };
+            if (n_readers > 0 && !model.hparams.no_alloc && std::any_of(model.layers.begin(), model.layers.end(), host_engram)) {
                 engram_reader = std::make_unique<llama_engram_reader>(n_readers);
                 LLAMA_LOG_INFO("%s: Engram row prefetch with %d readers (up to 16 tokens)\n", __func__, n_readers);
             }

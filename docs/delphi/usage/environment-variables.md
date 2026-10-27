@@ -32,6 +32,19 @@ CPU-offloaded DeepSeek V4.1 Flash tests on two R9700s showed about 1.7x faster 1
 
 Adapted from [DeepInfer](https://github.com/deepseek-ai/DeepInfer/tree/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01), Apache-2.0: the consumer boundary in `decoder_layer.py` and `v4_modules/yoco.py`, full global-KV projection in `v4_modules/attn.py`, and bounded SWA visibility in `prepare_tensor_input_v4.cpp`. This implementation uses ggml graphs, separate local cache maps, and a suffix per microbatch rather than DeepInfer's request metadata. No source or kernels were copied.
 
+## DeepSeek V4.1 small batches
+
+| variable | default | effect |
+| --- | --- | --- |
+| `LLAMA_ENGRAM_PREFETCH` | `8` | Host reader count for Engram row lookup, capped at 32. `0` uses ordinary `GET_ROWS`. Read when the context is made. |
+| `LLAMA_MOE_SHARED_OVERLAP` | `1` | Submit the GPU shared FFN before cold CPU expert arithmetic. `0` uses the previous graph order. Read once per process. |
+
+Both paths apply to batches of at most 16 tokens. Engram readers gather known token-history rows from supported host tables into owned buffers; the graph consumes the result at the original layer. They use a separate pool from the CPU experts and respect the application CPU mask. Larger batches, unsupported tables and eval callbacks use ordinary lookup. A context without a supported host Engram table creates no readers.
+
+Shared overlap requires the expert-cache path and shared weights on the layer GPU. The routing packet is copied to the CPU before the independent cached/shared GPU work is submitted. Routed expert selection, FFN arithmetic and the hyper-connection injection point are unchanged.
+
+Teacher-forced checks at widths 1/2/3/4/5/8/16 and the width-17 fallback matched all 85 checked logit vectors bit for bit. Normal DSpark checks had equal acceptance counts. Both optimizations together improved repeated fixed-synthetic DSpark decode by about 4% on a tested hybrid CPU/GPU configuration; Engram benefit depends on page/cache state. Synthetic acceptance is performance-only evidence.
+
 ## Backend sampling (`-bs`)
 
 | variable | default | set to | effect of the non-default value |

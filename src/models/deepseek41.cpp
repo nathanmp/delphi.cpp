@@ -1594,7 +1594,7 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
         };
         static const bool shared_overlap = [] {
             const char * env = std::getenv("LLAMA_MOE_SHARED_OVERLAP");
-            return env && std::atoi(env) != 0;
+            return env == nullptr || std::atoi(env) != 0;
         }();
         std::function<void()> before_cpu_ffn;
         if (shared_overlap && expert_cache && expert_cache->layer(il) && cur->ne[1] <= llama_expert_cache::max_rows) {
