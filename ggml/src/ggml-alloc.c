@@ -1007,17 +1007,24 @@ static bool ggml_gallocr_node_needs_realloc(ggml_gallocr_t galloc, struct ggml_t
 }
 
 static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
+    // GGML_GALLOC_REALLOC_LOG=1 names the first reason for a reallocation
+    static int log_realloc = -1;
+    if (log_realloc < 0) {
+        const char * env = getenv("GGML_GALLOC_REALLOC_LOG");
+        log_realloc = env != NULL && atoi(env) != 0;
+    }
+
     if (galloc->n_nodes != graph->n_nodes) {
-#ifndef NDEBUG
-        GGML_LOG_DEBUG("%s: graph has different number of nodes\n", __func__);
-#endif
+        if (log_realloc) {
+            GGML_LOG_WARN("%s: graph has %d nodes, layout has %d\n", __func__, graph->n_nodes, galloc->n_nodes);
+        }
         return true;
     }
 
     if (galloc->n_leafs != graph->n_leafs) {
-#ifndef NDEBUG
-        GGML_LOG_DEBUG("%s: graph has different number of leafs\n", __func__);
-#endif
+        if (log_realloc) {
+            GGML_LOG_WARN("%s: graph has %d leafs, layout has %d\n", __func__, graph->n_leafs, galloc->n_leafs);
+        }
         return true;
     }
 
@@ -1026,9 +1033,10 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
         struct node_alloc * node_alloc = &galloc->node_allocs[i];
 
         if (!ggml_gallocr_node_needs_realloc(galloc, node, &node_alloc->dst)) {
-#ifndef NDEBUG
-            GGML_LOG_DEBUG("%s: node %s is not valid\n", __func__, node->name);
-#endif
+            if (log_realloc) {
+                GGML_LOG_WARN("%s: node %d %s (%s) needs %zu bytes, layout has %zu\n", __func__, i, node->name, ggml_op_desc(node),
+                        ggml_nbytes(node), node_alloc->dst.size_max);
+            }
             return true;
         }
 
@@ -1038,9 +1046,10 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
                 continue;
             }
             if (!ggml_gallocr_node_needs_realloc(galloc, src, &node_alloc->src[j])) {
-#ifndef NDEBUG
-                GGML_LOG_DEBUG("%s: src %d (%s) of node %s is not valid\n", __func__, j, src->name, node->name);
-#endif
+                if (log_realloc) {
+                    GGML_LOG_WARN("%s: src %d (%s) of node %d %s needs %zu bytes, layout has %zu\n", __func__, j, src->name, i,
+                            node->name, ggml_nbytes(src), node_alloc->src[j].size_max);
+                }
                 return true;
             }
         }
