@@ -1136,13 +1136,13 @@ void llama_context::reserve_max_prefill(
     if (model.arch == LLM_ARCH_DEEPSEEK4 || model.arch == LLM_ARCH_DEEPSEEK41) {
         return;
     }
-    // Only the first ubatch of a multi-ubatch single-sequence prefill: later
-    // ubatches are already covered, and a single ubatch cannot grow. A later
-    // ubatch that switches the attention variant (below) is the exception.
-    if (n_tokens_all <= cparams.n_ubatch) {
-        return;
-    }
-    if (ubatch.n_tokens != cparams.n_ubatch || ubatch.n_seq_tokens != cparams.n_ubatch) {
+    // Prompt-sized ubatches of one sequence only. A llama_decode call with a single ubatch also takes it: the server
+    // splits a prompt into several calls (it ends one before the last ubatch for a checkpoint), and a short ubatch
+    // (2044 tokens) recorded sizes that the full ubatch of the next call (2048) outgrew. That reallocation
+    // synchronized every backend and drained the ubatch still in flight from the previous call. Later ubatches of a
+    // call are already covered, except one that switches the attention variant (below).
+    GGML_UNUSED(n_tokens_all);
+    if (2*ubatch.n_tokens < cparams.n_ubatch || ubatch.n_seqs_unq != 1 || ubatch.n_seq_tokens != ubatch.n_tokens) {
         return;
     }
     if (model.hparams.no_alloc) {
