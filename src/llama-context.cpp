@@ -654,13 +654,18 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
-        if (model.arch == LLM_ARCH_DEEPSEEK41 && cparams.cb_eval == nullptr) {
+        const bool engram_model = model.arch == LLM_ARCH_DEEPSEEK41 ||
+            (model.arch == LLM_ARCH_QWEN4EXP && params.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT);
+        if (engram_model && cparams.cb_eval == nullptr) {
             const char * env = getenv("LLAMA_ENGRAM_PREFETCH");
             const int n_readers = env ? std::min(32, std::max(0, atoi(env))) : 8;
             const auto host_engram = [](const llama_layer & layer) {
                 return llama_engram_reader::supports(layer.engram_embd);
             };
-            if (n_readers > 0 && !model.hparams.no_alloc && std::any_of(model.layers.begin(), model.layers.end(), host_engram)) {
+            const bool host_table = model.arch == LLM_ARCH_QWEN4EXP ?
+                llama_engram_reader::supports(model.per_layer_tok_embd) :
+                std::any_of(model.layers.begin(), model.layers.end(), host_engram);
+            if (n_readers > 0 && !model.hparams.no_alloc && host_table) {
                 engram_reader = std::make_unique<llama_engram_reader>(n_readers);
                 LLAMA_LOG_INFO("%s: Engram row prefetch with %d readers (up to 16 tokens)\n", __func__, n_readers);
             }

@@ -219,7 +219,7 @@ int main(int argc, char ** argv) {
     }
     std::vector<llama_model_tensor_buft_override> overrides;
     if (cpu_moe) { overrides.push_back(llm_ffn_exps_cpu_override()); }
-    if (cpu_engram) { overrides.push_back({ "engram_embd", ggml_backend_cpu_buffer_type() }); }
+    if (cpu_engram) { overrides.push_back({ "engram_embd|per_layer_token_embd", ggml_backend_cpu_buffer_type() }); }
     overrides.push_back({ nullptr, nullptr });
     mparams.tensor_buft_overrides = overrides.data();
     llama_model * model = llama_model_load_from_file(model_path.c_str(), mparams);

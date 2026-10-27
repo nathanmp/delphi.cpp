@@ -2725,7 +2725,8 @@ struct llama_model_qwen4exp : public llama_model_base {
                             int   il);
 
         ggml_tensor * build_inp_ple(
-  const llama_memory_hybrid_idx_context * mctx_hyb);
+  const llama_memory_hybrid_idx_context * mctx_hyb,
+                    llama_engram_reader * reader);
 
         ggml_tensor * build_ple(
              llm_graph_input_rs * inp,
