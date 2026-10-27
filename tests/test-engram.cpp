@@ -22,11 +22,18 @@ static bool test_type(ggml_type type, int n_readers) {
     auto * out = ggml_get_rows(ctx, table, ids);
     auto * graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, out);
-    auto * cpu = ggml_backend_cpu_init();
+    auto * dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    auto * reg = ggml_backend_dev_backend_reg(dev);
+    const auto new_pool = (decltype(&ggml_threadpool_new)) ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_new");
+    const auto free_pool = (decltype(&ggml_threadpool_free)) ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_free");
+    const auto set_pool = (decltype(&ggml_backend_cpu_set_threadpool)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_set_threadpool");
+    const auto set_threads = (decltype(&ggml_backend_cpu_set_n_threads)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
+    GGML_ASSERT(new_pool && free_pool && set_pool && set_threads);
+    auto * cpu = ggml_backend_dev_init(dev, nullptr);
     auto pool_params = ggml_threadpool_params_default(4);
-    auto * pool = ggml_threadpool_new(&pool_params);
-    ggml_backend_cpu_set_threadpool(cpu, pool);
-    ggml_backend_cpu_set_n_threads(cpu, 4);
+    auto * pool = new_pool(&pool_params);
+    set_pool(cpu, pool);
+    set_threads(cpu, 4);
     auto * buffer = ggml_backend_alloc_ctx_tensors(ctx, cpu);
 
     std::vector<float> values(width*height);
@@ -69,13 +76,17 @@ static bool test_type(ggml_type type, int n_readers) {
     printf("%s readers=%d: %s\n", ggml_type_name(type), n_readers, ok ? "OK" : "FAIL");
     ggml_backend_buffer_free(buffer);
     ggml_backend_free(cpu);
-    ggml_threadpool_free(pool);
+    free_pool(pool);
     ggml_free(ctx);
     return ok;
 }
 
 int main() {
-    ggml_numa_init(GGML_NUMA_STRATEGY_TENSORS);
+    ggml_backend_load_all();
+    auto * reg = ggml_backend_dev_backend_reg(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU));
+    const auto numa_init = (decltype(&ggml_numa_init)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_numa_init");
+    GGML_ASSERT(numa_init);
+    numa_init(GGML_NUMA_STRATEGY_TENSORS);
     bool ok = true;
     for (int n : { 1, 4, 8 }) {
         for (auto type : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0 }) {
