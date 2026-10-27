@@ -115,7 +115,7 @@ static double log_sum_exp(const float * x, int n, int & argmax) {
 static void usage(const char * argv0) {
     fprintf(stderr,
         "usage: %s -m model.gguf -f text [--save FILE] [--compare FILE] [-ngl N] [-t N] [-fa on|off|auto] [-ub N] [--plan PLAN]\n"
-        "       [--keep-pp N] [--expect-bitwise R,...] [--numa tensors] [--device NAME] [-cmoe] [-v]\n"
+        "       [--keep-pp N] [--expect-bitwise R,...] [--numa tensors] [--device NAMES] [-ts SPLIT] [-cmoe] [--cpu-engram] [-lm MODE] [-lzm on|off|auto] [-v]\n"
         "  --plan            requests separated by '|', each a list of P:T steps (default: %s)\n"
         "  --keep-pp         stored logits per prefill, its last tokens (default: 8)\n"
         "  --expect-bitwise  exit 1 unless every stored position of these requests is bitwise identical to --compare\n",
@@ -136,7 +136,11 @@ int main(int argc, char ** argv) {
     int keep_pp = 8;
     bool numa_tensors = false;
     bool cpu_moe = false;
+    bool cpu_engram = false;
+    llama_load_mode load_mode = llama_model_default_params().load_mode;
+    llama_lazy_mode lazy_mode = llama_model_default_params().lazy_mode;
     std::string device_name;
+    std::string tensor_split;
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -158,7 +162,17 @@ int main(int argc, char ** argv) {
         else if (a == "-ub")              { n_ub    = atoi(next().c_str()); }
         else if (a == "--keep-pp")        { keep_pp = atoi(next().c_str()); }
         else if (a == "-cmoe")            { cpu_moe = true; }
+        else if (a == "--cpu-engram")     { cpu_engram = true; }
+        else if (a == "-lm")             { load_mode = llama_load_mode_from_str(next().c_str()); }
+        else if (a == "-lzm") {
+            const auto value = next();
+            if (value == "on") { lazy_mode = LLAMA_LAZY_MODE_ON; }
+            else if (value == "off") { lazy_mode = LLAMA_LAZY_MODE_OFF; }
+            else if (value == "auto") { lazy_mode = LLAMA_LAZY_MODE_AUTO; }
+            else { usage(argv[0]); return 1; }
+        }
         else if (a == "--device")         { device_name = next(); }
+        else if (a == "-ts")              { tensor_split = next(); }
         else if (a == "--numa") {
             if (next() != "tensors") { usage(argv[0]); return 1; }
             numa_tensors = true;
@@ -184,14 +198,30 @@ int main(int argc, char ** argv) {
 
     llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = ngl;
-    ggml_backend_dev_t devices[] = { nullptr, nullptr };
+    mparams.load_mode = load_mode;
+    mparams.lazy_mode = lazy_mode;
+    std::vector<ggml_backend_dev_t> devices;
     if (!device_name.empty()) {
-        devices[0] = ggml_backend_dev_by_name(device_name.c_str());
-        if (!devices[0]) { fprintf(stderr, "error: unknown device %s\n", device_name.c_str()); return 1; }
-        mparams.devices = devices;
+        for (const auto & name : split(device_name, ',')) {
+            auto * dev = ggml_backend_dev_by_name(name.c_str());
+            if (!dev) { fprintf(stderr, "error: unknown device %s\n", name.c_str()); return 1; }
+            devices.push_back(dev);
+        }
+        devices.push_back(nullptr);
+        mparams.devices = devices.data();
     }
-    const llama_model_tensor_buft_override overrides[] = { llm_ffn_exps_cpu_override(), { nullptr, nullptr } };
-    if (cpu_moe) { mparams.tensor_buft_overrides = overrides; }
+    std::vector<float> device_split(llama_max_devices(), 0.0f);
+    if (!tensor_split.empty()) {
+        const auto parts = split(tensor_split, ',');
+        if (parts.size() > device_split.size()) { usage(argv[0]); return 1; }
+        for (size_t i = 0; i < parts.size(); ++i) { device_split[i] = std::stof(parts[i]); }
+        mparams.tensor_split = device_split.data();
+    }
+    std::vector<llama_model_tensor_buft_override> overrides;
+    if (cpu_moe) { overrides.push_back(llm_ffn_exps_cpu_override()); }
+    if (cpu_engram) { overrides.push_back({ "engram_embd", ggml_backend_cpu_buffer_type() }); }
+    overrides.push_back({ nullptr, nullptr });
+    mparams.tensor_buft_overrides = overrides.data();
     llama_model * model = llama_model_load_from_file(model_path.c_str(), mparams);
     if (model == nullptr) {
         fprintf(stderr, "error: cannot load %s\n", model_path.c_str());

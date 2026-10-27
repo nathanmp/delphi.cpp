@@ -1677,6 +1677,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cross            (params.cross),
     mtp_device_draft_cache(params.mtp_device_draft_cache),
     expert_cache     (params.expert_cache),
+    engram_reader    (params.engram_reader),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),

@@ -808,6 +808,7 @@ struct llm_graph_params {
     const llama_cross            * cross;
     const llama_mtp_device_draft_cache * mtp_device_draft_cache;
     llama_expert_cache * expert_cache = nullptr;
+    class llama_engram_reader * engram_reader = nullptr;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -1084,6 +1085,7 @@ struct llm_graph_context {
     const llama_cross            * cross;
     const llama_mtp_device_draft_cache * mtp_device_draft_cache;
     llama_expert_cache * expert_cache = nullptr;
+    class llama_engram_reader * engram_reader = nullptr;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 

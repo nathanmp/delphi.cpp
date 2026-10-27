@@ -416,6 +416,7 @@ private:
     ggml_backend_buffer_ptr  attn_split_buf;
     std::vector<ggml_backend_ptr> backends;
     std::unique_ptr<llama_expert_cache> expert_cache;
+    std::unique_ptr<class llama_engram_reader> engram_reader;
     llama_expert_device_policy expert_device_policy;
 
     // delphi: VRAM sharing. share_gen changes the graphs (graph reuse); mem_params create the memory module again after a release.

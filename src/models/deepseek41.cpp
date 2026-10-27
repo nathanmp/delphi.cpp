@@ -2,6 +2,7 @@
 #include "models.h"
 
 #include "llama-kv-cache-dsv4.h"
+#include "llama-engram.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -337,6 +338,16 @@ public:
     }
 
     ggml_tensor * rows = nullptr;   // I32 [n_cols * n_tokens]
+    const ggml_tensor * table = nullptr;
+    llama_engram_reader * reader = nullptr;
+    llama_engram_reader::job_ptr lookup;
+
+    static void collect(ggml_tensor * dst, int ith, int nth, void * userdata) {
+        GGML_UNUSED(ith);
+        GGML_UNUSED(nth);
+        auto * input = static_cast<llm_graph_input_engram *>(userdata);
+        llama_engram_reader::collect(input->lookup, (float *) dst->data, ggml_nbytes(dst));
+    }
 
     const llama_model_deepseek41 & pmodel;
 
@@ -410,6 +421,9 @@ void llm_graph_input_engram::set_input(const llama_ubatch * ubatch) {
     }
 
     ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
+    if (reader) {
+        lookup = reader->submit(table, std::move(idx));
+    }
 }
 
 ggml_tensor * llama_model_deepseek41::graph::build_inp_engram(
@@ -427,10 +441,21 @@ ggml_tensor * llama_model_deepseek41::graph::build_inp_engram(
     inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_cols * n_tokens);
     ggml_set_input(inp->rows);
     ggml_tensor * rows = inp->rows;
-    res->add_input(std::move(inp));
-
     // gather then flatten, laying the buckets out slowest, as the reference does
-    ggml_tensor * emb = ggml_get_rows(ctx0, model.layers[il].engram_embd, rows);
+    ggml_tensor * emb;
+    const auto * table = model.layers[il].engram_embd;
+    if (engram_reader && n_tokens <= 16 && llama_engram_reader::supports(table)) {
+        inp->reader = engram_reader;
+        inp->table = table;
+        ggml_tensor * args[] = { rows };
+        emb = ggml_custom_4d(ctx0, GGML_TYPE_F32, key_len, n_cols*n_tokens, 1, 1,
+                args, 1, llm_graph_input_engram::collect, 1, inp.get());
+        cb(emb, "engram_lookup", il);
+        ggml_backend_sched_set_tensor_backend(sched, emb, backend_cpu);
+    } else {
+        emb = ggml_get_rows(ctx0, model.layers[il].engram_embd, rows);
+    }
+    res->add_input(std::move(inp));
     emb = ggml_reshape_2d(ctx0, emb, key_len * n_cols, n_tokens);
     cb(emb, "engram_embd", il);
 

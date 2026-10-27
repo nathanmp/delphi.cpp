@@ -1,4 +1,5 @@
 #include "llama-context.h"
+#include "llama-engram.h"
 
 #include "ggml-cpuset.h"
 #include "ggml-exec-trace.h"
@@ -651,6 +652,15 @@ llama_context::llama_context(
 
         if (cparams.pipeline_parallel) {
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
+        }
+
+        if (model.arch == LLM_ARCH_DEEPSEEK41 && cparams.cb_eval == nullptr) {
+            const char * env = getenv("LLAMA_ENGRAM_PREFETCH");
+            const int n_readers = env ? std::min(32, std::max(0, atoi(env))) : 0;
+            if (n_readers > 0 && !model.hparams.no_alloc) {
+                engram_reader = std::make_unique<llama_engram_reader>(n_readers);
+                LLAMA_LOG_INFO("%s: Engram row prefetch with %d readers (up to 16 tokens)\n", __func__, n_readers);
+            }
         }
 
         if (params.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && params.ctx_other == nullptr) {
@@ -3932,6 +3942,7 @@ llm_graph_params llama_context::graph_params(
         /*.cross       =*/ &cross,
         /*.mtp_device_draft_cache =*/ &mtp_device_draft_cache,
         /*.expert_cache =*/ expert_cache.get(),
+        /*.engram_reader =*/ engram_reader.get(),
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
