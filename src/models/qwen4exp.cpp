@@ -456,10 +456,8 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
         engram_reader : nullptr;
     if (hparams.ple_n_heads > 0) {
         ple_emb = build_inp_ple(mctx_hyb, ple_reader);
-        if (!ple_reader) {
-            // Keep ordinary lookup and token embedding in the same CPU split.
-            ggml_build_forward_expand(gf, ple_emb);
-        }
+        // Keep collection and token embedding in the same CPU split.
+        ggml_build_forward_expand(gf, ple_emb);
     }
 
     // the wide residual starts as hc identical copies of the embedding
@@ -472,10 +470,6 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
         res->t_layer_inp[il] = res_hc;
 
         if (hparams.is_ple(il)) {
-            if (ple_reader) {
-                // Submit the preceding layer before waiting for independent table reads.
-                ggml_build_forward_expand(gf, res_hc);
-            }
             res_hc = build_ple(inp->get_recr(), ple_emb, res_hc, il);
         }
 
