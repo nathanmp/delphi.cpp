@@ -5613,8 +5613,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     if (use_cuda_graph) {
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         if (graph->instance == nullptr && graph->instance_lent) {
-            // this graph needs its executable back, so shapes of this topology alternate
-            cuda_ctx->graph_topo_no_lend.insert(graph->topo_key);
+            // this graph needs its executable back, so shapes of this topology alternate. Prefill splits keep
+            // lending: each prompt repeats the shapes of the earlier prompts as its KV grows, and a long prompt
+            // brings new ones. Without a sibling, each new shape was instantiated (GLM on 3 CMPs: about 77 ms per
+            // 2000-node split, 3.7 s of a 16K prompt), and an update costs less.
+            if (!ggml_cuda_graph_is_prefill_candidate(cgraph)) {
+                cuda_ctx->graph_topo_no_lend.insert(graph->topo_key);
+            }
             graph->instance_lent = false;
         }
         ggml_cuda_graph * sibling = graph->instance == nullptr && !ggml_cuda_graph_prefer_instantiate(cgraph->n_nodes) ?
