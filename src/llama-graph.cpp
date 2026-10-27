@@ -2156,7 +2156,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * down_exps_s,
          ggml_tensor * selected_experts_in,
          ggml_tensor * post_exp_norm,
-               float   post_exp_norm_eps) const {
+               float   post_exp_norm_eps,
+        const std::function<void()> & before_cpu_ffn) const {
     return build_moe_ffn(
         cur,
         gate_inp,  /* gate_inp_b  */ nullptr,
@@ -2179,7 +2180,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         down_exps_s,
         selected_experts_in,
         post_exp_norm,
-        post_exp_norm_eps
+        post_exp_norm_eps,
+        before_cpu_ffn
     );
 }
 
@@ -2209,7 +2211,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * down_exps_s,
          ggml_tensor * selected_experts_in,
          ggml_tensor * post_exp_norm,
-               float   post_exp_norm_eps) const {
+               float   post_exp_norm_eps,
+        const std::function<void()> & before_cpu_ffn) const {
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
@@ -2371,7 +2374,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             !up_exps_s && !gate_exps_s && !down_exps_s && !up_exps_b && !gate_exps_b && !down_exps_b &&
             (loras == nullptr || loras->empty()) && (swiglu_lim <= 1e-6f || clamp_arch)) {
         return build_moe_ffn_cache(cur, selected_experts, weights, up_exps, gate_exps, down_exps, il,
-                swiglu_lim > 1e-6f ? swiglu_lim : 0.0f);
+                swiglu_lim > 1e-6f ? swiglu_lim : 0.0f, before_cpu_ffn);
     }
 
     if (weight_before_ffn) {
@@ -2594,7 +2597,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
 ggml_tensor * llm_graph_context::build_moe_ffn_cache(
         ggml_tensor * cur, ggml_tensor * ids, ggml_tensor * weights,
-        ggml_tensor * up, ggml_tensor * gate, ggml_tensor * down, int il, float limit) const {
+        ggml_tensor * up, ggml_tensor * gate, ggml_tensor * down, int il, float limit,
+        const std::function<void()> & before_cpu_ffn) const {
     // Tiers on the layer GPU are named ffn_cache_gpu_*, tiers on another GPU ffn_cache_x<tier>_* (graph_get_cb places them).
     auto name = [&](ggml_tensor * t, const char * label, bool cpu) {
         cb(t, (std::string(cpu ? "ffn_cache_cpu_" : "ffn_cache_gpu_") + label).c_str(), il);
@@ -2751,6 +2755,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn_cache(
         auto * d = part(cur, route, expert_cache->prefill_bank(il, 0), expert_cache->prefill_bank(il, 1),
                 expert_cache->prefill_bank(il, 2), label);
         remote.push_back(reduce(d, weights, label));
+    }
+    if (before_cpu_ffn) {
+        // Keep independent GPU work after the packet readback, so it does not delay CPU startup on the same stream.
+        before_cpu_ffn();
     }
     auto * experts = part(cx, ci, gate, up, down, [&](ggml_tensor * x, const char * l) { name(x, l, true); });
     ggml_tensor * out = nullptr;

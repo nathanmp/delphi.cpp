@@ -3,6 +3,7 @@
 
 #include "llama-kv-cache-dsv4.h"
 #include "llama-engram.h"
+#include "llama-expert-cache.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -1582,6 +1583,42 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
             exp_probs_b = layer.ffn_exp_probs_b_vl;
         }
 
+        ggml_tensor * ffn_shexp = nullptr;
+        const auto build_shared = [&] {
+            ffn_shexp = build_ffn(cur,
+                    layer.ffn_up_shexp, nullptr, nullptr,
+                    layer.ffn_gate_shexp, nullptr, nullptr,
+                    layer.ffn_down_shexp, nullptr, nullptr,
+                    nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
+            cb(ffn_shexp, "ffn_shexp", il);
+        };
+        static const bool shared_overlap = [] {
+            const char * env = std::getenv("LLAMA_MOE_SHARED_OVERLAP");
+            return env && std::atoi(env) != 0;
+        }();
+        std::function<void()> before_cpu_ffn;
+        if (shared_overlap && expert_cache && expert_cache->layer(il) && cur->ne[1] <= llama_expert_cache::max_rows) {
+            auto * home = expert_cache->backend(il);
+            const auto on_home = [&](const ggml_tensor * weight) {
+                return weight && weight->buffer && !ggml_backend_buffer_is_host(weight->buffer) &&
+                    ggml_backend_buft_get_device(ggml_backend_buffer_get_type(weight->buffer)) == ggml_backend_get_device(home);
+            };
+            if (on_home(layer.ffn_gate_shexp) && on_home(layer.ffn_up_shexp) && on_home(layer.ffn_down_shexp)) {
+                before_cpu_ffn = [&, home] {
+                    build_shared();
+                    const int n0 = ggml_graph_n_nodes(gf);
+                    ggml_build_forward_expand(gf, ffn_shexp);
+                    // Packet/ID nodes precede this branch. Keep its supported ops on the layer GPU.
+                    for (int i = n0; i < ggml_graph_n_nodes(gf); ++i) {
+                        auto * node = ggml_graph_node(gf, i);
+                        if (ggml_backend_supports_op(home, node)) {
+                            ggml_backend_sched_set_tensor_backend(sched, node, home);
+                        }
+                    }
+                };
+            }
+        }
+
         ggml_tensor * moe_out = build_moe_ffn(cur,
                 layer.ffn_gate_inp,
                 layer.ffn_up_exps,
@@ -1592,15 +1629,21 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
                 LLM_FFN_SILU, hparams.expert_weights_norm,
                 hparams.expert_weights_scale,
                 (llama_expert_gating_func_type) hparams.expert_gating_func,
-                il);
+                il,
+                /* probs_in            */ nullptr,
+                /* gate_up_exps        */ nullptr,
+                /* up_exps_s           */ nullptr,
+                /* gate_exps_s         */ nullptr,
+                /* down_exps_s         */ nullptr,
+                /* selected_experts_in */ nullptr,
+                /* post_exp_norm       */ nullptr,
+                /* post_exp_norm_eps   */ 1e-5f,
+                before_cpu_ffn);
         cb(moe_out, "ffn_moe_out", il);
 
-        ggml_tensor * ffn_shexp = build_ffn(cur,
-                layer.ffn_up_shexp, nullptr, nullptr,
-                layer.ffn_gate_shexp, nullptr, nullptr,
-                layer.ffn_down_shexp, nullptr, nullptr,
-                nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
-        cb(ffn_shexp, "ffn_shexp", il);
+        if (!ffn_shexp) {
+            build_shared();
+        }
 
         cur = ggml_add(ctx0, moe_out, ffn_shexp);
         cb(cur, "ffn_out", il);

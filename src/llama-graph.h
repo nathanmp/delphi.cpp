@@ -1170,6 +1170,8 @@ struct llm_graph_context {
                      int   il) const;
 
     // build MoE FFN without bias tensors
+    // before_cpu_ffn expands independent work during graph construction, after the cache packet and GPU parts, before CPU expert arithmetic.
+    // It is called only on the expert-cache path; other paths leave it to the caller to build that work.
     ggml_tensor * build_moe_ffn(
              ggml_tensor * cur,
              ggml_tensor * gate_inp,
@@ -1191,7 +1193,8 @@ struct llm_graph_context {
              ggml_tensor * down_exps_s = nullptr,
              ggml_tensor * selected_experts_in = nullptr,
              ggml_tensor * post_exp_norm = nullptr,
-                   float   post_exp_norm_eps = 1e-5f) const;
+                   float   post_exp_norm_eps = 1e-5f,
+            const std::function<void()> & before_cpu_ffn = {}) const;
 
     ggml_tensor * build_moe_ffn(
              ggml_tensor * cur,
@@ -1219,13 +1222,15 @@ struct llm_graph_context {
              ggml_tensor * down_exps_s = nullptr,
              ggml_tensor * selected_experts_in = nullptr,
              ggml_tensor * post_exp_norm = nullptr,
-                   float   post_exp_norm_eps = 1e-5f) const;
+                   float   post_exp_norm_eps = 1e-5f,
+            const std::function<void()> & before_cpu_ffn = {}) const;
 
     // routed experts with hot experts in the GPU expert cache (LLAMA_MOE_CACHE_MIB), see build_moe_ffn;
     // limit > 0: clipped SwiGLU (ggml_swiglu_clamp)
     ggml_tensor * build_moe_ffn_cache(
             ggml_tensor * cur, ggml_tensor * selected_experts, ggml_tensor * weights,
-            ggml_tensor * up, ggml_tensor * gate, ggml_tensor * down, int il, float limit) const;
+            ggml_tensor * up, ggml_tensor * gate, ggml_tensor * down, int il, float limit,
+            const std::function<void()> & before_cpu_ffn) const;
 
     ggml_tensor * build_moe_ffn_split(
              ggml_tensor * cur,
