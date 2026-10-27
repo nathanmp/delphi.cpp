@@ -1,6 +1,7 @@
 #include "llama-engram.h"
 
 #include "ggml-backend.h"
+#include "ggml-cpuset.h"
 #include "ggml-impl.h"
 
 #include <algorithm>
@@ -10,6 +11,11 @@
 #include <deque>
 #include <mutex>
 #include <thread>
+
+#if defined(__linux__)
+#include <pthread.h>
+#include <sched.h>
+#endif
 
 struct llama_engram_reader::job {
     const ggml_tensor * table;
@@ -54,6 +60,20 @@ struct llama_engram_reader::impl {
     }
 
     void run() {
+#if defined(__linux__)
+        // A context can be created by an already pinned compute thread. Use the helper CPU limit instead of inheriting that one CPU.
+        cpu_set_t cpus;
+        CPU_ZERO(&cpus);
+        for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+            if (ggml_cpuset_allowed(cpu)) {
+                CPU_SET(cpu, &cpus);
+            }
+        }
+        if (CPU_COUNT(&cpus) > 0) {
+            pthread_setaffinity_np(pthread_self(), sizeof(cpus), &cpus);
+        }
+        pthread_setname_np(pthread_self(), "engram-reader");
+#endif
         for (;;) {
             job_ptr work;
             {
