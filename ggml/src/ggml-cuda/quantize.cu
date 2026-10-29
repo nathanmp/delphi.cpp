@@ -1,4 +1,5 @@
 #include "quantize.cuh"
+#include "grid-pad.cuh"
 #include <cstdint>
 
 #if defined(BLACKWELL_MMA_AVAILABLE)
@@ -576,7 +577,8 @@ void quantize_row_q8_1_cuda(
 
     const uint3 ne2_fastdiv = init_fastdiv_values(ne2);
 
-    const int64_t block_num_x = (ne0 + CUDA_QUANTIZE_BLOCK_SIZE - 1) / CUDA_QUANTIZE_BLOCK_SIZE;
+    const int64_t block_num_x = ggml_cuda_grid_pad((ne0 + CUDA_QUANTIZE_BLOCK_SIZE - 1) / CUDA_QUANTIZE_BLOCK_SIZE, ne1*ne2*ne3,
+            CUDA_QUANTIZE_BLOCK_SIZE); // the kernel skips i0 >= ne0
     const dim3 num_blocks(block_num_x, ne1, ne2*ne3);
     const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, block_size, 0, stream);

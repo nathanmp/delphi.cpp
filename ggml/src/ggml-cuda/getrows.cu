@@ -1,6 +1,7 @@
 #include "getrows.cuh"
 #include "dequantize.cuh"
 #include "convert.cuh"
+#include "grid-pad.cuh"
 
 template<int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static __global__ void k_get_rows(
@@ -267,7 +268,7 @@ static void get_rows_cuda_float(
 
         if (can_vec) {
             const int block_num_y = vec_block_num_y;
-            const dim3 block_nums(ne10, MIN(block_num_y, UINT16_MAX), MIN(ne11*ne12, UINT16_MAX));
+            const dim3 block_nums(ne10, MIN(ggml_cuda_grid_pad(block_num_y, ne10*MIN(ne11*ne12, UINT16_MAX), CUDA_GET_ROWS_BLOCK_SIZE), UINT16_MAX), MIN(ne11*ne12, UINT16_MAX));
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{block_nums, block_dims, 0, stream};
             ggml_cuda_kernel_launch(k_get_rows_float_vec<dst_t>, launch_params,
                 (const dst_t *) src0_d, src1_d, dst_d,
@@ -280,7 +281,7 @@ static void get_rows_cuda_float(
     }
 
     const int block_num_y = (ne00 + CUDA_GET_ROWS_BLOCK_SIZE - 1) / CUDA_GET_ROWS_BLOCK_SIZE;
-    const dim3 block_nums(ne10, MIN(block_num_y, UINT16_MAX), MIN(ne11*ne12, UINT16_MAX));
+    const dim3 block_nums(ne10, MIN(ggml_cuda_grid_pad(block_num_y, ne10*MIN(ne11*ne12, UINT16_MAX), CUDA_GET_ROWS_BLOCK_SIZE), UINT16_MAX), MIN(ne11*ne12, UINT16_MAX));
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{block_nums, block_dims, 0, stream};
     ggml_cuda_kernel_launch(k_get_rows_float<src0_t, dst_t>, launch_params,

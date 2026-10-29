@@ -10257,6 +10257,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 8, 2, 1, 1, false));
+    // delphi: shapes whose launch step is a multiple of 64 Ki threads (ggml_cuda_grid_pad must leave them alone), small and large
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 5120, 8, 256, 1, 1, false));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 5120, 8, 4096, 1, 1, false));
     for (ggml_type type : all_types) {
         for (int b : {1, 7}) {
             for (bool v : {false, true}) {
@@ -12806,6 +12809,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 5120, nb, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 640));
     }
 
+    // DeepSeek-V4.1 decode and DSpark verification below the sparse threshold: 64 query heads on one KV head, dense
+    for (int64_t nb : {1, 2, 3, 4, 5}) {
+        for (int64_t kv : {512, 1024, 2048}) {
+            test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, kv, nb, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0));
+        }
+    }
+
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
@@ -12908,6 +12918,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                     test_cases.emplace_back(new test_rope(type, { 80,  16, 2, 1},  80, GGML_ROPE_TYPE_VISION, 512, 1.0f, 0.0f, 1.0f, ff, v, fw)); // rope_multi,m-rope (qwen2vl ViT)
                 }
             }
+            // DeepSeek V4.1 decode/verify: 512-wide heads, the last 64 dims rotated (YaRN), 64 heads, 1-5 tokens
+            for (int64_t nt : {1, 2, 3, 4, 5, 6, 8}) {
+                for (int v : {0, 2}) {
+                    test_cases.emplace_back(new test_rope(type, {512, 64, nt, 1}, 64, GGML_ROPE_TYPE_NORMAL, 65536, 1.0f/16, 1.0f, 1.0f, false, v, fw, false, 448));
+                }
+            }
+            for (std::array<int64_t, 4> ne : std::vector<std::array<int64_t, 4>>{{512, 32, 8, 1}, {512, 128, 2, 1}, {512, 63, 4, 1}, {512, 65, 4, 1}, {512, 256, 1, 1}, {256, 64, 4, 1}}) {
+                test_cases.emplace_back(new test_rope(type, ne, 64, GGML_ROPE_TYPE_NORMAL, 65536, 1.0f/16, 1.0f, 1.0f, false, 0, fw, false, ne[0] - 64));
+            }
+            test_cases.emplace_back(new test_rope(type, {512, 64, 4, 1}, 64, GGML_ROPE_TYPE_NORMAL, 65536, 1.0f/16, 0.0f, 1.0f, false, 0, fw, false, 448));
+            test_cases.emplace_back(new test_rope(type, {512, 64, 4, 1}, 64, GGML_ROPE_TYPE_NORMAL, 512, 1.0f, 0.0f, 1.0f, false, 0, fw, false, 448));
         }
     }
 

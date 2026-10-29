@@ -1,4 +1,5 @@
 #include "concat.cuh"
+#include "grid-pad.cuh"
 
 #include <stdint.h>
 
@@ -65,7 +66,8 @@ static void concat_cont_cuda(const T * x,
                              int       dim,
                              cudaStream_t stream) {
     const int64_t n          = ne0 * ne1 * ne2;
-    const int     num_blocks = (n + CUDA_CONCAT_BLOCK_SIZE - 1) / CUDA_CONCAT_BLOCK_SIZE;
+    // the kernels loop with a grid stride, so idle blocks are harmless
+    const int     num_blocks = ggml_cuda_grid_pad((n + CUDA_CONCAT_BLOCK_SIZE - 1) / CUDA_CONCAT_BLOCK_SIZE, 1, CUDA_CONCAT_BLOCK_SIZE);
 
     if (dim == 0) {
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, CUDA_CONCAT_BLOCK_SIZE, 0, stream);
