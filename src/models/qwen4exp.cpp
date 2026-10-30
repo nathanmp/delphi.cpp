@@ -3,6 +3,7 @@
 #include "llama-kv-cache.h"
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
+#include "llama-engram.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -451,9 +452,11 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
     ggml_tensor * ple_emb = nullptr;
+    auto * ple_reader = engram_reader && n_tokens <= 16 && llama_engram_reader::supports(model.per_layer_tok_embd) ?
+        engram_reader : nullptr;
     if (hparams.ple_n_heads > 0) {
-        ple_emb = build_inp_ple(mctx_hyb);
-        // make sure ple_emb and build_inp_embd are in the same graph split
+        ple_emb = build_inp_ple(mctx_hyb, ple_reader);
+        // Keep collection and token embedding in the same CPU split.
         ggml_build_forward_expand(gf, ple_emb);
     }
 
@@ -1431,6 +1434,15 @@ public:
     }
 
     ggml_tensor * rows = nullptr;   // I32 [ple_n_heads * n_tokens]
+    llama_engram_reader * reader = nullptr;
+    llama_engram_reader::job_ptr lookup;
+
+    static void collect(ggml_tensor * dst, int ith, int nth, void * userdata) {
+        GGML_UNUSED(ith);
+        GGML_UNUSED(nth);
+        auto * input = static_cast<llm_graph_input_ple *>(userdata);
+        llama_engram_reader::collect(input->lookup, (float *) dst->data, ggml_nbytes(dst));
+    }
 
     const llama_model_qwen4exp & pmodel;
 
@@ -1502,6 +1514,9 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
     }
 
     ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
+    if (reader) {
+        lookup = reader->submit(pmodel.per_layer_tok_embd, std::move(idx));
+    }
 }
 
 // Read a conv history out of its own recurrent row and write the new tail back.
@@ -1561,7 +1576,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
 }
 
 ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
-        const llama_memory_hybrid_idx_context * mctx_hyb) {
+        const llama_memory_hybrid_idx_context * mctx_hyb,
+        llama_engram_reader * reader) {
     const int64_t n_heads = hparams.ple_n_heads;
 
     // the attention cells see every ubatch regardless of the layer types
@@ -1571,10 +1587,20 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
     ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
     ggml_set_input(ple_inp->rows);
     ggml_tensor * rows = ple_inp->rows;
-    res->add_input(std::move(ple_inp));
 
     // gather then flatten the heads: get_rows lays the head dimension out slowest, as the reference does
-    ggml_tensor * emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, rows);
+    ggml_tensor * emb;
+    if (reader) {
+        ple_inp->reader = reader;
+        ggml_tensor * args[] = { rows };
+        emb = ggml_custom_4d(ctx0, GGML_TYPE_F32, hparams.ple_head_dim, n_heads*n_tokens, 1, 1,
+                args, 1, llm_graph_input_ple::collect, 1, ple_inp.get());
+        cb(emb, "ple_lookup", -1);
+        ggml_backend_sched_set_tensor_backend(sched, emb, backend_cpu);
+    } else {
+        emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, rows);
+    }
+    res->add_input(std::move(ple_inp));
     emb = ggml_reshape_2d(ctx0, emb, hparams.ple_head_dim * n_heads, n_tokens);
     cb(emb, "ple_embd", -1);
 

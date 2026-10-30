@@ -52,6 +52,8 @@
 #define KEY_IMAGE_SIZE              "clip.vision.image_size"
 #define KEY_IMAGE_MIN_PIXELS        "clip.vision.image_min_pixels"
 #define KEY_IMAGE_MAX_PIXELS        "clip.vision.image_max_pixels"
+#define KEY_IMAGE_MAX_TOKENS        "clip.vision.image_max_tokens"   // deepseek4v, deepseek41v
+#define KEY_IMAGE_MAX_WH_RATIO      "clip.vision.image_max_wh_ratio" // deepseek4v, deepseek41v
 #define KEY_PREPROC_MIN_TILES       "clip.vision.preproc_min_tiles"
 #define KEY_PREPROC_MAX_TILES       "clip.vision.preproc_max_tiles"
 #define KEY_PREPROC_IMAGE_SIZE      "clip.vision.preproc_image_size"
@@ -491,6 +493,7 @@ enum projector_type {
     PROJECTOR_TYPE_DEEPSEEKOCR,
     PROJECTOR_TYPE_DEEPSEEKOCR2,
     PROJECTOR_TYPE_DEEPSEEK4V,
+    PROJECTOR_TYPE_DEEPSEEK41V,
     PROJECTOR_TYPE_LFM2A,
     PROJECTOR_TYPE_GLM4V,
     PROJECTOR_TYPE_GLM5NEXT,
@@ -558,6 +561,7 @@ static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
     { PROJECTOR_TYPE_DEEPSEEKOCR,       "deepseekocr"},
     { PROJECTOR_TYPE_DEEPSEEKOCR2,      "deepseekocr2"},
     { PROJECTOR_TYPE_DEEPSEEK4V,        "deepseek4v"},
+    { PROJECTOR_TYPE_DEEPSEEK41V,       "deepseek41v"},
     { PROJECTOR_TYPE_LFM2A,             "lfm2a"},
     { PROJECTOR_TYPE_GLM4V,             "glm4v"},
     { PROJECTOR_TYPE_GLM5NEXT,          "glm5next"},
@@ -804,6 +808,11 @@ static inline dsv4_block_layout dsv4_get_block_layout(int n_llm_w, int n_llm_h, 
     bl.pad_last = (bl.rows / 2 * bl.row_len) % 2 * 2;
     bl.n_out    = lead_pad + 1 + bl.rows * bl.row_len + bl.pad_last + 1;
     return bl;
+}
+
+// deepseek41v: plain layout [START] (grid row + NEWLINE) * rows [END], no pads and no row pairing
+static inline int dsv41_get_block_n_out(int n_llm_w, int n_llm_h) {
+    return 1 + n_llm_h * (n_llm_w + 1) + 1;
 }
 
 //

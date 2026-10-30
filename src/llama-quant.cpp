@@ -14,6 +14,7 @@
 #include <regex>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 
 // result of parsing --tensor-type option
 // (changes to this struct must be reflected in tools/quantize/quantize.cpp)
@@ -1235,6 +1236,25 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         gguf_set_val_u32(ctx_out.get(), ml.llm_kv(LLM_KV_BLOCK_COUNT).c_str(), blk_id);
     }
 
+    // split_tensors: the listed tensors form a second split, written after the others (so the files can be moved apart)
+    std::unordered_set<std::string> split_names;
+    if (params->split_tensors) {
+        if (params->keep_split) {
+            throw std::runtime_error("split_tensors cannot be used with keep_split");
+        }
+        for (const char * const * p = params->split_tensors; *p != nullptr; p++) {
+            split_names.insert(*p);
+        }
+        const auto in_second = [&](const llama_model_loader::llama_tensor_weight * w) {
+            return split_names.count(ggml_get_name(w->tensor)) > 0;
+        };
+        const auto mid = std::stable_partition(tensors.begin(), tensors.end(), [&](const auto * w) { return !in_second(w); });
+        if ((size_t) (tensors.end() - mid) != split_names.size()) {
+            throw std::runtime_error(format("split_tensors: %zu of %zu names are not tensors of the model",
+                    split_names.size() - (size_t) (tensors.end() - mid), split_names.size()));
+        }
+    }
+
     // keep_split requires that the weights are sorted by split index
     if (params->keep_split) {
         std::sort(tensors.begin(), tensors.end(), [](const llama_model_loader::llama_tensor_weight * a, const llama_model_loader::llama_tensor_weight * b) {
@@ -1254,14 +1274,44 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     // initialize quantization state counters and metadata categories
     init_quantize_state_counters(qs, metadata);
 
+    // --only-tensors: the type choice still sees every tensor (counters), but only the listed tensors are written
+    std::vector<bool> keep(tensors.size(), true);
+    if (params->only_tensors) {
+        if (params->keep_split) {
+            throw std::runtime_error("only_tensors cannot be used with keep_split");
+        }
+        std::unordered_set<std::string> only;
+        for (const char * const * p = params->only_tensors; *p != nullptr; p++) {
+            only.insert(*p);
+        }
+        size_t found = 0;
+        for (size_t i = 0; i < tensors.size(); ++i) {
+            keep[i] = only.count(metadata[i].name) > 0;
+            found += keep[i];
+        }
+        if (found != only.size()) {
+            throw std::runtime_error(format("only_tensors: %zu of %zu names are not tensors of the model", only.size() - found, only.size()));
+        }
+    }
+
     int idx = 0;
     uint16_t n_split = 1;
+
+    // output split of every tensor
+    const auto split_of = [&](size_t i) -> uint16_t {
+        if (params->keep_split) {
+            return tensors[i]->idx;
+        }
+        return split_names.count(ggml_get_name(tensors[i]->tensor)) > 0 ? 1 : 0;
+    };
 
     // Assume split index is continuous
     if (params->keep_split) {
         for (const auto * it : tensors) {
             n_split = std::max(uint16_t(it->idx + 1), n_split);
         }
+    } else if (!split_names.empty()) {
+        n_split = 2;
     }
     std::vector<gguf_context_ptr> ctx_outs(n_split);
     ctx_outs[0] = std::move(ctx_out);
@@ -1277,11 +1327,13 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         const auto * it = tensors[i];
         const struct ggml_tensor * tensor = it->tensor;
 
-        uint16_t i_split = params->keep_split ? it->idx : 0;
+        uint16_t i_split = split_of(i);
         if (!ctx_outs[i_split]) {
             ctx_outs[i_split].reset(gguf_init_empty());
         }
-        gguf_add_tensor(ctx_outs[i_split].get(), tensor);
+        if (keep[i]) {
+            gguf_add_tensor(ctx_outs[i_split].get(), tensor);
+        }
 
         metadata[i].allows_quantization = tensor_allows_quantization(params, model->arch, tensor);
 
@@ -1289,6 +1341,10 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             metadata[i].target_type = llama_tensor_get_type(qs, params, tensor, default_type, metadata[i]);
         } else {
             metadata[i].target_type = tensor->type;
+        }
+
+        if (!keep[i]) {
+            continue;
         }
 
         metadata[i].requires_imatrix = tensor_requires_imatrix(tensor->name, metadata[i].target_type, ftype);
@@ -1347,7 +1403,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         cur_split = index;
         GGML_ASSERT(ctx_outs[cur_split] && "Find uninitialized gguf_context");
         std::string fname = fname_out;
-        if (params->keep_split) {
+        if (n_split > 1) {
             std::vector<char> split_path(llama_path_max(), 0);
             llama_split_path(split_path.data(), split_path.size(), fname_out.c_str(), cur_split, n_split);
             fname = std::string(split_path.data());
@@ -1370,13 +1426,16 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     //
 
     for (size_t i = 0; i < tensors.size(); ++i) {
+        if (!keep[i]) {
+            continue;
+        }
         const auto & weight = *tensors[i];
         const auto & tm = metadata[i];
         ggml_tensor * tensor = weight.tensor;
 
-        if (!params->dry_run && (weight.idx != cur_split && params->keep_split)) {
+        if (!params->dry_run && n_split > 1 && split_of(i) != (uint16_t) cur_split) {
             close_ofstream();
-            new_ofstream(weight.idx);
+            new_ofstream(split_of(i));
         }
 
         const size_t tensor_size = ggml_nbytes(tensor);
@@ -1612,6 +1671,8 @@ llama_model_quantize_params llama_model_quantize_default_params() {
         /*.gptq_feedback              =*/ false,
         /*.gsq_steps                  =*/ 0,
         /*.refine_pattern             =*/ nullptr,
+        /*.only_tensors               =*/ nullptr,
+        /*.split_tensors              =*/ nullptr,
     };
 
     return result;

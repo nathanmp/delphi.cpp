@@ -168,6 +168,11 @@ llama_build(test-save-load-state.cpp)
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
     llama_build_and_test(test-unicode.cpp)
+    llama_build_and_test(test-expert-device.cpp)
+    if (UNIX)
+        # Four named GPU devices and a staging trace path are required; run this fixture explicitly.
+        llama_build(test-expert-device-gpu.cpp)
+    endif()
     llama_build_and_test(test-mimo-mtp-input.cpp)
     llama_build_and_test(test-sampling.cpp)
     llama_build_and_test(test-reasoning-budget.cpp)
@@ -208,6 +213,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # llama_build_and_test(test-double-float.cpp) # SLOW
 
     llama_build(test-llama-archs.cpp)
+    llama_test(test-llama-archs NAME test-deepseek41-ced ARGS --ced-trim --numa tensors --seed 1234)
     llama_build_and_test(test-glm5next-sparse.cpp)
     # requires a full GLM-5-Next GGUF as argv[1], so it is built but not registered
     llama_build(test-glm5next-pool-cache.cpp)
@@ -335,6 +341,10 @@ llama_build_and_test(test-offload-cost.cpp)
 # Logits of a model over a mixed prefill/decode sequence, saved or compared with another run (needs a model: build only).
 llama_build(test-mixed-logits.cpp)
 
+llama_build_and_test(test-engram.cpp)
+target_sources(test-engram PRIVATE ../src/llama-engram.cpp)
+target_include_directories(test-engram PRIVATE ../src ../ggml/src)
+
 llama_build(test-exec-trace.cpp)
 llama_test(test-exec-trace NAME test-exec-trace-disabled ARGS disabled)
 llama_test(test-exec-trace NAME test-exec-trace-enabled ARGS enabled ${CMAKE_CURRENT_BINARY_DIR}/test-exec-trace.bin)
@@ -378,11 +388,15 @@ if (NOT GGML_BACKEND_DL)
     llama_build_and_test(test-quantize-fns.cpp)
     llama_build_and_test(test-quantize-q8-k.cpp LABEL "quant")
     target_include_directories(test-quantize-q8-k PRIVATE ../ggml/src)
+    llama_build_and_test(test-vec-dot-batch.cpp LABEL "quant")
+    target_include_directories(test-vec-dot-batch PRIVATE ../ggml/src)
     llama_build_and_test(test-row-meta.cpp)
     llama_build_and_test(test-quantize-perf.cpp)
     llama_build_and_test(test-rope.cpp)
     llama_build_and_test(test-col2im-1d.cpp)
 endif()
+
+llama_build_and_test(test-cpu-repack-partial-mmid.cpp LABEL "quant")
 
 # libmtmd
 set(LLAMA_TEST_NAME test-mtmd-c-api)
@@ -392,6 +406,10 @@ unset(LLAMA_TEST_NAME)
 
 llama_build_and_test(test-mtmd-impl.cpp)
 target_link_libraries(test-mtmd-impl PRIVATE mtmd)
+
+# Requires a local vision projector and an explicit test GPU.
+llama_build(test-mtmd-memory.cpp)
+target_link_libraries(test-mtmd-memory PRIVATE mtmd)
 
 # GGUF model data fetcher library for tests that need real model metadata
 # Only compile when cpp-httplib has SSL support (CPPHTTPLIB_OPENSSL_SUPPORT)

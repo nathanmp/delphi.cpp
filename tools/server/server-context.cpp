@@ -23,6 +23,7 @@
 #include "sampling.h"
 #include "speculative.h"
 #include "mtmd.h"
+#include "mtmd-memory.h"
 #include "mtmd-helper.h"
 #include "../../src/llama-ext.h" // llama_expert_cache_auto
 
@@ -898,6 +899,18 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
     // TODO @ngxson : move this log line to debug when it become more stable
     SLT_TRC(slot, "encoding mtmd batch from idx = %zu, n_chunks = %d\n", idx, n_added);
 
+    if (auto * dev = mtmd_phase_device(mctx); dev && mtmd_input_chunk_get_type(chunk.get()) == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+        // The asynchronous drafter can still read target compute storage. Drain it before either context gives up scratch.
+        common_speculative_wait_ctx(slot.ctx_dft);
+        const char * name = ggml_backend_dev_name(dev);
+        if (llama_share_device_usage(slot.ctx_tgt, name).compute) {
+            llama_share_release_compute(slot.ctx_tgt);
+        }
+        if (slot.ctx_dft && slot.ctx_dft != slot.ctx_tgt && llama_share_device_usage(slot.ctx_dft, name).compute) {
+            llama_share_release_compute(slot.ctx_dft);
+        }
+    }
+
     res = mtmd_batch_encode(mbatch.get());
     if (res != 0) {
         SLT_ERR(slot, "failed to encode mtmd batch for chunk idx = %zu, res = %d\n", idx, res);
@@ -1334,12 +1347,23 @@ private:
                 mtmd_helper_log_set(common_log_default_callback, nullptr);
             }
 
-            mctx = mtmd_init_from_file(mmproj_path.c_str(), model_tgt, mparams);
+            auto * vision_dev = mparams.device;
+            if (mparams.use_gpu && !vision_dev) {
+                vision_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+                if (!vision_dev) {
+                    vision_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU);
+                }
+            }
+            const bool phase_default = mparams.use_gpu && vision_dev &&
+                llama_share_has_cache_on_device(ctx_tgt, ggml_backend_dev_name(vision_dev));
+            mctx = mtmd_init_from_file_phase(mmproj_path.c_str(), model_tgt, mparams, phase_default);
             if (mctx == nullptr) {
                 SRV_ERR("failed to load multimodal model, '%s'\n", mmproj_path.c_str());
                 return false;
             }
             SRV_INF("loaded multimodal model, '%s'\n", mmproj_path.c_str());
+            SRV_INF("vision memory: %s (LLAMA_MMPROJ_PHASE=0/1 overrides the cache-based default)\n",
+                mtmd_phase_device(mctx) ? "phase" : "resident");
 
             init_opt.video_params.fps_target = params_base.video_fps;
             init_opt.video_params.timestamp_interval_ms = params_base.video_timestamp_interval_ms;
@@ -4380,9 +4404,18 @@ private:
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
                         if (do_checkpoint) {
                             static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
+                            // LLAMA_SERVER_CKPT_TAIL_UBATCH=0 drops the 4 + n_ubatch break: with DeepSeek V4.1 CED, each prompt
+                            // batch that ends with a full ubatch runs the decoder window again, which the next batch then discards
+                            static const bool tail_ubatch = [] {
+                                const char * env = getenv("LLAMA_SERVER_CKPT_TAIL_UBATCH");
+                                return env == nullptr || atoi(env) != 0;
+                            }();
 
                             bool should_break = false;
                             for (int offset : checkpoint_offsets) {
+                                if (!tail_ubatch && offset != 4) {
+                                    continue;
+                                }
                                 const int n_last = std::min(n_batch, offset);
                                 if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
                                     should_break = true;

@@ -10,11 +10,12 @@ import subprocess
 import sys
 from pathlib import Path
 
-from config import ROOT, QuantError, digest, file_identity, write_json
-from model import tensor_bytes
+from config import ROOT, QuantError, cache_env, digest, file_identity, write_json
+import progress
+from model import is_lazy, lazy_args, tensor_bytes
 
 sys.path.insert(0, str(ROOT))
-from tools.bottlenecks.profile import BenchArm, Recipe, ProfileError, GPU_SETTING_KEYS, _gpu_state, run_recipe
+from tools.bottlenecks.profile import BenchArm, Recipe, ProfileError, GPU_SETTING_KEYS, TRACE, _gpu_state, run_recipe
 
 MODEL_REVISION = 3
 
@@ -40,30 +41,99 @@ def gpu(cfg):
     return next(name for name in cfg["devices"] if name != "RAM")
 
 
+def gpus(cfg):
+    """The GPU devices in configuration order."""
+    return [name for name in cfg["devices"] if name != "RAM"]
+
+
+def gpu_only(cfg):
+    """Several GPUs and no RAM: the model is split over the GPUs by layer and nothing is routed to the CPU."""
+    return len(gpus(cfg)) > 1 and "RAM" not in cfg["devices"]
+
+
+def projected(cfg):
+    """Several GPUs next to RAM: the user's throughput factors project the single-GPU timings."""
+    return len(gpus(cfg)) > 1 and "RAM" in cfg["devices"]
+
+
+def measure_cmoe(cfg):
+    """Quality and imatrix runs keep the routed experts in RAM (-cmoe) on the first GPU, also for a GPU-only deployment:
+    a big model does not fit on one GPU and the numerics do not depend on the placement."""
+    return "RAM" in cfg["devices"] or gpu_only(cfg)
+
+
+def measure_env(cfg):
+    """Quality and imatrix runs turn the expert cache off. Its default tier leaves the uncached experts of a prompt on the
+    CPU, which takes hours for a BF16 source on a CPU without BF16 dot products; op offload streams them to the GPU."""
+    env = dict(cfg["runtime"]["env"], LLAMA_MOE_CACHE_MIB="0")
+    if any(d.startswith("CUDA") for d in cfg["devices"]):
+        # The packed MoE weights of CUDA are a second copy of every expert tensor in a hotswap session (it turns packing in
+        # place off): 23 GiB more per CMP 170HX for GLM 5.3, so no band patch fitted. Grouped MMQ gives the same KL.
+        env.setdefault("GGML_CUDA_MOE_GROUPED", "grouped")
+    return env
+
+
 def requires_backend_signature(sig, cfg):
     return not (sig["expert"] and sig["device"] == gpu(cfg) and "RAM" in cfg["devices"] and not cfg["cache_mib"])
 
 
-def profile_model(cfg, model, output, trace=True):
+def profile_model(cfg, model, output, trace=True, placement=None):
+    """Fixed short/long prefill and decode with one model load. A GPU-only deployment needs its layer split
+    (memory()['layer_split']) and is profiled with the real placement.
+
+    The timing model sums the per-layer region costs over the devices, which is right for sequential decode. Pipeline
+    overlap between GPUs in multi-ubatch prefill is not modelled; the fitted slopes of validate absorb a uniform scale."""
     r = cfg["runtime"]
-    command = [str(Path(cfg["bindir"]) / "llama-bench"), "-m", str(model), "--numa", "tensors", "--device", gpu(cfg),
+    if gpu_only(cfg):
+        if not placement:
+            raise QuantError("GPU-only profiling needs the layer split of the recipe")
+        # llama-bench separates devices (and tensor-split entries) of one test value with '/'; ',' would start another test
+        place = ["--device", "/".join(gpus(cfg)), "-sm", "layer", "-ts", "/".join(str(c) for c in placement)]
+    else:
+        place = ["--device", gpu(cfg)]
+    command = [str(Path(cfg["bindir"]) / "llama-bench"), "-m", str(model), "--numa", "tensors", *place,
                "-ngl", "999", "-t", str(r["threads"]), "-b", str(r["batch"]), "-ub", str(r["ubatch"]),
                "-p", f"{r['short_tokens']},{r['long_tokens']}", "-n", str(r["decode_tokens"]),
-               "-d", str(r["depth_tokens"]), "-r", str(r["repetitions"]), *r["extra_args"]]
+               "-d", str(r["depth_tokens"]), "-r", str(r["repetitions"]), *lazy_args(cfg), *r["extra_args"]]
     if "RAM" in cfg["devices"]:
         command += ["-ncmoe", "999"]
     environment = dict(r["env"])
-    environment["LLAMA_MOE_CACHE_MIB"] = str(int(cfg["cache_mib"]))
-    arm = BenchArm(name="plain", command=tuple(command), model_paths=(str(model),), env=environment,
-                   trace_mode="submit" if trace else "off", trace_max_events=r["trace_max_events"],
-                   trace_prefill_target_tokens=r["long_tokens"])
-    recipe = Recipe(name="auto-quantize", description="Fixed V1 short/long prefill and decode with one model load.", arms=(arm,))
-    try:
-        result = run_recipe(recipe, Path(output).with_suffix(".artifacts"))
-    except ProfileError as exc:
-        raise QuantError(str(exc)) from exc
+    environment["LLAMA_MOE_CACHE_MIB"] = cache_env(cfg["cache_mib"])
+    artifacts = Path(output).with_suffix(".artifacts")
+    events = max(r["trace_max_events"], TRACE_EVENTS[0])
+    for attempt in range(2):
+        arm = BenchArm(name="plain", command=tuple(command), model_paths=(str(model),), env=environment,
+                       trace_mode="submit" if trace else "off", trace_max_events=events,
+                       trace_prefill_target_tokens=r["long_tokens"])
+        recipe = Recipe(name="auto-quantize", description="Fixed V1 short/long prefill and decode with one model load.", arms=(arm,))
+        try:
+            result = run_recipe(recipe, artifacts)
+            break
+        except ProfileError as exc:
+            needed = trace_events_needed(artifacts / arm.name / "execution.trace") if trace and attempt == 0 else 0
+            if not events < needed <= TRACE_LIMIT:
+                raise QuantError(str(exc)) from exc
+            events = min(TRACE_LIMIT, 1 << math.ceil(math.log2(needed * 1.25)))
+            TRACE_EVENTS[0] = events
+            print(f"The trace needs {needed} events; profiling again with a buffer of {events}", flush=True)
     write_json(output, result)
     return result
+
+
+# The native tracer limit, and the largest trace buffer this process needed (later profiles start with it). It stays out
+# of the configuration: runtime keys are inputs of the prepared tables
+TRACE_LIMIT = 128 * 1024 * 1024
+TRACE_EVENTS = [0]
+
+
+def trace_events_needed(path):
+    """Events that a trace with dropped events tried to record, else 0. A large model on several GPUs records more
+    events than the default buffer (Qwen 3.8 on 3 GPUs: 2.3 M)."""
+    try:
+        stats = TRACE.read_trace(Path(path))["trace_stats"]
+    except Exception:
+        return 0
+    return stats.get("attempted_event_count", 0) if stats.get("dropped_event_count", 0) else 0
 
 
 def profile_times(profile, cfg):
@@ -123,8 +193,8 @@ def regions(info):
         if group.get("quality_fixed"):
             continue
         members = [by_name[name] for name in group["members"]]
-        # MTP layers do not run in the profiled main-model workloads
-        if all(t["preserved"] for t in members) or all(t.get("mtp") for t in members):
+        # MTP layers do not run in the profiled main-model workloads; lazy tables are row lookups, not products
+        if all(t["preserved"] or is_lazy(t["name"]) for t in members) or all(t.get("mtp") for t in members):
             continue
         # A separate embedding is a lookup. A tied output also performs a vocabulary projection when its type varies.
         if all(t["name"] == "token_embd.weight" for t in members) and ("output.weight" in by_name or len(group["pool"]) == 1):
@@ -155,7 +225,9 @@ def measure_ops(info, cfg, directory, timeout=600):
                     sigs[digest(sig)] = sig
     values = {}
     environment = cfg["runtime"]["env"]
+    # with GGML_BACKEND_DL the kernels are in the backend libraries, which change without a relink of the binary
     identity = {"binary": file_identity(binary),
+                "libraries": [file_identity(p) for p in sorted(Path(binary).parent.glob("lib*.so*")) if not p.is_symlink()],
                 "devices": cfg["devices"], "threads": cfg["runtime"]["threads"], "env": environment, "numa": "tensors",
                 "machine_settings": machine_settings()}
     cache_path = directory / "operations.json"
@@ -166,12 +238,22 @@ def measure_ops(info, cfg, directory, timeout=600):
             values = old["values"]
     import time
     deadline = time.monotonic() + timeout
+    with progress.stage("prepare: operation measurement", total=len(sigs)) as steps:
+        measure_signatures(sigs, values, binary, cfg, directory, environment, identity, cache_path, deadline, steps)
+    return values
+
+
+def measure_signatures(sigs, values, binary, cfg, directory, environment, identity, cache_path, deadline, steps):
+    import time
+    pending = sum(key not in values for key in sigs)
+    started, fresh = time.monotonic(), 0
+    steps.update(len(sigs) - pending)
     for key, sig in sorted(sigs.items()):
         if key in values:
             continue
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise QuantError("operation measurement time cap reached; completed signatures were cached")
+            raise QuantError("operation measurement time cap reached; completed signatures were cached: run again (it continues), with a larger --measurement-seconds")
         shape = "x".join(str(x) for x in sig["shape"])
         spec = f"op={'MUL_MAT_ID' if sig['expert'] else 'MUL_MAT'},type={sig['dtype'].lower()},ne={shape},n={sig['tokens']},weights=zero"
         if sig["expert"]:
@@ -181,12 +263,17 @@ def measure_ops(info, cfg, directory, timeout=600):
         command = [str(binary), "perf", "-b", sig["device"], "--numa", "tensors", "--threads", str(cfg["runtime"]["threads"]),
                    "--output", "csv", "--custom", spec]
         log = directory / f"op-{key[:16]}.csv"
-        run(command, log, environment, timeout=max(1, remaining))
+        try:
+            run(command, log, environment, timeout=max(1, remaining))
+        except subprocess.TimeoutExpired:
+            raise QuantError("operation measurement time cap reached; completed signatures were cached: run again (it continues), with a larger --measurement-seconds") from None
         measured = operation_times(log.read_text())
         values[key] = {"signature": sig, "ms": statistics.median(measured) / 1000 if measured else None,
                        "command": command, "log": str(log), "reason": None if measured else "backend did not run this signature"}
         write_json(cache_path, {"schema": "delphi.auto-quantize.operations/1", "identity": identity, "values": values})
-    return values
+        # the estimate counts only the signatures that need a run; cached ones cost nothing
+        fresh += 1
+        steps.update(len(sigs) - pending + fresh, eta=(time.monotonic() - started) / fresh * (pending - fresh))
 
 
 def active_experts(count, top_k, tokens):
@@ -283,7 +370,7 @@ class Predictor:
         if any(not math.isfinite(value) or value <= 0 for value in result.values()):
             raise QuantError("anchored time estimate is nonpositive; recipe exceeds the calibrated model")
         factors = self.cfg["multi_gpu_speedup_percent"]
-        if sum(name != "RAM" for name in self.cfg["devices"]) > 1:
+        if projected(self.cfg):
             result = {r: value / (1 + factors[r] / 100) for r, value in result.items()}
         return result
 

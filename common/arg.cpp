@@ -2739,7 +2739,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) {
             params.mmproj.path = value;
         }
-    ).set_examples(mmproj_examples).set_env("LLAMA_ARG_MMPROJ"));
+    ).set_examples({LLAMA_EXAMPLE_MTMD, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_TTS, LLAMA_EXAMPLE_FIT_PARAMS}).set_env("LLAMA_ARG_MMPROJ"));
     add_opt(common_arg(
         {"-mmu", "--mmproj-url"}, "URL",
         "URL to a multimodal projector file. see tools/mtmd/README.md",
@@ -2782,7 +2782,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.mmproj_use_gpu = true;
             params.mmproj_device  = devices.front();
         }
-    ).set_examples(mmproj_examples).set_env("MTMD_BACKEND_DEVICE")); // no LLAMA_ARG_ prefix for backward compatibility reason
+    ).set_examples({LLAMA_EXAMPLE_MTMD, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_TTS, LLAMA_EXAMPLE_FIT_PARAMS}).set_env("MTMD_BACKEND_DEVICE")); // no LLAMA_ARG_ prefix for backward compatibility reason
     add_opt(common_arg(
         {"--image", "--audio", "--video"}, "FILE",
         "path to an image, audio, or video file. use with multimodal models, use comma-separated values for multiple files\n",
@@ -4306,7 +4306,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.n_max_set  = true;
             params.speculative.draft.n_max_auto = false;
         }
-    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX"));
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_FIT_PARAMS}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX"));
+    add_opt(common_arg(
+        {"--spec-draft-block"}, "N",
+        "draft-dspark: tokens in the drafted block; the first --spec-draft-n-max are verified, the rest only condition "
+        "them (default: 0 = the trained block size)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.speculative.draft.n_block = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_BLOCK"));
     add_opt(common_arg(
         {"--spec-draft-ubatch-size", "-ubd"}, "N",
         string_format("physical batch size of the draft context, 0 = same as -ub (default: %d); a draft rarely gains "
@@ -4492,7 +4503,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             auto types = common_speculative_types_from_names(types_str);
             params.speculative.types.insert(params.speculative.types.end(), types.begin(), types.end());
         }
-    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_TYPE"));
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_FIT_PARAMS}).set_env("LLAMA_ARG_SPEC_TYPE"));
     add_opt(common_arg(
         {"--spec-ngram-mod-n-min"}, "N",
         string_format("minimum number of ngram tokens to use for ngram-based speculative decoding (default: %d)", params.speculative.ngram_mod.n_min),

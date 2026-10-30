@@ -16,12 +16,34 @@ class QuantError(ValueError):
     pass
 
 
+def loss_only(cfg):
+    """Whether only the loss counts: no time importance and no speed bound. Then nothing measures or predicts speed."""
+    return not any(cfg["importance"][axis] or cfg["bounds"].get(f"min_{axis}_t_s") for axis in AXES[1:])
+
+
 def number(value, name, minimum=0, positive=False):
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
         raise QuantError(f"{name} must be finite")
     if value < minimum or (positive and value == 0):
         raise QuantError(f"{name} must be {'positive' if positive else 'nonnegative'}")
     return value
+
+
+def cache_size(value, name):
+    """MiB of the GPU expert cache: a number, or "auto" (the memory that the plan leaves on the GPU less the server's margin)."""
+    if isinstance(value, str) and value.strip().lower() == "auto":
+        return "auto"
+    if isinstance(value, str):
+        try:
+            value = float(value)
+        except ValueError:
+            raise QuantError(f"{name} must be a number of MiB or auto") from None
+    return number(value, name)
+
+
+def cache_env(value):
+    """The LLAMA_MOE_CACHE_MIB value of a cache_mib setting."""
+    return "auto" if value == "auto" else str(int(value))
 
 
 def capacity(value):
@@ -138,6 +160,53 @@ def write_json(path, value):
     temporary.replace(path)
 
 
+DEFAULT_PRIMARY_QTYPES = ("IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ2_KS", "IQ2_K", "Q2_K", "IQ3_XXS", "IQ3_S", "IQ3_KS", "IQ3_K",
+                          "Q3_K", "IQ4_XS", "IQ4_KS", "IQ4_NL", "IQ4_K", "Q4_0", "Q4_K", "MXFP4", "Q5_0", "IQ5_KS",
+                          "IQ5_K", "Q5_K", "IQ6_K", "Q6_K", "Q8_0")
+
+
+# Tensor types that each inference runtime loads: an allow-list per runtime, so that a type that a fork adds stays out
+# until it is listed here. delphi loads every type (None). The integer types and F64 only occur in preserved tensors.
+MAINLINE_QTYPES = frozenset(("F32", "F16", "BF16", "F64", "I8", "I16", "I32", "I64", "Q4_0", "Q4_1", "Q5_0", "Q5_1", "Q8_0",
+                             "Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "IQ1_S", "IQ1_M", "IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ3_XXS",
+                             "IQ3_S", "IQ4_NL", "IQ4_XS", "TQ1_0", "TQ2_0", "MXFP4"))
+# ported from ik_llama.cpp with its type ids (ggml.h)
+IK_QTYPES = frozenset(("IQ2_KS", "IQ2_K", "IQ3_KS", "IQ3_K", "IQ4_KS", "IQ4_K", "IQ5_KS", "IQ5_K", "IQ6_K"))
+# mainline additions of 2026 that ik_llama.cpp is not known to carry
+NEW_MAINLINE_QTYPES = frozenset(("NVFP4", "Q1_0", "Q2_0"))
+# not in ik_llama.cpp or mainline: Q4_G128 is a Delphi type (ggml.h)
+RUNTIME_QTYPES = {"delphi": None, "llama": MAINLINE_QTYPES | NEW_MAINLINE_QTYPES, "ik_llama": MAINLINE_QTYPES | IK_QTYPES}
+RUNTIME_ALIASES = {"delphi": "delphi", "delphi.cpp": "delphi", "llama": "llama", "llama.cpp": "llama",
+                   "ik_llama": "ik_llama", "ik_llama.cpp": "ik_llama"}
+RUNTIME_NAMES = {"delphi": "delphi.cpp", "llama": "llama.cpp", "ik_llama": "ik_llama.cpp"}
+
+
+def runtime_name(value):
+    """The runtime of a name or alias (delphi, llama, ik_llama; a .cpp suffix is accepted)."""
+    try:
+        return RUNTIME_ALIASES[str(value).lower()]
+    except KeyError:
+        raise QuantError(f"unknown runtime {value!r}; use delphi, llama or ik_llama") from None
+
+
+def runtime_allows(runtime, qtype):
+    allowed = RUNTIME_QTYPES[runtime]
+    return allowed is None or str(qtype).upper() in allowed
+
+
+def check_runtime_choices(cfg):
+    """Stop when a pool or pin that the user wrote names a type that the target runtime cannot load. The default pools
+    are not checked: the search leaves their unloadable types out."""
+    runtime = cfg.get("target_runtime", "delphi")
+    explicit = [(name, cfg[name]) for name in ("primary_qtypes", "other_qtypes") if name in cfg and name not in cfg.get("default_pools", ())]
+    explicit += [(f"pins of {name}", [q]) for name, q in cfg.get("pins", {}).items()]
+    for where, qtypes in explicit:
+        bad = [q for q in qtypes if not runtime_allows(runtime, q)]
+        if bad:
+            raise QuantError(f"{where} names {bad[0]}, which runtime {RUNTIME_NAMES[runtime]} cannot load; "
+                             "pick another type or another --runtime")
+
+
 def load_config(path):
     path = Path(path).resolve()
     cfg = json.loads(path.read_text())
@@ -146,7 +215,7 @@ def load_config(path):
     allowed = {"schema", "model", "devices", "reserve", "imatrix", "primary_qtypes", "other_qtypes", "importance",
                "preserve_below_mib", "tie_gate_up", "primary_regex", "pins", "preserve_regex", "allow_requantize",
                "bindir", "runtime", "sampling", "search", "bounds", "cache_mib", "multi_gpu_speedup_percent", "timing", "quality",
-               "calibration", "imatrix_collect"}
+               "calibration", "imatrix_collect", "mtp", "runtime_reserve", "target_runtime", "lazy_type", "routing_curve"}
     unknown = set(cfg) - allowed
     if unknown:
         raise QuantError(f"unknown configuration keys: {sorted(unknown)}")
@@ -176,19 +245,43 @@ def load_config(path):
         raise QuantError("at least one importance must be positive")
     cfg["importance"] = {axis: value / total for axis, value in priorities.items()}
     cfg["preserve_below_mib"] = number(cfg.get("preserve_below_mib", 1), "preserve_below_mib")
+    # Without explicit pools: every weight type with GPU kernels up to Q8_0 for the primary (expert or FFN) tensors,
+    # so the top calibration probe is Q8_0 and no plan goes beyond the probed range; the other tensors stay Q8_0.
+    cfg["default_pools"] = [name for name in ("primary_qtypes", "other_qtypes") if name not in cfg]
+    cfg.setdefault("primary_qtypes", list(DEFAULT_PRIMARY_QTYPES))
+    cfg.setdefault("other_qtypes", ["Q8_0"])
     cfg.setdefault("tie_gate_up", True)
     for field in ("tie_gate_up", "allow_requantize"):
         if field in cfg and not isinstance(cfg[field], bool):
             raise QuantError(f"{field} must be boolean")
     cfg.setdefault("pins", {})
+    # type of every lazy table that has no pin of its own (model.lazy_pins); None keeps the source types
+    cfg["lazy_type"] = cfg.get("lazy_type")
+    if cfg["lazy_type"] is not None:
+        from model import qtype
+        cfg["lazy_type"] = qtype(cfg["lazy_type"])
+    # the inference runtime that loads the encoded GGUF; "runtime" below holds the settings of the measurement runs
+    cfg["target_runtime"] = runtime_name(cfg.get("target_runtime", "delphi"))
+    check_runtime_choices(cfg)
     cfg.setdefault("preserve_regex", [])
     for regex in cfg["preserve_regex"] + ([cfg["primary_regex"]] if cfg.get("primary_regex") else []):
         re.compile(regex)
-    cfg["cache_mib"] = number(cfg.get("cache_mib", 0), "cache_mib")
+    cfg["cache_mib"] = cache_size(cfg.get("cache_mib", 0), "cache_mib")
+    if cfg.get("routing_curve"):
+        from routing import load_curve  # routing imports this module
+        cfg["routing_curve"] = load_curve(absolute(cfg["routing_curve"]))
+    # whether the MTP blocks are resident (served as the draft); without them the server does not load them
+    cfg.setdefault("mtp", True)
+    if not isinstance(cfg["mtp"], bool):
+        raise QuantError("mtp must be boolean")
+    cfg["runtime_reserve"] = {name: capacity(value) for name, value in cfg.get("runtime_reserve", {}).items()}
     speedups = cfg.get("multi_gpu_speedup_percent", {})
     if set(speedups) - {"decode", "short", "long"}:
         raise QuantError("multi_gpu_speedup_percent keys are decode, short, long")
     cfg["multi_gpu_speedup_percent"] = {axis: number(speedups.get(axis, 0), f"speedup.{axis}") for axis in AXES[1:]}
+    # timing imports this module, so the GPU-only condition of timing.gpu_only is repeated here
+    if sum(name != "RAM" for name in cfg["devices"]) > 1 and "RAM" not in cfg["devices"] and any(cfg["multi_gpu_speedup_percent"].values()):
+        raise QuantError("GPU-only placement profiles the real layer split; multi_gpu_speedup_percent applies only to RAM-routed projections")
     cfg.setdefault("runtime", {})
     runtime = cfg["runtime"]
     defaults = {"threads": 32, "depth_tokens": 0, "batch": 2048, "ubatch": 512, "short_tokens": 128,
@@ -227,8 +320,10 @@ def load_config(path):
     if cfg["sampling"]["max_samples"] < cfg["sampling"]["samples"] or not isinstance(cfg["sampling"]["row_stats"], bool):
         raise QuantError("invalid sampling range or row_stats flag")
     cfg.setdefault("search", {})
-    if set(cfg["search"]) - {"display"}:
-        raise QuantError("search accepts only display; the knapsack search has no beam or evaluation cap")
+    if set(cfg["search"]) - {"display", "minimize"}:
+        raise QuantError("search accepts only display and minimize; the knapsack search has no beam or evaluation cap")
+    if cfg["search"].get("minimize", "size") != "size":
+        raise QuantError("search.minimize can only be size")
     cfg["search"].setdefault("display", 8)
     if not isinstance(cfg["search"]["display"], int) or cfg["search"]["display"] <= 0:
         raise QuantError("search.display must be a positive integer")
@@ -237,9 +332,9 @@ def load_config(path):
         cfg["imatrix_collect"] = imatrix_collect(cfg["imatrix_collect"], absolute, cfg)
     cfg.setdefault("bounds", {})
     for name, value in cfg["bounds"].items():
-        if name not in {"max_damage", "max_loss", "min_decode_t_s", "min_short_t_s", "min_long_t_s"}:
+        if name not in {"max_damage", "max_loss", "max_total_bytes", "min_decode_t_s", "min_short_t_s", "min_long_t_s"}:
             raise QuantError(f"unknown bound {name}")
-        number(value, f"bounds.{name}")
+        number(value, f"bounds.{name}", positive=name == "max_total_bytes")
     if "max_loss" in cfg["bounds"] and "quality" not in cfg:
         raise QuantError("max_loss requires a calibrated quality table")
     if "max_damage" in cfg["bounds"] and "quality" in cfg:
@@ -253,13 +348,17 @@ def load_config(path):
     return cfg
 
 
+# General text, code and math; used when the configuration names no calibration text
+DEFAULT_CALIBRATION_TEXT = ROOT / "tools/auto-quantize/ubergarm-imatrix-calibration-corpus-v02.txt"
+
+
 def calibration(c, absolute, cfg):
     """Calibration inputs: text (a path or weighted corpora), teacher, probe design and the devices of the probe sessions."""
     if not isinstance(c, dict):
         raise QuantError("calibration must be an object")
-    defaults = {"text": None, "teacher": None, "chunks": 64, "context": 512, "batch": 0, "threads": None,
-                "probe_qtypes": None, "bands": 10, "recipes": 8, "seed": 1, "devices": None, "text_seed": 1,
-                "bytes_per_token": 4.0}
+    defaults = {"text": str(DEFAULT_CALIBRATION_TEXT), "teacher": None, "chunks": 64, "context": 512, "batch": 0, "threads": None,
+                "probe_qtypes": None, "bands": 10, "recipes": 10, "seed": 1, "devices": None, "text_seed": 1,
+                "bytes_per_token": 4.0, "patch_mib": 8192, "uniform": "auto"}
     if set(c) - set(defaults):
         raise QuantError(f"unknown calibration keys: {sorted(set(c) - set(defaults))}")
     result = {name: c.get(name, default) for name, default in defaults.items()}
@@ -269,7 +368,9 @@ def calibration(c, absolute, cfg):
     if result["text"] is not None:
         entries = corpora(result["text"], absolute, "calibration.text")
         result["text"] = entries[0]["path"] if len(entries) == 1 else entries
-    for name in ("chunks", "context", "bands", "recipes", "seed", "text_seed", "batch"):
+    if result["uniform"] not in ("auto", "session", "direct"):
+        raise QuantError("calibration.uniform must be auto, session or direct")
+    for name in ("chunks", "context", "bands", "recipes", "seed", "text_seed", "batch", "patch_mib"):
         value = result[name]
         if not isinstance(value, int) or isinstance(value, bool) or value < (0 if name in ("seed", "text_seed", "batch") else 1):
             raise QuantError(f"calibration.{name} must be a valid integer")

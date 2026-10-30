@@ -311,6 +311,16 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
         }
 #endif // defined(GGML_USE_HIP)
 
+        // delphi: 512-wide heads at 3-4 queries (DeepSeek V4.1 DSpark verification, 64 heads on one KV head): tiles of
+        // 4 queries x 4 heads give twice the tiles and 4x the blocks of 4 x 8 (32 blocks on 64 CUs at 512 KV rows),
+        // 51 vs 60 us at 512 KV rows and 95 vs 110 us at 2048 on gfx1201. 5+ queries keep 8 heads per tile.
+        if constexpr (DKQ == 512) {
+            if (use_gqa_opt && gqa_ratio % 4 == 0 && Q->ne[1] >= 3 && Q->ne[1] <= 4) {
+                ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 4>(ctx, dst);
+                return;
+            }
+        }
+
         if (use_gqa_opt && gqa_ratio % 8 == 0) {
             ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8>(ctx, dst);
             return;

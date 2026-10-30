@@ -1512,7 +1512,9 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
                 ggml_tensor * inp_pos,
                 ggml_tensor ** shared_top_k,
                 ggml_tensor ** shared_cand,
-                int il) const;
+                int il,
+                ggml_tensor * full_cur = nullptr,
+                uint32_t n_skip = 0) const;
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
@@ -2723,7 +2725,8 @@ struct llama_model_qwen4exp : public llama_model_base {
                             int   il);
 
         ggml_tensor * build_inp_ple(
-  const llama_memory_hybrid_idx_context * mctx_hyb);
+  const llama_memory_hybrid_idx_context * mctx_hyb,
+                    llama_engram_reader * reader);
 
         ggml_tensor * build_ple(
              llm_graph_input_rs * inp,

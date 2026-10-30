@@ -5613,8 +5613,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     if (use_cuda_graph) {
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         if (graph->instance == nullptr && graph->instance_lent) {
-            // this graph needs its executable back, so shapes of this topology alternate
-            cuda_ctx->graph_topo_no_lend.insert(graph->topo_key);
+            // this graph needs its executable back, so shapes of this topology alternate. Prefill splits keep
+            // lending: each prompt repeats the shapes of the earlier prompts as its KV grows, and a long prompt
+            // brings new ones. Without a sibling, each new shape was instantiated (GLM on 3 CMPs: about 77 ms per
+            // 2000-node split, 3.7 s of a 16K prompt), and an update costs less.
+            if (!ggml_cuda_graph_is_prefill_candidate(cgraph)) {
+                cuda_ctx->graph_topo_no_lend.insert(graph->topo_key);
+            }
             graph->instance_lent = false;
         }
         ggml_cuda_graph * sibling = graph->instance == nullptr && !ggml_cuda_graph_prefer_instantiate(cgraph->n_nodes) ?
@@ -7425,6 +7430,16 @@ static void ggml_backend_cuda_stage_upload_packed(ggml_backend_t backend, const 
 static void ggml_backend_cuda_moe_int4_forget_inside_proc(ggml_backend_t backend, const ggml_tensor * t) {
     ggml_cuda_moe_int4_forget_inside(((ggml_backend_cuda_context *) backend->context)->device, t);
 }
+#else
+// delphi: expert-cache slot writes (llama-expert-cache.cpp) on NVIDIA: a device copy ordered on the stream of backend. The banks
+// keep the GGUF layout (a bank packed in place aborts here).
+static void ggml_backend_cuda_moe_set_expert_proc(ggml_backend_t backend, const ggml_tensor * t, int64_t expert, const void * src) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    ggml_cuda_moe_packed_check_not_inplace(t);
+    CUDA_CHECK(cudaMemcpyAsync(static_cast<char *>(t->data) + expert * t->nb[2], src, t->nb[2], cudaMemcpyDeviceToDevice,
+            cuda_ctx->stream()));
+}
 #endif
 
 // delphi: give the cached device memory of an idle backend back to the driver, so that another process can use it (VRAM sharing
@@ -7550,6 +7565,11 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_cuda_moe_int4_get_pack") == 0) {
         return (void *)ggml_backend_cuda_moe_int4_get_pack;
     }
+#ifndef GGML_HIP_MOE_INT4_AVAILABLE
+    if (strcmp(name, "ggml_backend_cuda_moe_int4_set_expert") == 0) {
+        return (void *)ggml_backend_cuda_moe_set_expert_proc;
+    }
+#endif
 #ifdef GGML_HIP_MOE_INT4_AVAILABLE
     if (strcmp(name, "ggml_backend_cuda_moe_int4_set_expert") == 0) {
         return (void *)ggml_backend_cuda_moe_int4_set_expert_proc;

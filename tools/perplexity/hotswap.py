@@ -35,12 +35,14 @@ class HotswapSession:
         except (OSError, ValueError, IndexError):
             return None
 
-    def wait(self, sequence, initial=False, exiting=False):
+    def wait(self, sequence, initial=False, exiting=False, staged=False):
         deadline = time.monotonic() + self.timeout
         while time.monotonic() < deadline:
             state = self.state()
             if state and state[2] == sequence:
                 if state[0] == "exiting" and exiting:
+                    return state
+                if state[0] == "staged" and staged:
                     return state
                 if state[0] == "done" and (initial or state[1] > self.iteration):
                     self.iteration = state[1]
@@ -69,12 +71,16 @@ class HotswapSession:
         return {"state": self.state(), "seconds": time.monotonic()-started, "log": self.log.read_text(errors="replace")}
 
     def request(self, action, patch=None):
-        if action not in ("reload", "restore", "compute", "exit"):
+        # reload/restore/compute evaluate; add (patch on top of the current tensors) and reset (back to the floor)
+        # only stage tensors for the next compute.
+        if action not in ("reload", "restore", "compute", "exit", "add", "reset"):
             raise ValueError(action)
+        if (action == "add") != (patch is not None) and action != "reload":
+            raise ValueError("add requires a patch; only reload and add take one")
         if patch is not None:
             patch = Path(patch).resolve()
-            if action != "reload" or not patch.is_file() or "\n" in str(patch):
-                raise ValueError("reload requires an existing patch path without newlines")
+            if action not in ("reload", "add") or not patch.is_file() or "\n" in str(patch):
+                raise ValueError(f"{action} requires an existing patch path without newlines")
         self.sequence += 1
         line = f"{action} {self.sequence}" + (f" {patch}" if patch else "") + "\n"
         offset = self.log.stat().st_size
@@ -82,7 +88,7 @@ class HotswapSession:
         temporary.write_text(line)
         temporary.replace(self.control)
         started = time.monotonic()
-        self.wait(self.sequence, exiting=action == "exit")
+        self.wait(self.sequence, exiting=action == "exit", staged=action in ("add", "reset"))
         with self.log.open("rb") as stream:
             stream.seek(offset)
             text = stream.read().decode(errors="replace")

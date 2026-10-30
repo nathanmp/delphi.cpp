@@ -15,8 +15,8 @@ import re
 from pathlib import Path
 
 from config import QuantError, digest, file_identity, write_json
-from model import read_model
-from timing import gpu, run
+from model import lazy_args, read_model
+from timing import gpu, measure_cmoe, measure_env, run
 
 MARGIN = 1.2
 FORMAT = 1
@@ -113,12 +113,15 @@ def calibration_text(c, directory):
 
 
 def imatrix_command(cfg, c, text, output):
-    """llama-imatrix on one corpus, with the placement of the calibration runs (first GPU, experts in RAM when RAM is a device)."""
+    """llama-imatrix on one corpus, with the placement of the calibration runs: the first GPU, with the experts in RAM
+    (-cmoe) when RAM is a device or the deployment is GPU-only (a big model does not fit on one GPU; the numerics do
+    not depend on the placement)."""
     command = [str(Path(cfg["bindir"]) / "llama-imatrix"), "-m", cfg["model"], "-f", str(text), "-o", str(output),
                "--output-format", "gguf", "-c", str(c["context"]), "-t", str(c["threads"]), "--numa", "tensors",
                "--device", gpu(cfg), "-ngl", "999", "--no-ppl"]
-    if "RAM" in cfg["devices"]:
+    if measure_cmoe(cfg):
         command.append("-cmoe")
+    command += lazy_args(cfg)
     if c["chunks"]:
         command += ["--chunks", str(c["chunks"])]
     return command + [str(arg) for arg in c["extra_args"]]
@@ -143,7 +146,7 @@ def collect_imatrices(cfg, directory, timeout=86400):
         raise QuantError("collect-imatrix needs the imatrix_collect configuration")
     directory = Path(directory).resolve()
     directory.mkdir(parents=True, exist_ok=True)
-    environment = dict(cfg["runtime"]["env"])
+    environment = measure_env(cfg)
     if c["means"]:
         environment["DELPHI_IMATRIX_MEANS"] = "1"
     record = directory / "imatrix-collect.json"

@@ -132,7 +132,7 @@ static bool try_parse_ftype(const std::string & ftype_str_in, llama_ftype & ftyp
 static void usage(const char * executable) {
     printf("usage: %s [--help] [--allow-requantize] [--leave-output-tensor] [--pure] [--imatrix] [--include-weights]\n", executable);
     printf("       [--exclude-weights] [--output-tensor-type] [--token-embedding-type] [--tensor-type] [--tensor-type-file]\n");
-    printf("       [--prune-layers] [--keep-split] [--override-kv] [--dry-run] [--max-buffer-size]\n");
+    printf("       [--prune-layers] [--only-tensors] [--split-tensors] [--keep-split] [--override-kv] [--dry-run] [--max-buffer-size]\n");
     printf("       [--gptq-feedback] [--gsq-steps N] [--refine-tensor REGEX]\n");
     printf("       model-f32.gguf [model-quant.gguf] type [nthreads]\n\n");
     printf("  --allow-requantize\n");
@@ -165,9 +165,15 @@ static void usage(const char * executable) {
     printf("                                      list of tensors to quantize to a specific ggml_type\n");
     printf("                                      this is an advanced option to selectively quantize a long list of tensors.\n");
     printf("                                      the file should use the same format as above, separated by spaces or newlines.\n");
+    printf("  --only-tensors names.txt\n");
+    printf("                                      write only the listed tensors (one name per line); the output is a partial GGUF\n");
+    printf("                                      that holds the metadata of the source and the listed tensors only\n");
     printf("  --prune-layers L0,L1,L2...\n");
     printf("                                      comma-separated list of layer numbers to prune from the model\n");
     printf("                                      WARNING: this is an advanced option, use with care.\n");
+    printf("  --split-tensors names.txt\n");
+    printf("      write the tensors named in the file (one name per line) to a second split file, the others to the first\n");
+    printf("      (OUTPUT-00001-of-00002.gguf, OUTPUT-00002-of-00002.gguf); cannot be used with --keep-split\n");
     printf("  --keep-split\n");
     printf("                                      generate quantized model in the same shards as input\n");
     printf("  --override-kv KEY=TYPE:VALUE\n");
@@ -377,6 +383,23 @@ static bool parse_tensor_type_file(const char * filename, std::vector<tensor_typ
     return true;
 }
 
+static bool parse_only_tensors(const char * filename, std::vector<std::string> & names) {
+    std::ifstream file(filename);
+    if (!file) {
+        printf("\n%s: failed to open file '%s': %s\n\n", __func__, filename, std::strerror(errno));
+        return false;
+    }
+    std::string name;
+    while (file >> name) {
+        names.push_back(name);
+    }
+    if (names.empty()) {
+        printf("\n%s: no tensor names in '%s'\n\n", __func__, filename);
+        return false;
+    }
+    return true;
+}
+
 static bool parse_layer_prune(const char * data, std::vector<int> & prune_layers) {
     if (!data) {
         printf("\n%s: no layer pruning ids provided\n\n", __func__);
@@ -421,6 +444,10 @@ int llama_quantize(int argc, char ** argv) {
     std::vector<llama_model_kv_override> kv_overrides;
     std::vector<tensor_type_option> tensor_type_opts;
     std::vector<int> prune_layers;
+    std::vector<std::string> only_tensors;
+    std::vector<std::string> split_tensors;
+    std::vector<const char *> split_tensor_ptrs;
+    std::vector<const char *> only_tensor_ptrs;
 
     for (; arg_idx < argc && strncmp(argv[arg_idx], "--", 2) == 0; arg_idx++) {
         if (strcmp(argv[arg_idx], "--leave-output-tensor") == 0) {
@@ -449,6 +476,14 @@ int llama_quantize(int argc, char ** argv) {
             }
         } else if (strcmp(argv[arg_idx], "--tensor-type-file") == 0) {
             if (arg_idx == argc-1 || !parse_tensor_type_file(argv[++arg_idx], tensor_type_opts)) {
+                usage(argv[0]);
+            }
+        } else if (strcmp(argv[arg_idx], "--split-tensors") == 0) {
+            if (arg_idx == argc-1 || !parse_only_tensors(argv[++arg_idx], split_tensors)) {
+                usage(argv[0]);
+            }
+        } else if (strcmp(argv[arg_idx], "--only-tensors") == 0) {
+            if (arg_idx == argc-1 || !parse_only_tensors(argv[++arg_idx], only_tensors)) {
                 usage(argv[0]);
             }
         } else if (strcmp(argv[arg_idx], "--prune-layers") == 0) {
@@ -610,6 +645,20 @@ int llama_quantize(int argc, char ** argv) {
         t_override.push_back({nullptr, GGML_TYPE_COUNT});  // array terminator
         params.tt_overrides = t_override.data();
     }
+    if (!only_tensors.empty()) {
+        for (const auto & name : only_tensors) {
+            only_tensor_ptrs.push_back(name.c_str());
+        }
+        only_tensor_ptrs.push_back(nullptr);  // array terminator
+        params.only_tensors = only_tensor_ptrs.data();
+    }
+    if (!split_tensors.empty()) {
+        for (const auto & name : split_tensors) {
+            split_tensor_ptrs.push_back(name.c_str());
+        }
+        split_tensor_ptrs.push_back(nullptr);  // array terminator
+        params.split_tensors = split_tensor_ptrs.data();
+    }
     if (!prune_layers.empty()) {
         prune_layers.push_back(-1);  // array terminator
         params.prune_layers = prune_layers.data();
@@ -635,7 +684,7 @@ int llama_quantize(int argc, char ** argv) {
 
             // export as [inp path]/ggml-model-[ftype]. Only add extension if there is no splitting
             fname_out = fpath + "ggml-model-" + ftype_str;
-            if (!params.keep_split) {
+            if (!params.keep_split && !params.split_tensors) {
                 fname_out += suffix;
             }
         }
@@ -646,7 +695,7 @@ int llama_quantize(int argc, char ** argv) {
     } else {
         // argv[arg_idx] is not a valid ftype, so treat it as output path: <input> <output> <ftype>
         fname_out = argv[arg_idx];
-        if (params.keep_split && fname_out.find(suffix) != std::string::npos) {
+        if ((params.keep_split || params.split_tensors) && fname_out.find(suffix) != std::string::npos) {
             fname_out = fname_out.substr(0, fname_out.length() - suffix.length());
         }
         arg_idx++;

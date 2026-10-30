@@ -720,7 +720,7 @@ class DeepseekV4Model(TextModel):
 
     def _write_mxfp4_expert_tensor(self, bid: int, proj: str, tensor_key: gguf.MODEL_TENSOR) -> list[str]:
         n_experts = self.hparams["n_routed_experts"]
-        data: np.ndarray | None = None
+        loaders = []
         consumed: list[str] = []
 
         for eid in range(n_experts):
@@ -728,16 +728,10 @@ class DeepseekV4Model(TextModel):
             scale_name = f"layers.{bid}.ffn.experts.{eid}.{proj}.scale"
             if weight_name not in self.model_tensors or scale_name not in self.model_tensors:
                 raise KeyError(f"Missing routed expert tensors for {weight_name}")
-
-            weight = LazyTorchTensor.to_eager(self.model_tensors[weight_name]())
-            scale = LazyTorchTensor.to_eager(self.model_tensors[scale_name]())
-            packed = self.repack_mxfp4_blocks(weight, scale)
-            if data is None:
-                data = np.empty((n_experts, *packed.shape), dtype=packed.dtype)
-            data[eid] = packed
+            loaders.append((self.model_tensors[weight_name], self.model_tensors[scale_name]))
             consumed.extend((weight_name, scale_name))
 
-        assert data is not None
+        data = self.mxfp4_expert_tensor(loaders)
         new_name = self.format_tensor_name(tensor_key, bid)
         shape = gguf.quant_shape_from_byte_shape(data.shape, gguf.GGMLQuantizationType.MXFP4)
         logger.info(f"{new_name}: repacked routed experts to MXFP4, shape = {{{', '.join(str(n) for n in reversed(shape))}}}")
@@ -1037,6 +1031,8 @@ class DeepseekV4DSparkModel(DeepseekV4Model):
 @ModelBase.register("DeepseekV4ForCausalLM")
 @ModelBase.example("deepseek-ai/DeepSeek-V4-Flash-Vision-Exp")
 class DeepseekV4FlashVisionModel(MmprojModel):
+    projector_type = gguf.VisionProjectorType.DEEPSEEK4V
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         assert self.hparams_vision is not None
@@ -1068,15 +1064,18 @@ class DeepseekV4FlashVisionModel(MmprojModel):
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
         assert self.hparams_vision is not None
-        self.gguf_writer.add_clip_projector_type(gguf.VisionProjectorType.DEEPSEEK4V)
+        self.gguf_writer.add_clip_projector_type(self.projector_type)
         # vision RMSNorm eps is the pytorch default, NOT the LLM's rms_norm_eps (1e-20)
         # ref: inference/vision.py (RMSNorm)
         self.gguf_writer.add_vision_attention_layernorm_eps(1e-6)
         self.gguf_writer.add_vision_use_silu(True) # SwiGLU MLP
         self.gguf_writer.add_vision_projector_scale_factor(self.hparams_vision["downsample_ratio"])
         self.gguf_writer.add_vision_min_pixels(self.hparams_vision["min_pixels"])
+        self.set_token_limits()
+
+    def set_token_limits(self):
         # hardcoded on the C++ side (see PROJECTOR_TYPE_DEEPSEEK4V in clip.cpp)
-        # if future models use different values, add GGUF keys for those
+        # models with other values use the DEEPSEEK41V type, which stores them in the GGUF
         assert self.global_config["vision_max_n_token"] == 384
         assert self.global_config["vision_max_wh_ratio"] == 8
 
@@ -1464,6 +1463,12 @@ class DeepseekV41Model(DeepseekV4Model):
             )
 
             out = _np.memmap(tmp_path, dtype=_np.uint8, mode="w+", shape=(n_rows, row_bytes))
+            # the mapping keeps the data until the writer is done; without a name the space comes back when the
+            # process ends, also after a failure (two tables stage about 208 GB)
+            try:
+                _os.unlink(tmp_path)
+            except OSError:
+                pass
             for ci, start in enumerate(range(0, n_rows, rows_per_chunk)):
                 stop = min(start + rows_per_chunk, n_rows)
                 chunk = wsl[start:stop, :].float()
@@ -1559,3 +1564,31 @@ class DeepseekV41DSparkModel(DeepseekV4DSparkModel, DeepseekV41Model):
         # the mean after the layer, which is why its exporter adds one.
         self.gguf_writer.add_target_layers([int(v) for v in self.hparams["dspark_target_layer_ids"]])
         self.gguf_writer.add_bool(f"{gguf.MODEL_ARCH_NAMES[self.model_arch]}.dsv41_semantics", True)
+
+
+@ModelBase.register("DeepseekV41ForCausalLM")
+@ModelBase.example("deepseek-ai/DeepSeek-V4.1-Flash")
+class DeepseekV41FlashVisionModel(DeepseekV4FlashVisionModel):
+    """DeepSeek V4.1 vision. Same ViT and aligner tensors as V4; the config is nested under vision_config
+    and the token block has a plain row layout (see PROJECTOR_TYPE_DEEPSEEK41V in clip.cpp)."""
+
+    projector_type = gguf.VisionProjectorType.DEEPSEEK41V
+
+    def get_vision_config(self) -> dict[str, Any] | None:
+        cfg = self.global_config.get("vision_config")
+        if not cfg:
+            raise ValueError("DeepseekV41FlashVisionModel requires vision_config in the model config")
+        assert cfg["hidden_size"] % cfg["num_attention_heads"] == 0
+        # the C++ side hardcodes the RoPE base, as for V4
+        assert cfg.get("rope_theta", 10000.0) == 10000.0
+        return {
+            **cfg,
+            # dynamic resolution; only used for compat / warmup
+            "image_size": cfg["patch_size"] * cfg["downsample_ratio"] * 16,
+        }
+
+    def set_token_limits(self):
+        assert self.hparams_vision is not None
+        # max_wh_ratio is null in V4.1 (no width clamp); 0 means unlimited in the GGUF
+        self.gguf_writer.add_vision_max_tokens(self.hparams_vision["max_image_tokens"])
+        self.gguf_writer.add_vision_max_wh_ratio(self.hparams_vision.get("max_wh_ratio") or 0)

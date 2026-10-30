@@ -339,6 +339,7 @@ struct common_params_model {
 struct common_params_speculative_draft {
     int32_t n_max = 3; // maximum number of tokens to draft during speculative decoding
     int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding
+    int32_t n_block = 0; // draft-dspark: tokens in the drafted block, at least n_max (0 = the trained block size)
 
     // adaptive draft depth (--spec-draft-adaptive): the depth moves within [n_min_adaptive, n_max] with the acceptance
     // delphi: draft-mtp defaults to the conf mode (common_speculative_params_resolve); the *_set flags record explicit options

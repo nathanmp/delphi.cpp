@@ -9310,9 +9310,10 @@ struct test_kpool_expand : public test_case {
     const int64_t n_tail;
     const int64_t n_query;
     const int64_t n_stream;
+    const ggml_type type_bias;
 
     std::string vars() override {
-        return VARS_TO_STR6(kpool, n_pools, n_select, n_tail, n_query, n_stream);
+        return VARS_TO_STR7(kpool, n_pools, n_select, n_tail, n_query, n_stream, type_bias);
     }
 
     double max_err() override {
@@ -9320,14 +9321,14 @@ struct test_kpool_expand : public test_case {
     }
 
     test_kpool_expand(int64_t kpool, int64_t n_pools, int64_t n_select,
-            int64_t n_tail, int64_t n_query, int64_t n_stream)
+            int64_t n_tail, int64_t n_query, int64_t n_stream, ggml_type type_bias = GGML_TYPE_F32)
         : kpool(kpool), n_pools(n_pools), n_select(n_select), n_tail(n_tail),
-          n_query(n_query), n_stream(n_stream) {}
+          n_query(n_query), n_stream(n_stream), type_bias(type_bias) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * selected = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, n_select, n_query, n_stream);
         ggml_tensor * pool_cells = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kpool*n_pools, n_stream);
-        ggml_tensor * pool_bias = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_pools, n_query, n_stream);
+        ggml_tensor * pool_bias = ggml_new_tensor_3d(ctx, type_bias, n_pools, n_query, n_stream);
         ggml_tensor * tail_cells = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, n_tail, n_query, n_stream);
         ggml_tensor * tail_mask = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, n_tail, n_query, n_stream);
         ggml_set_name(selected, "selected");
@@ -9368,7 +9369,15 @@ struct test_kpool_expand : public test_case {
                         values[row*n_pools + i] = (row + i) % 5 == 0 ? -INFINITY : 0.0f;
                     }
                 }
-                ggml_backend_tensor_set(t, values.data(), 0, ggml_nbytes(t));
+                if (t->type == GGML_TYPE_F16) {
+                    std::vector<ggml_fp16_t> half(values.size());
+                    for (size_t i = 0; i < values.size(); ++i) {
+                        half[i] = ggml_fp32_to_fp16(values[i]);
+                    }
+                    ggml_backend_tensor_set(t, half.data(), 0, ggml_nbytes(t));
+                } else {
+                    ggml_backend_tensor_set(t, values.data(), 0, ggml_nbytes(t));
+                }
             } else if (strcmp(t->name, "tail_cells") == 0) {
                 std::vector<int32_t> values(ggml_nelements(t));
                 for (int64_t i = 0; i < (int64_t) values.size(); ++i) {
@@ -9552,6 +9561,10 @@ struct test_generic_op : public test_case {
 
     void initialize_tensors(ggml_context * ctx) override {
         ggml_tensor * out = ggml_get_tensor(ctx, "out");
+
+        for (ggml_tensor * sentinel : sentinels) {
+            init_tensor_uniform(sentinel);
+        }
 
         std::random_device rd;
         std::default_random_engine rng(rd());
@@ -10244,6 +10257,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 8, 2, 1, 1, false));
+    // delphi: shapes whose launch step is a multiple of 64 Ki threads (ggml_cuda_grid_pad must leave them alone), small and large
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 5120, 8, 256, 1, 1, false));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 5120, 8, 4096, 1, 1, false));
     for (ggml_type type : all_types) {
         for (int b : {1, 7}) {
             for (bool v : {false, true}) {
@@ -11390,6 +11406,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 8, 4, false, 64, 64, 512));
     }
 
+    for (int n = 1; n <= 8; ++n) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_KS, GGML_TYPE_F32, 32, n, 2304, {1, 1}, {1, 1}));
+    }
+
     // MMQ must only select tile widths J that have a config entry (fewer with the m % 128 != 0 fallback):
     // a Q8_1-layout type, a Q8_0_16-layout type and a type that borrows another type's config.
     for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q3_K, GGML_TYPE_IQ2_K}) {
@@ -11438,6 +11458,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_partial_ffn(rows, 1, type, type, type, limit, false, rows == 6));
             }
         }
+    }
+    for (int64_t rows : {2, 3, 4, 5, 7, 8}) {
+        test_cases.emplace_back(new test_partial_ffn(rows, 3, GGML_TYPE_IQ4_KS, GGML_TYPE_IQ4_KS, GGML_TYPE_IQ4_KS));
     }
     for (float limit : {0.0f, 2.0f}) {
         test_cases.emplace_back(new test_partial_ffn(6, 3, GGML_TYPE_IQ3_K, GGML_TYPE_IQ4_KS, GGML_TYPE_IQ3_KS, limit));
@@ -12442,6 +12465,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_interval_mask(GGML_TYPE_F16, 300, 7, 2));
     test_cases.emplace_back(new test_interval_mask(GGML_TYPE_F32, 1000, 33, 1));
     test_cases.emplace_back(new test_kpool_expand(8, 11, 5, 7, 3, 2));
+    test_cases.emplace_back(new test_kpool_expand(8, 11, 5, 7, 3, 2, GGML_TYPE_F16));
 
     return test_cases;
 }
@@ -12785,6 +12809,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 5120, nb, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 640));
     }
 
+    // DeepSeek-V4.1 decode and DSpark verification below the sparse threshold: 64 query heads on one KV head, dense
+    for (int64_t nb : {1, 2, 3, 4, 5}) {
+        for (int64_t kv : {512, 1024, 2048}) {
+            test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, kv, nb, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0));
+        }
+    }
+
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
@@ -12887,6 +12918,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                     test_cases.emplace_back(new test_rope(type, { 80,  16, 2, 1},  80, GGML_ROPE_TYPE_VISION, 512, 1.0f, 0.0f, 1.0f, ff, v, fw)); // rope_multi,m-rope (qwen2vl ViT)
                 }
             }
+            // DeepSeek V4.1 decode/verify: 512-wide heads, the last 64 dims rotated (YaRN), 64 heads, 1-5 tokens
+            for (int64_t nt : {1, 2, 3, 4, 5, 6, 8}) {
+                for (int v : {0, 2}) {
+                    test_cases.emplace_back(new test_rope(type, {512, 64, nt, 1}, 64, GGML_ROPE_TYPE_NORMAL, 65536, 1.0f/16, 1.0f, 1.0f, false, v, fw, false, 448));
+                }
+            }
+            for (std::array<int64_t, 4> ne : std::vector<std::array<int64_t, 4>>{{512, 32, 8, 1}, {512, 128, 2, 1}, {512, 63, 4, 1}, {512, 65, 4, 1}, {512, 256, 1, 1}, {256, 64, 4, 1}}) {
+                test_cases.emplace_back(new test_rope(type, ne, 64, GGML_ROPE_TYPE_NORMAL, 65536, 1.0f/16, 1.0f, 1.0f, false, 0, fw, false, ne[0] - 64));
+            }
+            test_cases.emplace_back(new test_rope(type, {512, 64, 4, 1}, 64, GGML_ROPE_TYPE_NORMAL, 65536, 1.0f/16, 0.0f, 1.0f, false, 0, fw, false, 448));
+            test_cases.emplace_back(new test_rope(type, {512, 64, 4, 1}, 64, GGML_ROPE_TYPE_NORMAL, 512, 1.0f, 0.0f, 1.0f, false, 0, fw, false, 448));
         }
     }
 

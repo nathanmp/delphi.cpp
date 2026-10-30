@@ -1147,6 +1147,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     int32_t n_embd_tgt = 0;  // target model hidden size
 
     int32_t     block_size    = 0;
+    int32_t     n_block_draft = 0; // DSpark: tokens in the drafted block, at least n_max
     llama_token mask_token_id = 0;
 
     bool    is_dflash2     = false;
@@ -1236,6 +1237,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             this->params.n_min = std::min(this->params.n_min, n_draft_max);
         }
         this->n_max = this->params.n_max;
+
+        // DSpark attends across the whole block: drafting the trained block gives better proposals for the first n_max
+        // positions than a block cut to n_max (2026-10-26, DeepSeek V4.1 Flash, n_max 3: acceptance 0.54 -> 0.58, +4% TG)
+        n_block_draft = this->params.n_max;
+        if (is_dspark && sample_from_anchor) {
+            n_block_draft = this->params.n_block > 0 ? this->params.n_block : n_draft_max;
+            n_block_draft = std::clamp(n_block_draft, this->params.n_max, n_draft_max);
+            LOG_INF("%s: - drafted block %d, verified %d\n", __func__, n_block_draft, this->params.n_max);
+        }
 
         batch        = llama_batch_init(llama_n_batch(ctx_dft), 0,          n_seq);
         batch_inject = llama_batch_init(llama_n_ubatch(ctx_dft), n_embd_enc, n_seq);
@@ -1437,7 +1447,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             const int32_t n = (int32_t) dp.pos0;
 
-            const int32_t n_draft = params.n_max;
+            const int32_t n_draft = is_dspark && sample_from_anchor ? n_block_draft : params.n_max;
 
             const int32_t n_block_tokens = n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
             i_block_beg[seq_id] = batch.n_tokens;
@@ -1571,7 +1581,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 const float * conf = params.p_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
                 // bonus-anchor drafts read the mask positions only, like DFlash
                 const int32_t i_draft_beg = sample_from_anchor ? 0 : 1;
-                for (int32_t i = i_draft_beg; i < n_block_tokens; ++i) {
+                for (int32_t i = i_draft_beg; i < n_block_tokens && (int32_t) result.size() < params.n_max; ++i) {
                     const int32_t idx = beg + i;
 
                     if (conf && conf[(size_t) idx * n_embd_dec] < params.p_min) {
@@ -2765,6 +2775,28 @@ common_speculative_type common_speculative_type_from_name(const std::string & na
     return it->second;
 }
 
+int32_t common_speculative_block_size_from_gguf(const std::string & path) {
+    struct gguf_init_params gguf_params = {
+        /* .no_alloc = */ true,
+        /* .ctx      = */ nullptr,
+    };
+
+    gguf_context_ptr gguf_ctx(gguf_init_from_file(path.c_str(), gguf_params));
+    if (!gguf_ctx) {
+        return 0;
+    }
+
+    const int64_t id = gguf_find_key(gguf_ctx.get(), "dflash.block_size");
+    if (id < 0) {
+        return 0;
+    }
+    switch (gguf_get_kv_type(gguf_ctx.get(), id)) {
+        case GGUF_TYPE_UINT32: return (int32_t) gguf_get_val_u32(gguf_ctx.get(), id);
+        case GGUF_TYPE_INT32:  return gguf_get_val_i32(gguf_ctx.get(), id);
+        default:               return 0;
+    }
+}
+
 std::vector<common_speculative_type> common_speculative_types_from_gguf(const std::string & path) {
     struct gguf_init_params gguf_params = {
         /* .no_alloc = */ true,
@@ -3021,7 +3053,13 @@ common_params common_base_params_to_speculative(const common_params & params) {
         });
     if (has_block_draft) {
         // per-seq output positions: DFlash decodes anchor + n_max masks (n_max + 1); DSpark n_max -> +1 covers both
-        const int32_t per_seq = std::max(1, params_spec.n_max + 1);
+        int32_t n_block = params_spec.n_max;
+        if (std::find(params.speculative.types.begin(), params.speculative.types.end(),
+                COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) != params.speculative.types.end()) {
+            // DSpark drafts a longer block than it verifies (--spec-draft-block)
+            n_block = std::max(n_block, params_spec.n_block > 0 ? params_spec.n_block : common_speculative_block_size_from_gguf(params_spec.mparams.path));
+        }
+        const int32_t per_seq = std::max(1, n_block + 1);
         // every slot's block is decoded in one micro-batch
         result.n_ubatch = std::max(result.n_ubatch, std::min(result.n_batch, params.n_parallel * per_seq));
         result.n_outputs_max = params.n_parallel * per_seq;

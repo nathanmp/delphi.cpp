@@ -114,6 +114,12 @@ void ggml_vec_dot_iq3_ks_q8_K (int n, float * GGML_RESTRICT s, size_t bs, const 
 void ggml_vec_dot_iq4_ks_q8_K (int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_vec_dot_iq5_ks_q8_K (int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 
+// dst[r][i] = dot(weight row i at vx + i*stride, vy[r]) for 1 <= nr <= 4 activation rows in vec_dot_type.
+// Each result equals the single-row vec_dot. The getter returns NULL without an AVX2 kernel for the type.
+typedef void (*ggml_vec_dot_batch_rows_t)(int n, float * const * dst, const void * vx, size_t stride,
+                                        const void * const * vy, int nr, int64_t rows);
+ggml_vec_dot_batch_rows_t ggml_get_vec_dot_batch_rows(enum ggml_type type);
+
 // Generic implementation
 void quantize_row_q8_0_generic(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k);
 void quantize_row_q8_1_generic(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k);

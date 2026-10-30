@@ -2,6 +2,8 @@
 #include "models.h"
 
 #include "llama-kv-cache-dsv4.h"
+#include "llama-engram.h"
+#include "llama-expert-cache.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -337,6 +339,16 @@ public:
     }
 
     ggml_tensor * rows = nullptr;   // I32 [n_cols * n_tokens]
+    const ggml_tensor * table = nullptr;
+    llama_engram_reader * reader = nullptr;
+    llama_engram_reader::job_ptr lookup;
+
+    static void collect(ggml_tensor * dst, int ith, int nth, void * userdata) {
+        GGML_UNUSED(ith);
+        GGML_UNUSED(nth);
+        auto * input = static_cast<llm_graph_input_engram *>(userdata);
+        llama_engram_reader::collect(input->lookup, (float *) dst->data, ggml_nbytes(dst));
+    }
 
     const llama_model_deepseek41 & pmodel;
 
@@ -363,8 +375,8 @@ void llm_graph_input_engram::set_input(const llama_ubatch * ubatch) {
     const uint64_t * prime = pmodel.engram_primes.data()  + (size_t) eg*n_cols;
     const uint64_t * offset = pmodel.engram_offsets.data() + (size_t) eg*n_cols;
 
-    // an image arrives as an embd batch, so ubatch->token is null; the reference gives those
-    // positions no engram contribution at all, which the padding token stands in for here
+    // an image arrives as an embd batch, so ubatch->token is null; the graph skips the engram for
+    // those batches, so the padding token here is only a safe default
     const int32_t pad = (int32_t) pmodel.engram_pad_id;
     auto map_of = [&](llama_token t) -> uint64_t {
         if (t < 0 || (size_t) t >= pmodel.engram_token_map.size()) {
@@ -410,6 +422,9 @@ void llm_graph_input_engram::set_input(const llama_ubatch * ubatch) {
     }
 
     ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
+    if (reader) {
+        lookup = reader->submit(table, std::move(idx));
+    }
 }
 
 ggml_tensor * llama_model_deepseek41::graph::build_inp_engram(
@@ -427,10 +442,21 @@ ggml_tensor * llama_model_deepseek41::graph::build_inp_engram(
     inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_cols * n_tokens);
     ggml_set_input(inp->rows);
     ggml_tensor * rows = inp->rows;
-    res->add_input(std::move(inp));
-
     // gather then flatten, laying the buckets out slowest, as the reference does
-    ggml_tensor * emb = ggml_get_rows(ctx0, model.layers[il].engram_embd, rows);
+    ggml_tensor * emb;
+    const auto * table = model.layers[il].engram_embd;
+    if (engram_reader && n_tokens <= 16 && llama_engram_reader::supports(table)) {
+        inp->reader = engram_reader;
+        inp->table = table;
+        ggml_tensor * args[] = { rows };
+        emb = ggml_custom_4d(ctx0, GGML_TYPE_F32, key_len, n_cols*n_tokens, 1, 1,
+                args, 1, llm_graph_input_engram::collect, 1, inp.get());
+        cb(emb, "engram_lookup", il);
+        ggml_backend_sched_set_tensor_backend(sched, emb, backend_cpu);
+    } else {
+        emb = ggml_get_rows(ctx0, model.layers[il].engram_embd, rows);
+    }
+    res->add_input(std::move(inp));
     emb = ggml_reshape_2d(ctx0, emb, key_len * n_cols, n_tokens);
     cb(emb, "engram_embd", il);
 
@@ -1023,7 +1049,9 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
         ggml_tensor * inp_pos,
         ggml_tensor ** shared_top_k,
         ggml_tensor ** shared_cand,
-        int il) const {
+        int il,
+        ggml_tensor * full_cur,
+        uint32_t n_skip) const {
     const auto & layer = model.layers[il];
     llm_graph_input_dsv4_raw * inp_attn = inp_dsv4->get_raw();
 
@@ -1036,6 +1064,9 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
     GGML_ASSERT(n_head % hparams.dsv4_o_group_count == 0);
 
     const dsv41_rope_cfg rc = rope_cfg(il);
+
+    ggml_tensor * k_idxs  = inp_attn->get_k_idxs(il);
+    ggml_tensor * kq_mask = inp_attn->get_kq_mask(il);
 
     // Query. V4 normalizes again after wq_b; V4.1 normalizes only the low rank part.
     ggml_tensor * qr = build_lora_mm(layer.wq_a, cur);
@@ -1067,9 +1098,9 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
             kv = llama_mul_mat_hadamard(ctx0, kv, k_rot);
         }
         ggml_build_forward_expand(gf, kv);
-        ggml_build_forward_expand(gf, inp_attn->mctx->cpy_k(ctx0, kv, inp_attn->get_k_idxs(), il));
+        ggml_build_forward_expand(gf, inp_attn->mctx->cpy_k(ctx0, kv, k_idxs, il));
 
-        return build_attention_split(model, qr, inp_attn->mctx->get_k(ctx0, il), k_rot, inp_attn->get_kq_mask(),
+        return build_attention_split(model, qr, inp_attn->mctx->get_k(ctx0, il), k_rot, kq_mask,
                 nullptr, nullptr, 0, inp_pos, nt, il);
     }
 
@@ -1085,7 +1116,19 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
     // plan produced them.
     const bool use_csa = (uint32_t) ratio == inp_dsv4->mctx->get_csa_state()->get_ratio();
 
-    const auto & inp_comp = use_csa ? inp_dsv4->get_csa() : inp_dsv4->get_hca();
+    auto inp_comp = use_csa ? inp_dsv4->get_csa() : inp_dsv4->get_hca();
+    if (n_skip > 0) {
+        inp_comp.kq_mask = ggml_view_4d(ctx0, inp_comp.kq_mask,
+                inp_comp.kq_mask->ne[0], nt, 1, 1,
+                inp_comp.kq_mask->nb[1], inp_comp.kq_mask->nb[2], inp_comp.kq_mask->nb[3],
+                n_skip*inp_comp.kq_mask->nb[1]);
+        if (inp_comp.cand_pin) {
+            inp_comp.cand_pin = ggml_view_4d(ctx0, inp_comp.cand_pin,
+                    inp_comp.cand_pin->ne[0], nt, 1, 1,
+                    inp_comp.cand_pin->nb[1], inp_comp.cand_pin->nb[2], inp_comp.cand_pin->nb[3],
+                    n_skip*inp_comp.cand_pin->nb[1]);
+        }
+    }
 
     const llama_dsv4_comp_state * comp_state = use_csa
         ? inp_dsv4->mctx->get_csa_state()
@@ -1094,14 +1137,16 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
     GGML_ASSERT(inp_comp.kq_mask && "a compressed layer needs a plan for its ratio");
 
     if (hparams.dsv41_is_kv_source(il) && inp_comp.state_pos) {
-        ggml_tensor * state_kv = build_lora_mm(layer.attn_comp_wkv, cur);
+        // CED keeps the full global KV stream while only decoder queries are compacted.
+        ggml_tensor * source = full_cur ? full_cur : cur;
+        ggml_tensor * state_kv = build_lora_mm(layer.attn_comp_wkv, source);
         cb(state_kv, "comp_state_kv", il);
 
         // At ratio 1 there is nothing to pool and the file carries no gate. The softmax below
         // then runs over a single element and returns 1.0 whatever the score holds, so the
         // values reach the cache unweighted, which is what a plain projection means.
         ggml_tensor * state_score = layer.attn_comp_wgate
-            ? build_lora_mm(layer.attn_comp_wgate, cur)
+            ? build_lora_mm(layer.attn_comp_wgate, source)
             : state_kv;
         cb(state_score, "comp_state_score", il);
 
@@ -1146,8 +1191,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
                 idx_k = llama_mul_mat_hadamard(ctx0, idx_k, inp_dsv4->get_lid().k_rot);
             }
 
-            ggml_build_forward_expand(gf, inp_dsv4->mctx->get_lid()->cpy_k(
-                        ctx0, idx_k, inp_comp.state_write_idxs, il));
+            inp_dsv4->mctx->get_lid()->cpy_k_mirrored(ctx0, gf, idx_k, inp_comp.state_write_idxs, il);
         }
 
         if (inp_dsv4->get_csa().k_rot) {
@@ -1155,8 +1199,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
             cb(latent, "comp_kv_rot", il);
         }
 
-        ggml_build_forward_expand(gf, inp_dsv4->mctx->get_csa()->cpy_k(
-                    ctx0, latent, inp_comp.state_write_idxs, il));
+        inp_dsv4->mctx->get_csa()->cpy_k_mirrored(ctx0, gf, latent, inp_comp.state_write_idxs, il);
 
         // carry whatever did not complete a row into the next ubatch
         ggml_tensor * snapshot_kv    = ggml_concat(ctx0, restored.kv,    state_kv,    1);
@@ -1207,7 +1250,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
 
     const llama_kv_cache_dsv4_raw_context * mctx_raw = inp_attn->mctx;
 
-    ggml_build_forward_expand(gf, mctx_raw->cpy_k(ctx0, kv, inp_attn->get_k_idxs(), il));
+    ggml_build_forward_expand(gf, mctx_raw->cpy_k(ctx0, kv, k_idxs, il));
 
     ggml_tensor * raw_k = mctx_raw->get_k(ctx0, il);
     cb(raw_k, "raw_k", il);
@@ -1223,7 +1266,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
             comp_k->nb[1], comp_k->nb[2], comp_k->nb[3], 0);
     cb(comp_k, "comp_k", il);
 
-    ggml_tensor * raw_mask  = inp_attn->get_kq_mask();
+    ggml_tensor * raw_mask = kq_mask;
     const int64_t n_stream = raw_k->ne[3];
     const bool use_compact = !split && top_k != nullptr && cparams.flash_attn &&
             dsv41_compact_attn_enabled(n_comp, top_k->ne[0], nt, n_stream);
@@ -1432,9 +1475,11 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
 
     ggml_tensor * inp = build_inp_embd(model.tok_embd);
     ggml_tensor * inp_pos = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
     llm_graph_input_dsv4 * inp_dsv4 = build_inp_dsv4();
     llm_graph_input_dsv4_raw * inp_attn = inp_dsv4->get_raw();
+    const auto ubatch_dec = inp_attn->mctx->decoder_ubatch(ubatch);
+    const uint32_t n_skip = ubatch.n_tokens - ubatch_dec.n_tokens;
+    ggml_tensor * inp_out_ids = build_inp_out_ids(n_skip);
     ggml_build_forward_expand(gf, inp_attn->self_kq_mask);
 
     const int64_t hc = hparams.dsv4_hc_mult;
@@ -1453,14 +1498,34 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
     ggml_tensor * shared_cand  = nullptr;
 
     for (int il = 0; il < n_layer; ++il) {
+        ggml_tensor * full_cur = nullptr;
+        if (il == (int) cparams.n_layer_prefill && n_skip > 0) {
+            // Adapt DeepInfer's consumer boundary: retain full normalized inputs for
+            // the global-KV projection, then compact the decoder trunk and its mix.
+            full_cur = build_hc_pre(inpL, pre_mix, il);
+            full_cur = build_norm(full_cur, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
+            cb(full_cur, "ced_full_norm", il);
+            inpL = ggml_cont(ctx0, ggml_view_3d(ctx0, inpL, n_embd, hc, ubatch_dec.n_tokens,
+                    inpL->nb[1], inpL->nb[2], n_skip*inpL->nb[2]));
+            pre_mix = ggml_cont(ctx0, ggml_view_2d(ctx0, pre_mix, hc, ubatch_dec.n_tokens,
+                    pre_mix->nb[1], n_skip*pre_mix->nb[1]));
+            inp_pos = ggml_view_1d(ctx0, inp_pos, ubatch_dec.n_tokens, n_skip*ggml_element_size(inp_pos));
+        }
         if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
             res->t_layer_inp[il] = dsv41_hc_mean(ctx0, inpL);
+            if (n_skip > 0 && il >= (int) cparams.n_layer_prefill) {
+                // The host feature API keeps batch row indices. DSpark only retains
+                // the suffix; pad discarded rows so it cannot read stale features.
+                auto * pad = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_skip), 0.0f);
+                res->t_layer_inp[il] = ggml_concat(ctx0, pad, res->t_layer_inp[il], 1);
+            }
             cb(res->t_layer_inp[il], "layer_inp", il);
             ggml_build_forward_expand(gf, res->t_layer_inp[il]);
         }
 
         // the engram sits before the block and writes straight into the stream
-        if (pmodel.engram_index(il) >= 0) {
+        // an embd batch is an mtmd image span: the reference shuts the engram gate for those positions
+        if (pmodel.engram_index(il) >= 0 && ubatch.embd == nullptr) {
             inpL = build_engram(model, inpL, build_inp_engram(model, il), il);
             cb(inpL, "engram_out", il);
         }
@@ -1483,7 +1548,8 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
         cur = build_norm(cur, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
         cb(cur, "attn_norm", il);
 
-        cur = build_attention_v41(model, inp_dsv4, cur, inp_pos, &shared_top_k, &shared_cand, il);
+        cur = build_attention_v41(model, inp_dsv4, cur, inp_pos, &shared_top_k, &shared_cand, il,
+                full_cur, il >= (int) cparams.n_layer_prefill ? n_skip : 0);
 
         inpL = build_hc_post(cur, residual, post, comb, il);
         cb(inpL, "hc_attn_post", il);
@@ -1515,6 +1581,42 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
             exp_probs_b = layer.ffn_exp_probs_b_vl;
         }
 
+        ggml_tensor * ffn_shexp = nullptr;
+        const auto build_shared = [&] {
+            ffn_shexp = build_ffn(cur,
+                    layer.ffn_up_shexp, nullptr, nullptr,
+                    layer.ffn_gate_shexp, nullptr, nullptr,
+                    layer.ffn_down_shexp, nullptr, nullptr,
+                    nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
+            cb(ffn_shexp, "ffn_shexp", il);
+        };
+        static const bool shared_overlap = [] {
+            const char * env = std::getenv("LLAMA_MOE_SHARED_OVERLAP");
+            return env == nullptr || std::atoi(env) != 0;
+        }();
+        std::function<void()> before_cpu_ffn;
+        if (shared_overlap && expert_cache && expert_cache->layer(il) && cur->ne[1] <= llama_expert_cache::max_rows) {
+            auto * home = expert_cache->backend(il);
+            const auto on_home = [&](const ggml_tensor * weight) {
+                return weight && weight->buffer && !ggml_backend_buffer_is_host(weight->buffer) &&
+                    ggml_backend_buft_get_device(ggml_backend_buffer_get_type(weight->buffer)) == ggml_backend_get_device(home);
+            };
+            if (on_home(layer.ffn_gate_shexp) && on_home(layer.ffn_up_shexp) && on_home(layer.ffn_down_shexp)) {
+                before_cpu_ffn = [&, home] {
+                    build_shared();
+                    const int n0 = ggml_graph_n_nodes(gf);
+                    ggml_build_forward_expand(gf, ffn_shexp);
+                    // Packet/ID nodes precede this branch. Keep its supported ops on the layer GPU.
+                    for (int i = n0; i < ggml_graph_n_nodes(gf); ++i) {
+                        auto * node = ggml_graph_node(gf, i);
+                        if (ggml_backend_supports_op(home, node)) {
+                            ggml_backend_sched_set_tensor_backend(sched, node, home);
+                        }
+                    }
+                };
+            }
+        }
+
         ggml_tensor * moe_out = build_moe_ffn(cur,
                 layer.ffn_gate_inp,
                 layer.ffn_up_exps,
@@ -1525,15 +1627,21 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
                 LLM_FFN_SILU, hparams.expert_weights_norm,
                 hparams.expert_weights_scale,
                 (llama_expert_gating_func_type) hparams.expert_gating_func,
-                il);
+                il,
+                /* probs_in            */ nullptr,
+                /* gate_up_exps        */ nullptr,
+                /* up_exps_s           */ nullptr,
+                /* gate_exps_s         */ nullptr,
+                /* down_exps_s         */ nullptr,
+                /* selected_experts_in */ nullptr,
+                /* post_exp_norm       */ nullptr,
+                /* post_exp_norm_eps   */ 1e-5f,
+                before_cpu_ffn);
         cb(moe_out, "ffn_moe_out", il);
 
-        ggml_tensor * ffn_shexp = build_ffn(cur,
-                layer.ffn_up_shexp, nullptr, nullptr,
-                layer.ffn_gate_shexp, nullptr, nullptr,
-                layer.ffn_down_shexp, nullptr, nullptr,
-                nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
-        cb(ffn_shexp, "ffn_shexp", il);
+        if (!ffn_shexp) {
+            build_shared();
+        }
 
         cur = ggml_add(ctx0, moe_out, ffn_shexp);
         cb(cur, "ffn_out", il);
@@ -1545,12 +1653,16 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
 
     if ((size_t) n_layer < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[n_layer]) {
         res->t_layer_inp[n_layer] = dsv41_hc_mean(ctx0, inpL);
+        if (n_skip > 0) {
+            auto * pad = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_skip), 0.0f);
+            res->t_layer_inp[n_layer] = ggml_concat(ctx0, pad, res->t_layer_inp[n_layer], 1);
+        }
         cb(res->t_layer_inp[n_layer], "layer_inp", n_layer);
         ggml_build_forward_expand(gf, res->t_layer_inp[n_layer]);
     }
 
     if (inp_out_ids) {
-        ggml_tensor * flat = ggml_reshape_2d(ctx0, inpL, n_embd*hc, n_tokens);
+        ggml_tensor * flat = ggml_reshape_2d(ctx0, inpL, n_embd*hc, inpL->ne[2]);
         inpL = ggml_reshape_3d(ctx0, ggml_get_rows(ctx0, flat, inp_out_ids), n_embd, hc, n_outputs);
         pre_mix = ggml_get_rows(ctx0, pre_mix, inp_out_ids);
     }

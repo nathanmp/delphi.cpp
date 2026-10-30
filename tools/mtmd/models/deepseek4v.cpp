@@ -11,6 +11,8 @@
 //
 // each aligner row ends with a NEWLINE, an odd row count is padded with a full row of PADs
 // pairs of adjacent rows are interleaved column-wise ("N-layout")
+//
+// deepseek41v (V4.1) uses the plain layout instead: [START] (row + NEWLINE) * rows [END], no PAD
 // the mapping is precomputed on CPU as the "layout_idx" input (see set_input in clip.cpp)
 //
 // ref: inference/vision.py and inference/image_processor.py in the HF repo
@@ -73,19 +75,25 @@ ggml_cgraph * clip_graph_deepseek4v::build() {
         const int64_t n_grid     = cur->ne[1]; // n_llm_w * n_llm_h
 
         // rows n_grid + 0..3, keep in sync with the index computation in set_input
+        // deepseek41v has no PAD row
+        const bool is_v41 = proj_type == PROJECTOR_TYPE_DEEPSEEK41V;
         ggml_tensor * sentinels[] = {
             model.token_embd_img_start,
             model.token_embd_img_end,
             model.image_newline,
-            model.token_embd_img_pad,
+            is_v41 ? nullptr : model.token_embd_img_pad,
         };
         for (ggml_tensor * tok : sentinels) {
-            cur = ggml_concat(ctx0, cur, ggml_reshape_2d(ctx0, tok, n_embd_out, 1), 1);
+            if (tok) {
+                cur = ggml_concat(ctx0, cur, ggml_reshape_2d(ctx0, tok, n_embd_out, 1), 1);
+            }
         }
 
         const int n_llm_w = CLIP_ALIGN(n_patches_x, n_merge) / n_merge;
         const int n_llm_h = CLIP_ALIGN(n_patches_y, n_merge) / n_merge;
-        const int n_out   = dsv4_get_block_layout(n_llm_w, n_llm_h, img.lead_pad).n_out;
+        const int n_out   = is_v41
+            ? dsv41_get_block_n_out(n_llm_w, n_llm_h)
+            : dsv4_get_block_layout(n_llm_w, n_llm_h, img.lead_pad).n_out;
         GGML_ASSERT(n_grid == n_llm_w * n_llm_h);
 
         ggml_tensor * layout_idx = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_out);

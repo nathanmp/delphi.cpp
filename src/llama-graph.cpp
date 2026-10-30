@@ -253,6 +253,7 @@ void llm_graph_input_out_ids::set_input(const llama_ubatch * ubatch) {
     int32_t * data = (int32_t *) out_ids->data;
 
     if (n_outputs == n_tokens) {
+        GGML_ASSERT(row_offset == 0);
         for (int i = 0; i < n_tokens; ++i) {
             data[i] = i;
         }
@@ -266,7 +267,8 @@ void llm_graph_input_out_ids::set_input(const llama_ubatch * ubatch) {
 
     for (int i = 0; i < n_tokens; ++i) {
         if (ubatch->output[i]) {
-            data[n_outputs++] = i;
+            GGML_ASSERT(i >= (int64_t) row_offset);
+            data[n_outputs++] = i - row_offset;
         }
     }
 }
@@ -861,8 +863,9 @@ static ggml_tensor * dsv4_build_raw_kq_mask(
         const llama_kv_cache_dsv4_raw_context * mctx,
         const llama_ubatch & ubatch,
         const llama_cparams & cparams,
-        int64_t n_stream) {
-    const auto n_kv     = mctx->get_n_kv();
+        int64_t n_stream,
+        bool dec = false) {
+    const auto n_kv     = dec ? mctx->get_n_kv_dec() : mctx->get_n_kv();
     const auto n_tokens = ubatch.n_tokens;
 
     GGML_ASSERT(n_stream > 0);
@@ -872,7 +875,7 @@ static ggml_tensor * dsv4_build_raw_kq_mask(
 
     ggml_tensor * res = ggml_new_tensor_4d(ctx, type, n_kv, n_tokens/n_stream, 1, n_stream);
     ggml_set_input(res);
-    ggml_set_name(res, "attn_inp_kq_mask");
+    ggml_set_name(res, dec ? "attn_inp_kq_mask_dec" : "attn_inp_kq_mask");
 
     return res;
 }
@@ -881,8 +884,9 @@ static bool dsv4_can_reuse_raw_kq_mask(
         ggml_tensor * kq_mask,
         const llama_kv_cache_dsv4_raw_context * mctx,
         const llama_ubatch & ubatch,
-        int64_t n_stream) {
-    const auto n_kv     = mctx->get_n_kv();
+        int64_t n_stream,
+        bool dec = false) {
+    const auto n_kv     = dec ? mctx->get_n_kv_dec() : mctx->get_n_kv();
     const auto n_tokens = ubatch.n_tokens;
 
     GGML_ASSERT(n_stream > 0);
@@ -1078,13 +1082,29 @@ static void dsv4_build_comp_inputs(
     }
 }
 
+ggml_tensor * llm_graph_input_dsv4_raw::get_k_idxs(int32_t il) const {
+    return mctx->is_dec(il) ? self_k_idxs_dec : self_k_idxs;
+}
+
+ggml_tensor * llm_graph_input_dsv4_raw::get_kq_mask(int32_t il) const {
+    return mctx->is_dec(il) ? self_kq_mask_dec_cnv : self_kq_mask_cnv;
+}
+
 void llm_graph_input_dsv4_raw::set_input(const llama_ubatch * ubatch) {
     if (self_k_idxs && self_k_idxs->buffer) {
         mctx->set_input_k_idxs(self_k_idxs);
     }
 
+    if (self_k_idxs_dec && self_k_idxs_dec->buffer) {
+        mctx->set_input_k_idxs_dec(self_k_idxs_dec);
+    }
+
     if (self_kq_mask && self_kq_mask->buffer) {
         mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+    }
+
+    if (self_kq_mask_dec && self_kq_mask_dec->buffer) {
+        mctx->set_input_kq_mask_dec(self_kq_mask_dec, ubatch, cparams.causal_attn);
     }
 
     if (self_k_rot) {
@@ -1134,11 +1154,19 @@ bool llm_graph_input_dsv4::can_reuse(const llm_graph_params & params) {
     const auto * raw_ctx = mctx->get_raw();
     inp_raw->mctx = raw_ctx;
 
+    const auto ubatch_dec = raw_ctx->decoder_ubatch(params.ubatch);
+
     if (inp_raw->self_k_idxs && inp_raw->self_k_idxs->buffer) {
         res &= inp_raw->self_k_idxs->ne[0] == raw_ctx->get_n_write();
     }
+    if (inp_raw->self_k_idxs_dec && inp_raw->self_k_idxs_dec->buffer) {
+        res &= inp_raw->self_k_idxs_dec->ne[0] == raw_ctx->get_n_write_dec();
+    }
     if (inp_raw->self_kq_mask && inp_raw->self_kq_mask->buffer) {
         res &= dsv4_can_reuse_raw_kq_mask(inp_raw->self_kq_mask, raw_ctx, params.ubatch, n_stream);
+    }
+    if (inp_raw->self_kq_mask_dec && inp_raw->self_kq_mask_dec->buffer) {
+        res &= dsv4_can_reuse_raw_kq_mask(inp_raw->self_kq_mask_dec, raw_ctx, ubatch_dec, n_stream, true);
     }
 
     res &= dsv4_can_reuse_comp_input(inp_csa, plan_csa, params.ubatch.n_tokens, n_stream);
@@ -1649,6 +1677,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cross            (params.cross),
     mtp_device_draft_cache(params.mtp_device_draft_cache),
     expert_cache     (params.expert_cache),
+    engram_reader    (params.engram_reader),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -2127,7 +2156,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * down_exps_s,
          ggml_tensor * selected_experts_in,
          ggml_tensor * post_exp_norm,
-               float   post_exp_norm_eps) const {
+               float   post_exp_norm_eps,
+        const std::function<void()> & before_cpu_ffn) const {
     return build_moe_ffn(
         cur,
         gate_inp,  /* gate_inp_b  */ nullptr,
@@ -2150,7 +2180,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         down_exps_s,
         selected_experts_in,
         post_exp_norm,
-        post_exp_norm_eps
+        post_exp_norm_eps,
+        before_cpu_ffn
     );
 }
 
@@ -2180,7 +2211,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * down_exps_s,
          ggml_tensor * selected_experts_in,
          ggml_tensor * post_exp_norm,
-               float   post_exp_norm_eps) const {
+               float   post_exp_norm_eps,
+        const std::function<void()> & before_cpu_ffn) const {
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
@@ -2334,13 +2366,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     const bool  clamp_arch  = arch == LLM_ARCH_MAPLE || arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK41 ||
             arch == LLM_ARCH_GLM5NEXT || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0) || arch == LLM_ARCH_HY_V4;
     const float swiglu_lim  = il >= 0 ? hparams.swiglu_clamp_exp[il] : 0.0f;
-    if (expert_cache && ((expert_cache->active() && ubatch.n_tokens <= expert_cache->graph_rows()) ||
-            expert_cache->prefill_enabled(ubatch.n_tokens)) && expert_cache->layer(il) &&
+    // CED decoder FFNs have fewer rows than the input ubatch and use the small-batch expert path.
+    const uint32_t cache_rows = cparams.ced_compact ? n_tokens : ubatch.n_tokens;
+    if (expert_cache && ((expert_cache->active() && cache_rows <= expert_cache->graph_rows()) ||
+            expert_cache->prefill_enabled(cache_rows)) && expert_cache->layer(il) &&
             type_op == LLM_FFN_SILU && !weight_before_ffn && !gate_up_exps &&
             !up_exps_s && !gate_exps_s && !down_exps_s && !up_exps_b && !gate_exps_b && !down_exps_b &&
             (loras == nullptr || loras->empty()) && (swiglu_lim <= 1e-6f || clamp_arch)) {
         return build_moe_ffn_cache(cur, selected_experts, weights, up_exps, gate_exps, down_exps, il,
-                swiglu_lim > 1e-6f ? swiglu_lim : 0.0f);
+                swiglu_lim > 1e-6f ? swiglu_lim : 0.0f, before_cpu_ffn);
     }
 
     if (weight_before_ffn) {
@@ -2563,13 +2597,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
 ggml_tensor * llm_graph_context::build_moe_ffn_cache(
         ggml_tensor * cur, ggml_tensor * ids, ggml_tensor * weights,
-        ggml_tensor * up, ggml_tensor * gate, ggml_tensor * down, int il, float limit) const {
+        ggml_tensor * up, ggml_tensor * gate, ggml_tensor * down, int il, float limit,
+        const std::function<void()> & before_cpu_ffn) const {
     // Tiers on the layer GPU are named ffn_cache_gpu_*, tiers on another GPU ffn_cache_x<tier>_* (graph_get_cb places them).
     auto name = [&](ggml_tensor * t, const char * label, bool cpu) {
         cb(t, (std::string(cpu ? "ffn_cache_cpu_" : "ffn_cache_gpu_") + label).c_str(), il);
     };
     auto name_tier = [&](ggml_tensor * t, int tier, const char * label) {
-        if (expert_cache->tier_backend(tier) == expert_cache->backend()) {
+        if (expert_cache->tier_backend(tier) == expert_cache->backend(il)) {
             name(t, label, false);
         } else {
             cb(t, (std::string("ffn_cache_x") + std::to_string(tier) + "_" + label).c_str(), il);
@@ -2580,7 +2615,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn_cache(
     auto gather = [&](bool local) {
         for (int t = 0; t < expert_cache->n_tiers(); ++t) {
             auto * map = expert_cache->hot_ids(t, il);
-            if (map && (expert_cache->tier_backend(t) == expert_cache->backend()) == local) {
+            if (map && (expert_cache->tier_backend(t) == expert_cache->backend(il)) == local) {
                 auto * hot = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, map, flat), ids->ne[0], ids->ne[1]);
                 name_tier(hot, t, "hot");
                 ggml_build_forward_expand(gf, hot);
@@ -2591,7 +2626,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn_cache(
     gather(true);
     bool any_remote = false;
     for (int t = 0; t < expert_cache->n_tiers(); ++t) {
-        any_remote |= expert_cache->hot_ids(t, il) && expert_cache->tier_backend(t) != expert_cache->backend();
+        any_remote |= expert_cache->hot_ids(t, il) && expert_cache->tier_backend(t) != expert_cache->backend(il);
     }
 
     // One CPU transfer before GPU expert work. Expert IDs are exactly representable as F32. The CPU maps the original IDs to
@@ -2696,7 +2731,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn_cache(
     }
     for (int t = 0; t < expert_cache->n_tiers(); ++t) {
         auto * map = expert_cache->hot_ids(t, il);
-        if (!map || expert_cache->tier_backend(t) == expert_cache->backend()) {
+        if (!map || expert_cache->tier_backend(t) == expert_cache->backend(il)) {
             continue;
         }
         const labeler label = [&, t](ggml_tensor * x, const char * l) { name_tier(x, t, l); };
@@ -2720,6 +2755,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn_cache(
         auto * d = part(cur, route, expert_cache->prefill_bank(il, 0), expert_cache->prefill_bank(il, 1),
                 expert_cache->prefill_bank(il, 2), label);
         remote.push_back(reduce(d, weights, label));
+    }
+    if (before_cpu_ffn) {
+        // Keep independent GPU work after the packet readback, so it does not delay CPU startup on the same stream.
+        before_cpu_ffn();
     }
     auto * experts = part(cx, ci, gate, up, down, [&](ggml_tensor * x, const char * l) { name(x, l, true); });
     ggml_tensor * out = nullptr;
@@ -2993,7 +3032,7 @@ ggml_tensor * llm_graph_context::build_inp_attn_scale() const {
     return cur;
 }
 
-ggml_tensor * llm_graph_context::build_inp_out_ids() const {
+ggml_tensor * llm_graph_context::build_inp_out_ids(uint32_t row_offset) const {
     // note: when all tokens are output, we could skip this optimization to spare the ggml_get_rows() calls,
     //       but this would make the graph topology depend on the number of output tokens, which can interfere with
     //       features that require constant topology such as pipeline parallelism
@@ -3002,7 +3041,7 @@ ggml_tensor * llm_graph_context::build_inp_out_ids() const {
     //    return nullptr;
     //}
 
-    auto inp = std::make_unique<llm_graph_input_out_ids>(hparams, cparams, n_outputs);
+    auto inp = std::make_unique<llm_graph_input_out_ids>(hparams, cparams, n_outputs, row_offset);
 
     auto & cur = inp->out_ids;
 
@@ -3975,6 +4014,13 @@ llm_graph_input_dsv4 * llm_graph_context::build_inp_dsv4() const {
     inp_raw->self_kq_mask = dsv4_build_raw_kq_mask(ctx0, raw_ctx, ubatch, cparams, n_stream);
     inp_raw->self_kq_mask_cnv = inp_raw->self_kq_mask;
 
+    if (raw_ctx->has_dec()) {
+        const auto ubatch_dec = raw_ctx->decoder_ubatch(ubatch);
+        inp_raw->self_kq_mask_dec = dsv4_build_raw_kq_mask(ctx0, raw_ctx, ubatch_dec, cparams, n_stream, true);
+        inp_raw->self_kq_mask_dec_cnv = inp_raw->self_kq_mask_dec;
+        inp_raw->self_k_idxs_dec = raw_ctx->build_input_k_idxs_dec(ctx0, ubatch);
+    }
+
     inp_raw->self_k_rot = raw_ctx->build_input_k_rot(ctx0);
     auto inp = std::make_unique<llm_graph_input_dsv4>(cparams, std::move(inp_raw), mctx_cur);
 
@@ -4205,9 +4251,20 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
         ggml_set_input(inp->pool_cells);
         ggml_set_name(inp->pool_cells, "kpool_pool_cells");
 
-        inp->pool_bias = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_pools, n_tps, n_stream);
-        ggml_set_input(inp->pool_bias);
-        ggml_set_name(inp->pool_bias, "kpool_pool_bias");
+        if (llama_kpool_device_masks_enabled()) {
+            // the pool bias is built per device from these (see llm_graph_input_kpool)
+            inp->pool_iv_cells = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_pools, 2, 1, n_stream);
+            ggml_set_input(inp->pool_iv_cells);
+            ggml_set_name(inp->pool_iv_cells, "kpool_pool_iv_cells");
+
+            inp->pool_iv_queries = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_tps, 2, 1, n_stream);
+            ggml_set_input(inp->pool_iv_queries);
+            ggml_set_name(inp->pool_iv_queries, "kpool_pool_iv_queries");
+        } else {
+            inp->pool_bias = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_pools, n_tps, n_stream);
+            ggml_set_input(inp->pool_bias);
+            ggml_set_name(inp->pool_bias, "kpool_pool_bias");
+        }
 
         if (pool_cache != nullptr) {
             inp->pool_cache_slots = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_pools, n_stream);
@@ -4247,7 +4304,7 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
         }
 
         // the fused indexer wants f16; built once, shared by every indexer layer
-        if (cparams.fused_lid) {
+        if (cparams.fused_lid && inp->pool_bias != nullptr) {
             inp->pool_bias_f16 = ggml_cast(ctx0,
                     ggml_reshape_4d(ctx0, inp->pool_bias, n_pools, n_tps, 1, n_stream),
                     GGML_TYPE_F16);

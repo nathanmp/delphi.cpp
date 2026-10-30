@@ -1,5 +1,6 @@
 #pragma once
 
+#include "grid-pad.cuh"
 #include "common.cuh"
 #include "convert.cuh"
 #include "vecdotq.cuh"
@@ -771,9 +772,12 @@ static __global__ void flash_attn_stream_k_fixup_uniform(
     const int jc       = j*ncols2 + c;
     const int tid      = threadIdx.x;
 
-    // nblocks_stream_k is a multiple of ntiles_dst (== gridDim.x), so each tile gets the same number of blocks.
+    // nblocks_stream_k is a multiple of ntiles_dst, so each tile gets the same number of blocks.
     const int b_first = tile_idx * blocks_per_tile;
     const int b_last  = b_first + blocks_per_tile - 1;
+    if (b_first >= nblocks_stream_k) {
+        return; // idle tile from ggml_cuda_grid_pad
+    }
 
     const float * dst_fixup_data = ((const float *) dst_fixup) + nblocks_stream_k*(2*2*ncols);
 
@@ -947,7 +951,8 @@ static __global__ void flash_attn_combine_results(
         const float  * VKQ_parts_ptr,
         const float2 * VKQ_meta_ptr,
         float * dst_ptr,
-        const int parallel_blocks) {
+        const int parallel_blocks,
+        const int ne01) {
     ggml_cuda_pdl_lc();
     const float  * GGML_CUDA_RESTRICT VKQ_parts = VKQ_parts_ptr;
     const float2 * GGML_CUDA_RESTRICT VKQ_meta  = VKQ_meta_ptr;
@@ -958,12 +963,15 @@ static __global__ void flash_attn_combine_results(
     // Dimension 3: blockIdx.z
     // Memory layout is permuted with [0, 2, 1, 3]
 
-    const int ne01 = gridDim.x;
     const int ne02 = gridDim.y;
 
     const int col      = blockIdx.x;
     const int head     = blockIdx.y;
     const int sequence = blockIdx.z;
+
+    if (col >= ne01) {
+        return; // idle column from ggml_cuda_grid_pad
+    }
 
     const int j_dst_unrolled = (sequence*ne01 + col)*ne02 + head;
 
@@ -1305,7 +1313,7 @@ void launch_fattn(
             const uint3 fd2 = init_fastdiv_values(ntiles_x);
 
             const dim3 block_dim_combine(DV, 1, 1);
-            const dim3 blocks_num_combine = {(unsigned)ntiles_dst, ncols1, ncols2};
+            const dim3 blocks_num_combine = {(unsigned) ggml_cuda_grid_pad(ntiles_dst, ncols1*ncols2, DV), ncols1, ncols2};
 
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_combine, block_dim_combine, 0, main_stream);
             ggml_cuda_kernel_launch(flash_attn_stream_k_fixup_uniform<DV, ncols1, ncols2>, launch_params,
@@ -1332,12 +1340,12 @@ void launch_fattn(
         }
     } else if (parallel_blocks > 1) {
         const dim3 block_dim_combine(DV, 1, 1);
-        const dim3 blocks_num_combine(Q->ne[1], Q->ne[2], Q->ne[3]);
+        const dim3 blocks_num_combine((unsigned) ggml_cuda_grid_pad(Q->ne[1], Q->ne[2]*Q->ne[3], DV), Q->ne[2], Q->ne[3]);
         const size_t nbytes_shared_combine = parallel_blocks*sizeof(float2);
 
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_combine, block_dim_combine, nbytes_shared_combine, main_stream);
         ggml_cuda_kernel_launch(flash_attn_combine_results<DV>, launch_params,
-            dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks);
+            dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks, (int) Q->ne[1]);
     }
     CUDA_CHECK(cudaGetLastError());
 }

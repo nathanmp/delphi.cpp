@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cerrno>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -159,6 +160,21 @@ struct clip_ctx {
     ggml_backend_t backend_cpu = nullptr;
     ggml_backend_buffer_ptr buf;
 
+    // delphi: retain the authoritative vision weights in RAM while their tensor headers are rebound for a GPU phase.
+    struct phase_binding {
+        ggml_tensor * tensor;
+        void * data;
+        ggml_backend_buffer_t buffer;
+        void * extra;
+    };
+    bool phase = false;
+    bool phase_default = false;
+    ggml_backend_t phase_backend = nullptr;
+    ggml_backend_buffer_ptr phase_host;
+    std::vector<phase_binding> phase_bindings;
+    ggml_backend_sched_eval_callback cb_eval = nullptr;
+    void * cb_eval_user_data = nullptr;
+
 
     int max_nodes = 8192;
     ggml_backend_sched_ptr sched;
@@ -181,6 +197,7 @@ struct clip_ctx {
     clip_ctx(clip_context_params & ctx_params) {
         flash_attn_type = ctx_params.flash_attn_type;
         no_alloc = ctx_params.no_alloc;
+        phase_default = ctx_params.phase_default;
         backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
         if (!backend_cpu) {
             throw std::runtime_error("failed to initialize CPU backend");
@@ -200,8 +217,6 @@ struct clip_ctx {
 
         if (backend) {
             LOG_INF("%s: CLIP using %s backend\n", __func__, ggml_backend_name(backend));
-            backend_ptrs.push_back(backend);
-            backend_buft.push_back(ggml_backend_get_default_buffer_type(backend));
         } else {
             backend = backend_cpu;
             LOG_INF("%s: CLIP using CPU backend\n", __func__);
@@ -214,25 +229,63 @@ struct clip_ctx {
             model.hparams.custom_image_max_tokens = ctx_params.image_max_tokens;
         }
 
-        backend_ptrs.push_back(backend_cpu);
-        backend_buft.push_back(ggml_backend_get_default_buffer_type(backend_cpu));
-
-        sched.reset(
-            ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), 8192, false, true)
-        );
-
-        if (ctx_params.cb_eval != nullptr) {
-            ggml_backend_sched_set_eval_callback(sched.get(), ctx_params.cb_eval, ctx_params.cb_eval_user_data);
-        }
+        cb_eval = ctx_params.cb_eval;
+        cb_eval_user_data = ctx_params.cb_eval_user_data;
+        init_sched();
 
         debug_output_embeddings = std::getenv("MTMD_DEBUG_EMBEDDINGS") != nullptr;
     }
 
     ~clip_ctx() {
+        sched.reset();
+        buf.reset();
+        phase_host.reset();
         ggml_backend_free(backend);
         if (backend != backend_cpu) {
             ggml_backend_free(backend_cpu);
         }
+    }
+
+    void init_sched() {
+        backend_ptrs.clear();
+        backend_buft.clear();
+        if (backend != backend_cpu) {
+            backend_ptrs.push_back(backend);
+            backend_buft.push_back(ggml_backend_get_default_buffer_type(backend));
+        }
+        backend_ptrs.push_back(backend_cpu);
+        backend_buft.push_back(ggml_backend_get_default_buffer_type(backend_cpu));
+        sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, true));
+        if (cb_eval) {
+            ggml_backend_sched_set_eval_callback(sched.get(), cb_eval, cb_eval_user_data);
+        }
+    }
+
+    void phase_restore_host() {
+        for (const auto & b : phase_bindings) {
+            b.tensor->data = b.data;
+            b.tensor->buffer = b.buffer;
+            b.tensor->extra = b.extra;
+        }
+    }
+
+    void phase_release() {
+        if (sched) {
+            ggml_backend_sched_synchronize(sched.get());
+        }
+        sched.reset();
+        buf.reset();
+        phase_restore_host();
+        backend = phase_backend;
+        // Captured graphs and backend pools can retain addresses into the released encoder allocations.
+        auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        auto * trim = reg ? reinterpret_cast<void (*)(ggml_backend_t)>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_trim")) : nullptr;
+        if (trim) {
+            trim(backend);
+        }
+        is_allocated = false;
+        mem_compute.clear();
+        init_sched();
     }
 
     // this function is added so that we don't change too much of the existing code
@@ -1057,6 +1110,7 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const 
                 builder = std::make_unique<clip_graph_kimik25>(ctx, img);
             } break;
         case PROJECTOR_TYPE_DEEPSEEK4V:
+        case PROJECTOR_TYPE_DEEPSEEK41V:
             {
                 builder = std::make_unique<clip_graph_deepseek4v>(ctx, img);
             } break;
@@ -1613,14 +1667,19 @@ struct clip_model_loader {
                         }
                     } break;
                 case PROJECTOR_TYPE_DEEPSEEK4V:
+                case PROJECTOR_TYPE_DEEPSEEK41V:
                     {
                         hparams.image_resize_algo = RESIZE_ALGO_BICUBIC;
                         hparams.image_pad_color   = {127, 127, 127};
                         hparams.rope_theta = 10000.0f;
                         get_u32(KEY_PROJ_SCALE_FACTOR, hparams.n_merge);
                         get_u32(KEY_IMAGE_MIN_PIXELS,  hparams.image_min_pixels);
-                        hparams.dsv4_max_n_token  = 384;
-                        hparams.dsv4_max_wh_ratio = 8;
+                        // V4 files carry no limits and use the defaults below
+                        const bool is_v41 = model.proj_type == PROJECTOR_TYPE_DEEPSEEK41V;
+                        hparams.dsv4_max_n_token  = is_v41 ? 1024 : 384;
+                        hparams.dsv4_max_wh_ratio = is_v41 ? 0 : 8; // 0 = no limit
+                        get_u32(KEY_IMAGE_MAX_TOKENS,   hparams.dsv4_max_n_token,  false);
+                        get_u32(KEY_IMAGE_MAX_WH_RATIO, hparams.dsv4_max_wh_ratio, false);
                         const int patch_area = hparams.patch_size * hparams.patch_size * hparams.n_merge * hparams.n_merge;
                         // handle min/max token counts from CLI
                         if (hparams.custom_image_min_tokens > 0) {
@@ -2169,6 +2228,21 @@ struct clip_model_loader {
     void load_tensors(clip_ctx & ctx_clip) {
         auto & model = ctx_clip.model;
         auto & hparams = model.hparams;
+        const char * phase_env = std::getenv("LLAMA_MMPROJ_PHASE");
+        const bool phase_requested = phase_env ? std::atoi(phase_env) != 0 : ctx_clip.phase_default;
+        ctx_clip.phase = phase_requested && model.modality == CLIP_MODALITY_VISION &&
+            ctx_clip.backend != ctx_clip.backend_cpu;
+        if (ctx_clip.phase) {
+            auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(ctx_clip.backend));
+            if (!reg || !ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_trim")) {
+                if (phase_env) {
+                    throw std::runtime_error("phase vision requires a CUDA or HIP backend with scratch release support");
+                }
+                ctx_clip.phase = false;
+            } else {
+                ctx_clip.phase_backend = ctx_clip.backend;
+            }
+        }
         std::map<std::string, size_t> tensor_offset;
         std::vector<ggml_tensor *> tensors_to_load;
 
@@ -2217,7 +2291,7 @@ struct clip_model_loader {
                 loaded_tensor_names.insert(name);
                 cur = data_tensor;
                 // add to weight memory counter
-                ctx_clip.mem_usage[ggml_backend_get_device(ctx_clip.backend)] += ggml_nbytes(cur);
+                ctx_clip.mem_usage[ggml_backend_get_device(ctx_clip.phase ? ctx_clip.backend_cpu : ctx_clip.backend)] += ggml_nbytes(cur);
             }
             return cur;
         };
@@ -2857,6 +2931,17 @@ struct clip_model_loader {
                     model.token_embd_img_start = get_tensor(TN_TOK_IMG_START);
                     model.token_embd_img_end   = get_tensor(TN_TOK_IMG_END);
                     model.token_embd_img_pad   = get_tensor(TN_TOK_IMG_PAD);
+                } break;
+            case PROJECTOR_TYPE_DEEPSEEK41V:
+                {
+                    model.mm_1_w = get_tensor(string_format(TN_LLAVA_PROJ, 1, "weight"));
+                    model.mm_1_b = get_tensor(string_format(TN_LLAVA_PROJ, 1, "bias"));
+                    model.mm_2_w = get_tensor(string_format(TN_LLAVA_PROJ, 2, "weight"));
+                    model.mm_2_b = get_tensor(string_format(TN_LLAVA_PROJ, 2, "bias"));
+                    // no pad embedding in V4.1
+                    model.image_newline        = get_tensor(TN_IMAGE_NEWLINE);
+                    model.token_embd_img_start = get_tensor(TN_TOK_IMG_START);
+                    model.token_embd_img_end   = get_tensor(TN_TOK_IMG_END);
                 } break;
             case PROJECTOR_TYPE_PIXTRAL:
                 {
@@ -3701,8 +3786,11 @@ struct clip_model_loader {
             }
 
             // alloc memory and offload data
-            ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(ctx_clip.backend);
+            ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(ctx_clip.phase ? ctx_clip.backend_cpu : ctx_clip.backend);
             ctx_clip.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_clip.ctx_data.get(), buft));
+            if (!ctx_clip.buf) {
+                throw std::runtime_error("failed to allocate encoder weights");
+            }
             ggml_backend_buffer_set_usage(ctx_clip.buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
             // read the weight from file
             if (!ctx_clip.no_alloc) {
@@ -3740,6 +3828,14 @@ struct clip_model_loader {
                 LOG_DBG("%s: no_alloc is set, skipping tensor data loading (%zu tensors)\n", __func__, tensors_to_load.size());
             }
             fin.close();
+            if (ctx_clip.phase) {
+                for (auto * t = ggml_get_first_tensor(ctx_clip.ctx_data.get()); t; t = ggml_get_next_tensor(ctx_clip.ctx_data.get(), t)) {
+                    ctx_clip.phase_bindings.push_back({t, t->data, t->buffer, t->extra});
+                }
+                ctx_clip.phase_host = std::move(ctx_clip.buf);
+                LOG_INF("%s: phase vision: %.2f MiB of weights retained in RAM\n", __func__,
+                    ggml_backend_buffer_get_size(ctx_clip.phase_host.get()) / 1048576.0);
+            }
         }
 
     }
@@ -3796,13 +3892,13 @@ struct clip_model_loader {
         warmup(ctx_clip, batch);
     }
 
-    static void warmup(clip_ctx & ctx_clip, const clip_image_f32_batch & batch) {
+    static void warmup(clip_ctx & ctx_clip, const clip_image_f32_batch & batch, bool measure_only = false) {
         support_info_graph info;
 
         if (ctx_clip.flash_attn_type == CLIP_FLASH_ATTN_TYPE_AUTO) {
             // try to enable flash attention to see if it's supported
             ctx_clip.flash_attn_type = CLIP_FLASH_ATTN_TYPE_ENABLED;
-            info = reserve_compute_meta(ctx_clip, batch);
+            info = reserve_compute_meta(ctx_clip, batch, measure_only);
             if (!info.fattn && info.fattn_op) {
                 auto op = info.fattn_op;
                 LOG_WRN("%s: *****************************************************************\n", __func__);
@@ -3821,10 +3917,10 @@ struct clip_model_loader {
                 LOG_WRN("%s: please report this on github as an issue\n", __func__);
                 LOG_WRN("%s: *****************************************************************\n", __func__);
                 ctx_clip.flash_attn_type = CLIP_FLASH_ATTN_TYPE_DISABLED;
-                reserve_compute_meta(ctx_clip, batch);
+                reserve_compute_meta(ctx_clip, batch, measure_only);
             }
         } else {
-            info = reserve_compute_meta(ctx_clip, batch);
+            info = reserve_compute_meta(ctx_clip, batch, measure_only);
             if (!info.fattn && ctx_clip.flash_attn_type == CLIP_FLASH_ATTN_TYPE_ENABLED) {
                 LOG_WRN("%s: flash attention is not supported by the current backend; falling back to CPU (performance will be degraded)\n", __func__);
             }
@@ -3863,16 +3959,21 @@ struct clip_model_loader {
         }
     }
 
-    // only initialize backend buffers, but do not allocate them yet
-    static support_info_graph reserve_compute_meta(clip_ctx & ctx_clip, const clip_image_f32_batch & batch) {
+    // Reserve compute buffers, or measure their sizes without allocating them.
+    static support_info_graph reserve_compute_meta(clip_ctx & ctx_clip, const clip_image_f32_batch & batch, bool measure_only = false) {
         ggml_cgraph * gf = clip_get_graph_builder(&ctx_clip, batch)->build();
-        ggml_backend_sched_reserve(ctx_clip.sched.get(), gf);
+        std::vector<size_t> sizes(ctx_clip.backend_ptrs.size());
+        if (measure_only) {
+            ggml_backend_sched_reserve_size(ctx_clip.sched.get(), gf, sizes.data());
+        } else if (!ggml_backend_sched_reserve(ctx_clip.sched.get(), gf)) {
+            throw std::runtime_error("failed to reserve encoder compute buffers");
+        }
 
         ctx_clip.mem_compute.clear();
         for (size_t i = 0; i < ctx_clip.backend_ptrs.size(); ++i) {
             ggml_backend_t backend = ctx_clip.backend_ptrs[i];
             ggml_backend_buffer_type_t buft = ctx_clip.backend_buft[i];
-            size_t size = ggml_backend_sched_get_buffer_size(ctx_clip.sched.get(), backend);
+            size_t size = measure_only ? sizes[i] : ggml_backend_sched_get_buffer_size(ctx_clip.sched.get(), backend);
             if (size > 1) {
                 LOG_INF("%s: %10s compute buffer size = %8.2f MiB\n", __func__,
                         ggml_backend_buft_name(buft),
@@ -4075,7 +4176,7 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
             loader.load_hparams(ctx_vision->model, CLIP_MODALITY_VISION);
             loader.load_tensors(*ctx_vision);
             loader.init_ctx(*ctx_vision);
-            if (ctx_params.warmup) {
+            if (ctx_params.warmup && !ctx_vision->phase) {
                 loader.warmup(*ctx_vision);
             }
 
@@ -4128,6 +4229,10 @@ void clip_free(clip_ctx * ctx) {
         return;
     }
     delete ctx;
+}
+
+ggml_backend_dev_t clip_phase_device(const clip_ctx * ctx) {
+    return ctx && ctx->phase ? ggml_backend_get_device(ctx->phase_backend) : nullptr;
 }
 
 const char * clip_patch_merge_type(const struct clip_ctx * ctx) {
@@ -4303,6 +4408,13 @@ int clip_n_output_tokens(const clip_ctx * ctx, const clip_image_f32 * img) {
                 const int n_llm_w = CLIP_ALIGN(img->nx(), out_patch_size) / out_patch_size;
                 const int n_llm_h = CLIP_ALIGN(img->ny(), out_patch_size) / out_patch_size;
                 n_patches = dsv4_get_block_layout(n_llm_w, n_llm_h, img->lead_pad).n_out;
+            } break;
+        case PROJECTOR_TYPE_DEEPSEEK41V:
+            {
+                const int out_patch_size = params.patch_size * params.n_merge;
+                const int n_llm_w = CLIP_ALIGN(img->nx(), out_patch_size) / out_patch_size;
+                const int n_llm_h = CLIP_ALIGN(img->ny(), out_patch_size) / out_patch_size;
+                n_patches = dsv41_get_block_n_out(n_llm_w, n_llm_h);
             } break;
         case PROJECTOR_TYPE_PADDLEOCR:
         case PROJECTOR_TYPE_DOTS_OCR:
@@ -4525,6 +4637,100 @@ static std::vector<c2w_state_slot> list_gen_state_slots(const clip_hparams & hpa
     }
 }
 
+// delphi: one encoding owns the transient device weights, allocator and backend scratch.
+// Outputs are copied to the caller before this scope ends, including on cancellation or an exception. The host weights and preprocessor metadata stay valid.
+struct clip_phase_scope {
+    clip_ctx & ctx;
+    const clip_flash_attn_type flash_attn_type;
+
+    explicit clip_phase_scope(clip_ctx & ctx) : ctx(ctx), flash_attn_type(ctx.flash_attn_type) {}
+
+    ~clip_phase_scope() {
+        if (ctx.phase) {
+            ctx.phase_release();
+            ctx.flash_attn_type = flash_attn_type;
+        }
+    }
+
+    void prepare(const clip_image_f32_batch & batch) {
+        if (!ctx.phase) {
+            return;
+        }
+        const auto buft = ggml_backend_get_default_buffer_type(ctx.backend);
+        const size_t alignment = ggml_backend_buft_get_alignment(buft);
+        size_t weights = 0;
+        // A zero-sized device buffer tags the weights for placement without uploading or executing them.
+        // reserve_size only plans tensor lifetimes; the real batch determines the workspace requirement.
+        ggml_backend_buffer_ptr measure(ggml_backend_buft_alloc_buffer(buft, 0));
+        if (!measure) {
+            throw std::runtime_error("failed to create encoder measurement buffer");
+        }
+        ggml_backend_buffer_set_usage(measure.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        for (const auto & b : ctx.phase_bindings) {
+            b.tensor->buffer = measure.get();
+            weights += GGML_PAD(ggml_backend_buft_get_alloc_size(buft, b.tensor), alignment);
+        }
+        clip_model_loader::warmup(ctx, batch, true);
+        const auto dev = ggml_backend_get_device(ctx.backend);
+        const size_t compute = ctx.mem_compute[dev];
+        ctx.phase_restore_host();
+        ctx.sched.reset();
+        measure.reset();
+        size_t free = 0, total = 0;
+        ggml_backend_dev_memory(dev, &free, &total);
+        if (const char * cap = std::getenv("LLAMA_MMPROJ_PHASE_GPU_MIB")) {
+            char * end = nullptr;
+            errno = 0;
+            const auto mib = std::strtoull(cap, &end, 10);
+            if (errno || !*cap || *cap == '-' || *end || mib > (SIZE_MAX >> 20)) {
+                throw std::runtime_error("invalid LLAMA_MMPROJ_PHASE_GPU_MIB");
+            }
+            free = std::min(free, size_t(mib) << 20);
+        }
+        // Leave room for kernel scratch not represented in the ggml graph. This is independent of the cache safety margin.
+        constexpr size_t headroom = 256ULL << 20;
+        const bool fits = free >= headroom && weights <= free - headroom && compute <= free - headroom - weights;
+        LOG_INF("%s: phase vision on %s: weights %.2f + compute %.2f MiB, available %.2f MiB, %s\n", __func__,
+            ggml_backend_dev_name(dev), weights / 1048576.0, compute / 1048576.0, free / 1048576.0, fits ? "GPU" : "CPU fallback");
+
+        if (fits) {
+            for (const auto & b : ctx.phase_bindings) {
+                b.tensor->data = nullptr;
+                b.tensor->buffer = nullptr;
+                b.tensor->extra = nullptr;
+            }
+            ctx.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx.ctx_data.get(), buft));
+            if (ctx.buf) {
+                ggml_backend_buffer_set_usage(ctx.buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                for (const auto & b : ctx.phase_bindings) {
+                    ggml_backend_tensor_set(b.tensor, b.data, 0, ggml_nbytes(b.tensor));
+                }
+            } else {
+                LOG_WRN("%s: device weight allocation failed, using CPU vision\n", __func__);
+                ctx.phase_restore_host();
+            }
+        }
+        if (!ctx.buf) {
+            ctx.backend = ctx.backend_cpu;
+            ctx.flash_attn_type = flash_attn_type;
+        }
+        ctx.is_allocated = false;
+        ctx.init_sched();
+        if (ctx.buf) {
+            try {
+                clip_model_loader::warmup(ctx, batch);
+            } catch (const std::runtime_error & e) {
+                // Free a failed reservation before retrying on the authoritative host weights.
+                LOG_WRN("%s: GPU vision reserve failed (%s), using CPU vision\n", __func__, e.what());
+                ctx.phase_release();
+                ctx.backend = ctx.backend_cpu;
+                ctx.flash_attn_type = flash_attn_type;
+                ctx.init_sched();
+            }
+        }
+    }
+};
+
 bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
     const clip_image_f32_batch & imgs = *params->imgs;
     int n_batch_cur = imgs.entries.size();
@@ -4534,6 +4740,9 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
         LOG_ERR("%s: batch size %d exceeds maximum supported batch/temporal-merge size %d\n", __func__, n_batch_cur, clip_model_n_temporal_merge(ctx));
         return false;
     }
+
+    clip_phase_scope phase_scope(*ctx);
+    phase_scope.prepare(imgs);
 
     // if buffers are not allocated, we need to do a warmup run to allocate them
     if (!ctx->is_allocated) {
@@ -4548,7 +4757,10 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
     // build the inference graph
     ggml_backend_sched_reset(ctx->sched.get());
     ggml_cgraph * gf = clip_get_graph_builder(ctx, imgs, params)->build();
-    ggml_backend_sched_alloc_graph(ctx->sched.get(), gf);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched.get(), gf)) {
+        LOG_ERR("%s: failed to allocate encoder graph\n", __func__);
+        return false;
+    }
 
     // set inputs
     const auto & model   = ctx->model;
@@ -5182,6 +5394,7 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
                 set_input_i32("pos_w", pos_data);
             } break;
         case PROJECTOR_TYPE_DEEPSEEK4V:
+        case PROJECTOR_TYPE_DEEPSEEK41V:
             {
                 // set the 2D positions (mrope layout, only the first 2 channels are used)
                 int n_patches_per_row = image_size_width / patch_size;
@@ -5203,10 +5416,25 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
                 const int idx_newline = n_grid + 2;
                 const int idx_pad     = n_grid + 3;
 
+                std::vector<int32_t> idx;
+                if (ctx->model.proj_type == PROJECTOR_TYPE_DEEPSEEK41V) {
+                    // plain reading order, one NEWLINE per row (no pad sentinel in V4.1, so idx_pad is unused)
+                    idx.reserve(dsv41_get_block_n_out(n_llm_w, n_llm_h));
+                    idx.push_back(idx_start);
+                    for (int r = 0; r < n_llm_h; r++) {
+                        for (int c = 0; c < n_llm_w; c++) {
+                            idx.push_back(r * n_llm_w + c);
+                        }
+                        idx.push_back(idx_newline);
+                    }
+                    idx.push_back(idx_end);
+                    set_input_i32("layout_idx", idx);
+                    break;
+                }
+
                 const int lead_pad = imgs.entries[0].lead_pad;
                 const auto bl = dsv4_get_block_layout(n_llm_w, n_llm_h, lead_pad);
 
-                std::vector<int32_t> idx;
                 idx.reserve(bl.n_out);
                 for (int i = 0; i < lead_pad; i++) {
                     idx.push_back(idx_pad);
@@ -6094,6 +6322,7 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
         case PROJECTOR_TYPE_KIMIK25:
         case PROJECTOR_TYPE_YASA2:
         case PROJECTOR_TYPE_DEEPSEEK4V:
+        case PROJECTOR_TYPE_DEEPSEEK41V:
             return ctx->model.mm_2_w->ne[1];
         case PROJECTOR_TYPE_HUNYUANVL:
             return ctx->model.mm_model_proj->ne[1];

@@ -90,6 +90,12 @@ static bool ggml_cpu_iqk_mul_mat_enabled(void) {
     return value == NULL || strcmp(value, "0") != 0;
 }
 
+// GGML_CPU_BATCHED_VEC_DOT=0 restores the per-row expert dots for A/B tests.
+static bool ggml_cpu_batched_vec_dot_enabled(void) {
+    const char * value = getenv("GGML_CPU_BATCHED_VEC_DOT");
+    return value == NULL || strcmp(value, "0") != 0;
+}
+
 // precomputed f32 table for f16 (256 KB) (simd-mappings.h)
 float ggml_table_f32_f16[1 << 16];
 
@@ -1960,6 +1966,11 @@ static bool ggml_cpu_g128_rows_enabled(void) {
     return enabled != 0;
 }
 
+static bool ggml_cpu_numa_quant_flat_enabled(void) {
+    const char * env = getenv("GGML_NUMA_QUANT_FLAT");
+    return !env || atoi(env) != 0;
+}
+
 // GGML_CPU_G128_PANEL=0 recomputes the activation correction and scale per weight row (A/B).
 static bool ggml_cpu_g128_panel_enabled(void) {
     static int enabled = -1;
@@ -2028,7 +2039,8 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
     const bool src1_cont,
     const void * wdata,
     char * g128_panels,
-    const char * gemm_panels) {
+    const char * gemm_panels,
+    ggml_vec_dot_batch_rows_t batch_rows) {
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -2089,6 +2101,24 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
                     dsts[r][ir0] = out[r];
                 }
             }
+        }
+        return;
+    }
+
+    // Reuse each decoded weight block across up to four activation rows.
+    if (batch_rows && ir0_start < ir0_end && ir1_end - ir1_start > 1) {
+        for (int64_t first = ir1_start; first < ir1_end; first += 4) {
+            const int nr = (int) MIN(4, ir1_end - first);
+            const void * ys[4];
+            float * outs[4];
+            for (int r = 0; r < nr; ++r) {
+                const struct mmid_row_mapping rm = MMID_MATRIX_ROW(cur_a, first + r);
+                const int64_t i11 = rm.i1 % ne11;
+                ys[r] = (const char *) wdata + (src1_cont || src1->type != vec_dot_type
+                    ? (i11 + rm.i2 * ne11) * row_size : i11 * nb11 + rm.i2 * nb12);
+                outs[r] = (float *) ((char *) dst->data + rm.i1 * nb1 + rm.i2 * nb2) + ir0_start;
+            }
+            batch_rows(ne00, outs, src0_cur + ir0_start * nb01, nb01, ys, nr, ir0_end - ir0_start);
         }
         return;
     }
@@ -2249,7 +2279,7 @@ static void ggml_mmid_piece(
         struct ggml_tensor * dst, struct ggml_tensor * fuse_up, struct ggml_tensor * fuse_dst, bool g128_fused,
         int64_t cur_a, int64_t ir0_start, int64_t ir0_end, int64_t ir1_start, int64_t ir1_end,
         const struct mmid_row_mapping * matrix_rows, size_t row_size, bool src1_cont, const void * wdata,
-        char * g128_panels, const char * gemm_panels) {
+        char * g128_panels, const char * gemm_panels, ggml_vec_dot_batch_rows_t batch_rows) {
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
     const struct ggml_tensor * ids  = dst->src[2];
@@ -2258,7 +2288,7 @@ static void ggml_mmid_piece(
         dst, src0, src1, ids, cur_a,
         ir0_start, ir0_end, ir1_start, ir1_end,
         (const char *) src0->data + cur_a * src0->nb[2],
-        matrix_rows, row_size, src1_cont, wdata, g128_panels, gemm_panels
+        matrix_rows, row_size, src1_cont, wdata, g128_panels, gemm_panels, batch_rows
     );
     if (g128_fused) {
         // the same rows of up, then SwiGLU over them: one node and one barrier instead of three
@@ -2266,7 +2296,7 @@ static void ggml_mmid_piece(
             fuse_up, fuse_up->src[0], src1, ids, cur_a,
             ir0_start, ir0_end, ir1_start, ir1_end,
             (const char *) fuse_up->src[0]->data + cur_a * fuse_up->src[0]->nb[2],
-            matrix_rows, row_size, src1_cont, wdata, g128_panels, gemm_panels
+            matrix_rows, row_size, src1_cont, wdata, g128_panels, gemm_panels, batch_rows
         );
         for (int64_t ir1 = ir1_start; ir1 < ir1_end; ++ir1) {
             const struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, ir1);
@@ -2313,6 +2343,9 @@ static void ggml_compute_forward_mul_mat_id_impl(
     const bool g128_fused = fuse_up != NULL && ggml_cpu_g128_rows_supported(src0);
 
     const bool src1_cont = ggml_is_contiguous(src1);
+
+    const ggml_vec_dot_batch_rows_t batch_rows = !params->use_ref && ggml_cpu_batched_vec_dot_enabled()
+        ? ggml_get_vec_dot_batch_rows(type) : NULL;
 
     enum ggml_type    const vec_dot_type    = type_traits_cpu[type].vec_dot_type;
     ggml_from_float_t const from_float      = type_traits_cpu[vec_dot_type].from_float;
@@ -2437,6 +2470,23 @@ static void ggml_compute_forward_mul_mat_id_impl(
                 void * q = wdata + i13*nbw3 + i12*nbw2 + i11*nbw1;
                 from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11), q, ne10);
                 ggml_q4_g128_gemm_panel(ne10, q, gemm_panels + ir*gemm_panel_size);
+            }
+        } else if (numa_tensors && vec_dot_type == GGML_TYPE_Q8_K && ggml_cpu_numa_quant_flat_enabled()) {
+            // Split blocks across all rows. A short row can have fewer blocks than this node has workers.
+            const int64_t bs = ggml_blck_size(vec_dot_type);
+            const int64_t blocks_per_row = ne10 / bs;
+            const int64_t blocks = blocks_per_row * ne11 * ne12 * ne13;
+            const int64_t end = blocks * (work_ith + 1) / work_nth;
+            for (int64_t block = blocks * work_ith / work_nth; block < end;) {
+                const int64_t row = block / blocks_per_row;
+                const int64_t first = block % blocks_per_row;
+                const int64_t count = MIN(blocks_per_row - first, end - block);
+                const int64_t i11 = row % ne11;
+                const int64_t i12 = (row / ne11) % ne12;
+                const int64_t i13 = row / (ne11 * ne12);
+                from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + first*bs*nb10),
+                           wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + first*nbw0, count * bs);
+                block += count;
             }
         } else
 
@@ -2655,7 +2705,7 @@ static void ggml_compute_forward_mul_mat_id_impl(
             const int64_t ir1_end = MIN(ir1_start + dr1, nr1);
 
             ggml_mmid_piece(dst, fuse_up, fuse_dst, g128_fused, cur_a, ir0_start, ir0_end, ir1_start, ir1_end,
-                matrix_rows, row_size, src1_cont, wdata, g128_panels, g128_gemm ? gemm_panels : NULL);
+                matrix_rows, row_size, src1_cont, wdata, g128_panels, g128_gemm ? gemm_panels : NULL, batch_rows);
 
             if (work_nth >= nchunk0 * nchunk1) {
                 break;
@@ -2725,7 +2775,7 @@ static void ggml_compute_forward_mul_mat_id_impl(
                     const int64_t ir1_end = MIN(ir1_start + dr1, cne1);
 
                     ggml_mmid_piece(dst, fuse_up, fuse_dst, g128_fused, cur_a, ir0_start, ir0_end, ir1_start, ir1_end,
-                        matrix_rows, row_size, src1_cont, wdata, g128_panels, g128_gemm ? gemm_panels : NULL);
+                        matrix_rows, row_size, src1_cont, wdata, g128_panels, g128_gemm ? gemm_panels : NULL, batch_rows);
 
                     chunk = atomic_fetch_add_explicit(ctr, 1, memory_order_relaxed);
                 }

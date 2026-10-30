@@ -11,6 +11,7 @@
 #include "../src/llama-arch.h"
 #include "../src/llama-ext.h"
 #include "../src/llama-model-saver.h"
+#include "../src/llama-kv-cache-dsv4.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -70,7 +71,7 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 }
 
 static void usage(char ** argv) {
-    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v N] [-h/--help]\n", argv[0]);
+    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v N] [--ced-trim] [--numa tensors] [-h/--help]\n", argv[0]);
 }
 
 static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32_t n_vocab, const size_t seed){
@@ -505,7 +506,7 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false,
         const llama_context_type ctx_type = LLAMA_CONTEXT_TYPE_DEFAULT,
         ggml_backend_sched_eval_callback cb_eval = nullptr, void * cb_eval_user_data = nullptr,
-        uint32_t n_seq_max = 1) {
+        uint32_t n_seq_max = 1, uint32_t n_rs_seq = 0) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
@@ -521,6 +522,7 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     ctx_params.n_threads = 4;
     ctx_params.n_threads_batch = 4;
     ctx_params.n_seq_max = n_seq_max;
+    ctx_params.n_rs_seq = n_rs_seq;
     ctx_params.cb_eval = cb_eval;
     ctx_params.cb_eval_user_data = cb_eval_user_data;
     if (!encode) {
@@ -902,8 +904,18 @@ struct shared_gguf {
 // shares its streams. Compress ratios are {0, 2, 2, 1, 1}: layers 1 and 3 publish, layer 2 still
 // scores layer 1's index keys, layer 4 reuses layer 3's top-k pick, and layer 3 pools without a
 // gate, as the real model does at ratio 1.
-static shared_gguf get_deepseek41_shared_gguf(gguf_context * gguf_ctx, const size_t seed) {
+static shared_gguf get_deepseek41_shared_gguf(gguf_context * gguf_ctx, const size_t seed, bool ced = false) {
     shared_gguf ret;
+
+    if (ced) {
+        // Keep all global sources on/below the split (2), with a compressed reader
+        // at 3 and a raw-only decoder layer at 4 to test both cache write paths.
+        llama_model_saver ms(LLM_ARCH_DEEPSEEK41, gguf_ctx);
+        ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS,        std::vector<uint32_t>({0, 2, 1, 1, 0}));
+        ms.add_kv(LLM_KV_ATTENTION_CANDIDATE_SOURCE_LAYER, uint32_t(2));
+        ms.add_kv(LLM_KV_ENGRAM_LAYER_IDS,                std::vector<uint32_t>({0, 1}));
+        ms.add_kv(LLM_KV_CONTEXT_LENGTH,                   uint32_t(1024));
+    }
 
     FILE * full = tmpfile();
     GGML_ASSERT(full != nullptr);
@@ -927,11 +939,13 @@ static shared_gguf get_deepseek41_shared_gguf(gguf_context * gguf_ctx, const siz
         GGML_ASSERT(key_id >= 0);
         return gguf_get_val_u32(src.get(), key_id);
     };
-    GGML_ASSERT(get_u32("deepseek41.attention.candidate_source_layer_id") == 3);
+    GGML_ASSERT(get_u32("deepseek41.attention.candidate_source_layer_id") == (ced ? 2u : 3u));
     GGML_ASSERT(get_u32("deepseek41.attention.candidate_block_size") == 2);
     GGML_ASSERT(get_u32("deepseek41.attention.candidate_topk_blocks") == 5);
 
-    const std::vector<std::string> drop = {
+    const std::vector<std::string> drop = ced ? std::vector<std::string>{
+        "blk.2.attn_compressor_gate", "blk.3.attn_compressor_", "blk.3.indexer.",
+    } : std::vector<std::string>{
         "blk.2.attn_compressor_", "blk.2.indexer.attn_k", "blk.2.indexer.k_norm",
         "blk.3.attn_compressor_gate",
         "blk.4.attn_compressor_", "blk.4.indexer.",
@@ -956,6 +970,196 @@ static FILE * get_shared_gguf_file(const shared_gguf & shared) {
     GGML_ASSERT(gguf_write_to_file_ptr(shared.gguf.get(), file, /*only_meta =*/ false));
     rewind(file);
     return file;
+}
+
+static void set_ced_trim_env(int mode) {
+#ifdef _WIN32
+    _putenv_s("LLAMA_DSV41_TRIM", mode < 0 ? "" : mode == 1 ? "1" : mode == 2 ? "2" : "0");
+#else
+    if (mode < 0) {
+        unsetenv("LLAMA_DSV41_TRIM");
+    } else {
+        setenv("LLAMA_DSV41_TRIM", mode == 1 ? "1" : mode == 2 ? "2" : "0", 1);
+    }
+#endif
+}
+
+static std::vector<uint8_t> tensor_bytes(ggml_tensor * tensor) {
+    std::vector<uint8_t> bytes(ggml_nbytes(tensor));
+    ggml_backend_tensor_get(tensor, bytes.data(), 0, bytes.size());
+    return bytes;
+}
+
+static bool count_ced_layers(ggml_tensor * tensor, bool ask, void * user_data) {
+    int il = -1;
+    const bool selected = sscanf(tensor->name, "ffn_out-%d", &il) == 1;
+    if (ask) {
+        return selected;
+    }
+    if (selected) {
+        GGML_ASSERT(il >= 0 && il < 5);
+        (*static_cast<std::vector<uint32_t> *>(user_data))[il] += tensor->ne[1];
+    }
+    return true;
+}
+
+static int test_deepseek41_ced(const size_t seed) {
+    auto gguf_ctx = get_gguf_ctx(LLM_ARCH_DEEPSEEK41, true);
+    const auto shared = get_deepseek41_shared_gguf(gguf_ctx.get(), seed, true);
+    const auto tokens = get_tokens(512, 128, seed);
+
+    std::vector<std::vector<ggml_backend_dev_t>> configs = {{}};
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        auto dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            configs.push_back({dev});
+            break;
+        }
+    }
+
+    for (const auto & devs : configs) {
+        common_threadpools pools_full, pools_mask, pools_trim;
+        common_params params;
+        params.cpuparams.n_threads = params.cpuparams_batch.n_threads = 4;
+        set_ced_trim_env(0);
+        auto full = get_model_and_ctx(nullptr, get_shared_gguf_file(shared), seed, devs,
+                LLAMA_SPLIT_MODE_LAYER, false, LLAMA_CONTEXT_TYPE_DEFAULT, nullptr, nullptr, 2, 4);
+        set_ced_trim_env(2);
+        auto mask = get_model_and_ctx(nullptr, get_shared_gguf_file(shared), seed, devs,
+                LLAMA_SPLIT_MODE_LAYER, false, LLAMA_CONTEXT_TYPE_DEFAULT, nullptr, nullptr, 2, 4);
+        set_ced_trim_env(-1);
+        std::vector<uint32_t> rows(5, 0);
+        auto trim = get_model_and_ctx(nullptr, get_shared_gguf_file(shared), seed, devs,
+                LLAMA_SPLIT_MODE_LAYER, false, LLAMA_CONTEXT_TYPE_DEFAULT, count_ced_layers, &rows, 2, 4);
+        pools_full.init(full.second.get(), params);
+        pools_mask.init(mask.second.get(), params);
+        pools_trim.init(trim.second.get(), params);
+        for (auto * ctx : {mask.second.get(), trim.second.get()}) {
+            llama_set_embeddings_layer_inp(ctx, 4, true);
+        }
+        auto * mem_full = static_cast<llama_kv_cache_dsv4 *>(llama_get_memory(full.second.get()));
+        auto * mem_mask = static_cast<llama_kv_cache_dsv4 *>(llama_get_memory(mask.second.get()));
+        auto * mem_trim = static_cast<llama_kv_cache_dsv4 *>(llama_get_memory(trim.second.get()));
+        GGML_ASSERT(!mem_full->get_raw_dec() && mem_trim->get_n_split_raw() == 1);
+        auto * dec = mem_trim->get_raw_dec()->get_swa();
+        const uint32_t keep = 32 + mem_trim->get_n_rs_seq();
+        GGML_ASSERT(keep < 63);
+        const uint32_t skip = 63 - keep;
+
+        const auto eval = [&](llama_context * ctx, llama_pos pos, uint32_t count, const std::vector<llama_seq_id> & seq_ids) {
+            llama_batch batch = llama_batch_init(count, 0, 2);
+            for (uint32_t i = 0; i < count; ++i) {
+                common_batch_add(batch, tokens[pos + i], pos + i, seq_ids, i + 1 == count);
+            }
+            GGML_ASSERT(llama_decode(ctx, batch) == 0);
+            const float * logits = llama_get_logits_ith(ctx, count - 1);
+            std::vector<float> res(logits, logits + 128);
+            GGML_ASSERT(std::all_of(res.begin(), res.end(), [](float v) { return std::isfinite(v); }));
+            llama_batch_free(batch);
+            return res;
+        };
+        const auto compare = [](const std::vector<float> & a, const std::vector<float> & b) {
+            const double error = nmse(a, b);
+            if (!(error < 1e-5)) {
+                throw std::runtime_error("CED compact/mask mismatch: NMSE = " + std::to_string(error));
+            }
+        };
+        for (int il : dec->get_layer_ids()) {
+            auto * k = dec->get_k_storage(il);
+            ggml_backend_tensor_memset(k, 0x55, 0, ggml_nbytes(k));
+        }
+        eval(full.second.get(), 0, 63, {0});
+        const auto reference = eval(mask.second.get(), 0, 63, {0});
+        rows.assign(5, 0);
+        compare(reference, eval(trim.second.get(), 0, 63, {0}));
+        GGML_ASSERT(rows[0] == 63 && rows[1] == 63);
+        GGML_ASSERT(rows[2] == keep && rows[3] == keep && rows[4] == keep);
+        GGML_ASSERT(mem_trim->seq_pos_max(0) == 62 && dec->seq_pos_min(0) == (llama_pos) skip);
+        GGML_ASSERT(dec->get_cells(0).get_used() == keep);
+        for (int il : dec->get_layer_ids()) {
+            auto * k = dec->get_k_storage(il);
+            const auto bytes = tensor_bytes(k);
+            GGML_ASSERT(std::any_of(bytes.begin(), bytes.begin() + keep*k->nb[1], [](uint8_t b) { return b != 0x55; }));
+            GGML_ASSERT(std::all_of(bytes.begin() + keep*k->nb[1], bytes.end(), [](uint8_t b) { return b == 0x55; }));
+        }
+        const float * features = llama_get_embeddings_layer_inp(trim.second.get(), 4);
+        const float * features_ref = llama_get_embeddings_layer_inp(mask.second.get(), 4);
+        GGML_ASSERT(std::all_of(features, features + skip*512, [](float v) { return v == 0.0f; }));
+        compare({features_ref + skip*512, features_ref + 63*512}, {features + skip*512, features + 63*512});
+
+        // Global streams and partial pooling groups must be independent of query compaction.
+        for (auto * other : {mem_mask, mem_trim}) {
+            for (int il : mem_full->get_csa()->get_layer_ids()) {
+                GGML_ASSERT(tensor_bytes(mem_full->get_csa()->get_k_storage(il)) == tensor_bytes(other->get_csa()->get_k_storage(il)));
+            }
+            for (int il : mem_full->get_lid()->get_layer_ids()) {
+                GGML_ASSERT(tensor_bytes(mem_full->get_lid()->get_k_storage(il)) == tensor_bytes(other->get_lid()->get_k_storage(il)));
+            }
+            ggml_context_ptr ctx(ggml_init({128*ggml_tensor_overhead(), nullptr, true}));
+            for (int il : {1, 2}) {
+                auto * sa = il == 1 ? mem_full->get_csa_state() : mem_full->get_hca_state();
+                auto * sb = il == 1 ? other->get_csa_state() : other->get_hca_state();
+                GGML_ASSERT(tensor_bytes(sa->get_kv_all(ctx.get(), il)) == tensor_bytes(sb->get_kv_all(ctx.get(), il)));
+                GGML_ASSERT(tensor_bytes(sa->get_score_all(ctx.get(), il)) == tensor_bytes(sb->get_score_all(ctx.get(), il)));
+            }
+        }
+        rows.assign(5, 0);
+        compare(eval(mask.second.get(), 63, 1, {0}), eval(trim.second.get(), 63, 1, {0}));
+        GGML_ASSERT(std::all_of(rows.begin(), rows.end(), [](uint32_t n) { return n == 1; }));
+        GGML_ASSERT(dec->get_cells(0).get_used() == keep + 1);
+
+        std::vector<uint8_t> state(llama_state_seq_get_size(trim.second.get(), 0));
+        GGML_ASSERT(llama_state_seq_get_data(trim.second.get(), state.data(), state.size(), 0) == state.size());
+        std::vector<uint8_t> full_state(llama_state_seq_get_size(full.second.get(), 0));
+        GGML_ASSERT(llama_state_seq_get_data(full.second.get(), full_state.data(), full_state.size(), 0) == full_state.size());
+        GGML_ASSERT(llama_state_seq_set_data(full.second.get(), state.data(), state.size(), 0) == 0);
+        GGML_ASSERT(llama_state_seq_set_data(trim.second.get(), full_state.data(), full_state.size(), 0) == 0);
+        mem_trim->clear(true);
+        GGML_ASSERT(llama_state_seq_set_data(trim.second.get(), state.data(), state.size(), 0) == state.size());
+        GGML_ASSERT(mem_trim->seq_pos_max(0) == 63 && dec->seq_pos_max(0) == 63);
+        // Full checkpoints omit rows already outside the current sliding window.
+        GGML_ASSERT(dec->get_cells(0).get_used() >= 32 && dec->get_cells(0).get_used() <= keep + 1);
+
+        compare(eval(mask.second.get(), 64, 4, {0}), eval(trim.second.get(), 64, 4, {0}));
+        GGML_ASSERT(mem_trim->seq_rm(0, 66, -1) && mem_mask->seq_rm(0, 66, -1));
+        compare(eval(mask.second.get(), 66, 1, {0}), eval(trim.second.get(), 66, 1, {0}));
+
+        mem_trim->seq_cp(0, 1, -1, -1);
+        mem_mask->seq_cp(0, 1, -1, -1);
+        compare(eval(mask.second.get(), 67, 1, {1}), eval(trim.second.get(), 67, 1, {1}));
+        GGML_ASSERT(dec->seq_pos_max(0) == 66 && dec->seq_pos_max(1) == 67);
+        mem_trim->seq_keep(1);
+        GGML_ASSERT(dec->seq_pos_max(0) == -1 && dec->seq_pos_max(1) == 67);
+        GGML_ASSERT(mem_trim->seq_rm(1, -1, -1));
+        GGML_ASSERT(dec->get_cells(1).get_used() == 0);
+
+        // Reuse the compact graph across changing positions, then wrap both rings.
+        mem_trim->clear(true);
+        mem_mask->clear(true);
+        for (uint32_t pos = 0; pos < 6*63; pos += 63) {
+            compare(eval(mask.second.get(), pos, 63, {0}), eval(trim.second.get(), pos, 63, {0}));
+        }
+        mem_trim->clear(true);
+        mem_mask->clear(true);
+        rows.assign(5, 0);
+        compare(eval(mask.second.get(), 0, 126, {0}), eval(trim.second.get(), 0, 126, {0}));
+        GGML_ASSERT(rows[0] == 126 && rows[1] == 126);
+        GGML_ASSERT(rows[2] == 2*keep && rows[3] == 2*keep && rows[4] == 2*keep);
+        mem_trim->clear(true);
+        mem_mask->clear(true);
+        compare(eval(mask.second.get(), 0, 65, {0}), eval(trim.second.get(), 0, 65, {0}));
+        GGML_ASSERT(dec->get_cells(0).get_used() >= keep + 1);
+        GGML_ASSERT(dec->seq_pos_max(0) == 64);
+        mem_trim->clear(true);
+        mem_full->clear(true);
+        // All-row logits require the full decoder, including rows outside the suffix.
+        compare(get_logits(full.first.get(), full.second.get(), {tokens.begin(), tokens.begin() + 65}),
+                get_logits(trim.first.get(), trim.second.get(), {tokens.begin(), tokens.begin() + 65}));
+        GGML_ASSERT(dec->get_cells(0).get_used() == 65);
+        printf("CED compact/mask, cache and graph checks: %s OK\n", devs.empty() ? "CPU" : ggml_backend_dev_name(devs[0]));
+    }
+    set_ced_trim_env(0);
+    return 0;
 }
 
 static bool moe_mandatory(const llm_arch arch) {
@@ -1420,10 +1624,21 @@ int main(int argc, char ** argv) {
     llm_arch arch = LLM_ARCH_UNKNOWN;
     size_t seed = rd();
     std::string out;
+    bool ced_trim = false;
 
     int verbosity = LOG_LEVEL_ERROR;
 
     for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--ced-trim") == 0) {
+            ced_trim = true;
+        }
+        if (strcmp(argv[i], "--numa") == 0) {
+            if (++i >= argc || strcmp(argv[i], "tensors") != 0) {
+                usage(argv);
+                return 1;
+            }
+            llama_numa_init(GGML_NUMA_STRATEGY_TENSORS);
+        }
         if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(argv);
             return 0;
@@ -1469,6 +1684,9 @@ int main(int argc, char ** argv) {
     printf("%s: using seed %zu\n", __func__, seed);
 
     try {
+        if (ced_trim) {
+            return test_deepseek41_ced(seed);
+        }
         if (!out.empty()) {
             return save_models(arch, seed, verbosity, out);
         }

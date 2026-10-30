@@ -111,6 +111,11 @@ class LossModel:
         self.roles = table["roles"]
         self.kinf, self.u0 = table["composition"]["kappa_inf"], table["composition"]["u0"]
         self.kl_floor = table["floor"]["kl"]
+        # The measured uniform recipe at the top probe qtype is the lowest loss that the pools reach: the linear gains
+        # go below it (and below zero) for large recipes, so predictions stop there.
+        top = table.get("probe_qtypes", {}).get("top")
+        uniform = [p["kl"] for p in table.get("fit", {}).get("probes", []) if p.get("label") == f"uniform-{top}"]
+        self.kl_min = min(uniform) if uniform else 0.0
         self.groups = {g["name"]: g for g in modelled_groups(info, table["floor"]["choices"])}
         for g in self.groups.values():
             if g["role"] not in self.roles:
@@ -156,10 +161,25 @@ class LossModel:
         """d(kappa(u) G)/dG at u: the composed value of one unit of additive gain."""
         return self.kappa(u) + u * (self.kinf - 1) * math.exp(-u / self.u0) / self.u0
 
+    def extrapolated(self, choices, tolerance=0.02):
+        """Groups whose chosen qtype has a smaller local error than the top probe qtype: the fit did not measure that
+        range, so their predicted gain is an extrapolation."""
+        top = self.table.get("probe_qtypes", {}).get("top")
+        if top is None:
+            return []
+        result = []
+        for name, g in self.groups.items():
+            q = choices.get(name)
+            if q in (None, g["floor"], top) or top not in g["pool"]:
+                continue
+            if self.metric(g, q) < (1 - tolerance) * self.metric(g, top):
+                result.append(name)
+        return result
+
     def predict(self, choices):
         g = sum(self.gain(name, choices[name]) for name in self.groups)
         u = g / self.full
-        return {"loss": self.kl_floor * (1 - self.kappa(u) * g), "gain": g, "u": u}
+        return {"loss": max(self.kl_floor * (1 - self.kappa(u) * g), self.kl_min), "gain": g, "u": u}
 
 
 def check_files(expected, paths, label, weights=None):
@@ -187,8 +207,6 @@ def load_quality(info, cfg, prepared):
         raise QuantError("quality table was fitted to different sampled damage; calibrate with this prepared directory")
     if table["floor"]["choices"] != prepared["baseline"]["choices"]:
         raise QuantError("quality table floor differs from the prepared minimum-byte baseline")
-    if cfg["cache_mib"]:
-        raise QuantError("quality tables with an expert cache need separate calibration and are not implemented")
     for role, entry in table["roles"].items():
         knots, values = entry["knots"], entry["log_s"]
         if not knots or len(knots) != len(values) or any(b <= a for a, b in zip(knots, knots[1:])):
@@ -197,7 +215,7 @@ def load_quality(info, cfg, prepared):
             if not isinstance(value, (int, float)) or not math.isfinite(value):
                 raise QuantError(f"quality role {role} knots and sensitivities must be finite")
         number(entry["gamma"], f"quality role {role} gamma", positive=True)
-    number(table["composition"]["kappa_inf"], "kappa_inf", minimum=1)
+    number(table["composition"]["kappa_inf"], "kappa_inf", minimum=0.12)
     number(table["composition"]["u0"], "u0", positive=True)
     number(table["floor"]["kl"], "floor KL", positive=True)
     table["identity"] = file_identity(path, content=True)

@@ -3322,7 +3322,7 @@ static bool ggml_backend_sched_stage_whole(
     if ((weight->flags & GGML_TENSOR_FLAG_INPUT) || weight->buffer == nullptr ||
             ggml_backend_buffer_get_usage(weight->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
             !ggml_backend_buffer_is_host(weight->buffer) || ggml_nbytes(weight) < GGML_SCHED_STAGE_MIN_BYTES ||
-            sched->stage->rings[backend_id].upload == nullptr) {
+            sched->stage->rings[backend_id].upload == nullptr || sched->stage->blocked[backend_id]) {
         return false;
     }
     if (node != nullptr && node->op == GGML_OP_MUL_MAT_ID && (node->src[0] == weight || sched_hv_copy(sched, (ggml_tensor *) weight, backend_id, sched->cur_copy) == node->src[0])) {

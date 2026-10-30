@@ -6623,7 +6623,7 @@ struct ggml_tensor * ggml_kpool_expand(
     GGML_ASSERT(kpool > 0);
     GGML_ASSERT(selected->type == GGML_TYPE_I32);
     GGML_ASSERT(pool_cells->type == GGML_TYPE_I32);
-    GGML_ASSERT(pool_bias->type == GGML_TYPE_F32);
+    GGML_ASSERT(pool_bias->type == GGML_TYPE_F32 || pool_bias->type == GGML_TYPE_F16);
     GGML_ASSERT(tail_cells->type == GGML_TYPE_I32);
     GGML_ASSERT(tail_mask->type == GGML_TYPE_F16);
     GGML_ASSERT(pool_cells->ne[0] % kpool == 0);

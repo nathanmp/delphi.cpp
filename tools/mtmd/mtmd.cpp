@@ -1,6 +1,7 @@
 #include "clip.h"
 #include "clip-impl.h"
 #include "mtmd.h"
+#include "mtmd-memory.h"
 #include "mtmd-internal.h"
 #include "mtmd-audio.h"
 #include "mtmd-image.h"
@@ -530,7 +531,8 @@ struct mtmd_context {
     mtmd_context(const char * mmproj_fname,
                    const llama_model * text_model,
                    const mtmd_context_params & ctx_params,
-                   bool no_alloc = false) :
+                   bool no_alloc = false,
+                   bool phase_default = false) :
         print_timings   (ctx_params.print_timings),
         n_threads       (ctx_params.n_threads),
         media_marker    (ctx_params.media_marker),
@@ -577,6 +579,7 @@ struct mtmd_context {
             /* no_alloc          */ no_alloc,
             /* progress_callback */ ctx_params.progress_callback,
             /* progress_callback_user_data */ ctx_params.progress_callback_user_data,
+            /* phase_default */ phase_default,
         };
 
         auto res = clip_init(mmproj_fname, ctx_clip_params);
@@ -830,6 +833,11 @@ struct mtmd_context {
                 {
                     // no vocab tokens are added; the start/end/newline markers are learned embeddings emitted by the encoder
                     image_preproc = std::make_unique<mtmd_image_preprocessor_deepseek4v>(ctx_v);
+                } break;
+            case PROJECTOR_TYPE_DEEPSEEK41V:
+                {
+                    // same as deepseek4v; the text model needs no block alignment, so there are no lead pads
+                    image_preproc = std::make_unique<mtmd_image_preprocessor_deepseek41v>(ctx_v);
                 } break;
             case PROJECTOR_TYPE_DOTS_OCR:
             case PROJECTOR_TYPE_DOTS3NOTE_V:
@@ -1098,8 +1106,13 @@ private:
 mtmd_context * mtmd_init_from_file(const char * mmproj_fname,
         const struct llama_model * text_model,
         const struct mtmd_context_params ctx_params) {
+    return mtmd_init_from_file_phase(mmproj_fname, text_model, ctx_params, false);
+}
+
+mtmd_context * mtmd_init_from_file_phase(const char * mmproj_fname, const llama_model * text_model,
+        mtmd_context_params ctx_params, bool phase_default) {
     try {
-        return new mtmd_context(mmproj_fname, text_model, ctx_params);
+        return new mtmd_context(mmproj_fname, text_model, ctx_params, false, phase_default);
     } catch (const std::exception & e) {
         LOG_ERR("%s: error: %s\n", __func__, e.what());
         return nullptr;
@@ -1108,6 +1121,10 @@ mtmd_context * mtmd_init_from_file(const char * mmproj_fname,
 
 void mtmd_free(mtmd_context * ctx) {
     delete ctx;
+}
+
+ggml_backend_dev_t mtmd_phase_device(const mtmd_context * ctx) {
+    return ctx ? clip_phase_device(ctx->ctx_v) : nullptr;
 }
 
 std::vector<std::vector<const mtmd_bitmap *>> mtmd_group_mergeable_bitmaps(std::vector<mtmd_internal_part> & parts, int n_merge) {

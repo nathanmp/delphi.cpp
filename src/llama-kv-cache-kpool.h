@@ -140,7 +140,8 @@ bool llama_kpool_indexed_attn_enabled(int64_t n_kv, int64_t n_tps);
 
 // Build the dense sparse-attention masks on the device (ggml_interval_mask) from
 // per-cell and per-query scalars instead of uploading two O(n_kv*n_tps) host masks
-// to every device. LLAMA_GLM5_DEVICE_MASKS=0 restores the host masks.
+// to every device, and the same for the pool bias of the indexer. LLAMA_GLM5_DEVICE_MASKS=0 restores the
+// host masks.
 bool llama_kpool_device_masks_enabled();
 
 // `kv` must be the ATTENTION (MLA) cache; the indexer cache shares its slot layout.
@@ -153,6 +154,7 @@ bool llama_kpool_device_masks_enabled();
 //   sel_mask   F16/F32 [n_kv, n_batch, 1, n_stream] 0.0f on the always-selected tail only
 //   cand_mask  F16/F32 [n_kv, n_batch, 1, n_stream] max(bias, sel_mask); bounds the top-k
 //       spills that a partial seq_rm would otherwise let escape the candidate set
+//   pool_iv_cells, pool_iv_queries: the scalars of the device-built pool_bias (llm_graph_input_kpool)
 void llama_kv_cache_set_input_kpool(
         const llama_kv_cache * kv,
               ggml_tensor    * cell_pool,
@@ -175,7 +177,9 @@ void llama_kv_cache_set_input_kpool(
               bool             rebuild_pool_cache = false,
               uint32_t         stream0            = 0,
               ggml_tensor    * mask_cells         = nullptr,
-              ggml_tensor    * mask_queries       = nullptr);
+              ggml_tensor    * mask_queries       = nullptr,
+              ggml_tensor    * pool_iv_cells      = nullptr,
+              ggml_tensor    * pool_iv_queries    = nullptr);
 
 // One pooling map per ubatch; rebuilding it per indexer layer costs O(n_kv * n_tokens)
 // host writes and dominates prefill. sharing is valid only while every indexer layer sees
@@ -224,6 +228,16 @@ public:
 
     // graph-build cache: one (sel, cand) pair per device that runs sparse attention
     std::map<ggml_backend_dev_t, std::pair<ggml_tensor *, ggml_tensor *>> dev_masks;
+
+    // Device-built replacement for pool_bias and pool_bias_f16. The host bias is O(n_pools*n_tps) per pipeline
+    // copy (GLM 5.3 at -c 500000 -ub 1024: 8 x 489 MiB on the first GPU). Pool rows: the slot of a complete
+    // pool of a sequence run, BIG otherwise. Query rows: the last slot that the query sees in its own run, the
+    // first slot of that run. ggml_interval_mask gives pool_valid & pool_visible from them.
+    ggml_tensor * pool_iv_cells   = nullptr; // F32 [n_pools, 2, 1, n_stream]
+    ggml_tensor * pool_iv_queries = nullptr; // F32 [n_tps, 2, 1, n_stream]
+
+    // graph-build cache: the pool bias of each device that scores pools (F16 for the fused indexer, else F32)
+    std::map<ggml_backend_dev_t, ggml_tensor *> dev_pool_bias;
 
     // The direct compact-attention suffix: the real incomplete tail followed by
     // masked cell-zero padding up to the CUDA FA stride. Shared by every layer.

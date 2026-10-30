@@ -5,7 +5,10 @@
 #include "common.h"
 #include "fit.h"
 #include "log.h"
+#include "mtmd.h"
+#include "speculative.h"
 
+#include <algorithm>
 #include <cinttypes>
 
 #if defined(_MSC_VER)
@@ -72,6 +75,37 @@ int llama_fit_params(int argc, char ** argv) {
         common_log_flush(common_log_main());
 
         common_fit_print(params.model.path.c_str(), &mparams, &cparams);
+
+        // with --spec-type draft-mtp the lines above include the MTP weights and the recurrent states of the draft;
+        // the MTP draft context of the server (its KV cache and compute buffers, on the weights of the main model)
+        // follows as "mtp <device> <context> <compute>"
+        const bool spec_mtp = std::find(params.speculative.types.begin(), params.speculative.types.end(),
+                COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+        if (spec_mtp && !params.speculative.has_dft()) {
+            common_params params_dft = common_base_params_to_speculative(params);
+            auto mparams_dft = common_model_params_to_llama(params_dft);
+            auto cparams_dft = common_context_params_to_llama(params_dft);
+            cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+            cparams_dft.n_ctx    = cparams.n_ctx;
+            cparams_dft.n_rs_seq = 0;
+            std::vector<ggml_backend_dev_t> devs;
+            uint32_t ngl = 0, nct = 0, nex = 0;
+            const auto dmd = common_get_device_memory_data(params.model.path.c_str(), &mparams_dft, &cparams_dft, devs,
+                    ngl, nct, nex, GGML_LOG_LEVEL_ERROR);
+            for (size_t id = 0; id < devs.size(); id++) {
+                printf("mtp %s %zu %zu\n", ggml_backend_dev_name(devs[id]), dmd[id].context/1024/1024, dmd[id].compute/1024/1024);
+            }
+        }
+
+        // the multimodal projector (weights and worst-case compute buffers) goes to the first device, as in the server
+        if (!params.mmproj.path.empty()) {
+            mtmd_context_params mp = mtmd_context_params_default();
+            mp.use_gpu = params.mmproj_use_gpu;
+            mp.device  = params.mmproj_device;
+            for (const auto & [dev, size] : mtmd_get_memory_usage(params.mmproj.path.c_str(), mp)) {
+                printf("mmproj %s %zu\n", ggml_backend_dev_name(dev), (size + (1 << 20) - 1) / (1 << 20));
+            }
+        }
     }
 
     return 0;

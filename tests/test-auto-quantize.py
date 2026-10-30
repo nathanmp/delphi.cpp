@@ -1,23 +1,29 @@
 #!/usr/bin/env python3
 """Offline advisor invariants; no inference or GPU is needed."""
+import contextlib
 import copy
+import io
 import itertools
 import json
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools/auto-quantize"))
-from config import QuantError, capacity, devices, file_identity, imatrix_identities, imatrix_inputs, load_config, normalized, write_json
+from config import QuantError, RUNTIME_QTYPES, capacity, devices, file_identity, imatrix_identities, imatrix_inputs, load_config, normalized, write_json
 from corpus import calibration_text, collect_imatrices, compose_text, imatrix_command, shares
-from model import classify, merge_imatrices, read_model, tensor_bytes
-from search import dominates, make_options, memory, pareto, search
+from model import (check_runtime_source, classify, is_lazy, lazy_args, merge_imatrices, read_model, shard_name, tensor_bytes,
+                   unlink_model, unsharded)
+from search import dominates, llama_layer_devices, make_options, memory, pareto, search
 from quality import LossModel, damage_digest, load_quality, modelled_groups, role_of
-from calibrate import Fit, design, probe_qtypes
-from timing import Predictor, digest, operation_times, regions, signature, token_counts
-from auto_quantize import tensor_plan, verify_output, witness_choices
+from calibrate import Fit, PatchWriter, anchor_qtypes, design, probe_qtypes
+from timing import Predictor, ProfileError, digest, measure_env, operation_times, profile_model, regions, signature, token_counts
+from auto_quantize import gpu_descriptions, require_identical_gpus, tensor_plan, verify_output, witness_choices
+import routing
+from calibrate import OFFLOAD_BATCH, SPLIT_MARGIN, full_offload_devices, perplexity_command, split_session
 import numpy as np
 from gguf import GGUFReader, GGUFWriter, GGMLQuantizationType
 
@@ -42,6 +48,116 @@ def info():
     return {"architecture": "olmoe", "n_expert": 8, "top_k": 2, "tensors": [
         tensor("blk.0.ffn_up_exps.weight"), tensor("blk.0.ffn_gate_exps.weight"), tensor("blk.0.ffn_down_exps.weight"),
         tensor("blk.0.ffn_gate_inp.weight", (256, 8)), tensor("output.weight", (256, 256))]}
+
+
+class LazyTables(unittest.TestCase):
+    def info(self):
+        base = info()
+        base["tensors"].append(tensor("per_layer_token_embd.weight", (256, 1024)))
+        return base
+
+    def test_lazy_tables_are_fixed_and_outside_every_budget(self):
+        model = classify(self.info(), cfg())
+        lazy = next(t for t in model["tensors"] if t["name"] == "per_layer_token_embd.weight")
+        self.assertTrue(lazy["preserved"] and is_lazy(lazy["name"]))
+        choices = {g["name"]: g["pool"][0] for g in model["groups"]}
+        result = memory(model, cfg(), choices)
+        plain = memory(classify(info(), cfg()), cfg(), {g["name"]: g["pool"][0] for g in classify(info(), cfg())["groups"]})
+        self.assertEqual(result["used_bytes"], plain["used_bytes"])
+        self.assertEqual(result["lazy_bytes"], lazy["source_bytes"])
+        self.assertEqual(plain["lazy_bytes"], 0)
+
+    def test_options_exclude_lazy_bytes_so_budgets_stay_consistent(self):
+        model = classify(self.info(), cfg())
+        for g in model["groups"]:
+            g["options"] = [{"qtype": q, "damage": 0, "sampling_se": 0,
+                             "bytes": sum(tensor_bytes(next(t["shape"] for t in model["tensors"] if t["name"] == n), q)
+                                          for n in g["members"] if not is_lazy(n))} for q in g["pool"]]
+        group = next(g for g in model["groups"] if g["name"] == "per_layer_token_embd.weight")
+        self.assertEqual([o["bytes"] for o in group["options"]], [0])
+
+    def test_a_pin_stores_a_lazy_table_below_the_source_type(self):
+        model = classify(self.info(), cfg(pins={"per_layer_token_embd.weight": "q8_0"}))
+        lazy = next(t for t in model["tensors"] if t["name"] == "per_layer_token_embd.weight")
+        self.assertFalse(lazy["preserved"])
+        self.assertEqual(lazy["pool"], ["Q8_0"])
+        # still a lookup outside the budgets: no timing region, lazy bytes at the pinned type
+        self.assertFalse(any(m["name"] == lazy["name"] for _, members, _ in regions(model) for m in members))
+        result = memory(model, cfg(), {g["name"]: g["pool"][0] for g in model["groups"]})
+        self.assertEqual(result["lazy_bytes"], tensor_bytes(lazy["shape"], "Q8_0"))
+
+    def test_lazy_type_pins_the_lazy_tables_that_have_another_type(self):
+        model = classify(self.info(), cfg(lazy_type="Q4_K"))
+        lazy = next(t for t in model["tensors"] if t["name"] == "per_layer_token_embd.weight")
+        self.assertFalse(lazy["preserved"])
+        self.assertEqual(lazy["pool"], ["Q4_K"])
+        # an explicit pin wins, and a table that has the type already stays a preserved copy
+        model = classify(self.info(), cfg(lazy_type="Q4_K", pins={"per_layer_token_embd.weight": "q8_0"}))
+        self.assertEqual(next(t for t in model["tensors"] if t["name"] == "per_layer_token_embd.weight")["pool"], ["Q8_0"])
+        source = self.info()
+        source["tensors"][-1]["source_dtype"] = "Q4_K"
+        self.assertTrue(next(t for t in classify(source, cfg(lazy_type="Q4_K"))["tensors"]
+                             if t["name"] == "per_layer_token_embd.weight")["preserved"])
+
+    def write(self, path, tensors, extra=lambda w: None):
+        writer = GGUFWriter(str(path), "olmoe")
+        extra(writer)
+        for t in tensors:
+            writer.add_tensor(t, np.ones(256, dtype=np.float32))
+        writer.write_header_to_file()
+        writer.write_kv_data_to_file()
+        writer.write_tensors_to_file()
+        writer.close()
+
+    def test_a_lazy_shard_of_its_own_is_found_and_the_files_follow_the_first_shard(self):
+        with tempfile.TemporaryDirectory() as d:
+            first, last = shard_name(Path(d) / "m.gguf", 0, 2), shard_name(Path(d) / "m.gguf", 1, 2)
+            self.assertEqual(first.name, "m-00001-of-00002.gguf")
+            self.assertEqual(unsharded(first), Path(d) / "m.gguf")
+            for path, names, no in ((first, ["blk.0.attn_norm.weight", "blk.1.attn_norm.weight"], 0), (last, ["blk.1.engram_embd.weight"], 1)):
+                def split(w, no=no):
+                    w.add_uint16("split.no", no)
+                    w.add_uint16("split.count", 2)
+                    w.add_int32("split.tensors.count", 3)
+                self.write(path, names, split)
+            info_ = read_model(str(first))
+            self.assertTrue(info_["lazy_separate"])
+            self.assertEqual(lazy_args({"model": str(first)}), ["-lm", "mmap", "-lzm", "on", "-ot", "engram_embd=CPU"])
+            # the lazy shard is shared with the models written from this one, so they do not count it
+            from space import recipe_bytes
+            types = {t["name"]: "F32" for t in info_["tensors"]}
+            self.assertEqual(recipe_bytes(info_, types), 2 * 256 * 4)
+            self.assertEqual(recipe_bytes({**info_, "lazy_separate": False}, types), 3 * 256 * 4)
+            unlink_model(first)
+            self.assertFalse(first.exists() or last.exists())
+
+    def test_a_lazy_table_in_the_first_shard_is_not_a_lazy_shard(self):
+        with tempfile.TemporaryDirectory() as d:
+            first, last = shard_name(Path(d) / "m.gguf", 0, 2), shard_name(Path(d) / "m.gguf", 1, 2)
+            for path, names, no in ((first, ["blk.0.attn_norm.weight", "blk.1.engram_embd.weight"], 0), (last, ["blk.1.attn_norm.weight"], 1)):
+                def split(w, no=no):
+                    w.add_uint16("split.no", no)
+                    w.add_uint16("split.count", 2)
+                    w.add_int32("split.tensors.count", 3)
+                self.write(path, names, split)
+            self.assertFalse(read_model(str(first))["lazy_separate"])
+
+    def test_load_options_follow_the_model_tensors(self):
+        with tempfile.TemporaryDirectory() as d:
+            for name, tensors, expected in (("lazy", ["per_layer_token_embd.weight", "blk.0.attn_norm.weight"],
+                                              ["-lm", "mmap", "-lzm", "on", "-ot", "per_layer_token_embd=CPU"]),
+                                             ("engram", ["blk.0.engram_embd.weight", "blk.0.attn_norm.weight"],
+                                              ["-lm", "mmap", "-lzm", "on", "-ot", "engram_embd=CPU"]),
+                                             ("plain", ["blk.0.attn_norm.weight"], [])):
+                path = Path(d) / f"{name}.gguf"
+                writer = GGUFWriter(str(path), "olmoe")
+                for t in tensors:
+                    writer.add_tensor(t, np.ones(256, dtype=np.float32))
+                writer.write_header_to_file()
+                writer.write_kv_data_to_file()
+                writer.write_tensors_to_file()
+                writer.close()
+                self.assertEqual(lazy_args({"model": str(path)}), expected)
 
 
 class Inputs(unittest.TestCase):
@@ -144,6 +260,49 @@ class Frontier(unittest.TestCase):
         self.assertTrue(result["frontier"])
         self.assertTrue(all(s["damage"] <= 3 for s in result["frontier"]))
 
+    def exhaustive(self, model):
+        """(damage, total tensor bytes, choices) of every combination of group options."""
+        result = []
+        for combination in itertools.product(*(g["options"] for g in model["groups"])):
+            choices = {g["name"]: q["qtype"] for g, q in zip(model["groups"], combination)}
+            result.append((sum(q["damage"] for q in combination), sum(q["bytes"] for q in combination), choices))
+        return result
+
+    def test_smallest_recipe_matches_exhaustive_search(self):
+        model, predictor, baseline = self.fixture()
+        every = self.exhaustive(model)
+        best = min(d for d, _, _ in every)
+        for ceiling in (best, best + 1, best + 2, best + 3):
+            feasible = [b for d, b, _ in every if d <= ceiling]
+            result = search(model, cfg(bounds={"max_damage": ceiling}, search={"display": 8, "minimize": "size"}), predictor, baseline)
+            smallest = [s for s in result["frontier"] if s.get("smallest")]
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(len(smallest), 1)
+            self.assertLessEqual(smallest[0]["damage"], ceiling)
+            self.assertEqual(sum(o["bytes"] for o in (next(o for o in g["options"] if o["qtype"] == smallest[0]["choices"][g["name"]])
+                                                     for g in model["groups"])), min(feasible))
+
+    def test_smallest_recipe_unreachable_bound(self):
+        model, predictor, baseline = self.fixture()
+        floor = min(d for d, _, _ in self.exhaustive(model))
+        result = search(model, cfg(bounds={"max_damage": floor - 0.5}, search={"display": 8, "minimize": "size"}), predictor, baseline)
+        self.assertEqual(result["status"], "loss_bound_unreachable")
+        self.assertFalse(result["frontier"])
+        with self.assertRaises(QuantError):
+            search(model, cfg(search={"display": 8, "minimize": "size"}), predictor, baseline)
+
+    def test_total_byte_cap_pools_the_devices(self):
+        model, predictor, baseline = self.fixture()
+        every = self.exhaustive(model)
+        sizes = sorted({b for _, b, _ in every})
+        cap = sizes[len(sizes) // 2]
+        result = search(model, cfg(bounds={"max_total_bytes": cap}), predictor, baseline)
+        total = lambda s: sum(s["memory"]["used_bytes"].values())
+        self.assertTrue(result["frontier"])
+        self.assertTrue(all(total(s) <= cap for s in result["frontier"]))
+        best = min(d for d, b, _ in every if b <= cap)
+        self.assertEqual(min(s["damage"] for s in result["frontier"]), best)
+
     def test_budget_failure_and_byte_budget(self):
         model, predictor, baseline = self.fixture()
         self.assertEqual(search(model, cfg(devices={"ROCm1": 1, "RAM": 1}), predictor, baseline)["status"], "infeasible_minimum_bytes")
@@ -155,6 +314,73 @@ class Frontier(unittest.TestCase):
         result = search(model, cfg(devices={"ROCm1": 1 << 30, "RAM": floor + step}), predictor, baseline)
         self.assertTrue(result["frontier"])
         self.assertTrue(all(list(s["choices"].values()).count("Q4_0") <= 1 for s in result["frontier"]))
+
+    LOSS_ONLY = {"precision": 1, "decode": 0, "short": 0, "long": 0}
+
+    def test_search_without_timing_trades_loss_against_bytes(self):
+        model, _, baseline = self.fixture()
+        result = search(model, cfg(importance=self.LOSS_ONLY), None, baseline)
+        every = [(d, b) for d, b, _ in self.exhaustive(model)]
+        nondominated = {x for x in every if not any(dominates(y, x) for y in every)}
+        self.assertEqual({tuple(s["axes"]) for s in result["frontier"]}, nondominated)
+        self.assertTrue(all(s["predicted_ms"] is None for s in result["frontier"]))
+        self.assertEqual(result["frontier"][0]["damage"], min(d for d, _ in every))
+
+    def test_plan_without_timing_needs_loss_only_weights(self):
+        import auto_quantize as aq
+        model, _, baseline = self.fixture()
+        data = {"model": dict(model, identity={"files": []}), "baseline": {"choices": baseline}, "timing_qualified": False,
+                "timed": False}
+        with tempfile.TemporaryDirectory() as d, mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            with self.assertRaisesRegex(QuantError, "no timing"):
+                aq.plan(data, cfg(), d)
+            with self.assertRaisesRegex(QuantError, "no timing"):
+                aq.plan(data, cfg(importance=self.LOSS_ONLY, bounds={"min_decode_t_s": 10}), d)
+            with self.assertRaisesRegex(QuantError, "no timing"):
+                aq.validate(data, cfg(), "mixes.json", d)
+            payload = aq.plan(data, cfg(importance=self.LOSS_ONLY), d)
+        self.assertFalse(payload["timed"])
+        self.assertTrue(payload["recipes"])
+        self.assertIn("Speed was not measured", out.getvalue())
+
+    def test_prepare_skips_timing_with_loss_only_weights_and_measures_it_later(self):
+        import auto_quantize as aq
+        model, _, _ = self.fixture()
+        calls = []
+
+        def encode(info, config, choices, imatrix, output, quality=None):
+            calls.append("encode")
+            Path(output).write_text("gguf")
+        patches = [mock.patch.object(aq.subprocess, "check_output", return_value=b"ROCm1: GPU (1 MiB, 1 MiB free)"),
+                   mock.patch.object(aq, "configured_model", side_effect=lambda config: copy.deepcopy(model)),
+                   mock.patch.object(aq, "inputs", return_value={"k": 1}),
+                   mock.patch.object(aq, "merge_imatrices", return_value=None),
+                   mock.patch.object(aq, "get_damage", return_value=[]),
+                   mock.patch.object(aq, "make_options", return_value=[]),
+                   mock.patch.object(aq, "measure_ops", side_effect=lambda *a: calls.append("ops") or {}),
+                   mock.patch.object(aq, "profile_model", side_effect=lambda *a, **k: calls.append("profile") or {}),
+                   mock.patch.object(aq, "profile_times", return_value={"decode": 1, "short": 2, "long": 3}),
+                   mock.patch.object(aq, "encode", side_effect=encode),
+                   mock.patch.object(aq, "verify_output"),
+                   mock.patch("sys.stdout", new_callable=io.StringIO)]
+        lossy, weighted = cfg(bindir="/b", imatrix=[], importance=self.LOSS_ONLY), cfg(bindir="/b", imatrix=[])
+        with tempfile.TemporaryDirectory() as d, contextlib.ExitStack() as stack:
+            for patch in patches:
+                stack.enter_context(patch)
+            data = aq.prepare(lossy, d, 10)
+            # the floor GGUF is still encoded: calibration measures on it
+            self.assertEqual(calls, ["encode"])
+            self.assertFalse(data["timed"])
+            self.assertEqual(data["operations"], {})
+            self.assertIsNone(data["baseline"]["measured_ms"])
+            self.assertFalse(aq.prepare(lossy, d, 10)["timed"])
+            self.assertEqual(calls, ["encode"])
+            data = aq.prepare(weighted, d, 10)
+            self.assertEqual(calls, ["encode", "ops", "profile"])
+            self.assertTrue(data["timed"])
+            self.assertEqual(data["baseline"]["measured_ms"], {"decode": 1, "short": 2, "long": 3})
+            self.assertTrue(aq.prepare(lossy, d, 10)["timed"])
+            self.assertEqual(calls, ["encode", "ops", "profile"])
 
 
 class Knapsack(unittest.TestCase):
@@ -449,8 +675,10 @@ class Collect(unittest.TestCase):
 
     def test_command_and_configuration(self):
         c = {"context": 512, "chunks": 0, "threads": 4, "extra_args": []}
-        command = imatrix_command({"bindir": "/b", "model": "/m.gguf", "devices": {"ROCm1": 1}}, c, "/t.txt", "/o.gguf")
+        with mock.patch("corpus.lazy_args", return_value=["-lzm", "on"]):
+            command = imatrix_command({"bindir": "/b", "model": "/m.gguf", "devices": {"ROCm1": 1}}, c, "/t.txt", "/o.gguf")
         self.assertEqual(command[0], "/b/llama-imatrix")
+        self.assertIn("-lzm", command)
         self.assertNotIn("-cmoe", command)
         self.assertNotIn("--chunks", command)
         self.assertEqual(self.config(text="a.txt")["imatrix_collect"]["means"], True)
@@ -624,11 +852,11 @@ class Quality(unittest.TestCase):
         self.load()
         bad_knots = {**self.table["roles"], "gu": {"knots": [2.5, 0.5], "log_s": [-2.0, -1.8], "gamma": 1.0}}
         for table in (dict(self.table, roles=bad_knots), dict(self.table, damage="0" * 64), dict(self.table, floor={"choices": {**self.floor, "blk.0.ffn_down_exps.weight": "Q4_K"}, "kl": .1}),
-                      dict(self.table, schema="delphi.floor-quality/2"), dict(self.table, composition={"kappa_inf": .5, "u0": .3})):
+                      dict(self.table, schema="delphi.floor-quality/2"), dict(self.table, composition={"kappa_inf": .05, "u0": .3})):
             with self.assertRaises(QuantError):
                 self.load(table)
-        with self.assertRaises(QuantError):
-            self.load(config={**self.config, "cache_mib": 1})
+        # the quality runs turn the cache off, so a plan with a cache reads the same table
+        self.load(config={**self.config, "cache_mib": 1})
         with self.source.open("r+b") as stream:
             stream.seek(read_model(str(self.source))["tensors"][0]["offset"])
             stream.write(b"\x01")
@@ -656,6 +884,27 @@ class Quality(unittest.TestCase):
         fastest = min(result["frontier"], key=lambda s: s["axes"][1])
         self.assertGreater(fastest["loss"], .04)
 
+    def test_smallest_recipe_with_the_quality_model(self):
+        config = dict(self.config, bounds={"max_loss": .06}, search={"display": 8, "minimize": "size"})
+        loss = LossModel(self.model, self.load(), self.damage)
+        make_options(self.model, self.damage, {}, config)
+        ops = {}
+        for group, members, paired in regions(self.model):
+            for dtype in group["pool"]:
+                for n in set(token_counts(config).values()):
+                    for device in (["CPU", "ROCm1"] if members[0]["expert"] else ["ROCm1"]):
+                        sig = signature(members, paired, dtype, device, n, self.model["top_k"])
+                        ops[digest(sig)] = {"signature": sig, "ms": {"Q2_K": 1, "Q4_K": 2, "Q6_K": 3}.get(dtype, 1)}
+        predictor = Predictor(self.model, config, ops, self.floor, {"decode": 20, "short": 30, "long": 50})
+        plain = search(self.model, dict(config, search={"display": 8}), predictor, self.floor, loss)
+        result = search(self.model, config, predictor, self.floor, loss)
+        total = lambda s: sum(s["memory"]["used_bytes"].values())
+        smallest = [s for s in result["frontier"] if s.get("smallest")]
+        self.assertEqual(len(smallest), 1)
+        self.assertLessEqual(smallest[0]["loss"], .06)
+        self.assertLessEqual(total(smallest[0]), min(total(s) for s in plain["frontier"]))
+        self.assertLess(total(smallest[0]), max(total(s) for s in plain["frontier"]))
+
     def test_fit_recovers_a_known_model(self):
         groups = modelled_groups(self.model, self.floor)
         records = {(t["name"], q["qtype"]): q["R"] for t in self.damage[0]["tensors"] for q in t["runs"][0]["types"]}
@@ -672,6 +921,20 @@ class Quality(unittest.TestCase):
         # a step at the first down band survives the smoothness penalty
         self.assertGreater(params["dn"]["log_s"][0] - params["dn"]["log_s"][1], .4)
 
+    def test_fit_recovers_a_saturating_composition(self):
+        groups = modelled_groups(self.model, self.floor)
+        records = {(t["name"], q["qtype"]): q["R"] for t in self.damage[0]["tensors"] for q in t["runs"][0]["types"]}
+        fit = Fit(groups, records, 4, 4)
+        knots = [0.0, 1.0, 2.0, 3.0]
+        truth = {"gu": {"knots": knots, "log_s": [-1.0, -0.9, -0.7, -0.4], "gamma": 1.0},
+                 "dn": {"knots": knots, "log_s": [-0.5, -0.8, -0.9, -1.0], "gamma": 1.0}}
+        jobs = design(groups, "Q4_K", "Q6_K", {"bands": 4, "recipes": 8, "seed": 3})
+        observations = [(j["choices"], float(y), .002) for j, y in zip(jobs, fit.predict(truth, .4, 1.0, [j["choices"] for j in jobs]))]
+        params, kinf, u0, chi2 = fit.fit(observations)
+        predicted = fit.predict(params, kinf, u0, [o[0] for o in observations])
+        self.assertLess(np.max(np.abs(predicted - np.array([o[1] for o in observations]))), .004)
+        self.assertLess(kinf, 1)
+
     def test_design_cost_is_independent_of_the_candidate_count(self):
         groups = modelled_groups(self.model, self.floor)
         jobs = design(groups, "Q4_K", "Q6_K", {"bands": 2, "recipes": 5, "seed": 1})
@@ -682,6 +945,148 @@ class Quality(unittest.TestCase):
         records = {(t["name"], q["qtype"]): q["R"] for t in self.damage[0]["tensors"] for q in t["runs"][0]["types"]}
         self.assertEqual(probe_qtypes(groups, records, {"probe_qtypes": None}), ("Q4_K", "Q6_K"))
 
+    def test_anchor_qtypes_fill_the_range_between_the_probes(self):
+        groups = modelled_groups(self.model, self.floor)
+        errors = {"Q2_K": 1e-1, "Q3_K": 3e-2, "Q4_K": 1e-2, "Q5_K": 3e-3, "Q6_K": 1e-3, "IQ6_K": 1e-4, "Q8_0": 1e-5}
+        wide = [dict(g, floor="Q2_K", pool=list(errors)) for g in groups]
+        records = {(n, q): r for g in wide for n in g["members"] for q, r in errors.items()}
+        self.assertEqual(probe_qtypes(wide, records, {"probe_qtypes": None}), ("Q6_K", "Q8_0"))
+        self.assertEqual(anchor_qtypes(wide, records, "Q6_K", "Q8_0"), ["Q4_K", "IQ6_K"])
+        jobs = design(wide, "Q6_K", "Q8_0", {"bands": 2, "recipes": 10, "seed": 1}, ["Q4_K", "IQ6_K"])
+        self.assertEqual(sorted(j["direct"] for j in jobs if "direct" in j), ["IQ6_K", "Q4_K", "Q6_K", "Q8_0"])
+        mixed = [j for j in jobs if j["label"].startswith("mix")]
+        self.assertEqual(len(mixed), 6)
+        self.assertTrue(all(j["label"].endswith("-Q4_K-IQ6_K") for j in mixed))
+        self.assertEqual({q for j in mixed for q in j["choices"].values()}, {"Q4_K", "Q6_K", "IQ6_K", "Q8_0"})
+        # no qtype between floor and top: no anchors
+        self.assertEqual(anchor_qtypes(groups, {k: v for k, v in records.items() if k[1] in ("Q4_K", "Q6_K")}, "Q4_K", "Q6_K"), [])
+
+    def test_predicted_loss_stops_at_the_measured_uniform_top_recipe(self):
+        full = {g: None for g in LossModel(self.model, self.table, self.damage).groups}
+        free = LossModel(self.model, self.table, self.damage).predict({**self.floor, **full})["loss"]
+        table = {**self.table, "probe_qtypes": {"mid": "Q2_K", "top": "Q6_K"},
+                 "fit": {"probes": [{"label": "uniform-Q6_K", "kl": free + 0.5}]}}
+        model = LossModel(self.model, table, self.damage)
+        self.assertEqual(model.predict({**self.floor, **full})["loss"], free + 0.5)
+        self.assertEqual(model.predict(self.floor)["loss"], max(self.table["floor"]["kl"], free + 0.5))
+
+    def test_plans_beyond_the_top_probe_are_marked_extrapolated(self):
+        model = LossModel(self.model, {**self.table, "probe_qtypes": {"mid": "Q2_K", "top": "Q4_K"}}, self.damage)
+        group = next(iter(model.groups))
+        self.assertEqual(model.extrapolated({**self.floor, group: "Q4_K"}), [])
+        self.assertEqual(model.extrapolated({**self.floor, group: "Q6_K"}), [group])
+        self.assertEqual(LossModel(self.model, self.table, self.damage).extrapolated({**self.floor, group: "Q6_K"}), [])
+
+    def test_patch_chunks_hold_whole_groups_within_the_limit(self):
+        config = {**self.config, "bindir": "/nonexistent", "model": str(self.source), "runtime": {"threads": 1, "env": {}}}
+        writer = PatchWriter(config, self.model, None, self.root / "scratch", patch_mib=1)
+        members = {g["name"]: g["members"] for g in self.model["groups"] if len(g["pool"]) > 1}
+        tensors = {n: "Q6_K" for names in members.values() for n in names}
+        group_bytes = [writer.bytes_of({n: "Q6_K" for n in names}) for names in members.values()]
+        writer.patch_bytes = max(group_bytes) + min(group_bytes) // 2
+        chunks = writer.chunks(tensors, members)
+        self.assertEqual({n: q for c in chunks for n, q in c.items()}, tensors)
+        self.assertGreater(len(chunks), 1)
+        for chunk in chunks:
+            self.assertLessEqual(writer.bytes_of(chunk), writer.patch_bytes)
+            for names in members.values():
+                self.assertIn(len(set(names) & set(chunk)), (0, len(names)))
+        writer.patch_bytes = 1
+        self.assertEqual(len(writer.chunks(tensors, members)), len(members))
+
+    def patch_writer(self):
+        """A PatchWriter whose quantizer writes zero Q8_0 tensors and counts its calls."""
+        import gguf
+        config = {**self.config, "bindir": "/nonexistent", "model": str(self.source), "runtime": {"threads": 1, "env": {}}}
+        writer = PatchWriter(config, self.model, None, self.root / "scratch", patch_mib=1024)
+        writer.calls = []
+        # the tests must not depend on the free space of the host
+        usage = mock.patch("calibrate.shutil.disk_usage", return_value=mock.Mock(free=1 << 50))
+        usage.start()
+        self.addCleanup(usage.stop)
+
+        def quantize(tensors, path):
+            writer.calls.append(set(tensors))
+            out = GGUFWriter(str(path), "patch")
+            for n, q in sorted(tensors.items()):
+                data = np.zeros(tuple(reversed(writer.shapes[n])), dtype=np.float32)
+                out.add_tensor(n, gguf.quants.quantize(data, GGMLQuantizationType[q]), raw_dtype=GGMLQuantizationType[q])
+            out.write_header_to_file()
+            out.write_kv_data_to_file()
+            out.write_tensors_to_file()
+            out.close()
+        writer.quantize = quantize
+        groups = [g for g in self.model["groups"] if len(g["pool"]) > 1]
+        members = {g["name"]: g["members"] for g in groups}
+        bands = [{"label": f"band{i}", "choices": {g["name"]: "Q8_0"}} for i, g in enumerate(groups)]
+        uniform = {"label": "uniform", "choices": {g["name"]: "Q8_0" for g in groups}}
+        return writer, members, bands, uniform
+
+    def patch(self, writer, members, job, name):
+        tensors = {n: q for g, q in job["choices"].items() for n in members[g]}
+        path = writer.write(tensors, self.root / "scratch" / name)
+        self.assertEqual({t.name: t.tensor_type.name for t in GGUFReader(str(path)).tensors}, tensors)
+        path.unlink()
+        return tensors
+
+    def test_patch_cache_serves_the_uniform_recipe_from_the_band_chunks(self):
+        writer, members, bands, uniform = self.patch_writer()
+        writer.expect(bands + [uniform], self.floor, members)
+        for i, band in enumerate(bands):
+            self.patch(writer, members, band, f"band{i}.gguf")
+        self.assertEqual(len(writer.calls), len(bands))
+        self.assertEqual(len(list(writer.cache.glob("chunk-*.gguf"))), len(bands))
+        tensors = self.patch(writer, members, uniform, "uniform.gguf")
+        self.assertEqual(len(writer.calls), len(bands))  # nothing quantized again
+        self.assertEqual(writer.reused, len(tensors))
+        self.assertEqual(list(writer.cache.glob("chunk-*.gguf")), [])  # no job needs the chunks any more
+        writer.close()
+        self.assertFalse(writer.cache.exists())
+
+    def test_patch_cache_keeps_nothing_without_a_later_use_or_room(self):
+        writer, members, bands, uniform = self.patch_writer()
+        self.patch(writer, members, bands[0], "band0.gguf")  # not expected: written as before
+        self.assertEqual(list(writer.cache.glob("chunk-*.gguf")), [])
+        writer.expect(bands + [uniform], self.floor, members)
+        with mock.patch("calibrate.CACHE_MARGIN", 1 << 60):
+            for i, band in enumerate(bands):
+                self.patch(writer, members, band, f"band{i}.gguf")
+            self.assertEqual(list(writer.cache.glob("chunk-*.gguf")), [])
+            self.patch(writer, members, uniform, "uniform.gguf")
+        self.assertEqual(len(writer.calls), 2 + len(bands))
+        self.assertEqual(writer.reused, 0)
+
+    def test_patch_cache_survives_a_restart_with_the_same_inputs(self):
+        writer, members, bands, uniform = self.patch_writer()
+        writer.expect(bands + [uniform], self.floor, members)
+        self.patch(writer, members, bands[0], "band0.gguf")
+        again, members, bands, uniform = self.patch_writer()
+        self.assertEqual(set(again.entries), {(n, "Q8_0") for n in members[next(iter(bands[0]["choices"]))]})
+        again.expect([uniform], self.floor, members)
+        self.patch(again, members, uniform, "uniform.gguf")
+        self.assertEqual(len(again.calls), 1)
+        self.assertEqual(again.reused, len(members[next(iter(bands[0]["choices"]))]))
+
+    def test_default_pools_reach_q8_0_and_fit_the_row_length(self):
+        base = {"schema": "delphi.auto-quantize/1", "model": str(self.source), "devices": "ROCm1:16000,RAM:16000"}
+        path = self.root / "config.json"
+        write_json(path, base)
+        parsed = load_config(path)
+        self.assertIn("Q8_0", parsed["primary_qtypes"])
+        self.assertEqual(parsed["other_qtypes"], ["Q8_0"])
+        self.assertEqual(parsed["calibration"]["uniform"], "auto")
+        source = {"architecture": "olmoe", "n_expert": 8, "top_k": 2, "tensors": [
+            tensor("blk.0.ffn_down_exps.weight", (96, 256, 8)), tensor("blk.0.ffn_up_exps.weight")]}
+        model = classify(source, {**cfg(), **{k: parsed[k] for k in ("primary_qtypes", "other_qtypes", "default_pools")}})
+        pools = {t["name"]: t["pool"] for t in model["tensors"]}
+        self.assertIn("Q8_0", pools["blk.0.ffn_down_exps.weight"])
+        self.assertNotIn("Q4_K", pools["blk.0.ffn_down_exps.weight"])
+        self.assertIn("Q4_K", pools["blk.0.ffn_up_exps.weight"])
+        for bad in ({"uniform": "maybe"}, {"patch_mib": 0}):
+            write_json(path, {**base, "calibration": bad})
+            with self.assertRaises(QuantError):
+                load_config(path)
+
     def test_configuration(self):
         base = {"schema": "delphi.auto-quantize/1", "model": str(self.source), "devices": "ROCm1:16000,RAM:16000",
                 "primary_qtypes": ["Q2_K", "Q4_K"], "other_qtypes": ["F32"], "quality": {"table": "quality.json"},
@@ -691,6 +1096,11 @@ class Quality(unittest.TestCase):
         parsed = load_config(path)
         self.assertEqual(parsed["calibration"]["text"], str(self.root / "eval.txt"))
         self.assertEqual(parsed["calibration"]["bands"], 10)
+        write_json(path, {**base, "calibration": {}})
+        default = Path(load_config(path)["calibration"]["text"])
+        self.assertEqual(default.name, "ubergarm-imatrix-calibration-corpus-v02.txt")
+        self.assertTrue(default.is_file())
+        write_json(path, base)
         for changed in ({**base, "bounds": {"max_damage": .09}}, {k: v for k, v in base.items() if k != "quality"},
                         {**base, "calibration": {"recipes": 1}}, {**base, "calibration": {"devices": ["RAM"]}},
                         {**base, "calibration": {"batch": 1000}}, {**base, "search": {"beam": 4}}):
@@ -715,6 +1125,519 @@ class Quality(unittest.TestCase):
         model = classify(read_model(str(self.source)), config)
         with self.assertRaises(QuantError):
             make_options(model, self.damage, ops, {**config, "cache_mib": 1})
+
+
+class GpuOnly(unittest.TestCase):
+    """Several GPUs and no RAM: a contiguous layer split like -sm layer -ts."""
+    GPUS = ("ROCm0", "ROCm1", "ROCm2")
+
+    def config(self, caps, **changes):
+        return cfg(devices=dict(zip(self.GPUS, caps)), **changes)
+
+    def model(self, rows, embd_rows=4, tied=False, output_rows=8):
+        """One 256-column tensor per layer (rows[i] rows), the input embedding and, unless tied, an output tensor."""
+        names = [(f"blk.{i}.attn_q.weight", (256, r), i) for i, r in enumerate(rows)]
+        names.append(("token_embd.weight", (256, embd_rows), -1))
+        if not tied:
+            names.append(("output.weight", (256, output_rows), -1))
+        names.append(("output_norm.weight", (256,), -1))
+        tensors = [{"name": n, "shape": list(shape), "layer": layer, "expert": False, "source_dtype": "BF16", "source_bytes": 2 * int(np.prod(shape))}
+                   for n, shape, layer in names]
+        groups = [{"name": t["name"], "members": [t["name"]], "pool": ["Q2_K", "Q4_0", "Q6_K"]} for t in tensors]
+        return {"n_layer": len(rows), "n_expert": 0, "top_k": 1, "tensors": tensors, "groups": groups}
+
+    def choices(self, model, q="Q4_0"):
+        return {g["name"]: q for g in model["groups"]}
+
+    def test_split_is_contiguous_balanced_and_matches_brute_force(self):
+        rows = [3, 40, 7, 25, 12, 60, 5, 18, 33, 9]
+        model = self.model(rows)
+        caps = [30_000, 50_000, 40_000]
+        config = self.config(caps, reserve={"ROCm0": 1000, "ROCm2": 500})
+        choices = self.choices(model)
+        result = memory(model, config, choices)
+        split = result["layer_split"]
+        self.assertEqual(sum(split), len(rows) + 1)
+        self.assertEqual(result["runtime_args"], ["--device", "ROCm0,ROCm1,ROCm2", "-sm", "layer", "-ts", ",".join(map(str, split))])
+        embd = tensor_bytes([256, 4], "Q4_0")
+        self.assertEqual(result["host_bytes"], embd)
+        by = lambda name: tensor_bytes(next(t["shape"] for t in model["tensors"] if t["name"] == name), "Q4_0")
+        layer = [by(f"blk.{i}.attn_q.weight") for i in range(len(rows))]
+        tail = by("output.weight") + by("output_norm.weight")
+        # tensors of a contiguous run on each device, the output on the last
+        start, expected = 0, []
+        for d, c in enumerate(split):
+            count = c - 1 if d == 2 else c
+            expected.append(sum(layer[start:start + count]) + (tail if d == 2 else 0))
+            start += count
+        reserve = [1000, 0, 500]
+        self.assertEqual([result["used_bytes"][g] - r for g, r in zip(self.GPUS, reserve)], expected)
+        self.assertEqual(result["total_bytes"], sum(layer) + tail + embd)
+        utilization = max((r + e) / c for r, e, c in zip(reserve, expected, caps))
+        best = min(max((reserve[d] + b) / caps[d] for d, b in enumerate(
+            [sum(layer[:i]), sum(layer[i:j]), sum(layer[j:]) + tail])) for i in range(len(rows) + 1) for j in range(i, len(rows) + 1))
+        self.assertAlmostEqual(utilization, best, places=9)
+        for d, g in enumerate(self.GPUS):
+            self.assertEqual(result["headroom_bytes"][g], caps[d] - result["used_bytes"][g])
+
+    def test_tied_embedding_is_duplicated_on_the_last_gpu_and_overflow_is_negative(self):
+        rows = [10, 10, 10, 10]
+        tied, untied = self.model(rows, tied=True), self.model(rows)
+        config = self.config([100_000] * 3)
+        a, b = memory(tied, config, self.choices(tied)), memory(untied, config, self.choices(untied))
+        embd = tensor_bytes([256, 4], "Q4_0")
+        self.assertEqual(a["host_bytes"], embd)
+        self.assertEqual(sum(a["used_bytes"].values()) - (sum(b["used_bytes"].values()) - tensor_bytes([256, 8], "Q4_0")), embd)
+        small = self.config([2000] * 3)
+        over = memory(untied, small, self.choices(untied))
+        self.assertTrue(any(v < 0 for v in over["headroom_bytes"].values()))
+        self.assertEqual(sum(over["layer_split"]), 5)
+        # other modes keep their accounting and report the resident bytes
+        single = cfg(devices={"ROCm0": 1 << 30, "RAM": 1 << 30})
+        plain = memory(untied, single, self.choices(untied))
+        self.assertEqual(plain["total_bytes"], sum(plain["used_bytes"].values()))
+        self.assertEqual(plain["host_bytes"], 0)
+        self.assertNotIn("layer_split", plain)
+
+    def test_mtp_blocks_are_resident_only_when_served(self):
+        rows = [10, 10, 10, 30]
+        model = self.model(rows)
+        for t in model["tensors"]:
+            t["mtp"] = t["layer"] == 3
+        model["mtp_layers"] = [3]
+        config = self.config([100_000] * 3)
+        served = memory(model, config, self.choices(model))
+        unserved = memory(model, {**config, "mtp": False}, self.choices(model))
+        # llama.cpp splits -ts over every block, the MTP blocks too, whether it loads them or not
+        self.assertEqual(sum(served["layer_split"]), 5)
+        self.assertEqual(sum(unserved["layer_split"]), 5)
+        self.assertEqual(served["total_bytes"] - unserved["total_bytes"], tensor_bytes([256, 30], "Q4_0"))
+
+    def test_float32_assignment_reproduces_the_contiguous_blocks(self):
+        rng = np.random.default_rng(3)
+        for n in range(1, 121):
+            for _ in range(6):
+                k = int(rng.integers(1, 5))
+                cuts = sorted(rng.integers(0, n + 2, size=k - 1).tolist())
+                counts = [b - a for a, b in zip([0, *cuts], [*cuts, n + 1])]
+                expected = [d for d, c in enumerate(counts) for _ in range(c)]
+                self.assertEqual(llama_layer_devices(counts), expected, (n, counts))
+
+    def frontier_model(self, rows):
+        """Layers of rows * 1000 rows (megabytes): the 1 MiB step of the placement retry must be small against the devices."""
+        model = self.model([1000 * r for r in rows], embd_rows=4000, output_rows=8000)
+        for g in model["groups"]:
+            shape = next(t["shape"] for t in model["tensors"] if t["name"] == g["name"])
+            if not g["name"].startswith("blk."):
+                g["pool"] = ["Q4_0"]  # the layer tensors alone make the search space
+            g["options"] = [{"qtype": q, "damage": {"Q2_K": 3, "Q4_0": 1, "Q6_K": 0}[q] * int(np.prod(shape)) // 256, "sampling_se": 0,
+                             "bytes": tensor_bytes(shape, q)} for q in g["pool"]]
+
+        class Fake:
+            measured = {"decode": 3, "short": 4, "long": 5}
+            slopes = {"decode": 1, "short": 1, "long": 1}
+            def predict(self, choices, hit_fraction):
+                return dict(self.measured)
+            def group_costs(self):
+                return {g["name"]: {q: {r: 0.0 for r in self.measured} for q in g["pool"]} for g in model["groups"]}
+        baseline = {g["name"]: g["pool"][0] for g in model["groups"]}
+        return model, Fake(), baseline
+
+    def test_search_keeps_every_gpu_within_capacity_and_retries_for_granularity(self):
+        from knapsack import solve
+        rows = np.random.default_rng(11).integers(3, 30, size=24).tolist()
+        model, predictor, baseline = self.frontier_model(rows)
+        floor = memory(model, self.config([10**9] * 3), baseline)["total_bytes"]
+        host = tensor_bytes([256, 4000], "Q4_0")
+        # a capacity where the pooled optimum has room for upgrades but its layers do not split into three fitting runs
+        found = None
+        for capacity in range(int(.45 * floor), floor, floor // 300):
+            config = self.config([capacity] * 3)
+            table = {g["name"]: [(o["bytes"], o["damage"], o["qtype"]) for o in g["options"]] for g in model["groups"]}
+            naive = solve(table, 3 * capacity + host, max_units=1 << 16)
+            if naive is None or min(memory(model, config, naive[0])["headroom_bytes"].values()) >= 0:
+                continue
+            found = config, search(model, config, predictor, baseline)
+            break
+        self.assertIsNotNone(found, "no capacity where the pooled optimum misses a device")
+        config, result = found
+        self.assertTrue(result["frontier"])
+        for state in result["frontier"]:
+            self.assertGreaterEqual(min(state["memory"]["headroom_bytes"].values()), 0)
+            self.assertEqual(sum(state["memory"]["layer_split"]), len(rows) + 1)
+        best = min(result["frontier"], key=lambda s: s["damage"])
+        resident = best["memory"]["total_bytes"] - best["memory"]["host_bytes"]
+        self.assertGreater(resident, .9 * 3 * config["devices"]["ROCm0"])
+        self.assertEqual(result["budgets_bytes"], {g: config["devices"][g] for g in self.GPUS})
+        # the retry lowers a local cap only
+        self.assertEqual(result["pool_cap_bytes"], 3 * config["devices"]["ROCm0"] + host)
+
+    def test_search_in_gpu_only_mode_smallest_recipe_and_total_cap(self):
+        model, predictor, baseline = self.frontier_model(np.random.default_rng(5).integers(3, 30, size=24).tolist())
+        floor = memory(model, self.config([10**9] * 3), baseline)["total_bytes"]
+        start = sum(g["options"][0]["damage"] for g in model["groups"])
+        config = self.config([floor] * 3, search={"display": 8, "minimize": "size"}, bounds={"max_damage": .5 * start})
+        result = search(model, config, predictor, baseline)
+        self.assertEqual(result["status"], "ok")
+        smallest = next(s for s in result["frontier"] if s.get("smallest"))
+        self.assertLessEqual(smallest["damage"], .5 * start)
+        self.assertTrue(all(min(s["memory"]["headroom_bytes"].values()) >= 0 for s in result["frontier"]))
+        capped = search(model, self.config([floor] * 3, bounds={"max_total_bytes": int(1.3 * floor)}), predictor, baseline)
+        self.assertTrue(capped["frontier"])
+        self.assertTrue(all(s["memory"]["total_bytes"] <= 1.3 * floor for s in capped["frontier"]))
+        self.assertLess(min(s["damage"] for s in capped["frontier"]), start)
+
+    def test_prediction_scaling_and_config(self):
+        factors = {"decode": 100, "short": 100, "long": 100}
+        predictor = object.__new__(Predictor)
+        predictor.measured, predictor.slopes = {"decode": 4.0, "short": 4.0, "long": 4.0}, {r: 1.0 for r in factors}
+        predictor.baseline_cost = {r: 0.0 for r in factors}
+        predictor.cost = lambda choices, hit_fraction=0: {r: 0.0 for r in factors}
+        for devs, divisor in (({"ROCm0": 1, "ROCm1": 1}, 1), ({"ROCm0": 1, "ROCm1": 1, "RAM": 1}, 2), ({"ROCm0": 1, "RAM": 1}, 1)):
+            predictor.cfg = cfg(devices=devs, multi_gpu_speedup_percent=factors)
+            self.assertEqual(predictor.predict({}), {r: 4.0 / divisor for r in factors})
+        base = {"schema": "delphi.auto-quantize/1", "model": "/tmp/a.gguf", "primary_qtypes": ["Q2_K"], "other_qtypes": ["Q6_K"]}
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "c.json"
+            for devs, speed, ok in (("ROCm0:16000,ROCm1:16000", {"decode": 30}, False), ("ROCm0:16000,ROCm1:16000", {}, True),
+                                    ("ROCm0:16000,ROCm1:16000,RAM:16000", {"decode": 30}, True)):
+                path.write_text(json.dumps({**base, "devices": devs, "multi_gpu_speedup_percent": speed}))
+                if ok:
+                    load_config(path)
+                else:
+                    with self.assertRaisesRegex(QuantError, "GPU-only"):
+                        load_config(path)
+
+    def test_extra_calibration_devices_need_room_for_the_floor(self):
+        # DeepSeek V4.1 Flash on three CMP 170HX next to RAM: the floor (139 GiB) fits on none of them, so only the
+        # first GPU runs a session (with the experts in RAM); a device with room keeps its full-offload session
+        gib = 1 << 30
+        config = cfg(devices={"CUDA0": 63 * gib, "CUDA1": 63 * gib, "CUDA2": 63 * gib, "RAM": 250 * gib})
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(full_offload_devices(config, ["CUDA0", "CUDA1", "CUDA2"], 139 * gib), ["CUDA0"])
+            self.assertEqual(full_offload_devices(config, ["CUDA1", "CUDA2"], 139 * gib), ["CUDA0"])
+        self.assertIn("CUDA1, CUDA2 skipped", out.getvalue())
+        self.assertEqual(full_offload_devices(config, ["CUDA0", "CUDA1"], 40 * gib), ["CUDA0", "CUDA1"])
+        self.assertEqual(full_offload_devices(config, ["CUDA0", "ROCm0"], 139 * gib), ["CUDA0", "ROCm0"])  # size unknown
+
+    def test_measurement_commands_keep_experts_in_ram_and_profiling_uses_the_split(self):
+        config = self.config([1, 1, 1], bindir="/b", model="/m.gguf", cache_mib=0,
+                             runtime={"env": {}, "threads": 4, "batch": 512, "ubatch": 512, "short_tokens": 8, "long_tokens": 16,
+                                      "decode_tokens": 4, "depth_tokens": 0, "repetitions": 1, "extra_args": [], "trace_max_events": 10})
+        c = {"text": "t.txt", "chunks": 2, "context": 64, "batch": 0, "threads": 4}
+        with mock.patch("calibrate.lazy_args", return_value=[]), mock.patch("corpus.lazy_args", return_value=[]):
+            for device in self.GPUS:
+                self.assertIn("-cmoe", perplexity_command(config, c, "/m.gguf", device, "teacher"))
+            self.assertIn("-cmoe", imatrix_command(config, {**c, "extra_args": []}, "/t.txt", "/o.gguf"))
+            single = cfg(devices={"ROCm1": 1}, bindir="/b", model="/m.gguf")
+            self.assertNotIn("-cmoe", perplexity_command(single, c, "/m.gguf", "ROCm1", "teacher"))
+            split = perplexity_command(config, c, "/m.gguf", ",".join(self.GPUS), "teacher")
+            self.assertNotIn("-cmoe", split)
+            self.assertEqual(split[split.index("-sm") + 1], "layer")
+            self.assertEqual(split[split.index("-ub") + 1], "256")
+            big = perplexity_command(config, {**c, "context": 512}, "/m.gguf", self.GPUS[0], "teacher")
+            self.assertEqual(big[big.index("-ub") + 1], str(OFFLOAD_BATCH))
+        with tempfile.TemporaryDirectory() as d:
+            floor = Path(d) / "floor.gguf"
+            floor.write_bytes(b"x" * 1000)
+            gib = 1 << 30
+            fits = self.config([20 * gib, 20 * gib, 20 * gib], bindir="/b", model="/m.gguf")
+            name, room = split_session(fits, c | {"devices": None}, floor)
+            self.assertEqual(name, ",".join(self.GPUS))
+            self.assertEqual(room, (60 * gib - 1000) / 3 - SPLIT_MARGIN)
+            self.assertIsNone(split_session(fits, c | {"devices": [self.GPUS[0]]}, floor))
+            self.assertIsNone(split_session(self.config([gib, gib, gib], bindir="/b", model="/m.gguf"), c | {"devices": None}, floor))
+        self.assertNotIn("GGML_CUDA_MOE_GROUPED", measure_env(self.config([1, 1, 1], bindir="/b", model="/m.gguf")))
+        self.assertEqual(measure_env(cfg(devices={"CUDA0": 1}, bindir="/b", model="/m.gguf"))["GGML_CUDA_MOE_GROUPED"], "grouped")
+        seen = []
+        with tempfile.TemporaryDirectory() as d, mock.patch("timing.lazy_args", return_value=[]), \
+                mock.patch("timing.run_recipe", side_effect=lambda recipe, out: seen.append(recipe.arms[0].command) or {}):
+            profile_model(config, "/m.gguf", Path(d) / "p.json", placement=[3, 4, 5])
+            with self.assertRaisesRegex(QuantError, "layer split"):
+                profile_model(config, "/m.gguf", Path(d) / "q.json")
+            one = cfg(devices={"ROCm1": 1, "RAM": 1}, bindir="/b", model="/m.gguf", runtime=config["runtime"])
+            profile_model(one, "/m.gguf", Path(d) / "r.json")
+        command = seen[0]
+        events = []
+
+        def truncated(recipe, out):
+            events.append(recipe.arms[0].trace_max_events)
+            if len(events) == 1:
+                raise ProfileError("trace is truncated or dropped events")
+            return {}
+        with tempfile.TemporaryDirectory() as d, mock.patch("timing.lazy_args", return_value=[]), \
+                mock.patch("timing.run_recipe", side_effect=truncated), mock.patch("timing.trace_events_needed", return_value=1000), \
+                mock.patch("timing.TRACE_EVENTS", [0]):
+            profile_model(config, "/m.gguf", Path(d) / "s.json", placement=[3, 4, 5])
+        self.assertEqual(events, [10, 2048])
+        with tempfile.TemporaryDirectory() as d, mock.patch("timing.lazy_args", return_value=[]), \
+                mock.patch("timing.run_recipe", side_effect=ProfileError("other")), mock.patch("timing.trace_events_needed", return_value=0):
+            with self.assertRaisesRegex(QuantError, "other"):
+                profile_model(config, "/m.gguf", Path(d) / "t.json", placement=[3, 4, 5])
+        self.assertEqual(command[command.index("--device") + 1], "ROCm0/ROCm1/ROCm2")
+        self.assertEqual(command[command.index("-sm") + 1], "layer")
+        self.assertEqual(command[command.index("-ts") + 1], "3/4/5")
+        self.assertNotIn("-ncmoe", command)
+        self.assertEqual(seen[1][seen[1].index("--device") + 1], "ROCm1")
+        self.assertNotIn("-ts", seen[1])
+
+    def test_identical_gpu_check(self):
+        listed = ("ggml_cuda_init: found 3 ROCm devices\nAvailable devices:\n"
+                  "  ROCm0: AMD Radeon AI PRO R9700 (32624 MiB, 32000 MiB free)\n"
+                  "  ROCm1: AMD Radeon AI PRO R9700 (32624 MiB, 11000 MiB free)\n"
+                  "  ROCm2: AMD Radeon RX 7900 XTX (24560 MiB, 24000 MiB free)\n")
+        self.assertEqual(gpu_descriptions(listed, ["ROCm0", "ROCm1"]), {"ROCm0": "AMD Radeon AI PRO R9700", "ROCm1": "AMD Radeon AI PRO R9700"})
+        require_identical_gpus(listed, ["ROCm0", "ROCm1"])
+        with self.assertRaisesRegex(QuantError, "different GPU models"):
+            require_identical_gpus(listed, ["ROCm0", "ROCm1", "ROCm2"])
+        with self.assertRaisesRegex(QuantError, "could not read"):
+            require_identical_gpus(listed, ["ROCm0", "ROCm5"])
+
+
+class TargetRuntime(unittest.TestCase):
+    """--runtime: a type that the runtime cannot load is never chosen; the prepared groups do not depend on it."""
+    BASE = {"schema": "delphi.auto-quantize/1", "model": "/tmp/a.gguf", "devices": "ROCm1:16000,RAM:16000"}
+
+    def load(self, **change):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "c.json"
+            path.write_text(json.dumps({**self.BASE, **change}))
+            return load_config(path)
+
+    def test_names_and_allow_lists(self):
+        self.assertEqual(self.load()["target_runtime"], "delphi")
+        for name, canonical in (("llama.cpp", "llama"), ("LLAMA", "llama"), ("ik_llama.cpp", "ik_llama"), ("delphi.cpp", "delphi")):
+            self.assertEqual(self.load(target_runtime=name)["target_runtime"], canonical)
+        with self.assertRaisesRegex(QuantError, "unknown runtime"):
+            self.load(target_runtime="vllm")
+        mainline, ik = RUNTIME_QTYPES["llama"], RUNTIME_QTYPES["ik_llama"]
+        self.assertIsNone(RUNTIME_QTYPES["delphi"])
+        self.assertTrue({"Q8_0", "Q4_K", "IQ2_XXS", "IQ4_NL", "MXFP4", "BF16", "F32"} <= mainline & ik)
+        self.assertTrue({"IQ2_KS", "IQ2_K", "IQ3_KS", "IQ3_K", "IQ4_KS", "IQ4_K", "IQ5_KS", "IQ5_K", "IQ6_K"} <= ik)
+        self.assertFalse(mainline & {"IQ2_KS", "IQ4_K", "IQ6_K", "Q4_G128"})
+        self.assertFalse(ik & {"Q4_G128", "Q2_0"})
+
+    def test_default_pools_are_filtered_by_the_search_and_explicit_ones_are_checked(self):
+        self.assertIn("IQ4_K", self.load(target_runtime="llama")["primary_qtypes"])  # filtered at plan time, not here
+        self.load(target_runtime="llama", primary_qtypes=["Q2_K", "Q4_K"], other_qtypes=["Q8_0"])
+        self.load(target_runtime="ik_llama", primary_qtypes=["IQ4_K", "Q4_K"])
+        for change in ({"primary_qtypes": ["Q2_K", "iq4_k"]}, {"other_qtypes": ["Q4_G128"]}, {"pins": {"output.weight": "IQ6_K"}}):
+            with self.assertRaisesRegex(QuantError, r"names (?i:IQ4_K|Q4_G128|IQ6_K), which runtime llama.cpp cannot load"):
+                self.load(target_runtime="llama", **change)
+        with self.assertRaisesRegex(QuantError, "Q4_G128.*ik_llama.cpp"):
+            self.load(target_runtime="ik_llama", primary_qtypes=["Q4_G128"])
+        self.load(primary_qtypes=["Q4_G128", "IQ4_K"])
+
+    def test_the_prepared_groups_do_not_depend_on_the_runtime(self):
+        pools = {"primary_qtypes": ["Q2_K", "IQ4_K", "Q4_0"]}
+        plain = classify(info(), cfg(**pools))
+        for runtime in ("llama", "ik_llama"):
+            self.assertEqual(classify(info(), cfg(target_runtime=runtime, default_pools=["primary_qtypes"], **pools))["groups"], plain["groups"])
+
+    def fixture(self):
+        model = classify(info(), cfg(primary_qtypes=["Q2_K", "IQ4_K", "Q4_0"]))
+        damage = {"Q2_K": 2, "Q4_0": 1, "IQ4_K": 0}
+        for g in model["groups"]:
+            g["options"] = [{"qtype": q, "damage": damage.get(q, 0), "sampling_se": 0,
+                             "bytes": sum(tensor_bytes(next(t["shape"] for t in model["tensors"] if t["name"] == n), q) for n in g["members"])}
+                            for q in g["pool"]]
+        class Fake:
+            measured = {"decode": 3, "short": 4, "long": 5}
+            slopes = {"decode": 1, "short": 1, "long": 1}
+            def predict(self, choices, hit_fraction):
+                n = list(choices.values()).count("Q4_0")
+                return {"decode": 3 + n, "short": 4 + n, "long": 5 + n}
+            def group_costs(self):
+                return {g["name"]: {q: {r: float(q == "Q4_0") for r in self.measured} for q in g["pool"]} for g in model["groups"]}
+        # the floor recipe holds a type that llama.cpp cannot load: it only anchors the budget and the timing
+        return model, Fake(), {g["name"]: "IQ4_K" if "IQ4_K" in g["pool"] else g["pool"][0] for g in model["groups"]}
+
+    def test_search_never_picks_a_type_the_runtime_cannot_load(self):
+        model, predictor, baseline = self.fixture()
+        used = {}
+        for runtime in ("delphi", "llama", "ik_llama"):
+            result = search(model, cfg(target_runtime=runtime), predictor, baseline)
+            used[runtime] = {q for s in result["frontier"] for q in s["choices"].values()}
+            self.assertTrue(result["frontier"], runtime)
+        self.assertIn("IQ4_K", used["delphi"])
+        self.assertIn("IQ4_K", used["ik_llama"])
+        self.assertEqual(used["llama"] & {"IQ4_K"}, set())
+        self.assertTrue(used["llama"] & {"Q2_K", "Q4_0"})
+
+    def test_a_group_without_a_loadable_type_stops_the_search(self):
+        model, predictor, baseline = self.fixture()
+        for g in model["groups"]:
+            g["options"] = [o for o in g["options"] if o["qtype"] == "IQ4_K"] or g["options"]
+        with self.assertRaisesRegex(QuantError, "no candidate type .* llama.cpp"):
+            search(model, cfg(target_runtime="llama"), predictor, baseline)
+
+    def test_preserved_tensors_must_load_in_the_runtime(self):
+        source = info()
+        source["tensors"][3]["source_dtype"] = "IQ4_K"  # ffn_gate_inp.weight is preserved
+        model = classify(source, cfg(allow_requantize=True))
+        check_runtime_source(model, cfg(target_runtime="ik_llama"))
+        check_runtime_source(model, cfg())
+        with self.assertRaisesRegex(QuantError, "llama.cpp.*ffn_gate_inp.*IQ4_K"):
+            check_runtime_source(model, cfg(target_runtime="llama"))
+        check_runtime_source(classify(info(), cfg()), cfg(target_runtime="llama"))  # BF16 loads everywhere
+
+
+class Routing(unittest.TestCase):
+    """The hit curve: a replay of the expert-cache policy on a routing trace."""
+    L, E, K = 6, 32, 4
+
+    def trace(self, steps=240, seed=0):
+        rng = np.random.default_rng(seed)
+        p = 1.0 / (np.arange(self.E) + 1)
+        p /= p.sum()
+        def rows(n):
+            return np.stack([np.stack([rng.choice(self.E, size=self.K, replace=False, p=p) for _ in range(n)])
+                             for _ in range(self.L)]).astype(np.int16)
+        return [rows(40)] + [rows(1) for _ in range(steps)] + [rows(70)] + [rows(1) for _ in range(steps)]
+
+    def test_window_counts_are_the_last_rows(self):
+        batches = self.trace()
+        r = routing.Replay(self.L, self.E, self.K, 20, window=100)
+        for b in batches:
+            r.record(b)
+        last = np.concatenate(batches, axis=1)[:, -100:]
+        expected = np.zeros((self.L, self.E), int)
+        for layer in range(self.L):
+            for e in last[layer].ravel():
+                expected[layer, e] += 1
+        self.assertTrue((expected == r.count).all())
+        self.assertTrue((r.rows == 100).all())
+
+    def test_prompt_batch_with_fewer_rows_in_later_layers(self):
+        # DeepSeek V4.1 runs fewer rows in the layers after n_layer_prefill: the batch is a list with one array per layer
+        rng = np.random.default_rng(3)
+        rows = [300 if layer < 3 else 120 for layer in range(self.L)]
+        batch = [rng.integers(0, self.E, size=(n, self.K)).astype(np.int16) for n in rows]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "t.bin"
+            with open(path, "wb") as stream:
+                for layer, ids in enumerate(batch):
+                    np.array([layer, ids.shape[0], self.K], dtype=np.int32).tofile(stream)
+                    ids.astype(np.int32).tofile(stream)
+                small = self.trace(steps=1)[1]
+                for layer in range(self.L):
+                    np.array([layer, 1, self.K], dtype=np.int32).tofile(stream)
+                    small[layer].astype(np.int32).tofile(stream)
+            layers, read = routing.read_trace(path)
+        self.assertEqual(len(read), 2)
+        self.assertIsInstance(read[0], list)
+        self.assertEqual([a.shape[0] for a in read[0]], rows)
+        self.assertEqual(routing.batch_rows(read[0]), 300)
+        r = routing.Replay(self.L, self.E, self.K, 10, window=100)
+        r.record(read[0])
+        self.assertTrue((r.rows == 100).all())
+        self.assertTrue((r.count.sum(axis=1) == 100 * self.K).all())
+        last = batch[0][-100:]
+        self.assertEqual(int(r.count[0].sum()), 100 * self.K)
+        self.assertEqual(int(r.count[0][last[0, 0]] >= 1), 1)
+        out = routing.replay(layers, read, self.E, 10)
+        self.assertEqual(out["segments"][-1][1], self.L * self.K)
+
+    def test_curve_rises_and_beats_uniform_on_skewed_routing(self):
+        batches = self.trace()
+        points = routing.curve(list(range(self.L)), batches, self.E)
+        self.assertEqual(points[0], [0, 0.0])
+        self.assertEqual(points[-1], [self.L * self.E, 1.0])
+        self.assertTrue(all(b[0] > a[0] and b[1] >= a[1] for a, b in zip(points, points[1:])))
+        slots = int(0.1 * self.L * self.E)
+        self.assertGreater(routing.hit_at(points, slots), 2 * slots / (self.L * self.E))
+        self.assertAlmostEqual(routing.hit_at(points, 0), 0.0)
+
+    def test_a_cache_that_holds_everything_hits_after_its_first_refresh(self):
+        batches = self.trace()
+        out = routing.replay(list(range(self.L)), batches, self.E, self.L * self.E)
+        self.assertGreater(out["steady_hit_fraction"], 0.95)
+        self.assertEqual(out["segments"][0][0], 0)  # the span before the first refresh runs with an empty cache
+
+    def test_trace_file_round_trip_and_batches(self):
+        batches = self.trace(steps=3)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "t.bin"
+            with open(path, "wb") as stream:
+                for ids in batches:
+                    for layer in range(self.L):
+                        np.array([layer * 2, ids.shape[1], self.K], dtype=np.int32).tofile(stream)  # layers 0, 2, 4 ...
+                        ids[layer].astype(np.int32).tofile(stream)
+                        if ids.shape[1] <= routing.MAX_ROWS:
+                            # a batch of the cache graph logs a layer twice more: again, and as one reshaped row
+                            np.array([layer * 2, ids.shape[1], self.K], dtype=np.int32).tofile(stream)
+                            ids[layer].astype(np.int32).tofile(stream)
+                            np.array([layer * 2, 1, ids.shape[1] * self.K], dtype=np.int32).tofile(stream)
+                            ids[layer].astype(np.int32).tofile(stream)
+            layers, read = routing.read_trace(path)
+            self.assertEqual(layers, [0, 2, 4, 6, 8, 10])
+            self.assertEqual(len(read), len(batches))
+            for a, b in zip(read, batches):
+                self.assertTrue((a == b).all())
+            summary = routing.trace_summary(layers, read)
+            self.assertEqual((summary["decode_rows"], summary["prompts"]), (6, 2))
+            path.write_bytes(path.read_bytes()[:-5])
+            with self.assertRaises(QuantError):
+                routing.read_trace(path)
+
+    def test_server_lines_are_compared_per_span(self):
+        batches = self.trace()
+        line = ("expert-cache: refresh {i}: {n} resident, 10 uploaded (0 slots reclaimed) in 1.0 ms (memcpy 1, gpu wait 1), "
+                "window covers 100.0%; previous decode hits {v}% selections, 1.0% distinct\n")
+        log = line.format(i=0, n=0, v=0.0) + line.format(i=1, n=30, v=50.0) + (
+            "expert-cache: 2 refreshes, 30 experts uploaded, 1.0 ms; 3 decode-time refreshes, 9 experts, 1.0 ms applying; "
+            "decode hits since last refresh: 60.5% selections, 20.0% distinct\n")
+        result = routing.compare(log, list(range(self.L)), batches, self.E, 30)
+        # the startup refresh without rows is dropped: spans are the one before refresh 1 and the final one
+        self.assertEqual((result["server_spans"], len(result["spans"])), (2, 2))
+        self.assertEqual([r["server_percent"] for r in result["spans"]], [50.0, 60.5])
+
+    def test_memory_reads_the_curve_in_slot_units(self):
+        model = classify(info(), cfg())
+        choices = {g["name"]: g["pool"][0] for g in model["groups"]}
+        base = dict(cfg(cache_mib=2), devices={"ROCm1": 1 << 30, "RAM": 1 << 30})
+        uniform = memory(model, base, choices)
+        self.assertEqual(uniform["cache_hit_source"], "uniform prior")
+        slots = uniform["cache_slots"]
+        curve = {"schema": routing.SCHEMA, "n_expert": 8, "layers": 1, "points": [[0, 0.0], [1, 0.5], [8, 1.0]]}
+        measured = memory(model, dict(base, routing_curve=curve), choices)
+        self.assertEqual(measured["cache_hit_source"], "measured routing curve")
+        self.assertAlmostEqual(measured["cache_hit_prior"], routing.hit_at(curve["points"], slots))
+        self.assertGreater(measured["cache_hit_prior"], uniform["cache_hit_prior"] - 1e-12)
+        # a curve of another model (expert count or layer count) is not used
+        other = memory(model, dict(base, routing_curve=dict(curve, n_expert=16)), choices)
+        self.assertEqual(other["cache_hit_source"], "uniform prior")
+        # more cache, more hits
+        bigger = memory(model, dict(base, cache_mib=4, routing_curve=curve), choices)
+        self.assertGreaterEqual(bigger["cache_hit_prior"], measured["cache_hit_prior"])
+
+    def test_auto_cache_takes_what_the_reserves_and_the_margin_leave(self):
+        model = classify(info(), cfg())
+        choices = {g["name"]: g["pool"][0] for g in model["groups"]}
+        mib = 1 << 20
+        base = cfg(cache_mib="auto", devices={"ROCm1": 40 * mib, "RAM": 1 << 30}, runtime={"env": {"LLAMA_MOE_CACHE_AUTO_MARGIN_MIB": "2"}, "short_tokens": 8, "long_tokens": 128, "ubatch": 128})
+        free = memory(model, base, choices)
+        self.assertGreater(free["cache_slots"], 0)
+        self.assertLessEqual(free["used_bytes"]["ROCm1"] + 2 * mib, 40 * mib)
+        # a projector or a draft model that takes memory on the GPU is a reserve, and the cache gets that much less
+        reserved = memory(model, dict(base, reserve={"ROCm1": 6 * mib}), choices)
+        self.assertLess(reserved["cache_bytes"], free["cache_bytes"])
+        self.assertLessEqual(free["cache_bytes"] - reserved["cache_bytes"], 6 * mib)
+        self.assertGreaterEqual(free["cache_bytes"] - reserved["cache_bytes"], 6 * mib - 2 * free["cache_groups"][0]["expert_bytes"])
+        # no room for an expert of every layer: no cache (the server allocates no tier), but a fixed size is an error
+        none = memory(model, dict(base, reserve={"ROCm1": 40 * mib}), choices)
+        self.assertEqual((none["cache_slots"], none["cache_bytes"]), (0, 0))
+        with self.assertRaises(QuantError):
+            memory(model, dict(base, cache_mib=0.001), choices)
+
+    def test_load_curve_checks_the_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "c.json"
+            path.write_text(json.dumps({"schema": routing.SCHEMA, "points": [[0, 0], [5, 0.4], [9, 0.3]]}))
+            with self.assertRaises(QuantError):
+                routing.load_curve(path)
+            path.write_text(json.dumps({"schema": routing.SCHEMA, "n_expert": 8, "layers": 1, "points": [[0, 0], [5, 0.4], [9, 1]]}))
+            self.assertEqual(routing.load_curve(path)["points"][1], [5, 0.4])
 
 
 if __name__ == "__main__":

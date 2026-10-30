@@ -17,6 +17,9 @@ std::vector<enum common_speculative_type> common_speculative_types_from_names(co
 // infer the spec types from the GGUF metadata of a draft model; empty if unknown
 std::vector<enum common_speculative_type> common_speculative_types_from_gguf(const std::string & path);
 
+// the trained block size of a DFlash/DSpark draft model; 0 if unknown
+int32_t common_speculative_block_size_from_gguf(const std::string & path);
+
 // convert string to type
 enum common_speculative_type common_speculative_type_from_name(const std::string & name);
 

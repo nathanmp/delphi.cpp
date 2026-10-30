@@ -1,4 +1,5 @@
 #include "llama-context.h"
+#include "llama-engram.h"
 
 #include "ggml-cpuset.h"
 #include "ggml-exec-trace.h"
@@ -113,6 +114,14 @@ llama_context::llama_context(
     loras(std::make_unique<llama_adapter_loras>()),
     balloc(std::make_unique<llama_batch_allocr>(model.hparams.n_pos_per_embd())) {
     ggml_exec_trace_init();
+
+    expert_device_policy = llama_expert_device_policy::from_env();
+    std::vector<std::string> gpu_names;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        auto * dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) { gpu_names.emplace_back(ggml_backend_dev_name(dev)); }
+    }
+    expert_device_policy.validate(gpu_names);
 
     // TODO warning when creating llama_context with awkward ctx size that is not a power of 2,
     //     may need to be backend-dependent
@@ -288,6 +297,31 @@ llama_context::llama_context(
         if (LLAMA_FUSED_LID_DISABLE && atoi(LLAMA_FUSED_LID_DISABLE) != 0) {
             cparams.fused_lid = false;
             cparams.auto_flid = false;
+        }
+    }
+
+    cparams.n_layer_prefill = hparams.n_layer();
+    cparams.ced_compact = false;
+    if (model.arch == LLM_ARCH_DEEPSEEK41) {
+        const char * LLAMA_DSV41_TRIM = getenv("LLAMA_DSV41_TRIM");
+        const int mode = LLAMA_DSV41_TRIM ? atoi(LLAMA_DSV41_TRIM) : 1;
+        if (mode == 1 || mode == 2) {
+            const uint32_t split = hparams.n_layer()/2;
+            bool supported = split > 0 && hparams.dsv41_candidate_source == (int32_t) split &&
+                    hparams.dsv41_is_kv_source(split) && hparams.dsv41_owns_index_k(split);
+            for (uint32_t il = split + 1; il < hparams.n_layer(); ++il) {
+                supported &= !hparams.dsv41_is_kv_source(il) && !hparams.dsv41_owns_index_k(il);
+            }
+            for (uint32_t il = split; il < hparams.n_layer(); ++il) {
+                supported &= model.layers[il].engram_embd == nullptr;
+            }
+            if (supported) {
+                cparams.n_layer_prefill = split;
+                cparams.ced_compact = mode == 1;
+                LLAMA_LOG_INFO("%s: CED prefill: %s, encoder layers = %u\n", __func__, mode == 1 ? "compact" : "bounded mask", split);
+            } else {
+                LLAMA_LOG_WARN("%s: CED prefill disabled: unsupported decoder source layout\n", __func__);
+            }
         }
     }
 
@@ -573,6 +607,12 @@ llama_context::llama_context(
             if (allow_embedding_overrides && !model.has_non_embedding_tensor_overrides()) {
                 pp_blocked_by_overrides = false;
             }
+            // LLAMA_PP_ALLOW_OVERRIDES=1: keep pipeline parallelism with any override, e.g. some layers' experts on the CPU
+            // and the rest of a layer split over GPUs, where each ubatch otherwise runs the GPUs in series
+            const char * LLAMA_PP_ALLOW_OVERRIDES = getenv("LLAMA_PP_ALLOW_OVERRIDES");
+            if (LLAMA_PP_ALLOW_OVERRIDES && atoi(LLAMA_PP_ALLOW_OVERRIDES) != 0) {
+                pp_blocked_by_overrides = false;
+            }
         }
 
         // tensor split runs every layer on all GPUs at once, so there is no pipeline across devices, but
@@ -614,10 +654,27 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
+        const bool engram_model = model.arch == LLM_ARCH_DEEPSEEK41 ||
+            (model.arch == LLM_ARCH_QWEN4EXP && params.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT);
+        if (engram_model && cparams.cb_eval == nullptr) {
+            const char * env = getenv("LLAMA_ENGRAM_PREFETCH");
+            const int n_readers = env ? std::min(32, std::max(0, atoi(env))) : 8;
+            const auto host_engram = [](const llama_layer & layer) {
+                return llama_engram_reader::supports(layer.engram_embd);
+            };
+            const bool host_table = model.arch == LLM_ARCH_QWEN4EXP ?
+                llama_engram_reader::supports(model.per_layer_tok_embd) :
+                std::any_of(model.layers.begin(), model.layers.end(), host_engram);
+            if (n_readers > 0 && !model.hparams.no_alloc && host_table) {
+                engram_reader = std::make_unique<llama_engram_reader>(n_readers);
+                LLAMA_LOG_INFO("%s: Engram row prefetch with %d readers (up to 16 tokens)\n", __func__, n_readers);
+            }
+        }
+
         if (params.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && params.ctx_other == nullptr) {
             try {
                 // Eval callbacks execute subgraphs. Preserve their original CPU readiness boundary.
-                expert_cache = llama_expert_cache::create(model, backends, cparams.cb_eval == nullptr);
+                expert_cache = llama_expert_cache::create(model, backends, cparams.cb_eval == nullptr, expert_device_policy);
             } catch (const std::exception & e) {
                 if (!llama_expert_cache::auto_requested()) {
                     throw;
@@ -750,6 +807,16 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
             // TODO: make this descriptor-specific; model.dev_layer() preserves the current behavior,
             // but is still wrong for cases like --no-kv-offload.
             ggml_backend_dev_t device_layer = model.dev_layer(node.il);
+
+            // The scheduler can place a fused node that has no weights of its own on the device of its inputs, which
+            // at a layer split is the previous layer's device. That is not missing support: only disable the op when
+            // the layer's device cannot run it.
+            if (device_fused != device_layer && device_layer && ggml_backend_dev_supports_op(device_layer, node.tensor)) {
+                LLAMA_LOG_DEBUG("%s: layer %d: %s is on device %s, layer on %s, which supports it\n", func, node.il,
+                        probe.name, device_fused ? ggml_backend_dev_name(device_fused) : "none",
+                        ggml_backend_dev_name(device_layer));
+                continue;
+            }
 
             if (device_fused != device_layer) {
                 LLAMA_LOG_WARN("%s: layer %d is assigned to device %s but %s "
@@ -1087,13 +1154,13 @@ void llama_context::reserve_max_prefill(
     if (model.arch == LLM_ARCH_DEEPSEEK4 || model.arch == LLM_ARCH_DEEPSEEK41) {
         return;
     }
-    // Only the first ubatch of a multi-ubatch single-sequence prefill: later
-    // ubatches are already covered, and a single ubatch cannot grow. A later
-    // ubatch that switches the attention variant (below) is the exception.
-    if (n_tokens_all <= cparams.n_ubatch) {
-        return;
-    }
-    if (ubatch.n_tokens != cparams.n_ubatch || ubatch.n_seq_tokens != cparams.n_ubatch) {
+    // Prompt-sized ubatches of one sequence only. A llama_decode call with a single ubatch also takes it: the server
+    // splits a prompt into several calls (it ends one before the last ubatch for a checkpoint), and a short ubatch
+    // (2044 tokens) recorded sizes that the full ubatch of the next call (2048) outgrew. That reallocation
+    // synchronized every backend and drained the ubatch still in flight from the previous call. Later ubatches of a
+    // call are already covered, except one that switches the attention variant (below).
+    GGML_UNUSED(n_tokens_all);
+    if (2*ubatch.n_tokens < cparams.n_ubatch || ubatch.n_seqs_unq != 1 || ubatch.n_seq_tokens != ubatch.n_tokens) {
         return;
     }
     if (model.hparams.no_alloc) {
@@ -3470,7 +3537,7 @@ void llama_context::sched_set_workers(ggml_backend_sched_t s) {
         }
         bool remote = false;
         for (int t = 0; enabled && expert_cache && t < expert_cache->n_tiers(); ++t) {
-            remote |= expert_cache->tier_backend(t) == b.get() && b.get() != expert_cache->backend();
+            remote |= expert_cache->tier_backend(t) == b.get() && expert_cache->serves_remote(b.get());
         }
         const bool prefill = expert_cache && expert_cache->prefill_overlap() && b.get() == expert_cache->backend();
         const bool worker = remote || (enabled && prefill);
@@ -3496,10 +3563,6 @@ void llama_context::expert_cache_auto() {
         return;
     }
     expert_cache->auto_size = false;
-    const size_t margin = [] {
-        const char * e = getenv("LLAMA_MOE_CACHE_AUTO_MARGIN_MIB");
-        return size_t(e ? std::max(0LL, atoll(e)) : 1536LL) << 20;
-    }();
     synchronize();
     // staging slots of their own go back, so that the rings borrow from the tiers instead
     ggml_backend_sched_stage_release(sched.get());
@@ -3508,20 +3571,24 @@ void llama_context::expert_cache_auto() {
             ggml_backend_sched_stage_release(slot.sched.get());
         }
     }
+    // tiers on the GPUs of the cached layers only, unless LLAMA_MOE_CACHE_AUTO_REMOTE=1 (a tier on another GPU costs a copy to it
+    // and back per layer)
     for (const auto & d : model.devices) {
-        if (ggml_backend_dev_type(d.dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+        const std::string name = ggml_backend_dev_name(d.dev);
+        if (!expert_cache->auto_device(d.dev)) {
             continue;
         }
         size_t free = 0, total = 0;
         ggml_backend_dev_memory(d.dev, &free, &total);
-        if (free <= margin) {
+        const size_t budget = expert_device_policy.auto_budget(name, free);
+        if (!budget) {
             LLAMA_LOG_INFO("%s: expert cache auto: %s has %.0f MiB free, no tier\n", __func__, ggml_backend_dev_name(d.dev),
                     free / 1048576.0);
             continue;
         }
-        const int id = share_add_tier(d.dev, free - margin);
-        LLAMA_LOG_INFO("%s: expert cache auto: %s %.0f MiB free, tier %d of up to %.0f MiB\n", __func__,
-                ggml_backend_dev_name(d.dev), free / 1048576.0, id, (free - margin) / 1048576.0);
+        const int id = share_add_tier(d.dev, budget);
+        LLAMA_LOG_INFO("%s: expert cache auto: %s %.0f MiB free, %.0f MiB reserve, tier %d of up to %.0f MiB\n", __func__,
+                name.c_str(), free / 1048576.0, expert_device_policy.margin(name) / 1048576.0, id, budget / 1048576.0);
     }
 }
 
@@ -3531,7 +3598,9 @@ void llama_context::sched_set_stage_lender() {
         ggml_backend_sched_set_stage_lender(sched.get(), llama_expert_cache::lend, expert_cache.get());
     }
     for (auto & b : backends) {
-        if (std::find(stage_blocked.begin(), stage_blocked.end(), ggml_backend_get_device(b.get())) != stage_blocked.end()) {
+        auto * dev = ggml_backend_get_device(b.get());
+        if (dev && (!expert_device_policy.stage_allowed(ggml_backend_dev_name(dev)) ||
+                std::find(stage_blocked.begin(), stage_blocked.end(), dev) != stage_blocked.end())) {
             ggml_backend_sched_stage_allow(sched.get(), b.get(), false);
         }
     }
@@ -3736,10 +3805,11 @@ void llama_context::share_stage_allow(ggml_backend_dev_t dev, bool allow) {
         if (ggml_backend_get_device(b.get()) != dev) {
             continue;
         }
-        ggml_backend_sched_stage_allow(sched.get(), b.get(), allow);
+        const bool permitted = allow && expert_device_policy.stage_allowed(ggml_backend_dev_name(dev));
+        ggml_backend_sched_stage_allow(sched.get(), b.get(), permitted);
         for (auto & slot : graph_slots) {
             if (slot.sched) {
-                ggml_backend_sched_stage_allow(slot.sched.get(), b.get(), allow);
+                ggml_backend_sched_stage_allow(slot.sched.get(), b.get(), permitted);
             }
         }
     }
@@ -3880,6 +3950,7 @@ llm_graph_params llama_context::graph_params(
         /*.cross       =*/ &cross,
         /*.mtp_device_draft_cache =*/ &mtp_device_draft_cache,
         /*.expert_cache =*/ expert_cache.get(),
+        /*.engram_reader =*/ engram_reader.get(),
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
@@ -4012,11 +4083,11 @@ llm_graph_cb llama_context::graph_get_cb() const {
                 strcmp(name, "ffn_moe_weighted") == 0 || strcmp(name, "ffn_moe_out") == 0;
         // Model builders can rename the returned MoE tensor. Keep an explicitly placed cache merge on its GPU.
         const bool cache_merge = expert_cache && strcmp(name, "ffn_moe_out") == 0 &&
-                ggml_backend_sched_get_tensor_backend(sched.get(), cur) == expert_cache->backend();
+                ggml_backend_sched_get_tensor_backend(sched.get(), cur) == expert_cache->backend(il);
         if (cache_cpu || (cpu_experts && ubatch.n_tokens > 16 && routed && !cache_merge)) {
             ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend_cpu);
         } else if (cache_gpu && expert_cache) {
-            ggml_backend_sched_set_tensor_backend(sched.get(), cur, expert_cache->backend());
+            ggml_backend_sched_set_tensor_backend(sched.get(), cur, expert_cache->backend(il));
         } else if (expert_cache && strncmp(name, "ffn_cache_x", 11) == 0) {
             // an expert cache tier on another GPU
             const int tier = atoi(name + 11);
@@ -5054,6 +5125,27 @@ void llama_share_stage_allow(llama_context * ctx, const char * dev, bool allow) 
 
 bool llama_share_has_expert_cache(const llama_context * ctx) {
     return ctx->share_expert_cache() != nullptr;
+}
+
+bool llama_share_has_cache_on_device(const llama_context * ctx, const char * dev) {
+    const auto * cache = ctx->share_expert_cache();
+    const auto d = llama_share_find_dev(dev);
+    if (!cache || !d) {
+        return false;
+    }
+    if (cache->auto_size && cache->auto_device(d)) {
+        for (const auto & device : ctx->get_model().devices) {
+            if (device.dev == d) {
+                return true;
+            }
+        }
+    }
+    for (const auto & tier : cache->tier_list()) {
+        if (ggml_backend_get_device(tier.second) == d) {
+            return true;
+        }
+    }
+    return false;
 }
 
 const char * llama_share_home_device(const llama_context * ctx) {

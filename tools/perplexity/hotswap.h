@@ -33,6 +33,8 @@ public:
               const std::string & path, std::string & error);
     int reload(const std::string & patch_path, std::string & error);
     int restore(std::string & error);
+    // Applies a patch on top of the current tensors (no return to the floor first); returns the changed count.
+    int add(const std::string & patch_path, std::string & error);
     void commit();
     void rollback();
 

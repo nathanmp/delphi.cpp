@@ -11,13 +11,15 @@ import subprocess
 import sys
 from pathlib import Path
 
-from config import AXES, SCHEMA, QuantError, digest, file_identity, imatrix_identities, imatrix_inputs, load_config, write_json
-from model import classify, merge_imatrices, read_model
+from config import AXES, RUNTIME_NAMES, SCHEMA, QuantError, digest, file_identity, imatrix_identities, imatrix_inputs, load_config, loss_only, runtime_allows, write_json
+import progress
+from model import (check_runtime_source, classify, is_lazy, merge_imatrices, read_model, shard_name, tensor_bytes, unlink_model,
+                   unsharded)
 from calibrate import calibrate, per_chunk, perplexity_command, run_direct
 from corpus import collect_imatrices
 from quality import LossModel, load_quality, quality_metadata
 from search import make_options, memory, search
-from timing import MODEL_REVISION, Predictor, fit_slopes, gpu, machine_settings, measure_ops, profile_model, profile_times, run
+from timing import MODEL_REVISION, Predictor, fit_slopes, gpu, gpu_only, gpus, machine_settings, measure_env, measure_ops, profile_model, profile_times, projected, run
 
 
 def inputs(cfg, info):
@@ -27,10 +29,14 @@ def inputs(cfg, info):
                          ("llama-quant-damage", "llama-quantize", "test-backend-ops", "llama-bench")},
             "libraries": [file_identity(p) for p in sorted(Path(cfg["bindir"]).glob("lib*.so*")) if not p.is_symlink()],
             "runtime": cfg["runtime"], "timing": cfg["timing"], "timing_model_revision": MODEL_REVISION,
-            "gpu": gpu(cfg), "ram_routed": "RAM" in cfg["devices"], "cache_mib": cfg["cache_mib"],
+            "gpu": gpu(cfg), "ram_routed": "RAM" in cfg["devices"],
+            # whether a cache runs decides which operations are measured; its size is a planning input (the baseline records its own)
+            "cache_mib": cfg["cache_mib"] and 1,
             "machine_settings": machine_settings(),
             "inherited_environment": {name: value for name, value in os.environ.items()
                                       if name.startswith(("GGML_", "LLAMA_", "CUDA_", "HIP_", "HSA_", "ROCR_", "OMP_", "LD_LIBRARY_PATH"))}}
+    if gpu_only(cfg):
+        result["layer_split_gpus"] = gpus(cfg)  # only here, so the digests of earlier prepared snapshots stay valid
     return result
 
 
@@ -52,7 +58,8 @@ def get_damage(info, cfg, directory, imatrix):
     artifacts = []
     paths = []
     for category in ("primary", "other"):
-        selected = [t for t in info["tensors"] if t["category"] == category and not t["preserved"]
+        # a pinned lazy table has one option and no device cost, so its damage cannot change a decision
+        selected = [t for t in info["tensors"] if t["category"] == category and not t["preserved"] and not is_lazy(t["name"])
                     and any(q != t["source_dtype"] for q in t["pool"])]
         if not selected:
             continue
@@ -67,7 +74,11 @@ def get_damage(info, cfg, directory, imatrix):
         if not cfg["sampling"]["row_stats"]:
             command += ["--no-row-stats"]
         print(f"Sampling {category}: {len(selected)} tensors, {len(qtypes)} qtypes", flush=True)
-        run(command, directory / f"damage-{category}.log", cfg["runtime"]["env"])
+        log = directory / f"damage-{category}.log"
+        # llama-quant-damage prints one header line per sampled tensor
+        probe = lambda: (progress.count_matches(log, r"^\S+ \[[0-9, ]+\] \S+,"), len(selected), None, "")
+        with progress.Watcher(f"prepare: damage sampling ({category})", probe, total=len(selected), poll=5.0):
+            run(command, log, cfg["runtime"]["env"])
         artifact = json.loads((directory / f"damage-{category}.json").read_text())
         artifacts.append(artifact)
         paths.append(str(directory / f"damage-{category}.json"))
@@ -92,6 +103,8 @@ def verify_output(info, types, output, check_preserved=True):
         if check_preserved and source["preserved"]:
             if source["source_bytes"] != t["source_bytes"]:
                 raise QuantError(f"preserved tensor size changed: {name}")
+            if source["offset"] == t["offset"] and os.path.samefile(source["file"], t["file"]):
+                continue  # the same bytes of the same file (a shared lazy shard)
             with open(source["file"], "rb") as before, open(t["file"], "rb") as after:
                 before.seek(source["offset"])
                 after.seek(t["offset"])
@@ -104,16 +117,39 @@ def verify_output(info, types, output, check_preserved=True):
     return actual
 
 
+def encoded_path(info, output):
+    """The path that encode() writes for output: X.gguf, or shard 1 of X when the source keeps its lazy tables in a shard
+    of their own (the encoded model then has the same layout and shares that shard)."""
+    return shard_name(output, 0, 2) if info.get("lazy_separate") else Path(output)
+
+
+def link_lazy_shard(source, name):
+    """name becomes a hard link of the lazy shard source when both are on one file system, else a symbolic link."""
+    name = Path(name)
+    name.unlink(missing_ok=True)
+    try:
+        os.link(source, name)
+    except OSError:
+        os.symlink(Path(source).resolve(), name)
+
+
 def encode(info, cfg, choices, imatrix, output, quality=None):
-    """Write the recipe with llama-quantize and verify every planned type; quality is metadata for the record."""
-    output = Path(output).resolve()
+    """Write the recipe with llama-quantize and verify every planned type; quality is metadata for the record.
+
+    When the source keeps its lazy tables in a shard of their own (a base, see base.py), the encoded model gets the same
+    layout: shard 1 holds the other tensors and the lazy shard is a link to the source's (the lazy tables are not
+    changed, so the file is the same). Returns the path of the model: output, or its shard 1."""
+    stem = unsharded(Path(output).resolve())
+    output = encoded_path(info, stem)
+    split = bool(info.get("lazy_separate"))
     if output.exists():
         raise QuantError(f"output already exists: {output}")
     output.parent.mkdir(parents=True, exist_ok=True)
     types = tensor_plan(info, choices)
-    plan_file = output.with_suffix(".tensor-types.txt")
+    plan_file = stem.with_suffix(".tensor-types.txt")
     plan_file.write_text("".join(f"^{re.escape(name)}$={dtype.lower()}\n" for name, dtype in types.items()))
-    partial = output.with_suffix(".partial.gguf")
+    partial_stem = stem.with_suffix(".partial.gguf")
+    partial = encoded_path(info, partial_stem)
     if partial.exists():
         raise QuantError(f"partial output exists; inspect it before retrying: {partial}")
     command = [str(Path(cfg["bindir"]) / "llama-quantize"), "--pure", "--tensor-type-file", str(plan_file)]
@@ -121,15 +157,84 @@ def encode(info, cfg, choices, imatrix, output, quality=None):
         command += ["--imatrix", str(imatrix)]
     if cfg.get("allow_requantize", False):
         command += ["--allow-requantize"]
-    command += [cfg["model"], str(partial), "Q2_K", str(cfg["runtime"]["threads"])]
+    lazy_source = None
+    if split:
+        lazy = [t["name"] for t in info["tensors"] if is_lazy(t["name"])]
+        lazy_file, main_file = stem.with_suffix(".lazy-tensors.txt"), stem.with_suffix(".main-tensors.txt")
+        lazy_file.write_text("".join(f"{n}\n" for n in lazy))
+        command += ["--split-tensors", str(lazy_file)]
+        if all(types[n] == t["source_dtype"] for t in info["tensors"] for n in [t["name"]] if is_lazy(n)):
+            # only the first shard is written: the lazy shard is the one of the source
+            main_file.write_text("".join(f"{t['name']}\n" for t in info["tensors"] if not is_lazy(t["name"])))
+            command += ["--only-tensors", str(main_file)]
+            lazy_source = Path(info["files"][-1]["path"])
+    command += [cfg["model"], str(partial_stem), "Q2_K", str(cfg["runtime"]["threads"])]
     print(f"Encoding {output.name}", flush=True)
-    run(command, output.with_suffix(".encode.log"), cfg["runtime"]["env"])
-    verify_output(info, types, partial)
+    expected = sum(tensor_bytes(t["shape"], types[t["name"]]) for t in info["tensors"] if not (split and is_lazy(t["name"])))
+    try:
+        with progress.watch_file(f"encode {output.name}", partial, expected):
+            # no time limit: a large model with slow types (IQ2_XXS) takes hours
+            run(command, stem.with_suffix(".encode.log"), cfg["runtime"]["env"], timeout=None)
+        if split and lazy_source:
+            link_lazy_shard(lazy_source, shard_name(partial_stem, 1, 2))
+        verify_output(info, types, partial)
+    finally:
+        for name in ("lazy-tensors", "main-tensors"):
+            stem.with_suffix(f".{name}.txt").unlink(missing_ok=True)
     partial.replace(output)
-    write_json(output.with_suffix(".encode.json"), {"command": command, "types": types, "source": info["identity"],
-                                                  "output": file_identity(output), "verified_preserved_payloads": True,
-                                                  "quality": quality})
+    if split:
+        lazy_name = shard_name(stem, 1, 2)
+        if lazy_source:
+            link_lazy_shard(lazy_source, lazy_name)
+            shard_name(partial_stem, 1, 2).unlink()
+        else:
+            shard_name(partial_stem, 1, 2).replace(lazy_name)
+    write_json(stem.with_suffix(".encode.json"), {"command": command, "types": types, "source": info["identity"],
+                                                "output": file_identity(output), "verified_preserved_payloads": True,
+                                                "quality": quality})
     return str(output)
+
+
+def encode_from_frontier(frontier, recipe_id, output):
+    """Encode one recipe of a plan after checking that the source and the encoder inputs are unchanged."""
+    if frontier.get("schema") != SCHEMA:
+        raise QuantError("unsupported frontier schema")
+    cfg = frontier["config"]
+    info = frontier["prepared"]["model"]
+    if read_model(cfg["model"])["identity"] != info["identity"]:
+        raise QuantError("source model changed since planning")
+    current = configured_model(cfg)
+    if digest(inputs(cfg, current)) != frontier["prepared"]["input_key"]:
+        raise QuantError("encoder, imatrix or runtime inputs changed since planning")
+    recipe = next((r for r in frontier["recipes"] if r["id"] == recipe_id), None)
+    if recipe is None:
+        raise QuantError(f"unknown recipe {recipe_id}")
+    runtime = cfg.get("target_runtime", "delphi")
+    for name, dtype in recipe["tensor_types"].items():
+        if not runtime_allows(runtime, dtype):
+            raise QuantError(f"the recipe gives {name} the type {dtype}, which runtime {RUNTIME_NAMES[runtime]} cannot load")
+    return encode(info, cfg, recipe["choices"], frontier["prepared"]["imatrix"], output, frontier["quality"])
+
+
+def gpu_descriptions(listed, names):
+    """{device: description} from `--list-devices` lines like 'ROCm0: AMD Radeon AI PRO R9700 (32624 MiB, 32000 MiB free)'.
+
+    The memory part is dropped, so equal models compare equal whatever is free. A missing device is absent."""
+    found = {}
+    for line in listed.splitlines():
+        m = re.match(r"\s*(\S+):\s*(.*?)\s*\(\d+ MiB, \d+ MiB free\)\s*$", line)
+        if m and m[1] in names:
+            found[m[1]] = m[2]
+    return {name: found[name] for name in names if name in found}
+
+
+def require_identical_gpus(listed, names):
+    """GPU-only timings come from operation measurements on the first GPU, which stand for all of them only when the GPUs match."""
+    found = gpu_descriptions(listed, names)
+    if set(found) != set(names):
+        raise QuantError(f"could not read the descriptions of {sorted(set(names) - set(found))} from llama-bench --list-devices")
+    if len(set(found.values())) != 1:
+        raise QuantError("GPU-only placement across different GPU models is not implemented: operation timings are measured on the first GPU")
 
 
 def prepare(cfg, directory, timeout):
@@ -141,38 +246,63 @@ def prepare(cfg, directory, timeout):
         if device != "RAM" and not re.search(r"\b" + re.escape(device) + r"\b", listed):
             raise QuantError(f"unavailable device {device}")
     info = configured_model(cfg)
-    if any("engram_embd" in t["name"] or "per_layer_token_embd" in t["name"] for t in info["tensors"]):
-        raise QuantError("lazy-table residency planning needs explicit resident-byte accounting and is not implemented")
-    if len([name for name in cfg["devices"] if name != "RAM"]) > 1 and "RAM" not in cfg["devices"]:
-        raise QuantError("GPU-only multiple-device placement is not implemented; use one GPU or a RAM-routed speed projection")
+    if gpu_only(cfg):
+        require_identical_gpus(listed, gpus(cfg))
     key = digest(inputs(cfg, info))
+    # With loss-only weights the operation timings and the baseline profile are not measured. The floor GGUF is still
+    # encoded, because calibration measures on it.
+    timed = not loss_only(cfg)
     snapshot = directory / "prepared.json"
     if snapshot.exists():
         old = load_prepared(snapshot, cfg)
-        print(f"Reusing {snapshot}; timing reflects the recorded machine state", flush=True)
-        return old
+        if old.get("timed", True):
+            print(f"Reusing {snapshot}; timing reflects the recorded machine state", flush=True)
+            return old
+        if not timed:
+            print(f"Reusing {snapshot}; it has no timing (loss-only weights)", flush=True)
+            return old
+        print(f"{snapshot} has no timing (it was prepared with loss-only weights); preparing again with timing", flush=True)
     imatrix = merge_imatrices(cfg["imatrix"], directory / "merged-imatrix.gguf", cfg.get("imatrix_weights"))
     damage = get_damage(info, cfg, directory, imatrix)
-    print("Measuring bounded operation signatures", flush=True)
-    operations = measure_ops(info, cfg, directory / "calibration", timeout)
+    operations = {}
+    if timed:
+        print("Measuring bounded operation signatures", flush=True)
+        operations = measure_ops(info, cfg, directory / "calibration", timeout)
     excluded = make_options(info, damage, operations, cfg)
     baseline_choices = {group["name"]: min(group["options"], key=lambda o: (o["bytes"], o["damage"], o["qtype"]))["qtype"]
                         for group in info["groups"]}
     mem = memory(info, cfg, baseline_choices)
     if any(value < 0 for value in mem["headroom_bytes"].values()):
         raise QuantError("minimum-byte baseline exceeds a device budget")
-    baseline = directory / "baseline.gguf"
+    baseline = encoded_path(info, directory / "baseline.gguf")
     if baseline.exists():
-        verify_output(info, tensor_plan(info, baseline_choices), baseline)
+        try:
+            verify_output(info, tensor_plan(info, baseline_choices), baseline)
+        except QuantError as exc:
+            # a baseline of other inputs (another model or candidate set): encode it again
+            print(f"Encoding {baseline} again: {exc}", flush=True)
+            unlink_model(baseline)
+    if not baseline.exists():
+        partial = encoded_path(info, directory / "baseline.partial.gguf")
+        if partial.exists():
+            print(f"Removing the partial baseline of an interrupted encode: {partial}", flush=True)
+            unlink_model(partial)
+        encode(info, cfg, baseline_choices, imatrix, directory / "baseline.gguf")
+    measured, profile_file = None, None
+    if timed:
+        print("Profiling baseline short/long prefill and decode", flush=True)
+        profile_file = directory / "baseline-profile.json"
+        with progress.Watcher("prepare: profiling baseline", lambda: None):
+            # an auto-sized cache is measured at the size that the plan gives the baseline
+            profiled = {**cfg, "cache_mib": mem["cache_bytes"] // (1 << 20)} if cfg["cache_mib"] == "auto" else cfg
+            measured = profile_times(profile_model(profiled, baseline, profile_file, placement=mem.get("layer_split")), cfg)
     else:
-        encode(info, cfg, baseline_choices, imatrix, baseline)
-    print("Profiling baseline short/long prefill and decode", flush=True)
-    profile = profile_model(cfg, baseline, directory / "baseline-profile.json")
+        print("Loss-only weights: skipped the operation timing and the baseline profile", flush=True)
     result = {"schema": SCHEMA, "input_key": key, "config": cfg, "model": info, "damage": damage,
               "operations": operations, "excluded": excluded, "imatrix": imatrix,
-              "baseline": {"path": str(baseline), "choices": baseline_choices, "measured_ms": profile_times(profile, cfg),
-                           "memory": mem, "profile": str(directory / "baseline-profile.json")},
-              "slopes": {regime: 1.0 for regime in AXES[1:]}, "timing_qualified": False}
+              "baseline": {"path": str(baseline), "choices": baseline_choices, "measured_ms": measured,
+                           "memory": mem, "profile": str(profile_file) if profile_file else None},
+              "slopes": {regime: 1.0 for regime in AXES[1:]}, "timing_qualified": False, "timed": timed}
     write_json(snapshot, result)
     return result
 
@@ -187,7 +317,11 @@ def load_prepared(path, cfg):
         # Early V1 snapshots omitted the cost-model settings from their key. Upgrade only equivalent inputs.
         legacy = dict(facts)
         legacy.pop("timing")
-        if data["input_key"] == digest(legacy) and cfg["timing"] == data["config"].get("timing", {}):
+        # snapshots made when the key held the cache size itself: the same prepared cache size is the same input
+        sized = dict(facts, cache_mib=data["config"].get("cache_mib", 0))
+        if data["input_key"] == digest(sized) and bool(data["config"].get("cache_mib", 0)) == bool(facts["cache_mib"]):
+            data["input_key"] = digest(facts)
+        elif data["input_key"] == digest(legacy) and cfg["timing"] == data["config"].get("timing", {}):
             data["input_key"] = digest(facts)
         else:
             raise QuantError("model, imatrix, candidates, binary, cost model or runtime changed; prepare again")
@@ -203,7 +337,10 @@ def predictor_for(data, cfg):
                                       .get("decode", {}).get("cpu_compute_ms", {}).get("median"))
     predictor = Predictor(data["model"], cfg, data["operations"], data["baseline"]["choices"],
                           data["baseline"]["measured_ms"], data["slopes"], baseline["cpu_compute_ms"])
-    predictor.baseline_cost = predictor.cost(data["baseline"]["choices"], data["baseline"]["memory"]["cache_hit_prior"])
+    # the baseline was measured with the cache size of the prepared inputs, whatever size the plan asks for
+    prepared_cache = data["config"].get("cache_mib", 0)
+    base = memory(data["model"], {**cfg, "cache_mib": prepared_cache}, data["baseline"]["choices"]) if prepared_cache else None
+    predictor.baseline_cost = predictor.cost(data["baseline"]["choices"], base["cache_hit_prior"] if base else 0.0)
     return predictor
 
 
@@ -213,9 +350,16 @@ def loss_model(data, cfg):
 
 
 def plan(data, cfg, output):
+    # the runtime only narrows the candidates of the search, so the prepared inputs and the calibration stay valid
+    check_runtime_source(data["model"], cfg)
     model, table = loss_model(data, cfg)
-    predictor = predictor_for(data, cfg)
-    result = search(data["model"], cfg, predictor, data["baseline"]["choices"], model)
+    timed = data.get("timed", True)
+    if not timed and not loss_only(cfg):
+        raise QuantError("the prepared inputs have no timing (they were prepared with loss-only weights); prepare again "
+                         "with these weights or speed bounds to measure it")
+    predictor = predictor_for(data, cfg) if timed else None
+    with progress.Watcher("plan: search", lambda: None):
+        result = search(data["model"], cfg, predictor, data["baseline"]["choices"], model)
     outdir = Path(output).resolve()
     outdir.mkdir(parents=True, exist_ok=True)
     recipes = []
@@ -223,34 +367,62 @@ def plan(data, cfg, output):
         state.pop("key")
         state["id"] = f"recipe-{index:03d}"
         state["tensor_types"] = tensor_plan(data["model"], state["choices"])
+        if model:
+            state["extrapolated_groups"] = model.extrapolated(state["choices"])
         write_json(outdir / f"{state['id']}.json", state)
         recipes.append(state)
-    projection = sum(name != "RAM" for name in cfg["devices"]) > 1 and any(cfg["multi_gpu_speedup_percent"].values())
+    projection = projected(cfg) and any(cfg["multi_gpu_speedup_percent"].values())
     qualified = data["timing_qualified"] and not projection
-    payload = {"schema": SCHEMA, "config": cfg, "source": data["model"]["identity"], "prepared": data,
-               "search": result, "recipes": recipes, "timing_qualified": qualified,
+    payload = {"schema": SCHEMA, "config": cfg, "target_runtime": cfg.get("target_runtime", "delphi"),
+               "source": data["model"]["identity"], "prepared": data,
+               "search": result, "recipes": recipes, "timing_qualified": qualified, "timed": timed,
                "single_gpu_timing_qualified": data["timing_qualified"], "user_gpu_projection": projection,
                "quality": quality_metadata(table),
-               "limitations": ["loss is the calibrated model's predicted KL against the teacher on the calibration text, not a bound" if table else "loss is a local source-relative proxy, not KLD or accuracy",
+               "limitations": ["loss is the calibrated model's predicted KL against the teacher on the calibration text, not a bound" if table else "loss is a local source-relative proxy, not KLD or accuracy"]
+               + (["speed was not measured (loss-only weights)"] if not timed else [
                                "uniform synthetic routing and fixed route frequencies",
                                "link bandwidth and handoff latency are priors unless supplied",
-                               "cache hits use a uniform residency prior; cache policy replay is not calibrated",
+                               *(["cache hits come from the measured routing curve (an offline replay of the cache policy on a routing trace)"
+                                  if cfg.get("routing_curve") else
+                                  "cache hits use a uniform residency prior; no routing curve was measured for this model"]
+                                 if cfg["cache_mib"] else []),
                                "tail ubatches use interpolation; trace integrity has not been certified",
-                               "multiple GPUs use user throughput factors, without pooled capacity or a runtime layout"]}
-    payload["effective_cpu_decode_gb_s"] = (predictor.cpu_bytes_per_ms or 0) / 1e6
+                               "the layers are split over the GPUs by memory (layer_split), with timings from operations measured on the first GPU and summed over the devices; pipeline overlap between GPUs is not modelled"
+                               if gpu_only(cfg) else
+                               "multiple GPUs use user throughput factors, without pooled capacity or a runtime layout"])}
+    payload["effective_cpu_decode_gb_s"] = (predictor.cpu_bytes_per_ms or 0) / 1e6 if timed else None
     write_json(outdir / "frontier.json", payload)
     print(f"{result['status']}: {len(recipes)} nondominated recipes; {result['evaluated']} evaluations")
     print(f"recipe       {'pred. KL' if table else 'local R':>10s}  decode t/s  short t/s  long t/s  score")
     for state in recipes[:cfg["search"]["display"]]:
         times = state["predicted_ms"]
-        print(f"{state['id']}  {state['loss']:10.5g}  {1000/times['decode']:10.2f}  "
-              f"{1000*cfg['runtime']['short_tokens']/times['short']:9.2f}  "
-              f"{1000*cfg['runtime']['long_tokens']/times['long']:8.2f}  {state['score']:.4f}")
+        speeds = (f"{1000/times['decode']:10.2f}  {1000*cfg['runtime']['short_tokens']/times['short']:9.2f}  "
+                  f"{1000*cfg['runtime']['long_tokens']/times['long']:8.2f}" if times else f"{'-':>10s}  {'-':>9s}  {'-':>8s}")
+        print(f"{state['id']}  {state['loss']:10.5g}  {speeds}  {state['score']:.4f}")
+    if not timed:
+        print("Speed was not measured (loss-only weights)")
     status = "user GPU projection from the single-GPU baseline" if projection else "qualified on held-out witnesses" if qualified else "unqualified estimates"
-    print(f"Saved {outdir / 'frontier.json'}; timing predictions are {status}")
+    print(f"Saved {outdir / 'frontier.json'}" + (f"; timing predictions are {status}" if timed else ""))
+    print(runtime_summary(cfg))
+    if cfg["cache_mib"] and recipes:
+        mem = recipes[0]["memory"]
+        print(f"Expert cache of the best recipe: {mem['cache_slots']} slots, {mem['cache_bytes'] / (1 << 20):.0f} MiB, "
+              f"predicted hit share {100 * mem['cache_hit_prior']:.1f} % ({mem['cache_hit_source']})")
     if table:
         print(f"Predicted KL is against the teacher on the calibration text (floor {table['floor']['kl']:.5f}); max_loss is a model ceiling, not a bound")
+        beyond = [len(state["extrapolated_groups"]) for state in recipes if state["extrapolated_groups"]]
+        if beyond:
+            print(f"warning: {len(beyond)} of {len(recipes)} recipes use qtypes more precise than the top probe "
+                  f"{table['probe_qtypes']['top']} in up to {max(beyond)} groups; their predicted KL is extrapolated "
+                  "(calibrate with a more precise top probe, for example without calibration.probe_qtypes)")
     return payload
+
+
+def runtime_summary(cfg):
+    runtime = cfg.get("target_runtime", "delphi")
+    if runtime == "delphi":
+        return f"Runtime {RUNTIME_NAMES[runtime]}: every tensor type is allowed"
+    return f"Runtime {RUNTIME_NAMES[runtime]}: only tensor types that it loads are used; speeds are Delphi estimates"
 
 
 def witness_choices(info, baseline, spec):
@@ -290,13 +462,16 @@ def witness_loss(cfg, table, model, directory, name, timeout=7200):
         command = perplexity_command(cfg, c, model, table["execution"]["devices"][0], teacher["path"])
         print(f"Measuring witness {name} KL against the teacher", flush=True)
         partial = directory / f"{name}-kl.partial.f32"
-        run_direct(command, partial, directory / f"{name}-kl.log", cfg["runtime"]["env"], timeout)
+        run_direct(command, partial, directory / f"{name}-kl.log", measure_env(cfg), timeout)
         partial.replace(tokens)
     chunks = per_chunk(tokens, table["teacher"]["chunks"])
     return float(chunks.mean()), float(chunks.std(ddof=1) / len(chunks) ** 0.5)
 
 
 def validate(data, cfg, specification, directory):
+    if not data.get("timed", True):
+        raise QuantError("validate qualifies the timing predictions, and the prepared inputs have no timing (loss-only "
+                         "weights); prepare again with a time importance")
     directory = Path(directory).resolve()
     directory.mkdir(parents=True, exist_ok=True)
     loss, table = loss_model(data, cfg)
@@ -316,17 +491,17 @@ def validate(data, cfg, specification, directory):
         seen_mixes.add(mix_key)
         if any(value < 0 for value in mem["headroom_bytes"].values()):
             raise QuantError(f"witness {name} exceeds budget")
-        model = directory / f"{name}.gguf"
+        model = encoded_path(data["model"], directory / f"{name}.gguf")
         if model.exists():
             verify_output(data["model"], tensor_plan(data["model"], choices), model)
         else:
-            encode(data["model"], cfg, choices, data["imatrix"], model, quality_metadata(table))
+            encode(data["model"], cfg, choices, data["imatrix"], directory / f"{name}.gguf", quality_metadata(table))
         profile_file = directory / f"{name}-profile.json"
         if profile_file.exists():
             profile = json.loads(profile_file.read_text())
         else:
             print(f"Profiling witness {name} ({spec['role']})", flush=True)
-            profile = profile_model(cfg, model, profile_file)
+            profile = profile_model(cfg, model, profile_file, placement=mem.get("layer_split"))
         witnesses.append({"name": name, "role": spec["role"], "choices": choices, "hit_fraction": mem["cache_hit_prior"],
                           "measured": profile_times(profile, cfg), "profile": str(profile_file)})
         if table is not None:
@@ -419,27 +594,15 @@ def main():
             print(f"Saved {merge_imatrices(paths, args.output.resolve(), weights)}")
             return
         if args.command == "encode":
-            frontier = json.loads(args.frontier.read_text())
-            if frontier.get("schema") != SCHEMA:
-                raise QuantError("unsupported frontier schema")
-            cfg = frontier["config"]
-            info = frontier["prepared"]["model"]
-            if read_model(cfg["model"])["identity"] != info["identity"]:
-                raise QuantError("source model changed since planning")
-            current = configured_model(cfg)
-            if digest(inputs(cfg, current)) != frontier["prepared"]["input_key"]:
-                raise QuantError("encoder, imatrix or runtime inputs changed since planning")
-            recipe = next((r for r in frontier["recipes"] if r["id"] == args.recipe), None)
-            if recipe is None:
-                raise QuantError(f"unknown recipe {args.recipe}")
-            encode(info, cfg, recipe["choices"], frontier["prepared"]["imatrix"], args.output, frontier["quality"])
+            encode_from_frontier(json.loads(args.frontier.read_text()), args.recipe, args.output)
             return
         cfg = load_config(args.config)
         if args.command == "inspect":
             info = configured_model(cfg)
             print(json.dumps({"model": info["architecture"], "devices_bytes": cfg["devices"],
-                              "classification": {c: sum(t["source_bytes"] for t in info["tensors"] if t["category"] == c)
-                                                 for c in ("primary", "other")}, "groups": info["groups"]}, indent=2))
+                              "classification": {c: sum(t["source_bytes"] for t in info["tensors"] if t["category"] == c and not is_lazy(t["name"]))
+                                                 for c in ("primary", "other")},
+                              "lazy_bytes": sum(t["source_bytes"] for t in info["tensors"] if is_lazy(t["name"])), "groups": info["groups"]}, indent=2))
         elif args.command == "prepare":
             prepare(cfg, args.output, args.measurement_seconds)
         elif args.command == "collect-imatrix":
@@ -452,7 +615,8 @@ def main():
                 if not data["imatrix"]:
                     # Without activation statistics R is a weight-space error and misranks groups inside a band.
                     raise QuantError("calibration needs an imatrix so that the sampled local error is activation-weighted")
-                calibrate(data, cfg, args.output, encode, verify_output, text_dir=args.prepared.resolve().parent)
+                with progress.CalibrationWatcher(args.output):
+                    calibrate(data, cfg, args.output, encode, verify_output, text_dir=args.prepared.resolve().parent)
             elif args.command == "plan":
                 plan(data, cfg, args.output)
             else:

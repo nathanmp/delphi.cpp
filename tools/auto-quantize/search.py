@@ -2,26 +2,138 @@
 from __future__ import annotations
 
 import math
+from bisect import bisect_right
 from collections import defaultdict
 
-from config import AXES, QuantError
+import routing
+from config import AXES, RUNTIME_NAMES, QuantError, runtime_allows
 from knapsack import solve
-from model import tensor_bytes
-from timing import gpu, requires_backend_signature
+from model import is_lazy, tensor_bytes
+from timing import gpu, gpu_only, gpus, projected, requires_backend_signature
+
+
+def split_layers(layer_bytes, tail_bytes, reserves, capacities):
+    """Layers per device of the contiguous split that minimizes the largest (reserve + bytes) / capacity.
+
+    The last device also holds tail_bytes (the output). Bisection on the utilization u with a greedy fill: each device
+    takes layers while it stays within u * capacity and the last takes the rest. O(devices * log(layers)) per step."""
+    n, count = len(layer_bytes), len(capacities)
+    prefix = [0]
+    for b in layer_bytes:
+        prefix.append(prefix[-1] + b)
+
+    def fill(u):
+        counts, start = [], 0
+        for d in range(count - 1):
+            end = bisect_right(prefix, prefix[start] + u * capacities[d] - reserves[d]) - 1
+            end = min(max(end, start), n)
+            counts.append(end - start)
+            start = end
+        counts.append(n - start)
+        last = reserves[-1] + prefix[n] - prefix[start] + tail_bytes
+        return counts, last <= u * capacities[-1]
+
+    low, high = 0.0, (prefix[n] + tail_bytes + max(reserves)) / min(capacities)
+    for _ in range(100):
+        mid = (low + high) / 2
+        if fill(mid)[1]:
+            high = mid
+        else:
+            low = mid
+        if high - low <= high * 1e-13:
+            break
+    return fill(high)[0]
+
+
+def llama_layer_devices(counts):
+    """Device index of every layer and then the output, as llama-model.cpp assigns them for -ts counts with -ngl 999.
+
+    The cumulative split points are normalized in float32 and layer il goes to upper_bound(splits, float(il) / (n + 1))."""
+    import numpy as np
+    f32 = np.float32
+    total = sum(counts)  # n_layer_all + 1: the output counts as a layer
+    splits, running = [], f32(0)
+    for c in counts:
+        running = f32(running + f32(c))
+        splits.append(running)
+    splits = [f32(x / running) for x in splits]
+    return [next((d for d, x in enumerate(splits) if f32(f32(il) / f32(total)) < x), len(splits)) for il in range(total)]
+
+
+AUTO_MARGIN_MIB = 1536  # LLAMA_MOE_CACHE_AUTO_MARGIN_MIB default
+
+
+def curve_for(info, cfg, n_layers):
+    """The measured hit curve of cfg["routing_curve"] when it belongs to this model (expert count, MoE layers), else None."""
+    curve = cfg.get("routing_curve")
+    if curve and curve.get("n_expert") == info["n_expert"] and curve.get("layers") == n_layers:
+        return curve
+    return None
+
+
+def hit_prior(info, cfg, slots, n_layers):
+    """Share of the routed-expert selections of small batches that a cache of `slots` slots serves: read off the measured
+    curve of the model (routing.py, slot units), else the uniform prior slots / (experts x layers)."""
+    curve = curve_for(info, cfg, n_layers)
+    if curve is not None:
+        return min(1.0, max(0.0, routing.hit_at(curve["points"], slots)))
+    return min(1.0, slots / max(1, info["n_expert"] * n_layers))
+
+
+def hit_source(info, cfg, n_layers):
+    return "measured routing curve" if curve_for(info, cfg, n_layers) is not None else "uniform prior"
 
 
 def memory(info, cfg, choices):
+    """Per-device resident bytes, headroom and the cache accounting of a recipe.
+
+    GPU-only (several GPUs, no RAM): the layers are split contiguously over the GPUs the way -sm layer -ts does it, the
+    output (and a tied embedding copy) on the last GPU, balancing (reserve + bytes) / capacity. The input embedding
+    stays on the host and is reported as host_bytes, outside every device budget."""
+    only = gpu_only(cfg)
     used = {name: cfg["reserve"].get(name, 0) for name in cfg["devices"]}
     types = {name: choices[group["name"]] for group in info["groups"] for name in group["members"]}
     experts = defaultdict(dict)
+    lazy_bytes, host_bytes, tail, tied = 0, 0, 0, 0
+    layer_bytes = [0] * (info["n_layer"] if only else 0)
+    tied_output = only and not any(t["name"] == "output.weight" for t in info["tensors"])
     for t in info["tensors"]:
+        if t.get("mtp") and not cfg.get("mtp", True):
+            # without an MTP draft the server does not load them; -ts still counts their blocks
+            continue
         dtype = types[t["name"]]
         size = tensor_bytes(t["shape"], dtype)
-        device = "RAM" if t["expert"] and "RAM" in used else gpu(cfg)
-        used[device] += size
+        if is_lazy(t["name"]):
+            # read on demand from disk: not resident, so outside every device budget
+            lazy_bytes += size
+            continue
+        if only:
+            if t["name"].startswith("token_embd"):
+                host_bytes += size
+                if tied_output and t["name"] == "token_embd.weight":
+                    tied += size  # llama.cpp duplicates the tied embedding onto the output device
+            elif t["layer"] >= 0:
+                if t["layer"] >= len(layer_bytes):
+                    raise QuantError(f"{t['name']} is outside the model's {len(layer_bytes)} blocks")
+                layer_bytes[t["layer"]] += size
+            else:
+                tail += size
+        else:
+            device = "RAM" if t["expert"] and "RAM" in used else gpu(cfg)
+            used[device] += size
         if t["expert"]:
             projection = next((p for p in ("gate_up", "gate", "up", "down") if f"ffn_{p}_exps" in t["name"]), None)
             experts[t["layer"]][projection] = (dtype, size // t["shape"][2], t["shape"])
+    split = None
+    if only:
+        names = gpus(cfg)
+        counts = split_layers(layer_bytes, tail + tied, [used[d] for d in names], [cfg["devices"][d] for d in names])
+        start = 0
+        for d, c in zip(names, counts):
+            used[d] += sum(layer_bytes[start:start + c])
+            start += c
+        used[names[-1]] += tail + tied
+        split = [*counts[:-1], counts[-1] + 1]  # the output counts as the last layer of -ts
     groups = {}
     cache_bytes, scratch, slots = 0, 0, 0
     if cfg["cache_mib"]:
@@ -39,29 +151,45 @@ def memory(info, cfg, choices):
             if key not in groups:
                 groups[key] = {"layers": [], "expert_bytes": sum(ws[p][1] for p in ("gate", "up", "down")), "slots": 0}
             groups[key]["layers"].append(layer)
-        budget = int(cfg["cache_mib"] * (1 << 20))
-        layer_bytes = sum(g["expert_bytes"] * len(g["layers"]) for g in groups.values())
-        per_layer = budget // layer_bytes
-        if per_layer == 0:
-            raise QuantError("cache allowance cannot hold an expert per layer")
-        left = budget - per_layer * layer_bytes
-        for g in groups.values():
-            g["slots"] = per_layer * len(g["layers"]) + left // g["expert_bytes"]
-            left %= g["expert_bytes"]
-            cache_bytes += g["slots"] * g["expert_bytes"]
-            slots += g["slots"]
         largest_slab = max(ws[p][1] for ws in experts.values() for p in ws)
         # Device scratch and pinned refill buffer each hold three slabs per async replacement.
         async_experts = int(cfg["runtime"]["env"].get("LLAMA_MOE_CACHE_ASYNC_EXPERTS", 32))
         scratch = 3 * largest_slab * max(1, async_experts)
-        used[gpu(cfg)] += cache_bytes + scratch + sum(ws["gate"][2][2] * 4 for ws in experts.values())
-        used["RAM"] += scratch
+        maps = sum(ws["gate"][2][2] * 4 for ws in experts.values())
+        layer_bytes = sum(g["expert_bytes"] * len(g["layers"]) for g in groups.values())
+        if cfg["cache_mib"] == "auto":
+            # what the server does in auto mode: the memory that the dense weights, the reserves (context, compute buffers,
+            # projector, draft model) and the staging buffers leave on the GPU, less the margin for buffers that grow later
+            margin = int(cfg["runtime"]["env"].get("LLAMA_MOE_CACHE_AUTO_MARGIN_MIB", AUTO_MARGIN_MIB)) * (1 << 20)
+            budget = max(0, cfg["devices"][gpu(cfg)] - used[gpu(cfg)] - scratch - maps - margin)
+        else:
+            budget = int(cfg["cache_mib"] * (1 << 20))
+        per_layer = budget // layer_bytes
+        if per_layer == 0:
+            if cfg["cache_mib"] != "auto":
+                raise QuantError("cache allowance cannot hold an expert per layer")
+            groups, scratch = {}, 0  # no room: the server allocates no tier
+        else:
+            left = budget - per_layer * layer_bytes
+            for g in groups.values():
+                g["slots"] = per_layer * len(g["layers"]) + left // g["expert_bytes"]
+                left %= g["expert_bytes"]
+                cache_bytes += g["slots"] * g["expert_bytes"]
+                slots += g["slots"]
+            used[gpu(cfg)] += cache_bytes + scratch + maps
+            used["RAM"] += scratch
     return {"used_bytes": used, "headroom_bytes": {name: cfg["devices"][name] - value for name, value in used.items()},
+            "lazy_bytes": lazy_bytes, "host_bytes": host_bytes,
+            "total_bytes": sum(used.values()) - sum(cfg["reserve"].get(name, 0) for name in cfg["devices"]) + host_bytes,
             "cache_bytes": cache_bytes, "cache_slots": slots,
             "cache_groups": [{"types": list(key), **value} for key, value in groups.items()],
-            "cache_hit_prior": min(1.0, slots / max(1, info["n_expert"] * len(experts))),
-            "allocation_scope": "tensor payloads, cache banks/maps/scratch and supplied reserves; allocator/repack overhead needs witness validation",
-            "secondary_gpus": "unassigned; percentages change speed predictions only"}
+            "cache_hit_prior": hit_prior(info, cfg, slots, len(experts)),
+            "cache_hit_source": hit_source(info, cfg, len(experts)),
+            "allocation_scope": "tensor payloads without lazy tables, cache banks/maps/scratch and supplied reserves; allocator/repack overhead needs witness validation; lazy tables sit on disk and use page cache as the system allows",
+            "secondary_gpus": "unassigned; percentages change speed predictions only" if not only else
+            "layers split contiguously over the GPUs in order (layer_split, last count includes the output); the input embedding stays on the host",
+            **({"layer_split": split, "runtime_args": ["--device", ",".join(gpus(cfg)), "-sm", "layer", "-ts", ",".join(map(str, split))]}
+               if only else {})}
 
 
 def make_options(info, damage, operations, cfg):
@@ -83,7 +211,7 @@ def make_options(info, damage, operations, cfg):
             error, variance, reason, uncertainty_known = 0.0, 0.0, None, True
             for name in group["members"]:
                 t = by_name[name]
-                if t["preserved"] or dtype == t["source_dtype"]:
+                if t["preserved"] or dtype == t["source_dtype"] or is_lazy(name):
                     continue
                 record = records.get((name, dtype))
                 if record is None:
@@ -104,7 +232,7 @@ def make_options(info, damage, operations, cfg):
                 excluded.append({"group": group["name"], "qtype": dtype, "reason": reason})
             else:
                 options.append({"qtype": dtype, "damage": error, "sampling_se": math.sqrt(variance) if uncertainty_known else None,
-                                "bytes": sum(tensor_bytes(by_name[n]["shape"], dtype) for n in group["members"])})
+                                "bytes": sum(tensor_bytes(by_name[n]["shape"], dtype) for n in group["members"] if not is_lazy(n))})
         if not options:
             raise QuantError(f"no measured legal candidates for {group['name']}")
         group["options"] = options
@@ -139,17 +267,31 @@ def search(info, cfg, predictor, baseline_choices, model=None):
     For each loss multiplier theta, an exact multiple-choice knapsack per device minimizes
     theta * loss / loss_ref + sum_regime importance * time / time_ref; theta = the precision importance is the linearized
     score. A sweep of theta gives the supported points, walks between neighbouring solutions add the recipes between
-    them, and bisection finds the edges of the bounds. Every candidate is then evaluated exactly."""
+    them, and bisection finds the edges of the bounds. Every candidate is then evaluated exactly.
+
+    predictor None (loss-only weights without timing): the trade-off is loss against the total bytes instead of time."""
     groups = info["groups"]
     options = {g["name"]: {o["qtype"]: o for o in g["options"]} for g in groups}
+    # the prepared options hold every type of the pool; the baseline may use types that the target runtime cannot load
+    prepared = options
+    runtime = cfg.get("target_runtime", "delphi")
+    options = {n: {q: o for q, o in opts.items() if runtime_allows(runtime, q)} for n, opts in prepared.items()}
+    for n, opts in options.items():
+        if not opts:
+            raise QuantError(f"no candidate type of {n} loads in runtime {RUNTIME_NAMES[runtime]}")
     baseline_memory = memory(info, cfg, baseline_choices)
     placement = {g["name"]: device_of(info, cfg, g) for g in groups}
-    budgets = {d: baseline_memory["headroom_bytes"][d] + sum(options[n][baseline_choices[n]]["bytes"]
-                                                             for n, dev in placement.items() if dev == d)
-               for d in cfg["devices"]}
-    costs = predictor.group_costs()
-    multi = sum(name != "RAM" for name in cfg["devices"]) > 1
-    scale = {r: predictor.slopes[r] / ((1 + cfg["multi_gpu_speedup_percent"][r] / 100) if multi else 1) for r in AXES[1:]}
+    only = gpu_only(cfg)
+    if only:
+        # the layers move between the GPUs with the recipe, so a device budget is its capacity less the reserve
+        budgets = {d: cfg["devices"][d] - cfg["reserve"].get(d, 0) for d in gpus(cfg)}
+    else:
+        budgets = {d: baseline_memory["headroom_bytes"][d] + sum(prepared[n][baseline_choices[n]]["bytes"]
+                                                                 for n, dev in placement.items() if dev == d)
+                   for d in cfg["devices"]}
+    timed = predictor is not None
+    costs = predictor.group_costs() if timed else {}
+    scale = {r: predictor.slopes[r] / ((1 + cfg["multi_gpu_speedup_percent"][r] / 100) if projected(cfg) else 1) for r in AXES[1:]} if timed else {}
     weights = cfg["importance"]
 
     # MTP layers do not run in the main model; the local metric ignores them too, so they stay at the floor
@@ -157,7 +299,7 @@ def search(info, cfg, predictor, baseline_choices, model=None):
     mtp = {g["name"] for g in groups if any(by_name[n].get("mtp") for n in g["members"])}
 
     def local(n, q):
-        return 0.0 if n in mtp else options[n][q]["damage"]
+        return 0.0 if n in mtp else prepared[n][q]["damage"]
 
     def loss_of(choices):
         if model is not None:
@@ -165,11 +307,24 @@ def search(info, cfg, predictor, baseline_choices, model=None):
         return sum(local(n, q) for n, q in choices.items())
 
     loss_ref = loss_of(baseline_choices) or 1.0
-    reference = [loss_ref, *[predictor.measured[regime] for regime in AXES[1:]]]
+    reference = [loss_ref, *[predictor.measured[regime] for regime in AXES[1:]]] if timed else [loss_ref]
     time_terms = {n: {q: sum(weights[r] * scale[r] * costs[n][q][r] / predictor.measured[r] for r in AXES[1:])
                       if n in costs else 0.0 for q in options[n]} for n in options}
     bounds = cfg["bounds"]
     loss_bound = "max_loss" if model is not None else "max_damage"
+    # Pooled mode: one knapsack over all groups under a cap on the summed tensor bytes (without reserves), whatever the
+    # device. The cap of the bounds is a hard limit; the knapsack cap moves during the search for the smallest recipe.
+    hard_cap = bounds.get("max_total_bytes")
+    device_cap = None
+    if only:
+        # GPU-only: layers are not fixed to a device, so one pooled knapsack over the summed GPU capacities. The input
+        # embedding lives on the host but is in the option bytes (unless it is tied: then its copy is on the last GPU).
+        by_name = {t["name"]: t for t in info["tensors"]}
+        host = 0 if "output.weight" not in by_name else sum(
+            max(o["bytes"] for o in options[g["name"]].values()) for g in groups if all(n.startswith("token_embd") for n in g["members"]))
+        device_cap = sum(budgets.values()) + host
+    pool = {"cap": device_cap if hard_cap is None else hard_cap if device_cap is None else min(device_cap, hard_cap)}
+    minimize = cfg["search"].get("minimize")
     evaluated, feasible, rejected, frontier = {}, [], defaultdict(int), []
 
     def evaluate(choices):
@@ -183,17 +338,20 @@ def search(info, cfg, predictor, baseline_choices, model=None):
             if any(value < 0 for value in mem["headroom_bytes"].values()):
                 rejected["memory"] += 1
                 return None
-            times = predictor.predict(choices, mem["cache_hit_prior"])
+            if hard_cap is not None and mem["total_bytes"] > hard_cap:
+                rejected["total_bytes"] += 1
+                return None
+            times = predictor.predict(choices, mem["cache_hit_prior"]) if timed else None
         except QuantError as exc:
             rejected[str(exc)] += 1
             return None
         loss = loss_of(choices)
-        axes = [loss, *[times[regime] for regime in AXES[1:]]]
+        axes = [loss, *[times[regime] for regime in AXES[1:]]] if timed else [loss, mem["total_bytes"]]
         violation = 0.0
         if loss > bounds.get(loss_bound, math.inf):
             rejected["loss_bound" if model is not None else "damage_bound"] += 1
             violation += loss / max(bounds[loss_bound], 1e-12) - 1
-        for regime in AXES[1:]:
+        for regime in AXES[1:] if timed else ():
             rate = 1000 / times[regime] * (1 if regime == "decode" else cfg["runtime"][f"{regime}_tokens"])
             if rate < bounds.get(f"min_{regime}_t_s", 0):
                 rejected["speed_bound"] += 1
@@ -213,13 +371,32 @@ def search(info, cfg, predictor, baseline_choices, model=None):
             frontier = pareto([*frontier, state])
         return state
 
+    def knapsacks(cap):
+        """(group names, byte budget) per knapsack: one per device, or one pooled knapsack under a total cap."""
+        if cap is None:
+            return {d: ([n for n, dev in placement.items() if dev == d], b) for d, b in budgets.items()}
+        return {"pool": (list(placement), cap)}
+
     def solve_for(theta):
-        """Knapsack recipe for a loss multiplier; the model's composition point is iterated to a fixed point."""
+        """Knapsack recipe for a loss multiplier. GPU-only: contiguity can make a recipe whose total fits fail on a
+        device, so the cap of this solve (not pool["cap"]) drops by the deficit and the solve repeats, up to 8 times."""
+        cap = pool["cap"]
+        for _ in range(9 if only else 1):
+            picked = solve_at(theta, cap)
+            if picked is None or not only:
+                return picked
+            deficit = -min(memory(info, cfg, picked)["headroom_bytes"].values())
+            if deficit <= 0:
+                return picked
+            cap -= max(deficit, 1 << 20)
+        return picked
+
+    def solve_at(theta, cap):
+        """Knapsack recipe under a cap; the model's composition point is iterated to a fixed point."""
         marginal, previous = 1.0, None
         for _ in range(8):
             picked = {}
-            for device, budget in budgets.items():
-                names = [n for n, d in placement.items() if d == device]
+            for device, (names, budget) in knapsacks(cap).items():
                 if not names:
                     continue
                 table = {}
@@ -242,18 +419,66 @@ def search(info, cfg, predictor, baseline_choices, model=None):
             marginal = model.marginal(model.predict(picked)["u"])
         return picked
 
+    def smallest_recipe():
+        """Smallest total bytes whose minimum-loss recipe meets the loss bound; sets the pooled cap to it.
+
+        The minimum-loss knapsack is exact for a byte cap and its loss does not increase with the cap, so the cap is
+        bisected. The loss multiplier is large, so time terms only break ties. Speed bounds and device capacities
+        are checked on the final recipe only."""
+        if loss_bound not in bounds:
+            raise QuantError("minimizing size needs a loss bound: max_loss with a quality table, otherwise max_damage")
+        ceiling = bounds[loss_bound]
+        theta = 2.0 ** 10
+        low = sum(min(o["bytes"] for o in options[n].values()) for n in options)
+        high = sum(max(o["bytes"] for o in options[n].values()) for n in options)
+        if hard_cap is not None:
+            high = min(high, hard_cap)
+        if device_cap is not None:
+            high = min(high, device_cap)
+        if high < low:
+            return None, "infeasible_minimum_bytes"
+
+        def meets(cap):
+            pool["cap"] = cap
+            choices = solve_for(theta)
+            return choices if choices is not None and loss_of(choices) <= ceiling else None
+
+        best = meets(high)
+        if best is None:
+            return None, "loss_bound_unreachable"
+        found = meets(low)
+        if found is not None:
+            best, high = found, low
+        while high - low > max(1, high * 1e-4):
+            mid = (low + high) // 2
+            found = meets(mid)
+            if found is None:
+                low = mid
+            else:
+                best, high = found, mid
+        pool["cap"] = high
+        return best, "ok"
+
     def separable(n, q, marginal):
         if model is not None:
             return -model.kl_floor * marginal * model.gain(n, q) / loss_ref
         return local(n, q) / loss_ref
 
+    smallest, smallest_status = None, None
+    if minimize == "size":
+        choices, smallest_status = smallest_recipe()
+        smallest = evaluate(choices) if choices is not None else None
+        if choices is not None and (smallest is None or smallest["constraint_violation"] > 0):
+            smallest_status = "smallest_violates_device_or_speed_bounds"
+        if smallest is not None:
+            smallest["smallest"] = True
     thetas = sorted({0.0, weights["precision"], *(2.0 ** k for k in range(-10, 11))})
     states = []
     for theta in thetas:
         choices = solve_for(theta)
         states.append((theta, evaluate(choices) if choices is not None else None))
     # Sweep solutions are the supported points of the trade-off only. Walk from each solution to the next one group at
-    # a time, most loss reduction per unit of time first, so recipes between them are also evaluated.
+    # a time, most loss reduction per unit of time (without timing: per byte) first, so recipes between them are also evaluated.
     solved = [s for _, s in states if s is not None]
     for a, b in zip(solved, solved[1:]):
         marginal = model.marginal(model.predict(a["choices"])["u"]) if model is not None else 1.0
@@ -262,7 +487,7 @@ def search(info, cfg, predictor, baseline_choices, model=None):
             p = a["choices"][n]
             if p != q:
                 dl = separable(n, q, marginal) - separable(n, p, marginal)
-                dt = time_terms[n][q] - time_terms[n][p]
+                dt = time_terms[n][q] - time_terms[n][p] if timed else options[n][q]["bytes"] - options[n][p]["bytes"]
                 changes.append((dl / dt if dt > 1e-15 else -math.inf if dl < 0 else math.inf, n, q))
         current = dict(a["choices"])
         for _, n, q in sorted(changes)[:-1]:
@@ -286,7 +511,11 @@ def search(info, cfg, predictor, baseline_choices, model=None):
     minimum = {g["name"]: min(options[g["name"]].values(), key=lambda o: (o["bytes"], o["damage"], o["qtype"]))["qtype"] for g in groups}
     minimum_memory = memory(info, cfg, minimum)
     infeasible_minimum = any(value < 0 for value in minimum_memory["headroom_bytes"].values()) and not cfg["cache_mib"]
+    if smallest is not None and smallest["constraint_violation"] == 0 and all(smallest is not f for f in frontier):
+        # the smallest recipe can be dominated on loss and speed; it stays in the result because size was the objective
+        frontier = [*frontier, smallest]
     return {"frontier": sorted(frontier, key=lambda s: (s["score"], s["key"])), "evaluated": len(evaluated),
             "feasible": len(feasible), "rejected": dict(rejected), "cap_reached": False,
             "budgets_bytes": budgets, "reference_scales": reference,
-            "status": "ok" if frontier else ("infeasible_minimum_bytes" if infeasible_minimum else "no_feasible_recipe")}
+            "minimize": minimize, "pool_cap_bytes": pool["cap"],
+            "status": smallest_status if smallest_status not in (None, "ok") else "ok" if frontier else ("infeasible_minimum_bytes" if infeasible_minimum else "no_feasible_recipe")}
