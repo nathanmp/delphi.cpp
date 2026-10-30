@@ -415,6 +415,8 @@ static void dsv4_state_read_k_cache(
 
         dsv4_state_read_tensor_streams(io, kv->get_k_storage(il), kv_size, n_rows_ref, s0, ns);
     }
+
+    kv->sync_mirrors();
 }
 
 static std::string dsv4_plan_positions(const std::vector<int32_t> & values) {
@@ -1427,13 +1429,18 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
 
     const bool unified_compressed = false;
 
+    // delphi: V4.1 readers on another device than their source layer (layers 21-39 read layer 20) read mirrors on their own
+    // device instead of copying their view of the stream there per graph. LLAMA_KV_MIRROR=0 turns them off.
+    static const bool kv_mirror_env = [] { const char * e = getenv("LLAMA_KV_MIRROR"); return e == nullptr || atoi(e) != 0; }();
+    const bool mirror = is_v41 && kv_mirror_env;
+
     LLAMA_LOG_INFO("%s: creating DSV4 CSA compressed KV cache, ratio = %u, size = %u cells\n",
             __func__, ratio_a, dsv4_comp_size(kv_size, ratio_kv));
 
     kv_csa = std::make_unique<llama_kv_cache>(
             model, hparams_csa, type_k, type_v,
             v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, ratio_kv), 256u), n_seq_max, n_pad,
-            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_csa, reuse_kv, nullptr);
+            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_csa, reuse_kv, nullptr, "", mirror);
 
     // V4.1 stores no rows in kv_hca, but its second-ratio sources are planned through this slot and
     // write into kv_csa, so the per-stream row offsets of the two caches must agree
@@ -1455,7 +1462,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     kv_lid = std::make_unique<llama_kv_cache>(
             model, hparams_lid, type_k, type_v,
             v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, ratio_kv), 256u), n_seq_max, n_pad,
-            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_lid, reuse_lid, nullptr);
+            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_lid, reuse_lid, nullptr, "", mirror);
 
     LLAMA_LOG_INFO("%s: creating DSV4 CSA compressor state\n", __func__);
 
@@ -2028,6 +2035,7 @@ void llama_kv_cache_dsv4::clear_compressed(llama_seq_id seq_id, bool data) {
                 for (uint32_t il : kv->get_layer_ids()) {
                     dsv4_clear_tensor_stream(kv->get_k_storage(il), (uint32_t) seq_id);
                 }
+                kv->sync_mirrors(seq_id);
             }
         };
 
@@ -2412,6 +2420,10 @@ ggml_tensor * llama_kv_cache_dsv4_comp_context::get_k(ggml_context * ctx, int32_
 
 ggml_tensor * llama_kv_cache_dsv4_comp_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {
     return kv->cpy_k(ctx, k_cur, k_idxs, il, sinfos[i_cur]);
+}
+
+void llama_kv_cache_dsv4_comp_context::cpy_k_mirrored(ggml_context * ctx, ggml_cgraph * gf, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {
+    kv->cpy_k_mirrored(ctx, gf, k_cur, k_idxs, il, sinfos[i_cur]);
 }
 
 ggml_tensor * llama_kv_cache_dsv4_comp_context::build_input_k_rot(ggml_context * ctx) const {

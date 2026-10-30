@@ -1191,8 +1191,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
                 idx_k = llama_mul_mat_hadamard(ctx0, idx_k, inp_dsv4->get_lid().k_rot);
             }
 
-            ggml_build_forward_expand(gf, inp_dsv4->mctx->get_lid()->cpy_k(
-                        ctx0, idx_k, inp_comp.state_write_idxs, il));
+            inp_dsv4->mctx->get_lid()->cpy_k_mirrored(ctx0, gf, idx_k, inp_comp.state_write_idxs, il);
         }
 
         if (inp_dsv4->get_csa().k_rot) {
@@ -1200,8 +1199,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
             cb(latent, "comp_kv_rot", il);
         }
 
-        ggml_build_forward_expand(gf, inp_dsv4->mctx->get_csa()->cpy_k(
-                    ctx0, latent, inp_comp.state_write_idxs, il));
+        inp_dsv4->mctx->get_csa()->cpy_k_mirrored(ctx0, gf, latent, inp_comp.state_write_idxs, il);
 
         // carry whatever did not complete a row into the next ubatch
         ggml_tensor * snapshot_kv    = ggml_concat(ctx0, restored.kv,    state_kv,    1);

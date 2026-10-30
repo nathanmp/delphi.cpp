@@ -114,7 +114,9 @@ public:
         const  layer_reuse_cb & reuse,
         const  layer_share_cb & share,
         // a model can hold more than one cache, so the tensor names have to stay unique
-                 const char *   name_tag = "");
+                 const char *   name_tag = "",
+        // delphi: a reused layer whose reader sits on another device gets a copy of the storage on that device (see mirrors)
+                       bool     mirror_reuse = false);
 
     ~llama_kv_cache() = default;
 
@@ -166,6 +168,10 @@ public:
     std::vector<uint32_t> get_layer_ids() const;
     ggml_tensor * get_k_storage(int32_t il) const;
 
+    // delphi: copy the storage of every mirrored layer into its mirrors (all streams, or one), after data was written outside
+    // a graph: state reads and clears. A no-op without mirrors.
+    void sync_mirrors(int32_t stream = -1) const;
+
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
 
     // state_read, plus the cells the restored tokens were placed in
@@ -192,6 +198,10 @@ public:
     // store k_cur and v_cur in the cache based on the provided head location
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const;
+
+    // delphi: cpy_k for a layer that may have mirrors: adds the write into the layer and the writes into its mirrors to gf.
+    // cpy_k aborts for a layer with mirrors, so that no write path leaves a mirror stale.
+    void cpy_k_mirrored(ggml_context * ctx, ggml_cgraph * gf, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
 
     //
     // preparation API
@@ -313,6 +323,29 @@ private:
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
 
+    // delphi: copies of a reused layer's storage on the devices of readers that sit elsewhere (DeepSeek V4.1: layers 21-39 read
+    // the compressed KV of layer 20). Without them, the scheduler copies the reader's view of the whole stream, which grows
+    // with the context, to the reader's device once per reader and graph. A mirror is written in the same graph as its
+    // source (cpy_k_mirrored) and is not part of the state: reads and clears refresh it (sync_mirrors).
+    struct kv_mirror {
+        int32_t ikv; // the mirrored KV cache layer
+
+        ggml_tensor * k;
+        ggml_tensor * v;
+
+        std::vector<ggml_tensor *> k_stream;
+        std::vector<ggml_tensor *> v_stream;
+    };
+
+    std::vector<kv_mirror> mirrors;
+
+    // model layer id of a reader -> its mirror
+    std::unordered_map<int32_t, int32_t> map_mirror_ids;
+
+    // the K/V storage that layer il reads: its mirror, if it has one
+    ggml_tensor * read_k(int32_t il) const;
+    ggml_tensor * read_v(int32_t il) const;
+
     size_t total_size() const;
 
     size_t size_k_bytes() const;
@@ -423,6 +456,9 @@ public:
     //   - v_idxs [n_tokens] or [n_tokens*n_embd_v_gqa] depending if V cache is transposed
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;
     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const;
+
+    // delphi: see llama_kv_cache::cpy_k_mirrored
+    void cpy_k_mirrored(ggml_context * ctx, ggml_cgraph * gf, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;
 
     // create destination indices for each head of the current batch for where it would be written in the KV cache
     // the indices address the global KV cache (not per stream) - this is not relevant for the user of this API, but

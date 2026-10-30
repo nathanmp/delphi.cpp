@@ -80,7 +80,8 @@ llama_kv_cache::llama_kv_cache(
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
     const  layer_share_cb & share,
-             const char *   name_tag) :
+             const char *   name_tag,
+                   bool     mirror_reuse) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
     other(static_cast<llama_kv_cache *>(mem_other)),
@@ -250,6 +251,8 @@ llama_kv_cache::llama_kv_cache(
         layers.push_back({ il, k, v, k_stream, v_stream, });
     }
 
+    std::vector<ggml_backend_dev_t> mirror_devs;
+
     if (reuse) {
         LLAMA_LOG_DEBUG("%s: reusing layers:\n", __func__);
 
@@ -274,6 +277,48 @@ llama_kv_cache::llama_kv_cache(
             map_layer_ids[il] = map_layer_ids[il_reuse];
 
             LLAMA_LOG_DEBUG("%s: - layer %3d: reuse layer %d, is_swa = %d\n", __func__, il, il_reuse, hparams.is_swa(il));
+
+            // delphi: a reader on another device than its source reads a mirror there, one per source and device
+            if (mirror_reuse && offload && model.dev_layer(il) != model.dev_layer(il_reuse)) {
+                const int32_t ikv = map_layer_ids[il_reuse];
+                auto * dev = model.dev_layer(il);
+
+                int32_t im = -1;
+                for (size_t i = 0; i < mirrors.size(); ++i) {
+                    if (mirrors[i].ikv == ikv && mirror_devs[i] == dev) {
+                        im = (int32_t) i;
+                    }
+                }
+
+                if (im < 0) {
+                    ggml_context * ctx = ctx_for_buft(ggml_backend_dev_buffer_type(dev));
+                    if (!ctx) {
+                        throw std::runtime_error("failed to create ggml context for kv cache");
+                    }
+
+                    const auto & src = layers[ikv];
+
+                    kv_mirror m = { ikv, nullptr, nullptr, {}, {} };
+                    m.k = src.k ? ggml_dup_tensor(ctx, src.k) : nullptr;
+                    m.v = src.v ? ggml_dup_tensor(ctx, src.v) : nullptr;
+
+                    m.k && ggml_format_name(m.k, "cache_%sk_l%d_mirror%d", name_tag, src.il, (int) mirrors.size());
+                    m.v && ggml_format_name(m.v, "cache_%sv_l%d_mirror%d", name_tag, src.il, (int) mirrors.size());
+
+                    for (uint32_t s = 0; s < n_stream; ++s) {
+                        m.k_stream.push_back(m.k ? ggml_view_2d(ctx, m.k, m.k->ne[0], m.k->ne[1], m.k->nb[1], s*m.k->nb[2]) : nullptr);
+                        m.v_stream.push_back(m.v ? ggml_view_2d(ctx, m.v, m.v->ne[0], m.v->ne[1], m.v->nb[1], s*m.v->nb[2]) : nullptr);
+                    }
+
+                    im = (int32_t) mirrors.size();
+                    mirrors.push_back(std::move(m));
+                    mirror_devs.push_back(dev);
+
+                    LLAMA_LOG_INFO("%s: layer %3d storage mirrored on %s for the readers there\n", __func__, src.il, ggml_backend_dev_name(dev));
+                }
+
+                map_mirror_ids[il] = im;
+            }
         }
     }
 
@@ -855,6 +900,15 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
                     ggml_backend_tensor_copy(layer.v_stream[ssrc], layer.v_stream[sdst]);
                 }
             }
+
+            for (const auto & m : mirrors) {
+                if (m.k_stream[ssrc]) {
+                    ggml_backend_tensor_copy(m.k_stream[ssrc], m.k_stream[sdst]);
+                }
+                if (m.v_stream[ssrc]) {
+                    ggml_backend_tensor_copy(m.v_stream[ssrc], m.v_stream[sdst]);
+                }
+            }
         }
     }
 
@@ -1245,6 +1299,31 @@ ggml_tensor * llama_kv_cache::get_k_storage(int32_t il) const {
     return layers[ikv].k;
 }
 
+ggml_tensor * llama_kv_cache::read_k(int32_t il) const {
+    const auto it = map_mirror_ids.find(il);
+
+    return it != map_mirror_ids.end() ? mirrors[it->second].k : layers[map_layer_ids.at(il)].k;
+}
+
+ggml_tensor * llama_kv_cache::read_v(int32_t il) const {
+    const auto it = map_mirror_ids.find(il);
+
+    return it != map_mirror_ids.end() ? mirrors[it->second].v : layers[map_layer_ids.at(il)].v;
+}
+
+void llama_kv_cache::sync_mirrors(int32_t stream) const {
+    for (const auto & m : mirrors) {
+        const auto & src = layers[m.ikv];
+        GGML_ASSERT(stream < 0 || (uint32_t) stream < n_stream);
+        if (m.k) {
+            ggml_backend_tensor_copy(stream < 0 ? src.k : src.k_stream[stream], stream < 0 ? m.k : m.k_stream[stream]);
+        }
+        if (m.v) {
+            ggml_backend_tensor_copy(stream < 0 ? src.v : src.v_stream[stream], stream < 0 ? m.v : m.v_stream[stream]);
+        }
+    }
+}
+
 const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 
@@ -1298,9 +1377,7 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
 }
 
 ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
-    const int32_t ikv = map_layer_ids.at(il);
-
-    auto * k = layers[ikv].k;
+    auto * k = read_k(il);
 
     const uint64_t kv_size      = get_size();
     const uint64_t n_embd_k_gqa = k->ne[0];
@@ -1318,9 +1395,7 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
 }
 
 ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
-    const int32_t ikv = map_layer_ids.at(il);
-
-    auto * v = layers[ikv].v;
+    auto * v = read_v(il);
 
     const uint64_t kv_size      = get_size();
     const uint64_t n_embd_v_gqa = v->ne[0];
@@ -1349,13 +1424,8 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
             ggml_row_size(v->type, kv_size*n_embd_v_gqa)*sinfo.s0);
 }
 
-ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const {
-    GGML_UNUSED(sinfo);
-
-    const int32_t ikv = map_layer_ids.at(il);
-
-    ggml_tensor * k = layers[ikv].k;
-
+// store k_cur into the rows k_idxs of the K storage k
+static ggml_tensor * llama_kv_cache_set_k_rows(ggml_context * ctx, ggml_tensor * k, ggml_tensor * k_cur, ggml_tensor * k_idxs, int64_t kv_size) {
     const int64_t n_embd_head = k_cur->ne[0];
     const int64_t n_head      = k_cur->ne[1];
     const int64_t n_tokens    = k_cur->ne[2];
@@ -1371,8 +1441,6 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
     const int64_t n_stream = k->ne[2];
 
     if (n_stream > 1) {
-        const int64_t kv_size = get_size();
-
         assert(n_embd_gqa == k->ne[0]);
         assert(kv_size    == k->ne[1]);
 
@@ -1382,6 +1450,33 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
 
     // store the current K values into the cache
     return ggml_set_rows(ctx, k, k_cur, k_idxs);
+}
+
+ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const {
+    GGML_UNUSED(sinfo);
+
+    const int32_t ikv = map_layer_ids.at(il);
+
+    for (const auto & m : mirrors) {
+        GGML_ASSERT(m.ikv != ikv && "a layer with mirrors is written through cpy_k_mirrored");
+    }
+
+    return llama_kv_cache_set_k_rows(ctx, layers[ikv].k, k_cur, k_idxs, get_size());
+}
+
+void llama_kv_cache::cpy_k_mirrored(ggml_context * ctx, ggml_cgraph * gf, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const {
+    GGML_UNUSED(sinfo);
+
+    const int32_t ikv = map_layer_ids.at(il);
+
+    ggml_build_forward_expand(gf, llama_kv_cache_set_k_rows(ctx, layers[ikv].k, k_cur, k_idxs, get_size()));
+
+    // the same rows go to each mirror: graph order puts these writes before the readers, which come in later layers
+    for (const auto & m : mirrors) {
+        if (m.ikv == ikv) {
+            ggml_build_forward_expand(gf, llama_kv_cache_set_k_rows(ctx, m.k, k_cur, k_idxs, get_size()));
+        }
+    }
 }
 
 ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const {
@@ -2158,6 +2253,7 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
 
 void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
     state_read_sinfo(io, seq_id, flags, nullptr, nullptr);
+    sync_mirrors();
 }
 
 void llama_kv_cache::state_read_sinfo(
@@ -2821,6 +2917,10 @@ ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) cons
 
 ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {
     return kv->cpy_k(ctx, k_cur, k_idxs, il, sinfos[i_cur]);
+}
+
+void llama_kv_cache_context::cpy_k_mirrored(ggml_context * ctx, ggml_cgraph * gf, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {
+    kv->cpy_k_mirrored(ctx, gf, k_cur, k_idxs, il, sinfos[i_cur]);
 }
 
 ggml_tensor * llama_kv_cache_context::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const {
