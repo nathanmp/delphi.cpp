@@ -4466,6 +4466,10 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
 #define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id) * ne12 + (i1)]
 
+        // partial: the ids outside [0, n_as) are experts computed elsewhere (expert cache). They are not
+        // computed here, and their rows are zeroed below.
+        const bool partial = ggml_mul_mat_id_is_partial(op);
+
         if (ith == 0) {
             // initialize matrix_row_counts
             memset(matrix_row_counts, 0, n_as * sizeof(int64_t));
@@ -4476,10 +4480,30 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                     const int32_t i02 =
                         *(const int32_t *) ((const char *) ids->data + iid1 * ids->nb[1] + id * ids->nb[0]);
 
+                    if (partial && (i02 < 0 || i02 >= n_as)) {
+                        continue; // zeroed by all threads below
+                    }
+
                     GGML_ASSERT(i02 >= 0 && i02 < n_as);
 
                     MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = { id, iid1 };
                     matrix_row_counts[i02] += 1;
+                }
+            }
+        }
+
+        // the threads share the zeroing of the skipped rows. It runs before the compute loop below, which
+        // returns early on the threads without rows.
+        if (partial) {
+            int64_t k = 0;
+            for (int32_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
+                for (int32_t id = 0; id < n_ids; ++id) {
+                    const int32_t i02 =
+                        *(const int32_t *) ((const char *) ids->data + iid1 * ids->nb[1] + id * ids->nb[0]);
+
+                    if ((i02 < 0 || i02 >= n_as) && k++ % nth == ith) {
+                        memset((char *) dst->data + id * nb1 + iid1 * nb2, 0, ne0 * sizeof(float));
+                    }
                 }
             }
         }
