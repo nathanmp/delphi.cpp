@@ -880,8 +880,10 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
         return true;
     }
 
-    // the extra buffer types do not skip the out-of-range ids of a partial MUL_MAT_ID
-    if (ggml_mul_mat_id_is_partial(op) && src0->buffer && ggml_backend_cpu_is_extra_buffer_type(src0->buffer->buft)) {
+    // the extra buffer types skip the out-of-range ids of a partial MUL_MAT_ID only if they implement it.
+    // The repack buffer does (forward_mul_mat_id); AMX, KleidiAI, spacemit, ... do not.
+    if (ggml_mul_mat_id_is_partial(op) && src0->buffer && ggml_backend_cpu_is_extra_buffer_type(src0->buffer->buft) &&
+        src0->buffer->buft != ggml_backend_cpu_repack_buffer_type()) {
         return false;
     }
 
