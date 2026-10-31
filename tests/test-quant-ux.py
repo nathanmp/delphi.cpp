@@ -362,6 +362,13 @@ class Capacity(unittest.TestCase):
         args = cap.serving_args({"ctx": 8192, "ub": 512, "parallel": 2, "ctk": "q8_0", "ctv": None})
         self.assertEqual(args, ["-c", "8192", "-ub", "512", "-np", "2", "-ctk", "q8_0"])
 
+    def test_dynamic_projector_reserves_only_what_exceeds_the_compute_buffers(self):
+        _, mmproj, _ = cap.parse_fit_print("mmproj-dynamic CUDA0 1500\nmmproj CPU 25\n")
+        self.assertEqual(mmproj, {"CUDA0": ("dynamic", 1500 << 20), "CPU": 25 << 20})
+        self.assertEqual(cap.projector_reserve(mmproj["CUDA0"], 6600 << 20), 0)
+        self.assertEqual(cap.projector_reserve(mmproj["CUDA0"], 1000 << 20), (1500 + 256 - 1000) << 20)
+        self.assertEqual(cap.projector_reserve(1114 << 20, 6600 << 20), 1114 << 20)
+
 
 class KldCorrection(unittest.TestCase):
     def cfg(self):
@@ -412,7 +419,8 @@ class Verify(unittest.TestCase):
         command = vf.server_command(self.cfg(), "/o.gguf", ["--device", "ROCm0,ROCm1", "-sm", "layer", "-ts", "9,8"],
                                     self.serve(mmproj="/p.gguf", ctk="q8_0"), 9000)
         text = " ".join(command)
-        for part in ("-m /o.gguf", "--port 9000", "--fit off", "-c 8192", "-ctk q8_0", "-ts 9,8", "--mmproj /p.gguf", "-t 16", "-lm mmap -ot engram=CPU"):
+        for part in ("-m /o.gguf", "--port 9000", "--fit off", "-c 8192", "-ctk q8_0", "-ts 9,8", "--mmproj /p.gguf --mmproj-memory dynamic",
+                     "-t 16", "-lm mmap -ot engram=CPU"):
             self.assertIn(part, text)
         self.assertNotIn("-cmoe", command)
 

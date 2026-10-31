@@ -151,7 +151,9 @@ def serving_args(serve):
 
 def parse_fit_print(text):
     """({device: (model, context, compute)}, {device: mmproj}, {device: mtp}) in bytes from `llama-fit-params
-    --fit-print on`; mtp is the KV cache and compute buffers of the MTP draft context (lines 'mtp DEV CONTEXT COMPUTE')."""
+    --fit-print on`; mtp is the KV cache and compute buffers of the MTP draft context (lines 'mtp DEV CONTEXT COMPUTE').
+    A dynamic projector ('mmproj-dynamic DEV MIB') is returned as ('dynamic', bytes): it needs the memory only while it
+    encodes."""
     devices, mmproj, mtp = {}, {}, {}
     for line in text.splitlines():
         parts = line.split()
@@ -161,6 +163,8 @@ def parse_fit_print(text):
             devices[parts[0]] = tuple(int(p) * MIB for p in parts[1:])
         elif len(parts) == 3 and parts[0] == "mmproj" and parts[2].isdigit():
             mmproj[parts[1]] = int(parts[2]) * MIB
+        elif len(parts) == 3 and parts[0] == "mmproj-dynamic" and parts[2].isdigit():
+            mmproj[parts[1]] = ("dynamic", int(parts[2]) * MIB)
     return devices, mmproj, mtp
 
 
@@ -211,7 +215,7 @@ def measure_reserves(cfg, serve, gpus, split, ram_routed, work=None):
     if ram_routed:
         command.append("-cmoe")
     if serve.get("mmproj"):
-        command += ["--mmproj", serve["mmproj"]]
+        command += ["--mmproj", serve["mmproj"], "--mmproj-memory", serve.get("mmproj_memory", "dynamic")]
     if mtp:
         command += ["--spec-type", "draft-mtp", *spec_depth_args(serve)]
     completed = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env={**os.environ, **cfg["runtime"]["env"]})
@@ -223,7 +227,8 @@ def measure_reserves(cfg, serve, gpus, split, ram_routed, work=None):
         raise QuantError("llama-fit-params printed no MTP memory; build it from this tree (--spec-type support), "
                          "or serve without MTP (--no-mtp)")
     runtime = runtime_reserves(work, gpus, mtp, serve["ub"])
-    result = {name: {"context": devices[name][1], "compute": devices[name][2], "mmproj": mmproj.get(name, 0),
+    result = {name: {"context": devices[name][1], "compute": devices[name][2],
+                     "mmproj": projector_reserve(mmproj.get(name, 0), devices[name][2]),
                      "draft": mtp_memory.get(name, 0), "runtime": runtime[name]} for name in gpus}
     if serve.get("mmproj") and not any(mmproj.get(name) for name in gpus):
         raise QuantError("llama-fit-params printed no projector memory; build it from this tree (--mmproj support)")
@@ -232,6 +237,18 @@ def measure_reserves(cfg, serve, gpus, split, ram_routed, work=None):
     for entry in result.values():
         entry["total"] = entry["context"] + entry["compute"] + entry["mmproj"] + entry["draft"] + entry["runtime"]
     return {"command": command, "mtp": mtp, "per_device": result}
+
+
+DYNAMIC_HEADROOM = 256 * MIB  # kernel scratch that a dynamic encoder keeps free (clip_dynamic_scope)
+
+
+def projector_reserve(mmproj, compute):
+    """Memory to keep for the projector on a device. A dynamic encoder runs in the compute buffers that the language model
+    releases for it, so only what it needs beyond them (encoder weights + compute + headroom - language compute) counts;
+    an image that needs more falls back to the CPU."""
+    if isinstance(mmproj, tuple):
+        return max(0, mmproj[1] + DYNAMIC_HEADROOM - compute)
+    return mmproj
 
 
 def spec_depth_args(serve):

@@ -37,7 +37,7 @@ def server_command(cfg, model, runtime_args, serve, port):
         command.append("-cmoe")
     command += lazy_args(cfg)
     if serve.get("mmproj"):
-        command += ["--mmproj", serve["mmproj"]]
+        command += ["--mmproj", serve["mmproj"], "--mmproj-memory", serve.get("mmproj_memory", "dynamic")]
     if serve.get("draft"):
         command += ["--spec-draft-model", serve["draft"], "--spec-type", serve.get("spec_type") or "draft-mtp"]
     elif cap.serves_mtp(cfg, serve):

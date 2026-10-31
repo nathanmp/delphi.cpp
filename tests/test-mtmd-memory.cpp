@@ -25,13 +25,12 @@ static void set_env(const char * name, const char * value) {
 
 using encoder_ptr = std::unique_ptr<clip_ctx, decltype(&clip_free)>;
 
-static encoder_ptr load(const char * path, ggml_backend_dev_t device, const char * override, bool phase_default = false) {
-    set_env("LLAMA_MMPROJ_PHASE", override);
+static encoder_ptr load(const char * path, ggml_backend_dev_t device, bool dynamic) {
     clip_context_params params = {};
     params.use_gpu = device != nullptr;
     params.device = device;
     params.flash_attn_type = CLIP_FLASH_ATTN_TYPE_AUTO;
-    params.phase_default = phase_default;
+    params.dynamic_requested = dynamic;
     auto res = clip_init(path, params);
     clip_free(res.ctx_a);
     clip_free(res.ctx_gen_a);
@@ -77,8 +76,8 @@ static void compare(const std::vector<float> & ref, const std::vector<float> & a
 }
 
 static void check_released(clip_ctx * ctx, ggml_backend_dev_t device) {
-    if (clip_phase_device(ctx) != device || clip_get_mem_usage(ctx)[device] != 0) {
-        throw std::runtime_error("phase retained device allocations");
+    if (clip_dynamic_device(ctx) != device || clip_get_mem_usage(ctx)[device] != 0) {
+        throw std::runtime_error("dynamic encoder retained device allocations");
     }
 }
 
@@ -97,11 +96,11 @@ int main(int argc, char ** argv) {
     try {
         std::vector<clip_image_size> sizes;
         std::vector<std::vector<float>> gpu_ref, cpu_ref;
-        set_env("LLAMA_MMPROJ_PHASE_GPU_MIB", nullptr);
+        set_env("LLAMA_MMPROJ_DYNAMIC_GPU_MIB", nullptr);
         {
-            auto ctx = load(argv[1], device, nullptr);
-            if (clip_phase_device(ctx.get())) {
-                throw std::runtime_error("standalone encoder unexpectedly enabled phase vision");
+            auto ctx = load(argv[1], device, false);
+            if (clip_dynamic_device(ctx.get())) {
+                throw std::runtime_error("resident encoder is dynamic");
             }
             const auto & hp = *clip_get_hparams(ctx.get());
             const int unit = hp.patch_size * hp.n_merge;
@@ -112,15 +111,15 @@ int main(int argc, char ** argv) {
             }
         }
         {
-            auto ctx = load(argv[1], nullptr, nullptr, true);
-            if (clip_phase_device(ctx.get())) {
-                throw std::runtime_error("CPU encoder unexpectedly enabled phase vision");
+            auto ctx = load(argv[1], nullptr, true);
+            if (clip_dynamic_device(ctx.get())) {
+                throw std::runtime_error("CPU encoder is dynamic");
             }
             for (auto size : sizes) {
                 cpu_ref.push_back(encode(ctx.get(), size));
             }
         }
-        auto ctx = load(argv[1], device, nullptr, true);
+        auto ctx = load(argv[1], device, true);
         check_released(ctx.get(), device);
         size_t free_after_first = 0, total = 0;
         for (int repeat = 0; repeat < 3; ++repeat) {
@@ -133,15 +132,15 @@ int main(int argc, char ** argv) {
             if (repeat == 0) {
                 free_after_first = free;
             } else if (free + (64ULL << 20) < free_after_first) {
-                throw std::runtime_error("device memory grew across repeated phases");
+                throw std::runtime_error("device memory grew across repeated encodings");
             }
         }
-        set_env("LLAMA_MMPROJ_PHASE_GPU_MIB", "0");
+        set_env("LLAMA_MMPROJ_DYNAMIC_GPU_MIB", "0");
         for (size_t i = 0; i < sizes.size(); ++i) {
             compare(cpu_ref[i], encode(ctx.get(), sizes[i]));
             check_released(ctx.get(), device);
         }
-        set_env("LLAMA_MMPROJ_PHASE_GPU_MIB", "invalid");
+        set_env("LLAMA_MMPROJ_DYNAMIC_GPU_MIB", "invalid");
         bool failed = false;
         try {
             encode(ctx.get(), sizes[0]);
@@ -152,22 +151,10 @@ int main(int argc, char ** argv) {
             throw std::runtime_error("invalid GPU budget was accepted");
         }
         check_released(ctx.get(), device);
-        set_env("LLAMA_MMPROJ_PHASE_GPU_MIB", nullptr);
+        set_env("LLAMA_MMPROJ_DYNAMIC_GPU_MIB", nullptr);
         compare(gpu_ref[0], encode(ctx.get(), sizes[0]));
         check_released(ctx.get(), device);
-        {
-            auto resident = load(argv[1], device, "0", true);
-            if (clip_phase_device(resident.get())) {
-                throw std::runtime_error("explicit phase disable was ignored");
-            }
-            compare(gpu_ref[0], encode(resident.get(), sizes[0]));
-        }
-        {
-            auto forced = load(argv[1], device, "1");
-            compare(gpu_ref[0], encode(forced.get(), sizes[0]));
-            check_released(forced.get(), device);
-        }
-        std::puts("vision phase defaults, overrides, GPU/CPU parity, release, growth and error recovery passed");
+        std::puts("dynamic vision: GPU/CPU parity, release, growth and error recovery passed");
     } catch (const std::exception & e) {
         std::fprintf(stderr, "%s\n", e.what());
         return 1;

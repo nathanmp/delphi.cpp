@@ -2784,6 +2784,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_MTMD, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_TTS, LLAMA_EXAMPLE_FIT_PARAMS}).set_env("MTMD_BACKEND_DEVICE")); // no LLAMA_ARG_ prefix for backward compatibility reason
     add_opt(common_arg(
+        {"--mmproj-memory"}, "dynamic|resident",
+        string_format("where the vision encoder weights live (default: %s)\n"
+        "dynamic: in RAM; each encoding loads them to the GPU in the compute memory that the language model frees for it, "
+        "then frees them (CUDA and HIP; other backends stay resident)\n"
+        "resident: on the GPU all the time", params.mmproj_dynamic ? "dynamic" : "resident"),
+        [](common_params & params, const std::string & value) {
+            if (value == "dynamic") {
+                params.mmproj_dynamic = true;
+            } else if (value == "resident") {
+                params.mmproj_dynamic = false;
+            } else {
+                throw std::invalid_argument("expected dynamic or resident");
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_FIT_PARAMS}).set_env("LLAMA_ARG_MMPROJ_MEMORY"));
+    add_opt(common_arg(
         {"--image", "--audio", "--video"}, "FILE",
         "path to an image, audio, or video file. use with multimodal models, use comma-separated values for multiple files\n",
         [](common_params & params, const std::string & value) {

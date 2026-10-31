@@ -532,7 +532,7 @@ struct mtmd_context {
                    const llama_model * text_model,
                    const mtmd_context_params & ctx_params,
                    bool no_alloc = false,
-                   bool phase_default = false) :
+                   bool dynamic = false) :
         print_timings   (ctx_params.print_timings),
         n_threads       (ctx_params.n_threads),
         media_marker    (ctx_params.media_marker),
@@ -579,7 +579,7 @@ struct mtmd_context {
             /* no_alloc          */ no_alloc,
             /* progress_callback */ ctx_params.progress_callback,
             /* progress_callback_user_data */ ctx_params.progress_callback_user_data,
-            /* phase_default */ phase_default,
+            /* dynamic_requested */ dynamic,
         };
 
         auto res = clip_init(mmproj_fname, ctx_clip_params);
@@ -1106,13 +1106,13 @@ private:
 mtmd_context * mtmd_init_from_file(const char * mmproj_fname,
         const struct llama_model * text_model,
         const struct mtmd_context_params ctx_params) {
-    return mtmd_init_from_file_phase(mmproj_fname, text_model, ctx_params, false);
+    return mtmd_init_from_file_dynamic(mmproj_fname, text_model, ctx_params, false);
 }
 
-mtmd_context * mtmd_init_from_file_phase(const char * mmproj_fname, const llama_model * text_model,
-        mtmd_context_params ctx_params, bool phase_default) {
+mtmd_context * mtmd_init_from_file_dynamic(const char * mmproj_fname, const llama_model * text_model,
+        mtmd_context_params ctx_params, bool dynamic) {
     try {
-        return new mtmd_context(mmproj_fname, text_model, ctx_params, false, phase_default);
+        return new mtmd_context(mmproj_fname, text_model, ctx_params, false, dynamic);
     } catch (const std::exception & e) {
         LOG_ERR("%s: error: %s\n", __func__, e.what());
         return nullptr;
@@ -1123,8 +1123,8 @@ void mtmd_free(mtmd_context * ctx) {
     delete ctx;
 }
 
-ggml_backend_dev_t mtmd_phase_device(const mtmd_context * ctx) {
-    return ctx ? clip_phase_device(ctx->ctx_v) : nullptr;
+ggml_backend_dev_t mtmd_dynamic_device(const mtmd_context * ctx) {
+    return ctx ? clip_dynamic_device(ctx->ctx_v) : nullptr;
 }
 
 std::vector<std::vector<const mtmd_bitmap *>> mtmd_group_mergeable_bitmaps(std::vector<mtmd_internal_part> & parts, int n_merge) {

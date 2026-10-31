@@ -899,7 +899,7 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
     // TODO @ngxson : move this log line to debug when it become more stable
     SLT_TRC(slot, "encoding mtmd batch from idx = %zu, n_chunks = %d\n", idx, n_added);
 
-    if (auto * dev = mtmd_phase_device(mctx); dev && mtmd_input_chunk_get_type(chunk.get()) == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+    if (auto * dev = mtmd_dynamic_device(mctx); dev && mtmd_input_chunk_get_type(chunk.get()) == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
         // The asynchronous drafter can still read target compute storage. Drain it before either context gives up scratch.
         common_speculative_wait_ctx(slot.ctx_dft);
         const char * name = ggml_backend_dev_name(dev);
@@ -1237,8 +1237,8 @@ private:
             mparams.progress_callback_user_data = &load_progress_mmproj;
         }
 
-        // optionally get the memory usage of mmproj
-        if (has_mmproj && params_base.fit_params && !ctx_only) {
+        // optionally get the memory usage of mmproj; a dynamic encoder uses the compute memory of the language model
+        if (has_mmproj && params_base.fit_params && !ctx_only && !params_base.mmproj_dynamic) {
             int64_t t_start = ggml_time_us();
             auto mmproj_mem = mtmd_get_memory_usage(mmproj_path.c_str(), mparams);
             int64_t t_elapsed = ggml_time_us() - t_start;
@@ -1347,23 +1347,13 @@ private:
                 mtmd_helper_log_set(common_log_default_callback, nullptr);
             }
 
-            auto * vision_dev = mparams.device;
-            if (mparams.use_gpu && !vision_dev) {
-                vision_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
-                if (!vision_dev) {
-                    vision_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU);
-                }
-            }
-            const bool phase_default = mparams.use_gpu && vision_dev &&
-                llama_share_has_cache_on_device(ctx_tgt, ggml_backend_dev_name(vision_dev));
-            mctx = mtmd_init_from_file_phase(mmproj_path.c_str(), model_tgt, mparams, phase_default);
+            mctx = mtmd_init_from_file_dynamic(mmproj_path.c_str(), model_tgt, mparams, params_base.mmproj_dynamic);
             if (mctx == nullptr) {
                 SRV_ERR("failed to load multimodal model, '%s'\n", mmproj_path.c_str());
                 return false;
             }
             SRV_INF("loaded multimodal model, '%s'\n", mmproj_path.c_str());
-            SRV_INF("vision memory: %s (LLAMA_MMPROJ_PHASE=0/1 overrides the cache-based default)\n",
-                mtmd_phase_device(mctx) ? "phase" : "resident");
+            SRV_INF("vision memory: %s (--mmproj-memory)\n", mtmd_dynamic_device(mctx) ? "dynamic" : "resident");
 
             init_opt.video_params.fps_target = params_base.video_fps;
             init_opt.video_params.timestamp_interval_ms = params_base.video_timestamp_interval_ms;

@@ -97,13 +97,16 @@ int llama_fit_params(int argc, char ** argv) {
             }
         }
 
-        // the multimodal projector (weights and worst-case compute buffers) goes to the first device, as in the server
+        // the multimodal projector (weights and worst-case compute buffers) goes to the first device, as in the server; a
+        // dynamic encoder ("mmproj-dynamic") needs that memory only while it encodes, when the language model has released
+        // its compute buffers
         if (!params.mmproj.path.empty()) {
             mtmd_context_params mp = mtmd_context_params_default();
             mp.use_gpu = params.mmproj_use_gpu;
             mp.device  = params.mmproj_device;
             for (const auto & [dev, size] : mtmd_get_memory_usage(params.mmproj.path.c_str(), mp)) {
-                printf("mmproj %s %zu\n", ggml_backend_dev_name(dev), (size + (1 << 20) - 1) / (1 << 20));
+                const bool dynamic = params.mmproj_dynamic && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU;
+                printf("%s %s %zu\n", dynamic ? "mmproj-dynamic" : "mmproj", ggml_backend_dev_name(dev), (size + (1 << 20) - 1) / (1 << 20));
             }
         }
     }

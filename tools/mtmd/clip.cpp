@@ -160,18 +160,18 @@ struct clip_ctx {
     ggml_backend_t backend_cpu = nullptr;
     ggml_backend_buffer_ptr buf;
 
-    // delphi: retain the authoritative vision weights in RAM while their tensor headers are rebound for a GPU phase.
-    struct phase_binding {
+    // delphi: dynamic vision keeps the authoritative weights in RAM; their tensor headers are rebound to GPU copies for one encoding.
+    struct dynamic_binding {
         ggml_tensor * tensor;
         void * data;
         ggml_backend_buffer_t buffer;
         void * extra;
     };
-    bool phase = false;
-    bool phase_default = false;
-    ggml_backend_t phase_backend = nullptr;
-    ggml_backend_buffer_ptr phase_host;
-    std::vector<phase_binding> phase_bindings;
+    bool dynamic = false;
+    bool dynamic_requested = false;
+    ggml_backend_t dynamic_backend = nullptr;
+    ggml_backend_buffer_ptr dynamic_host;
+    std::vector<dynamic_binding> dynamic_bindings;
     ggml_backend_sched_eval_callback cb_eval = nullptr;
     void * cb_eval_user_data = nullptr;
 
@@ -197,7 +197,7 @@ struct clip_ctx {
     clip_ctx(clip_context_params & ctx_params) {
         flash_attn_type = ctx_params.flash_attn_type;
         no_alloc = ctx_params.no_alloc;
-        phase_default = ctx_params.phase_default;
+        dynamic_requested = ctx_params.dynamic_requested;
         backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
         if (!backend_cpu) {
             throw std::runtime_error("failed to initialize CPU backend");
@@ -239,7 +239,7 @@ struct clip_ctx {
     ~clip_ctx() {
         sched.reset();
         buf.reset();
-        phase_host.reset();
+        dynamic_host.reset();
         ggml_backend_free(backend);
         if (backend != backend_cpu) {
             ggml_backend_free(backend_cpu);
@@ -261,22 +261,22 @@ struct clip_ctx {
         }
     }
 
-    void phase_restore_host() {
-        for (const auto & b : phase_bindings) {
+    void dynamic_restore_host() {
+        for (const auto & b : dynamic_bindings) {
             b.tensor->data = b.data;
             b.tensor->buffer = b.buffer;
             b.tensor->extra = b.extra;
         }
     }
 
-    void phase_release() {
+    void dynamic_release() {
         if (sched) {
             ggml_backend_sched_synchronize(sched.get());
         }
         sched.reset();
         buf.reset();
-        phase_restore_host();
-        backend = phase_backend;
+        dynamic_restore_host();
+        backend = dynamic_backend;
         // Captured graphs and backend pools can retain addresses into the released encoder allocations.
         auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
         auto * trim = reg ? reinterpret_cast<void (*)(ggml_backend_t)>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_trim")) : nullptr;
@@ -2228,19 +2228,17 @@ struct clip_model_loader {
     void load_tensors(clip_ctx & ctx_clip) {
         auto & model = ctx_clip.model;
         auto & hparams = model.hparams;
-        const char * phase_env = std::getenv("LLAMA_MMPROJ_PHASE");
-        const bool phase_requested = phase_env ? std::atoi(phase_env) != 0 : ctx_clip.phase_default;
-        ctx_clip.phase = phase_requested && model.modality == CLIP_MODALITY_VISION &&
+        ctx_clip.dynamic = ctx_clip.dynamic_requested && model.modality == CLIP_MODALITY_VISION &&
             ctx_clip.backend != ctx_clip.backend_cpu;
-        if (ctx_clip.phase) {
+        if (ctx_clip.dynamic) {
+            // only CUDA and HIP can give back the scratch of the released encoder; other backends keep it resident
             auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(ctx_clip.backend));
             if (!reg || !ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_trim")) {
-                if (phase_env) {
-                    throw std::runtime_error("phase vision requires a CUDA or HIP backend with scratch release support");
-                }
-                ctx_clip.phase = false;
+                LOG_INF("%s: %s cannot release encoder memory, keeping the projector resident\n", __func__,
+                    ggml_backend_name(ctx_clip.backend));
+                ctx_clip.dynamic = false;
             } else {
-                ctx_clip.phase_backend = ctx_clip.backend;
+                ctx_clip.dynamic_backend = ctx_clip.backend;
             }
         }
         std::map<std::string, size_t> tensor_offset;
@@ -2291,7 +2289,7 @@ struct clip_model_loader {
                 loaded_tensor_names.insert(name);
                 cur = data_tensor;
                 // add to weight memory counter
-                ctx_clip.mem_usage[ggml_backend_get_device(ctx_clip.phase ? ctx_clip.backend_cpu : ctx_clip.backend)] += ggml_nbytes(cur);
+                ctx_clip.mem_usage[ggml_backend_get_device(ctx_clip.dynamic ? ctx_clip.backend_cpu : ctx_clip.backend)] += ggml_nbytes(cur);
             }
             return cur;
         };
@@ -3786,7 +3784,7 @@ struct clip_model_loader {
             }
 
             // alloc memory and offload data
-            ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(ctx_clip.phase ? ctx_clip.backend_cpu : ctx_clip.backend);
+            ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(ctx_clip.dynamic ? ctx_clip.backend_cpu : ctx_clip.backend);
             ctx_clip.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_clip.ctx_data.get(), buft));
             if (!ctx_clip.buf) {
                 throw std::runtime_error("failed to allocate encoder weights");
@@ -3828,13 +3826,13 @@ struct clip_model_loader {
                 LOG_DBG("%s: no_alloc is set, skipping tensor data loading (%zu tensors)\n", __func__, tensors_to_load.size());
             }
             fin.close();
-            if (ctx_clip.phase) {
+            if (ctx_clip.dynamic) {
                 for (auto * t = ggml_get_first_tensor(ctx_clip.ctx_data.get()); t; t = ggml_get_next_tensor(ctx_clip.ctx_data.get(), t)) {
-                    ctx_clip.phase_bindings.push_back({t, t->data, t->buffer, t->extra});
+                    ctx_clip.dynamic_bindings.push_back({t, t->data, t->buffer, t->extra});
                 }
-                ctx_clip.phase_host = std::move(ctx_clip.buf);
-                LOG_INF("%s: phase vision: %.2f MiB of weights retained in RAM\n", __func__,
-                    ggml_backend_buffer_get_size(ctx_clip.phase_host.get()) / 1048576.0);
+                ctx_clip.dynamic_host = std::move(ctx_clip.buf);
+                LOG_INF("%s: dynamic vision: %.2f MiB of weights retained in RAM\n", __func__,
+                    ggml_backend_buffer_get_size(ctx_clip.dynamic_host.get()) / 1048576.0);
             }
         }
 
@@ -4176,7 +4174,7 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
             loader.load_hparams(ctx_vision->model, CLIP_MODALITY_VISION);
             loader.load_tensors(*ctx_vision);
             loader.init_ctx(*ctx_vision);
-            if (ctx_params.warmup && !ctx_vision->phase) {
+            if (ctx_params.warmup && !ctx_vision->dynamic) {
                 loader.warmup(*ctx_vision);
             }
 
@@ -4231,8 +4229,8 @@ void clip_free(clip_ctx * ctx) {
     delete ctx;
 }
 
-ggml_backend_dev_t clip_phase_device(const clip_ctx * ctx) {
-    return ctx && ctx->phase ? ggml_backend_get_device(ctx->phase_backend) : nullptr;
+ggml_backend_dev_t clip_dynamic_device(const clip_ctx * ctx) {
+    return ctx && ctx->dynamic ? ggml_backend_get_device(ctx->dynamic_backend) : nullptr;
 }
 
 const char * clip_patch_merge_type(const struct clip_ctx * ctx) {
@@ -4639,21 +4637,21 @@ static std::vector<c2w_state_slot> list_gen_state_slots(const clip_hparams & hpa
 
 // delphi: one encoding owns the transient device weights, allocator and backend scratch.
 // Outputs are copied to the caller before this scope ends, including on cancellation or an exception. The host weights and preprocessor metadata stay valid.
-struct clip_phase_scope {
+struct clip_dynamic_scope {
     clip_ctx & ctx;
     const clip_flash_attn_type flash_attn_type;
 
-    explicit clip_phase_scope(clip_ctx & ctx) : ctx(ctx), flash_attn_type(ctx.flash_attn_type) {}
+    explicit clip_dynamic_scope(clip_ctx & ctx) : ctx(ctx), flash_attn_type(ctx.flash_attn_type) {}
 
-    ~clip_phase_scope() {
-        if (ctx.phase) {
-            ctx.phase_release();
+    ~clip_dynamic_scope() {
+        if (ctx.dynamic) {
+            ctx.dynamic_release();
             ctx.flash_attn_type = flash_attn_type;
         }
     }
 
     void prepare(const clip_image_f32_batch & batch) {
-        if (!ctx.phase) {
+        if (!ctx.dynamic) {
             return;
         }
         const auto buft = ggml_backend_get_default_buffer_type(ctx.backend);
@@ -4666,35 +4664,35 @@ struct clip_phase_scope {
             throw std::runtime_error("failed to create encoder measurement buffer");
         }
         ggml_backend_buffer_set_usage(measure.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-        for (const auto & b : ctx.phase_bindings) {
+        for (const auto & b : ctx.dynamic_bindings) {
             b.tensor->buffer = measure.get();
             weights += GGML_PAD(ggml_backend_buft_get_alloc_size(buft, b.tensor), alignment);
         }
         clip_model_loader::warmup(ctx, batch, true);
         const auto dev = ggml_backend_get_device(ctx.backend);
         const size_t compute = ctx.mem_compute[dev];
-        ctx.phase_restore_host();
+        ctx.dynamic_restore_host();
         ctx.sched.reset();
         measure.reset();
         size_t free = 0, total = 0;
         ggml_backend_dev_memory(dev, &free, &total);
-        if (const char * cap = std::getenv("LLAMA_MMPROJ_PHASE_GPU_MIB")) {
+        if (const char * cap = std::getenv("LLAMA_MMPROJ_DYNAMIC_GPU_MIB")) {
             char * end = nullptr;
             errno = 0;
             const auto mib = std::strtoull(cap, &end, 10);
             if (errno || !*cap || *cap == '-' || *end || mib > (SIZE_MAX >> 20)) {
-                throw std::runtime_error("invalid LLAMA_MMPROJ_PHASE_GPU_MIB");
+                throw std::runtime_error("invalid LLAMA_MMPROJ_DYNAMIC_GPU_MIB");
             }
             free = std::min(free, size_t(mib) << 20);
         }
         // Leave room for kernel scratch not represented in the ggml graph. This is independent of the cache safety margin.
         constexpr size_t headroom = 256ULL << 20;
         const bool fits = free >= headroom && weights <= free - headroom && compute <= free - headroom - weights;
-        LOG_INF("%s: phase vision on %s: weights %.2f + compute %.2f MiB, available %.2f MiB, %s\n", __func__,
+        LOG_INF("%s: dynamic vision on %s: weights %.2f + compute %.2f MiB, available %.2f MiB, %s\n", __func__,
             ggml_backend_dev_name(dev), weights / 1048576.0, compute / 1048576.0, free / 1048576.0, fits ? "GPU" : "CPU fallback");
 
         if (fits) {
-            for (const auto & b : ctx.phase_bindings) {
+            for (const auto & b : ctx.dynamic_bindings) {
                 b.tensor->data = nullptr;
                 b.tensor->buffer = nullptr;
                 b.tensor->extra = nullptr;
@@ -4702,12 +4700,12 @@ struct clip_phase_scope {
             ctx.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx.ctx_data.get(), buft));
             if (ctx.buf) {
                 ggml_backend_buffer_set_usage(ctx.buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-                for (const auto & b : ctx.phase_bindings) {
+                for (const auto & b : ctx.dynamic_bindings) {
                     ggml_backend_tensor_set(b.tensor, b.data, 0, ggml_nbytes(b.tensor));
                 }
             } else {
                 LOG_WRN("%s: device weight allocation failed, using CPU vision\n", __func__);
-                ctx.phase_restore_host();
+                ctx.dynamic_restore_host();
             }
         }
         if (!ctx.buf) {
@@ -4722,7 +4720,7 @@ struct clip_phase_scope {
             } catch (const std::runtime_error & e) {
                 // Free a failed reservation before retrying on the authoritative host weights.
                 LOG_WRN("%s: GPU vision reserve failed (%s), using CPU vision\n", __func__, e.what());
-                ctx.phase_release();
+                ctx.dynamic_release();
                 ctx.backend = ctx.backend_cpu;
                 ctx.flash_attn_type = flash_attn_type;
                 ctx.init_sched();
@@ -4741,8 +4739,8 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
         return false;
     }
 
-    clip_phase_scope phase_scope(*ctx);
-    phase_scope.prepare(imgs);
+    clip_dynamic_scope dynamic_scope(*ctx);
+    dynamic_scope.prepare(imgs);
 
     // if buffers are not allocated, we need to do a warmup run to allocate them
     if (!ctx->is_allocated) {

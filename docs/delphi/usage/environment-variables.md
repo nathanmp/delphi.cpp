@@ -251,8 +251,7 @@ takes them back at the next refresh. So the cache and the staging slots do not n
 | `LLAMA_MOE_CACHE_ASYNC_EXPERTS` | `64` | experts per decode-time refresh. Each one needs 3 slabs of device scratch on every tier GPU and of pinned memory (DeepSeek V4.1: 18 MiB per expert). DeepSeek on 2 R9700: 32 36.8, 64 37.2, 96 37.9, 128 37.2, 192 36.7 t/s. |
 | `LLAMA_MOE_CACHE_PROMPT_ROWS` | `0` | prompt batches up to this many rows also run their hot experts on the GPU |
 | `LLAMA_MOE_CACHE_SHARED` | `0` | `1`: no tier of its own; tiers are leased at run time by the VRAM-sharing daemon. Turns auto mode off. |
-| `LLAMA_MMPROJ_PHASE` | conditional | Server: enabled for CUDA/HIP vision when the target expert cache uses the vision GPU, including pending auto-sized tiers. `0` keeps the encoder resident; `1` forces phase mode on supported backends. See [vision memory](vision-memory.md). |
-| `LLAMA_MMPROJ_PHASE_GPU_MIB` | none | Optional limit on the device-memory budget available for each phase encoding. `0` forces CPU encoding. |
+| `LLAMA_MMPROJ_DYNAMIC_GPU_MIB` | none | Optional limit on the device memory that each dynamic encoding may use (`--mmproj-memory dynamic`). `0` forces CPU encoding. See [vision memory](vision-memory.md). |
 
 DeepSeek V4.1 Flash (Q2_K experts, DSpark, `-ts 1,0` on ROCm1 with ROCm0 for staging, 256-token decode after short
 prompts): auto mode put 7.1 GiB on ROCm1 and 29.6 GiB on ROCm0. Decode was 36.3 t/s against 34.3 without the cache, with 90%

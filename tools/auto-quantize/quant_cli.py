@@ -220,8 +220,8 @@ def command_setup(args):
 def serve_from_args(args):
     """The serving layout of the options: what the memory reserves and the launched server depend on."""
     return {"ctx": args.ctx, "ub": args.ub, "parallel": args.parallel, "ctk": args.ctk, "ctv": args.ctv,
-            "mmproj": str(args.mmproj.resolve()) if args.mmproj else None, "draft": str(args.draft.resolve()) if args.draft else None,
-            "draft_device": args.draft_device, "spec_type": args.spec_type, "server_args": args.server_arg or [],
+            "mmproj": str(args.mmproj.resolve()) if args.mmproj else None, "mmproj_memory": args.mmproj_memory,
+            "draft": str(args.draft.resolve()) if args.draft else None, "draft_device": args.draft_device, "spec_type": args.spec_type, "server_args": args.server_arg or [],
             "mtp": not args.no_mtp}
 
 
@@ -936,6 +936,9 @@ def build_parser():
         p.add_argument("--ctx", type=int, required=required, default=None if required else 8192,
                        help="context size to serve (sets the KV reserve)")
         p.add_argument("--mmproj", type=Path, help="multimodal projector file (its memory is measured)")
+        p.add_argument("--mmproj-memory", choices=("dynamic", "resident"), default="dynamic",
+                       help="llama-server --mmproj-memory of the deployment: dynamic (default) counts only what an encoding "
+                            "needs beyond the compute buffers it borrows; resident counts the projector on its GPU")
         p.add_argument("--draft", type=Path, help="draft model or MTP head file (counts its file size)")
         p.add_argument("--draft-device", help="device of the draft file (default: the first GPU)")
         p.add_argument("--spec-type", default="draft-mtp", help="llama-server --spec-type for --draft (default draft-mtp)")
