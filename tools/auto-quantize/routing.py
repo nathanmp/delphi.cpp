@@ -37,7 +37,7 @@ MAX_ROWS = 16          # llama_expert_cache::max_rows: larger batches are prompt
 WINDOW = 256           # LLAMA_MOE_CACHE_WINDOW
 EVERY = 8              # LLAMA_MOE_CACHE_EVERY
 HYSTERESIS = 1.0       # LLAMA_MOE_CACHE_HYSTERESIS
-MAX_ASYNC = 32         # LLAMA_MOE_CACHE_ASYNC_EXPERTS
+MAX_ASYNC = 64         # LLAMA_MOE_CACHE_ASYNC_EXPERTS
 DELAY = 1              # small batches between queuing a swap and its taking effect
 GRID = (0.005, 0.01, 0.02, 0.03, 0.05, 0.08, 0.12, 0.16, 0.2, 0.25, 0.3, 0.4, 0.5, 0.6, 0.75, 0.9)
 

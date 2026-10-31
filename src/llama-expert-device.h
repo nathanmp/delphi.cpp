@@ -28,6 +28,6 @@ private:
     std::map<std::string, llama_expert_device_role> roles;
     std::vector<std::string> staging;
     bool staging_set = false;
-    size_t default_margin = size_t(1536) << 20;
+    size_t default_margin = size_t(1024) << 20;
     std::map<std::string, size_t> margins;
 };

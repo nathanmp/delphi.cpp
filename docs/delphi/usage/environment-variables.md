@@ -243,11 +243,12 @@ takes them back at the next refresh. So the cache and the staging slots do not n
 | variable | default | effect |
 | --- | --- | --- |
 | `LLAMA_MOE_CACHE_MIB` | `auto` | `auto` (or unset): when the model allows it, one tier per GPU of `--device`, of the GPU's free memory less `LLAMA_MOE_CACHE_AUTO_MARGIN_MIB`. The tiers are allocated when the server has loaded every model (draft and MTP included); other programs allocate them after the warmup. A number: one tier of that many MiB on the GPU of the layers. `0`: no cache. |
-| `LLAMA_MOE_CACHE_AUTO_MARGIN_MIB` | `1536` | memory left free on each GPU in auto mode, for buffers that grow later |
+| `LLAMA_MOE_CACHE_AUTO_MARGIN_MIB` | `1024` | memory left free on each GPU in auto mode, for buffers that grow later. The decode-time refresh scratch (3 slabs per `LLAMA_MOE_CACHE_ASYNC_EXPERTS` expert) is kept out of the tier in addition. |
 | `LLAMA_MOE_CACHE_TIERS` | none | more tiers, `<device>:<MiB>[,...]`, for example `ROCm0:16384` |
 | `LLAMA_MOE_CACHE_PROFILE` | none | expert frequencies (`tools/moe-static-cache/profile.py`), used until the window has rows |
 | `LLAMA_MOE_CACHE_WINDOW` | `256` | rows of routing that choose the hot experts; `0` keeps every row, negative never refreshes |
-| `LLAMA_MOE_CACHE_EVERY` | `8` | small batches between decode-time refreshes (at most `LLAMA_MOE_CACHE_ASYNC_EXPERTS`, default 32, experts each); `0` refreshes only after prompts |
+| `LLAMA_MOE_CACHE_EVERY` | `8` | small batches between decode-time refreshes (at most `LLAMA_MOE_CACHE_ASYNC_EXPERTS` experts each); `0` refreshes only after prompts |
+| `LLAMA_MOE_CACHE_ASYNC_EXPERTS` | `64` | experts per decode-time refresh. Each one needs 3 slabs of device scratch on every tier GPU and of pinned memory (DeepSeek V4.1: 18 MiB per expert). DeepSeek on 2 R9700: 32 36.8, 64 37.2, 96 37.9, 128 37.2, 192 36.7 t/s. |
 | `LLAMA_MOE_CACHE_PROMPT_ROWS` | `0` | prompt batches up to this many rows also run their hot experts on the GPU |
 | `LLAMA_MOE_CACHE_SHARED` | `0` | `1`: no tier of its own; tiers are leased at run time by the VRAM-sharing daemon. Turns auto mode off. |
 | `LLAMA_MMPROJ_PHASE` | conditional | Server: enabled for CUDA/HIP vision when the target expert cache uses the vision GPU, including pending auto-sized tiers. `0` keeps the encoder resident; `1` forces phase mode on supported backends. See [vision memory](vision-memory.md). |

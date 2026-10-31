@@ -97,6 +97,8 @@ struct llama_expert_cache {
     size_t tier_bytes(int id) const;
     // free the decode-time refresh buffers (allocated again when needed); returns the device bytes freed
     size_t release_scratch();
+    // device bytes of the decode-time refresh scratch on each tier GPU (0 without decode-time refreshes)
+    size_t async_scratch_bytes() const;
     // the caller reclaimed the staging slots outside a refresh: the lent slots are free again
     void reclaimed();
 
@@ -213,7 +215,7 @@ private:
                                // fill free slots at the next small batches
     bool fill_idle = false;    // a planned fill found nothing for the free slots: wait for the next `every`
     int64_t every = 8;         // small batches between decode-time refreshes; 0 refreshes only after prompts
-    int64_t max_async = 32;    // experts per decode-time refresh (device scratch and pinned buffer: 3 slabs each)
+    int64_t max_async = 64;    // experts per decode-time refresh (device scratch and pinned buffer: 3 slabs each)
     int64_t n_small = 0;
     std::unique_ptr<async_refresh> async;
     int64_t n_async = 0, n_async_uploaded = 0;

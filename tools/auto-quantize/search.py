@@ -60,7 +60,7 @@ def llama_layer_devices(counts):
     return [next((d for d, x in enumerate(splits) if f32(f32(il) / f32(total)) < x), len(splits)) for il in range(total)]
 
 
-AUTO_MARGIN_MIB = 1536  # LLAMA_MOE_CACHE_AUTO_MARGIN_MIB default
+AUTO_MARGIN_MIB = 1024  # LLAMA_MOE_CACHE_AUTO_MARGIN_MIB default
 
 
 def curve_for(info, cfg, n_layers):
@@ -153,7 +153,7 @@ def memory(info, cfg, choices):
             groups[key]["layers"].append(layer)
         largest_slab = max(ws[p][1] for ws in experts.values() for p in ws)
         # Device scratch and pinned refill buffer each hold three slabs per async replacement.
-        async_experts = int(cfg["runtime"]["env"].get("LLAMA_MOE_CACHE_ASYNC_EXPERTS", 32))
+        async_experts = int(cfg["runtime"]["env"].get("LLAMA_MOE_CACHE_ASYNC_EXPERTS", routing.MAX_ASYNC))
         scratch = 3 * largest_slab * max(1, async_experts)
         maps = sum(ws["gate"][2][2] * 4 for ws in experts.values())
         layer_bytes = sum(g["expert_bytes"] * len(g["layers"]) for g in groups.values())

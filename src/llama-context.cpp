@@ -3558,7 +3558,8 @@ void llama_context::sched_set_workers_all() {
 
 void llama_context::expert_cache_auto() {
     // At the first decode every context of the process (draft, MTP) holds its memory, so what is free can go to the cache.
-    // The margin is for buffers that grow later (graph reallocations, other processes).
+    // The margin is for buffers that grow later (graph reallocations, other processes). The decode-time refresh scratch is
+    // allocated later on each tier GPU, so it is kept out of the tier too.
     if (!expert_cache || !expert_cache->auto_size) {
         return;
     }
@@ -3580,15 +3581,18 @@ void llama_context::expert_cache_auto() {
         }
         size_t free = 0, total = 0;
         ggml_backend_dev_memory(d.dev, &free, &total);
-        const size_t budget = expert_device_policy.auto_budget(name, free);
+        const size_t scratch = expert_cache->async_scratch_bytes();
+        size_t budget = expert_device_policy.auto_budget(name, free);
+        budget = budget > scratch ? budget - scratch : 0;
         if (!budget) {
             LLAMA_LOG_INFO("%s: expert cache auto: %s has %.0f MiB free, no tier\n", __func__, ggml_backend_dev_name(d.dev),
                     free / 1048576.0);
             continue;
         }
         const int id = share_add_tier(d.dev, budget);
-        LLAMA_LOG_INFO("%s: expert cache auto: %s %.0f MiB free, %.0f MiB reserve, tier %d of up to %.0f MiB\n", __func__,
-                name.c_str(), free / 1048576.0, expert_device_policy.margin(name) / 1048576.0, id, budget / 1048576.0);
+        LLAMA_LOG_INFO("%s: expert cache auto: %s %.0f MiB free, %.0f MiB reserve, %.0f MiB refresh scratch, tier %d of up to %.0f MiB\n",
+                __func__, name.c_str(), free / 1048576.0, expert_device_policy.margin(name) / 1048576.0, scratch / 1048576.0, id,
+                budget / 1048576.0);
     }
 }
 

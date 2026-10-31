@@ -787,6 +787,10 @@ size_t llama_expert_cache::release_scratch() {
     return bytes;
 }
 
+size_t llama_expert_cache::async_scratch_bytes() const {
+    return every > 0 && window >= 0 ? size_t(3 * max_async) * max_slab() : 0;
+}
+
 void llama_expert_cache::reclaimed() {
     for (auto & t : tiers) {
         for (auto & g : t.groups) {

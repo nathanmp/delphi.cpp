@@ -32,7 +32,7 @@ int main() {
     assert(p.auto_budget("ROCm0", 32 * mib) == 0);
     assert(!policy::parse("ROCm3:pinned", nullptr, nullptr).stage_allowed("ROCm3"));
     assert(!policy::parse(nullptr, "none", nullptr).stage_allowed("ROCm0"));
-    assert(policy::parse(nullptr, nullptr, "ROCm2:6144").margin("ROCm1") == 1536 * mib);
+    assert(policy::parse(nullptr, nullptr, "ROCm2:6144").margin("ROCm1") == 1024 * mib);
 
     const auto invalid = [](const char * r, const char * s, const char * m) {
         try { policy::parse(r, s, m).validate({"ROCm0", "ROCm1", "ROCm2", "ROCm3"}); }
