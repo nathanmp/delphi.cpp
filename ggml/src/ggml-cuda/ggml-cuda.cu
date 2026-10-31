@@ -2376,6 +2376,56 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
 }
 
+// delphi: true if ggml_cuda_mul_mat may call cuBLAS for this node; mirrors its dispatch and errs toward true
+static bool ggml_cuda_mul_mat_may_use_cublas(const ggml_tensor * dst, const int cc, const int warp_size) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    const int64_t ne11 = src1->ne[1];
+    const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
+        && ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
+    if (bad_padding_clear || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return true;
+    }
+    if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11) ||
+            ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
+        return false;
+    }
+    return !ggml_is_quantized(src0->type) ||
+        (!ggml_cuda_should_use_mmvq(src0->type, cc, ne11, src0->ne[1]) && !ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0));
+}
+
+// delphi: true if the graph may create the BLAS handle of the current stream. Creating it inside a stream capture
+// fails on ROCm: hipBLASLt exits with "operation would make the legacy stream depend on a capturing blocking stream".
+static bool ggml_cuda_graph_may_create_blas_handle(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph) {
+    if (cuda_ctx->cublas_handles[cuda_ctx->device][cuda_ctx->curr_stream_no] != nullptr) {
+        return false;
+    }
+    const int cc        = ggml_cuda_info().devices[cuda_ctx->device].cc;
+    const int warp_size = ggml_cuda_info().devices[cuda_ctx->device].warp_size;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        switch (node->op) {
+            case GGML_OP_MUL_MAT:
+                if (ggml_cuda_mul_mat_may_use_cublas(node, cc, warp_size)) {
+                    return true;
+                }
+                break;
+            case GGML_OP_MUL_MAT_ID:
+                if (!ggml_is_quantized(node->src[0]->type)) {
+                    return true;
+                }
+                break;
+            case GGML_OP_OUT_PROD:
+            case GGML_OP_SSM_SCAN:
+            case GGML_OP_SOLVE_TRI:
+                return true;
+            default:
+                break;
+        }
+    }
+    return false;
+}
+
 // returns true when ggml_cuda_mul_mat_id takes the fallback path that requires stream synchronization
 // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
 static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int cc) {
@@ -5756,11 +5806,13 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     // shape is a new key that would never warm up within one prompt; capture
                     // itself never blocks on the launch queue, so first-use capture still wins.
                     const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
-                    if (ggml_cuda_graph_prefill_capture_enabled() && !GGML_CUDA_CC_IS_AMD(cc) &&
+                    // a graph that may create the BLAS handle runs eagerly first: it must not be created during capture
+                    const bool first_use_capture = !ggml_cuda_graph_may_create_blas_handle(cuda_ctx, cgraph);
+                    if (first_use_capture && ggml_cuda_graph_prefill_capture_enabled() && !GGML_CUDA_CC_IS_AMD(cc) &&
                             ggml_cuda_graph_is_prefill_candidate(cgraph)) {
                         use_cuda_graph = true;
                         cuda_graph_update_required = true;
-                    } else if (ggml_cuda_graph_find_sibling(cuda_ctx, cgraph, graph) != nullptr) {
+                    } else if (first_use_capture && ggml_cuda_graph_find_sibling(cuda_ctx, cgraph, graph) != nullptr) {
                         // capture right away: updating the sibling's executable is cheaper than an eager run
                         graph->warmup_complete = true;
                         use_cuda_graph = true;
