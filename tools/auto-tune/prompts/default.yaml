@@ -1,0 +1,831 @@
+# Small default question bank for the auto-tuner. 8 domains x 6 prompts.
+# Items with an `answer` are checked by string comparison after the model's bold final answer.
+
+# ---------------------------------------------------------------- math
+
+- domain: math
+  id: math-7times10
+  prompt: |
+    What is 7x10?
+    End your answer with your final answer in bold, on a separate line.
+  answer: "70"
+
+- domain: math
+  id: math-train-speed
+  prompt: |
+    A train travels 180 km in 2.5 hours at a constant speed. What is its speed in kilometres per hour?
+    End your answer with your final answer in bold, on a separate line.
+  answer: "72"
+
+- domain: math
+  id: math-discount-chain
+  prompt: |
+    A jacket costs $80. The shop takes 15% off the price, and then takes a further 10% off the already discounted price. What is the final price in dollars? Give the answer with two decimal places.
+    End your answer with your final answer in bold, on a separate line.
+  answer: "61.20"
+
+- domain: math
+  id: math-linear-equation
+  prompt: |
+    Solve for x:
+
+    3(x - 4) + 2x = 4x + 9
+    End your answer with your final answer in bold, on a separate line.
+  answer: "21"
+
+- domain: math
+  id: math-dice-sum-eight
+  prompt: |
+    Two fair six-sided dice are rolled. What is the probability that the two faces add up to 8? Give the answer as a fraction in lowest terms.
+    End your answer with your final answer in bold, on a separate line.
+  answer: "5/36"
+
+- domain: math
+  id: math-rectangle-area
+  prompt: |
+    The length of a rectangle is 3 cm more than twice its width. The perimeter of the rectangle is 54 cm. What is the area of the rectangle in square centimetres? Show the steps briefly.
+    End your answer with your final answer in bold, on a separate line.
+  answer: "152"
+
+# ---------------------------------------------------------------- reasoning
+
+- domain: reasoning
+  id: reasoning-finish-order
+  prompt: |
+    Four friends finished a race, and there were no ties. These statements are all true:
+
+    1. Ivy finished ahead of Jon.
+    2. Kai finished ahead of Ivy.
+    3. Lena did not finish first.
+    4. Jon did not finish last.
+
+    Who finished third?
+    End your answer with your final answer in bold, on a separate line.
+  answer: "Jon"
+
+- domain: reasoning
+  id: reasoning-box-draw
+  prompt: |
+    Three boxes are labeled "Apples", "Oranges" and "Mixed". The boxes contain, in some order, only apples, only oranges, or a mix of both. Every label is wrong: no box contains what its label says. You may draw one piece of fruit from one box, without looking into the box, and then you must know the contents of all three boxes. Which box should you draw from?
+
+    A) The box labeled "Mixed"
+    B) The box labeled "Apples"
+    C) The box labeled "Oranges"
+    D) Any box works equally well
+
+    Reply with the letter only.
+    End your answer with your final answer in bold, on a separate line.
+  answer: "A"
+
+- domain: reasoning
+  id: reasoning-books-shelf
+  prompt: |
+    Four books, one red, one blue, one green and one yellow, sit side by side on a shelf in positions 1, 2, 3 and 4 from left to right. The following are all true:
+
+    - The blue book is immediately to the left of the green book.
+    - The yellow book is in position 1 or position 4.
+    - The red book is not in position 2.
+    - The green book is not in position 3.
+
+    Which colour book is in position 3? Answer with one lowercase colour word.
+    End your answer with your final answer in bold, on a separate line.
+  answer: "red"
+
+- domain: reasoning
+  id: reasoning-syllogism-bloops
+  prompt: |
+    Consider these three statements, which are all true:
+
+    - All bloops are razzies.
+    - Some razzies are lazzies.
+    - No lazzies are bloops.
+
+    Which of the following must be true?
+
+    A) Some razzies are not bloops.
+    B) Some bloops are lazzies.
+    C) No razzies are lazzies.
+    D) All lazzies are razzies.
+
+    Reply with the letter only.
+    End your answer with your final answer in bold, on a separate line.
+  answer: "A"
+
+- domain: reasoning
+  id: reasoning-tom-ann-ages
+  prompt: |
+    Tom is 3 years older than his sister Ann. In 5 years, the sum of their two ages will be 41. How old is Tom now, in years?
+    End your answer with your final answer in bold, on a separate line.
+  answer: "17"
+
+- domain: reasoning
+  id: reasoning-bat-ball
+  prompt: |
+    A bat and a ball cost $1.10 in total. The bat costs $1.00 more than the ball. How many cents does the ball cost? Answer with a number only.
+    End your answer with your final answer in bold, on a separate line.
+  answer: "5"
+
+# ---------------------------------------------------------------- knowledge
+
+- domain: knowledge
+  id: knowledge-capital-australia
+  prompt: |
+    What is the capital city of Australia?
+    End your answer with your final answer in bold, on a separate line.
+  answer: "Canberra"
+
+- domain: knowledge
+  id: knowledge-apollo11-year
+  prompt: |
+    In which year did the Apollo 11 mission land the first crewed spacecraft on the Moon?
+    End your answer with your final answer in bold, on a separate line.
+  answer: "1969"
+
+- domain: knowledge
+  id: knowledge-gold-symbol
+  prompt: |
+    What is the chemical symbol for gold?
+    End your answer with your final answer in bold, on a separate line.
+  answer: "Au"
+
+- domain: knowledge
+  id: knowledge-largest-ocean
+  prompt: |
+    Which is the largest ocean on Earth by area? Answer with one word.
+    End your answer with your final answer in bold, on a separate line.
+  answer: "Pacific"
+
+- domain: knowledge
+  id: knowledge-grams-per-kilogram
+  prompt: |
+    How many grams are there in one kilogram? Answer with a number only.
+    End your answer with your final answer in bold, on a separate line.
+  answer: "1000"
+
+- domain: knowledge
+  id: knowledge-berlin-wall-year
+  prompt: |
+    In which year did the Berlin Wall fall, opening the border crossings between East and West Berlin?
+    End your answer with your final answer in bold, on a separate line.
+  answer: "1989"
+
+# ---------------------------------------------------------------- code-write
+
+- domain: code-write
+  id: code-write-merge-intervals
+  prompt: |
+    Write a Python function `merge_intervals(intervals)` that takes a list of `[start, end]` integer pairs. Each pair has start <= end. The list may be unsorted, and intervals may overlap or touch; touching intervals such as [1, 2] and [2, 3] must be merged. Return a new list of merged intervals sorted by start. Do not modify the input list.
+
+    Include a docstring, and add an `if __name__ == "__main__":` block with three example calls that print their results.
+
+- domain: code-write
+  id: code-write-count-words-c
+  prompt: |
+    Write a C99 function `size_t count_words(const char *s)` that returns the number of words in a NUL-terminated string. A word is a maximal run of non-whitespace bytes. Whitespace means only these ASCII bytes: space, tab, newline, carriage return, vertical tab and form feed. Bytes with the high bit set are not whitespace, so UTF-8 text is counted by ASCII whitespace only. The function returns 0 for a NULL pointer or an empty string. Do not use any library function other than those in the C standard headers you need.
+
+    Also write a short `main` that checks three strings: an empty string, a string with leading and trailing spaces and tabs, and a string with a newline between two words. Print the results.
+
+- domain: code-write
+  id: code-write-debounce-js
+  prompt: |
+    Write a JavaScript function `debounce(fn, waitMs, options)` with no dependencies. The `options` object may contain `leading` (boolean, default false). The function returns a debounced wrapper. The wrapper forwards the most recent arguments and the `this` value to `fn` after `waitMs` milliseconds have passed without another call. When `leading` is true, `fn` runs immediately on the first call of a burst instead of at the end. The returned wrapper must also have a `cancel()` method that drops any pending call. Keep the code under 40 lines and add brief comments where the logic is not obvious.
+
+- domain: code-write
+  id: code-write-parse-duration-rust
+  prompt: |
+    Write a Rust function `parse_duration(s: &str) -> Result<std::time::Duration, String>`. It parses strings made of one or more components, where each component is a non-negative integer immediately followed by one unit: `ms`, `s`, `m` or `h`. Examples: "250ms", "90s", "15m", "1h30m". Components may appear in any order, but each unit may appear at most once. Whitespace is not allowed. An empty string, a missing number, an unknown unit, a repeated unit or a number that overflows must return an `Err` with a short message.
+
+    Include unit tests for at least one valid input and two invalid inputs.
+
+- domain: code-write
+  id: code-write-top-countries-sql
+  prompt: |
+    Given these PostgreSQL tables:
+
+    customers(id integer primary key, name text, country text)
+    orders(id integer primary key, customer_id integer references customers(id), placed_at timestamp, total_cents integer)
+
+    Write one SQL query that returns the top three countries by total revenue from orders placed during calendar year 2025. Return three columns: country, orders_count (number of orders in 2025), and revenue_usd (the sum of total_cents divided by 100, as a numeric value rounded to two decimal places). Sort by revenue_usd descending, then country ascending, and return at most three rows. Use a half-open date range for 2025 rather than a function on the timestamp column.
+
+- domain: code-write
+  id: code-write-tidy-names-bash
+  prompt: |
+    Write a Bash script named `tidy_names.sh`. It takes one argument, a directory path, and renames every regular file directly inside that directory (not recursively) so that each name is lowercase and every space becomes an underscore. Hidden files are skipped.
+
+    Requirements:
+    - Support a `-n` flag for dry-run mode. In dry-run mode, print each planned rename as "old -> new" and change nothing.
+    - If the target name already exists, skip that file and print a warning to stderr.
+    - Begin the script with `set -euo pipefail`, quote every expansion, and handle filenames containing spaces or leading dashes.
+    - If the arguments are wrong, print a usage line to stderr and exit with status 2.
+
+# ---------------------------------------------------------------- code-edit
+
+- domain: code-edit
+  id: code-edit-inventory-python
+  prompt: |
+    Here is a Python module that reads an inventory CSV file and prints a report:
+
+    ```python
+    import csv
+    from dataclasses import dataclass
+
+
+    @dataclass
+    class Item:
+        sku: str
+        name: str
+        quantity: int
+        unit_price: float
+
+
+    def load_items(path):
+        items = []
+        with open(path, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                item = Item(
+                    sku=row["sku"].strip(),
+                    name=row["name"].strip(),
+                    quantity=int(row["quantity"]),
+                    unit_price=float(row["unit_price"]),
+                )
+                items.append(item)
+        return items
+
+
+    def total_value(items):
+        return sum(i.quantity * i.unit_price for i in items)
+
+
+    def low_stock(items, threshold=5):
+        return [i for i in items if i.quantity < threshold]
+
+
+    def format_report(items):
+        lines = []
+        for i in sorted(items, key=lambda x: x.sku):
+            lines.append(f"{i.sku:<10} {i.name:<25} {i.quantity:>5} {i.unit_price:>10.2f}")
+        lines.append(f"Total value: {total_value(items):.2f}")
+        return "\n".join(lines)
+
+
+    if __name__ == "__main__":
+        import sys
+
+        items = load_items(sys.argv[1])
+        print(format_report(items))
+        for i in low_stock(items):
+            print(f"LOW: {i.sku}")
+    ```
+
+    Make these changes:
+    1. Rename `load_items` to `read_inventory` and update every call site.
+    2. If the file does not exist, print a clear message to stderr and exit with status 1.
+    3. If a row has a missing or non-numeric `quantity` or `unit_price`, skip that row and print a warning to stderr that includes the line number from the CSV reader.
+
+    Return the full updated file.
+
+- domain: code-edit
+  id: code-edit-http-client-js
+  prompt: |
+    Here is a small Node.js HTTP helper module (Node 18 or later):
+
+    ```javascript
+    // httpClient.js
+    const DEFAULT_TIMEOUT_MS = 5000;
+    const DEFAULT_RETRIES = 2;
+
+    function sleep(ms) {
+      return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
+    async function fetchWithTimeout(url, options = {}, timeoutMs = DEFAULT_TIMEOUT_MS) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        return await fetch(url, { ...options, signal: controller.signal });
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+
+    async function getJson(url, options = {}) {
+      const res = await fetch(url, {
+        headers: { Accept: "application/json", ...(options.headers || {}) },
+      });
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status} for ${url}`);
+      }
+      return res.json();
+    }
+
+    async function getJsonRetry(url, options = {}) {
+      let lastError;
+      for (let attempt = 0; attempt <= DEFAULT_RETRIES; attempt++) {
+        try {
+          const res = await fetchWithTimeout(url, {
+            headers: { Accept: "application/json" },
+          });
+          if (res.status >= 500) {
+            throw new Error(`server error ${res.status}`);
+          }
+          if (!res.ok) {
+            throw new Error(`HTTP ${res.status} for ${url}`);
+          }
+          return await res.json();
+        } catch (err) {
+          lastError = err;
+          if (attempt < DEFAULT_RETRIES) {
+            await sleep(200);
+          }
+        }
+      }
+      throw lastError;
+    }
+
+    function buildQuery(params) {
+      const search = new URLSearchParams();
+      for (const [key, value] of Object.entries(params)) {
+        if (value !== undefined && value !== null) {
+          search.append(key, String(value));
+        }
+      }
+      return search.toString();
+    }
+
+    module.exports = {
+      fetchWithTimeout,
+      getJson,
+      getJsonRetry,
+      buildQuery,
+      sleep,
+    };
+    ```
+
+    Make these changes:
+    1. Make the retry delay exponential: 200 ms before the first retry, doubling each time, capped at 2000 ms.
+    2. Let `getJsonRetry` accept per-call `retries` and `timeoutMs` options that override the module constants. Pass the options through to the underlying request.
+    3. Do not retry 4xx responses. Only network errors, timeouts and 5xx responses should be retried.
+    4. Remove any export that nothing in the module uses.
+
+    Return the full updated file.
+
+- domain: code-edit
+  id: code-edit-ring-buffer-c
+  prompt: |
+    Here is a byte ring buffer in C:
+
+    ```c
+    #include <stdbool.h>
+    #include <stddef.h>
+    #include <stdlib.h>
+    #include <string.h>
+
+    typedef struct {
+        unsigned char *data;
+        size_t capacity;
+        size_t head;
+        size_t tail;
+        size_t count;
+    } ring_buf;
+
+    ring_buf *rb_create(size_t capacity) {
+        ring_buf *rb = malloc(sizeof *rb);
+        if (!rb) return NULL;
+        rb->data = malloc(capacity);
+        if (!rb->data) {
+            free(rb);
+            return NULL;
+        }
+        rb->capacity = capacity;
+        rb->head = 0;
+        rb->tail = 0;
+        rb->count = 0;
+        return rb;
+    }
+
+    void rb_destroy(ring_buf *rb) {
+        if (!rb) return;
+        free(rb->data);
+        free(rb);
+    }
+
+    size_t rb_size(const ring_buf *rb) {
+        return rb->count;
+    }
+
+    bool rb_push(ring_buf *rb, unsigned char byte) {
+        if (rb->count == rb->capacity) return false;
+        rb->data[rb->tail] = byte;
+        rb->tail = (rb->tail + 1) % rb->capacity;
+        rb->count++;
+        return true;
+    }
+
+    bool rb_pop(ring_buf *rb, unsigned char *out) {
+        if (rb->count == 0) return false;
+        *out = rb->data[rb->head];
+        rb->head = (rb->head + 1) % rb->capacity;
+        rb->count--;
+        return true;
+    }
+
+    size_t rb_write(ring_buf *rb, const unsigned char *src, size_t len) {
+        size_t written = 0;
+        while (written < len && rb_push(rb, src[written])) {
+            written++;
+        }
+        return written;
+    }
+
+    size_t rb_read(ring_buf *rb, unsigned char *dst, size_t len) {
+        size_t read = 0;
+        unsigned char b;
+        while (read < len && rb_pop(rb, &b)) {
+            dst[read++] = b;
+        }
+        return read;
+    }
+    ```
+
+    Make these changes:
+    1. Add `bool rb_peek(const ring_buf *rb, size_t offset, unsigned char *out)`. It copies the byte at `offset` counted from the head, without removing it, and returns false if `offset` is out of range.
+    2. Add `void rb_clear(ring_buf *rb)`.
+    3. Make `rb_create` return NULL when `capacity` is 0.
+    4. Make `rb_write` and `rb_read` copy in bulk with `memcpy` when the copied region does not wrap around the end of the buffer, and fall back to the byte loop otherwise.
+
+    Return the full updated file.
+
+- domain: code-edit
+  id: code-edit-config-parser-rust
+  prompt: |
+    Here is a small Rust module that parses `key = value` config text:
+
+    ```rust
+    use std::collections::HashMap;
+    use std::fs;
+    use std::path::Path;
+
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum Value {
+        Text(String),
+        Int(i64),
+        Bool(bool),
+    }
+
+    pub fn parse_value(raw: &str) -> Value {
+        let trimmed = raw.trim();
+        if trimmed == "true" {
+            return Value::Bool(true);
+        }
+        if trimmed == "false" {
+            return Value::Bool(false);
+        }
+        if let Ok(n) = trimmed.parse::<i64>() {
+            return Value::Int(n);
+        }
+        let unquoted = trimmed
+            .strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))
+            .unwrap_or(trimmed);
+        Value::Text(unquoted.to_string())
+    }
+
+    pub fn parse_config(text: &str) -> HashMap<String, Value> {
+        let mut map = HashMap::new();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some((key, value)) = line.split_once('=') {
+                map.insert(key.trim().to_string(), parse_value(value));
+            }
+        }
+        map
+    }
+
+    pub fn load_config(path: &Path) -> HashMap<String, Value> {
+        let text = fs::read_to_string(path).unwrap_or_default();
+        parse_config(&text)
+    }
+
+    pub fn get_int(map: &HashMap<String, Value>, key: &str) -> Option<i64> {
+        match map.get(key) {
+            Some(Value::Int(n)) => Some(*n),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn parses_basic_pairs() {
+            let m = parse_config("port = 8080\nname = \"demo\"\n# comment\ndebug = true");
+            assert_eq!(get_int(&m, "port"), Some(8080));
+            assert_eq!(m.get("debug"), Some(&Value::Bool(true)));
+        }
+    }
+    ```
+
+    Make these changes:
+    1. Change `parse_config` to return `Result<HashMap<String, Value>, ConfigError>`. A `ConfigError` must record the 1-based line number and the text of any non-empty, non-comment line that has no `=` sign.
+    2. Implement `std::fmt::Display` for `ConfigError`.
+    3. Change `load_config` to return a `Result` that propagates I/O errors instead of silently returning an empty map.
+    4. Rename `get_int` to `get_i64`, and keep the existing test passing after the changes.
+
+    Return the full updated file.
+
+- domain: code-edit
+  id: code-edit-backup-script-bash
+  prompt: |
+    Here is a Bash script that archives a directory and keeps only the newest archives:
+
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    SRC_DIR="${1:-}"
+    DEST_ROOT="${BACKUP_ROOT:-$HOME/backups}"
+    KEEP=7
+
+    usage() {
+      echo "usage: $(basename "$0") SOURCE_DIR" >&2
+      exit 2
+    }
+
+    [[ -n "$SRC_DIR" ]] || usage
+    [[ -d "$SRC_DIR" ]] || { echo "error: not a directory: $SRC_DIR" >&2; exit 1; }
+
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    name="$(basename "$SRC_DIR")"
+    dest="$DEST_ROOT/$name-$stamp.tar.gz"
+
+    mkdir -p "$DEST_ROOT"
+    echo "Creating $dest"
+    tar -czf "$dest" -C "$(dirname "$SRC_DIR")" "$name"
+
+    # Prune old archives for this source, keeping the newest $KEEP.
+    shopt -s nullglob
+    archives=("$DEST_ROOT/$name"-*.tar.gz)
+    shopt -u nullglob
+
+    count=${#archives[@]}
+    if (( count > KEEP )); then
+      mapfile -t sorted < <(printf '%s\n' "${archives[@]}" | sort)
+      to_delete=$(( count - KEEP ))
+      for (( i = 0; i < to_delete; i++ )); do
+        echo "Removing ${sorted[$i]}"
+        rm -f -- "${sorted[$i]}"
+      done
+    fi
+
+    echo "Done. $(( count > KEEP ? KEEP : count )) archive(s) kept."
+    ```
+
+    Make these changes:
+    1. Parse options with `getopts`. Add `-n` for dry-run mode: print what would be archived and removed, and do not touch the filesystem.
+    2. Add `-k N` to override the number of archives kept. Reject a value that is not a positive integer with a message and exit status 2.
+    3. Before doing anything else, check that `tar` is installed, and fail with a clear message if it is not.
+    4. After creating the archive, print its size in human-readable form.
+
+    Return the full updated script.
+
+- domain: code-edit
+  id: code-edit-token-bucket-python
+  prompt: |
+    Here is a Python token bucket rate limiter:
+
+    ```python
+    import threading
+    import time
+
+
+    class TokenBucket:
+        """Allow up to `capacity` events in a burst, refilled at `rate` tokens per second."""
+
+        def __init__(self, rate, capacity):
+            if rate <= 0:
+                raise ValueError("rate must be positive")
+            if capacity <= 0:
+                raise ValueError("capacity must be positive")
+            self.rate = float(rate)
+            self.capacity = float(capacity)
+            self.tokens = float(capacity)
+            self.updated = time.time()
+            self._lock = threading.Lock()
+
+        def _refill(self):
+            now = time.time()
+            elapsed = now - self.updated
+            self.tokens = min(self.capacity, self.tokens + elapsed * self.rate)
+            self.updated = now
+
+        def try_acquire(self, n=1):
+            with self._lock:
+                self._refill()
+                if self.tokens >= n:
+                    self.tokens -= n
+                    return True
+                return False
+
+        def wait_time(self, n=1):
+            with self._lock:
+                self._refill()
+                deficit = n - self.tokens
+                return max(0.0, deficit / self.rate)
+
+
+    class KeyedLimiter:
+        def __init__(self, rate, capacity):
+            self._rate = rate
+            self._capacity = capacity
+            self._buckets = {}
+            self._guard = threading.Lock()
+
+        def allow(self, key):
+            with self._guard:
+                bucket = self._buckets.get(key)
+                if bucket is None:
+                    bucket = TokenBucket(self._rate, self._capacity)
+                    self._buckets[key] = bucket
+            return bucket.try_acquire()
+
+        def forget(self, key):
+            with self._guard:
+                self._buckets.pop(key, None)
+    ```
+
+    Make these changes:
+    1. Let `TokenBucket` and `KeyedLimiter` take an optional `clock` argument, a zero-argument callable that defaults to `time.monotonic`. Use it everywhere the code currently calls `time.time`, so tests can pass a fake clock.
+    2. Add a `reset()` method to `TokenBucket` that refills it to capacity, and a `reset_all()` method to `KeyedLimiter` that does the same for every bucket.
+    3. Make `try_acquire` raise `ValueError` when `n` is less than 1.
+    4. Keep the code thread-safe.
+
+    Return the full updated file.
+
+# ---------------------------------------------------------------- summarize
+
+- domain: summarize
+  id: summarize-bakery-quarter
+  prompt: |
+    Read the report below and then follow the instruction at the end.
+
+    Harbor Lane Bakery: Quarterly Operations Report, Q3
+
+    Revenue for the third quarter reached 412,600 dollars, which is 9 percent above the same quarter last year. Most of the growth came from the two new wholesale accounts that began in July, a café chain on the east side and a grocery co-op in the north. Wholesale now accounts for roughly a third of total sales, up from a fifth a year ago. Walk-in sales at the original shop were flat, reflecting a slow summer for tourism along the harbour.
+
+    Production costs rose faster than revenue. Flour prices increased by 14 percent after the spring contract renewal, and butter costs stayed high through August. The bakery absorbed part of this increase rather than passing it on, which cut the gross margin from 61 percent to 57 percent. Labour costs were stable because the team added one overnight baker in June, which also reduced overtime by about 300 hours.
+
+    Waste fell for the first time in two years. The bakery now records unsold bread and pastries each evening, and the donation program distributed about 1,100 kilograms of day-old goods to local shelters. Staff suggested the tracking sheet, and the team has kept it running through the autumn.
+
+    Two problems remain open. The delivery van failed its inspection in September and has been out of service for nine days, forcing the wholesale route to use a rented vehicle at a higher cost. Customer complaints about the sourdough rye also increased; most mention a dense crumb and a sharper taste than before. The head baker has traced this to a change in the supplier's flour blend and is testing an alternative.
+
+    Priorities for the next quarter are to secure a second delivery vehicle, restore the gross margin to at least 60 percent through pricing and supplier changes, and sign one more wholesale account before the holiday season.
+
+    Instruction: Summarize the report in no more than four sentences. Then list the three most important action items for next quarter as a numbered list.
+
+- domain: summarize
+  id: summarize-product-meeting-notes
+  prompt: |
+    Below are notes from a product meeting. Use them as the source for the request at the end.
+
+    Onboarding redesign review, Tuesday 14 October. Attendees: Dana (product), Ruth (design), Omar (mobile engineering), Priya (customer success), Sam (data).
+
+    The group reviewed the results of the two-week trial of the shorter onboarding flow. Users in the trial group completed setup in a median of four minutes, down from seven minutes in the control group. However, the seven-day retention figures were nearly identical between the groups, at 38 percent for the trial and 37 percent for the control. Sam noted that the sample of 1,200 users per group is large enough to trust the completion time result, but that the retention difference is too small to read as an effect either way.
+
+    Priya reported that support tickets about "missing settings" rose by about 20 percent in the trial group. Several of these came from users who skipped the company-size question, which the new flow moved to the end. Ruth proposed moving that question back to the start, but as an optional field with a clear reason shown beside it. Omar cautioned that the mobile layout has a fixed step counter that would need rework if the number of screens changes again.
+
+    Decisions: the team agreed to ship the shorter flow to all users in the first week of November, with the company-size question restored as optional. Omar will check whether the step counter can be data-driven before the release. Sam will run a follow-up analysis of retention at thirty days, not seven, because early churn in the trial was concentrated in users who never connected a bank account.
+
+    Open items: decide whether the bank-connection step should be required, and whether the team should run a separate trial for the mobile app. Dana will bring both questions to the next planning session on 28 October.
+
+    Request: Rewrite these notes as a short message to the company's executive team, under 120 words, in a plain and confident tone. Lead with the decision.
+
+- domain: summarize
+  id: summarize-kettle-description
+  prompt: |
+    Read the product description below, then complete the task at the end.
+
+    The Brindle Pour-Over Kettle is designed for people who want precise control of water temperature without a complicated menu. Its gooseneck spout has a narrow opening that lets you direct a slow, steady stream onto coffee grounds or loose tea. The kettle holds 900 millilitres, enough for two large cups, and the stainless steel body keeps its shape through years of daily use.
+
+    A single dial on the base selects one of five preset temperatures: 80, 85, 90, 96 and 100 degrees Celsius. Green tea and light roasts usually taste best between 80 and 85 degrees, while darker coffee and black tea do well at the higher settings. The dial locks into place so that the kettle cannot be accidentally moved to a new setting while it is pouring. A hold function keeps the water at the chosen temperature for up to 60 minutes, which is useful when you are preparing a pot for several people.
+
+    The base is cordless, so the kettle can be lifted and carried to the counter, the sink or the table. The lid opens with a hinged latch that stays closed while the kettle is moving. An automatic shut-off turns the heater off when the water boils dry or if the kettle is lifted from the base for more than two minutes.
+
+    Care is simple. The interior can be wiped with a damp cloth, and the filter basket in the spout can be removed for rinsing. The kettle is dishwasher-safe only on the top rack, and the base should never be immersed. The Brindle Pour-Over Kettle carries a two-year warranty, and replacement parts such as the lid gasket and the filter are sold separately for about the price of a cup of coffee.
+
+    Task: Give three bullet-point key points that a shopper should know before buying, then write one sentence that summarizes the product for a product listing page.
+
+- domain: summarize
+  id: summarize-hash-table-explainer
+  prompt: |
+    The passage below is a technical explanation. Read it and then complete the task at the end.
+
+    A hash table stores key-value pairs and aims to find a value from its key in roughly constant time. It works by passing each key through a hash function, which converts the key into an integer. That integer is reduced to an index within a fixed-size array of buckets, and the value is stored in that bucket. To look up a key later, the same hash function is applied, the same index is computed, and the bucket is checked.
+
+    Two different keys can produce the same index. This event is called a collision, and it is unavoidable because there are usually many more possible keys than buckets. The two most common strategies for handling collisions are chaining and open addressing. In chaining, each bucket holds a small list of entries, and colliding keys are appended to that list. In open addressing, a colliding key is placed in another empty bucket found by a fixed probing rule, such as checking the next slot.
+
+    The load factor is the number of stored entries divided by the number of buckets. As the load factor rises, collisions become more frequent and lookups slow down, so most implementations resize the array when the load factor passes a threshold. Resizing requires computing new indexes for every entry, which is expensive for a single operation but cheap when averaged over many insertions.
+
+    A good hash function distributes keys evenly across buckets, and it should be fast to compute. Hash functions that are too simple can create clusters, where many keys land in a few buckets and performance degrades toward that of a linked list. Some systems also use randomized hash seeds to make it hard for an attacker to craft keys that all collide.
+
+    Task: Summarize the passage in about 80 words for a reader who has never programmed. Avoid technical jargon, and if you must use a term such as "collision", explain it in the same sentence.
+
+- domain: summarize
+  id: summarize-council-bike-lanes
+  prompt: |
+    The article below is a news report. Read it, then complete the task at the end.
+
+    The Eastbrook City Council voted 6 to 3 on Monday to approve a permanent protected bike lane along Mill Street, a four-kilometre corridor that connects the rail station to the university campus. The lane replaces a temporary pilot that began in March and that council members have debated since the summer. Supporters said the pilot reduced collisions involving cyclists by a third, while local businesses reported that customers were still able to reach their shops.
+
+    Opponents raised concerns about the removal of 46 on-street parking spaces. Several shop owners said the loss of parking would hurt businesses that rely on customers who drive, particularly older shoppers and those carrying heavy goods. One councillor proposed a delay to study alternative parking options in a nearby car park, but the proposal failed. The council did agree to a review in two years that will measure travel times, parking occupancy and sales at the affected shops.
+
+    City transport staff estimated that construction will begin in the spring and take about five months. Work will include new kerbs, improved crossings at three junctions, and additional street trees. The total cost is 2.1 million dollars, of which about 800,000 dollars will come from a state active travel grant. The remaining funds will come from the city's capital budget.
+
+    Residents who spoke at the public session were divided. A group of parents from the northern neighbourhood said the lane would make the school route safer for children. A resident of a nearby street said the design had not been explained clearly enough before the vote, and asked for more public meetings before construction begins.
+
+    Task: Write a neutral one-paragraph summary of the decision and its context, then list the open questions that remain unresolved, as bullet points.
+
+- domain: summarize
+  id: summarize-lighthouse-story
+  prompt: |
+    The short story below is complete. Read it, then complete the task at the end.
+
+    Every evening for thirty-one years, Teodora climbed the one hundred and twelve iron steps of the Carrow Point lighthouse to light the lamp. Her father had done the same, and his father before him, and by now the habit felt less like a job than a kind of breathing. The lamp needed winding and the glass needed polishing, and she did both without thinking.
+
+    That autumn the new automatic beacon was installed on the far headland. The men who brought it talked about it kindly, the way one talks about a horse that will replace an old friend. Teodora helped them carry the crates. She did not say that she had hoped they would take longer.
+
+    The rumour in the village was that the lighthouse would be closed by spring. Her nephew Iven, who worked the ferry, came up one evening and said she should accept the pension and move to the mainland, where his wife could look after her. Teodora said nothing, and when he left she climbed the stairs and sat in the dark at the top for a long time, watching the water turn from grey to black.
+
+    In the last week of October, a fishing boat failed to return before the storm. Teodora lit the lamp early and kept it burning through the night, even though the automatic beacon was operating and the official instructions said she should not need to. At dawn the boat appeared at the harbour mouth, its crew waving from the stern. The harbourmaster later wrote a short report that did not mention the lamp at all.
+
+    The following spring the lighthouse was closed. Teodora moved to the mainland, but she often told visitors that she still woke at four in the morning, listening for the sound of the winding mechanism that no longer ran.
+
+    Task: Summarize the plot in three sentences, then state the narrator's main internal conflict in one sentence.
+
+# ---------------------------------------------------------------- writing
+
+- domain: writing
+  id: writing-night-train-opening
+  prompt: |
+    Write the opening paragraph of a short story, about 120 to 180 words. The setting is a night train that stops at a small station that none of the passengers remembers ever seeing on the timetable. Write in the third person, past tense, and end the paragraph on a line of dialogue.
+
+- domain: writing
+  id: writing-reschedule-email
+  prompt: |
+    Write a short professional email to a client named Mr. Okafor. Our Thursday 2:00 pm project review has to move to the following Monday at 10:00 am because a team member is sick. Apologize once, offer to send a calendar invite, and ask him to confirm the new time. Keep the email under 120 words, and include a subject line.
+
+- domain: writing
+  id: writing-autumn-kitchen-poem
+  prompt: |
+    Write a poem of eight lines about a kitchen on the last warm evening of October. Use rhyme, and aim for lines of roughly ten syllables. Do not use the words "pumpkin" or "leaf".
+
+- domain: writing
+  id: writing-database-announcement
+  prompt: |
+    Write a product announcement of about 100 words for a fictional open-source database called Tessera, announcing version 3.0. The release includes three headline features: much faster bulk imports, a rewritten query planner that handles multi-table joins more efficiently, and a built-in migration tool that can run in dry-run mode. The audience is software developers. Use a confident but not hype-heavy tone, and end with a call to action that points to the upgrade guide.
+
+- domain: writing
+  id: writing-library-instruments-essay
+  prompt: |
+    Write one persuasive essay paragraph of about 150 words arguing that public libraries should lend tools and musical instruments as well as books. Use a clear topic sentence, at least one concrete example, and a closing sentence that anticipates one objection and answers it.
+
+- domain: writing
+  id: writing-siblings-piano-dialogue
+  prompt: |
+    Write a dialogue of about twelve lines between two adult siblings, Lena and Marcus, who must decide whether to sell their late grandmother's upright piano. Let the conflict be about what the piano means to each of them rather than about money. Format it as a script with speaker names followed by a colon, and do not include any narration or stage directions.
+
+# ---------------------------------------------------------------- chat
+
+- domain: chat
+  id: chat-git-for-hobbyists
+  prompt: |
+    I keep hearing people talk about git. In simple terms, what is it, and why would someone who writes small programs alone for fun bother using it?
+
+- domain: chat
+  id: chat-laptop-student
+  prompt: |
+    I'm a university student. I write essays, do some light photo editing, and I have about 800 dollars to spend. What kind of laptop should I look for, and why? Keep the answer short.
+
+- domain: chat
+  id: chat-rent-or-buy
+  prompt: |
+    I expect to move for work in about three years. Give me a quick comparison of renting versus buying a home for someone in that situation. What are the main factors I should weigh?
+
+- domain: chat
+  id: chat-sourdough-feeding-steps
+  prompt: |
+    How do I feed a sourdough starter that has been sitting in the fridge all week? Give me numbered steps, and tell me what it should look like when it is ready to use.
+
+- domain: chat
+  id: chat-waking-at-3am
+  prompt: |
+    I wake up around 3 am most nights and then can't get back to sleep for an hour or more. What practical things could I try to fix this?
+
+- domain: chat
+  id: chat-inflation-for-kids
+  prompt: |
+    Explain inflation to a twelve-year-old in a few sentences. Use an example involving candy bars so it is easy to picture.
