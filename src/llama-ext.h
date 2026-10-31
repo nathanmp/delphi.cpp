@@ -45,6 +45,9 @@ LLAMA_API bool    llama_share_restore_memory(struct llama_context * ctx);
 LLAMA_API bool    llama_share_memory_released(const struct llama_context * ctx);
 // Allow or forbid staging (GGML_SCHED_STAGE) to device `dev`; forbidden staging keeps the routed experts on the CPU.
 LLAMA_API void    llama_share_stage_allow(struct llama_context * ctx, const char * dev, bool allow);
+// Measure the staging threshold (GGML_SCHED_STAGE_MIN_TOKENS) with three prompts of random tokens and set it, unless that
+// variable sets it. Clears the memory module. Returns the threshold, or -1 without staging or routed experts on the host.
+LLAMA_API int32_t llama_share_stage_calibrate(struct llama_context * ctx);
 // Whether the context has an expert cache (LLAMA_MOE_CACHE_MIB or LLAMA_MOE_CACHE_SHARED), and its layer device.
 LLAMA_API bool         llama_share_has_expert_cache(const struct llama_context * ctx);
 // An existing tier, or an auto-sized tier that will be allocated after all models are loaded.

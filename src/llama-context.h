@@ -97,6 +97,9 @@ struct llama_context {
     bool   share_restore_memory();
     bool   share_memory_released() const { return memory_released; }
     void   share_stage_allow(ggml_backend_dev_t dev, bool allow);
+    int32_t share_stage_calibrate();
+    bool    stage_calibrated = false; // measured once per context: common and the server both ask
+    int32_t stage_min_tokens = -1;    // the measured threshold, for schedulers created later; -1: none
     llama_expert_cache * share_expert_cache() const { return expert_cache.get(); }
 
     enum llama_pooling_type pooling_type() const;

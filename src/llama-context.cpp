@@ -3604,6 +3604,9 @@ void llama_context::sched_set_stage_lender() {
             ggml_backend_sched_stage_allow(sched.get(), b.get(), false);
         }
     }
+    if (stage_min_tokens >= 0) {
+        ggml_backend_sched_stage_set_min_tokens(sched.get(), stage_min_tokens);
+    }
 }
 
 void llama_context::graph_slot_activate(int id) {
@@ -3814,6 +3817,167 @@ void llama_context::share_stage_allow(ggml_backend_dev_t dev, bool allow) {
         }
     }
     share_gen++;
+}
+
+// host-to-device rate of a GPU in bytes/us, from a 64 MiB copy out of pinned memory (the staging rings copy through pinned
+// buffers); 0 if the buffers cannot be allocated
+static double llama_stage_link_rate(ggml_backend_dev_t dev) {
+    const size_t size = 64u << 20;
+    ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(dev);
+    ggml_backend_buffer_t host = host_buft ? ggml_backend_buft_alloc_buffer(host_buft, size) : nullptr;
+    ggml_backend_buffer_t gpu  = ggml_backend_buft_alloc_buffer(ggml_backend_dev_buffer_type(dev), size);
+    ggml_init_params ip = { ggml_tensor_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    double rate = 0;
+    if (host != nullptr && gpu != nullptr && ctx != nullptr) {
+        ggml_tensor * t = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, size);
+        if (ggml_backend_tensor_alloc(gpu, t, ggml_backend_buffer_get_base(gpu)) == GGML_STATUS_SUCCESS) {
+            void * src = ggml_backend_buffer_get_base(host);
+            memset(src, 0, size);
+            for (int i = 0; i < 3; i++) {
+                const int64_t t0 = ggml_time_us();
+                ggml_backend_tensor_set(t, src, 0, size);
+                rate = std::max(rate, size / (double) std::max<int64_t>(1, ggml_time_us() - t0));
+            }
+        }
+    }
+    ggml_free(ctx);
+    ggml_backend_buffer_free(gpu);
+    ggml_backend_buffer_free(host);
+    return rate;
+}
+
+// The staging threshold: prompts of n/2 and n random tokens with the routed experts on the CPU, then streamed to the GPUs.
+// The time of the CPU splits is the expert time e(t) of t tokens; the rest of a CPU run, r(t) = run(t) - e(t), is the same when
+// streaming, so streaming the experts costs s(t) = run_streamed(t) - r(t). e(t) is taken as affine in t, and the threshold is
+// where it reaches s(t). Every expert crosses the link whatever the batch, so s(t) is flat at the link time for short batches
+// and rises once the GPU's expert compute takes longer (Qwen 3.8 on an R9700, -ub 4096: streamed 2.5 s for 1024 tokens, 9.5 s
+// for 4096, so with 56 threads the CPU stays ahead): s(t) is affine above n/2 and s(n/2) below it. When
+// the link rate says that streaming takes 3 times e(n_ubatch) or more, the streamed runs are skipped and the experts stay on
+// the CPU (CMP 170HX links: about 1 GB/s). The calibration adds a few seconds to the warmup at -ub 512, 15 s at 2048.
+int32_t llama_context::share_stage_calibrate() {
+    if (!sched || ggml_backend_sched_stage_get_min_tokens(sched.get()) < 0) {
+        return -1;
+    }
+    if (stage_calibrated) {
+        return ggml_backend_sched_stage_get_min_tokens(sched.get());
+    }
+    stage_calibrated = true;
+    std::vector<ggml_backend_sched_t> scheds = { sched.get() };
+    for (auto & slot : graph_slots) {
+        if (slot.sched) {
+            scheds.push_back(slot.sched.get());
+        }
+    }
+    const int prev = ggml_backend_sched_stage_get_min_tokens(sched.get());
+    double expert_bytes = 0;
+    for (const auto & l : model.layers) {
+        for (const ggml_tensor * w : { l.ffn_gate_exps, l.ffn_up_exps, l.ffn_down_exps, l.ffn_gate_up_exps }) {
+            if (w != nullptr && w->buffer != nullptr && ggml_backend_buffer_is_host(w->buffer)) {
+                expert_bytes += ggml_nbytes(w);
+            }
+        }
+    }
+    // up to 2048: the streamed cost is flat while the link bounds it and rises once the GPU's expert compute does (Qwen 3.8,
+    // R9700, 56 threads: from 1024 tokens on), and points below that rise miss it
+    const int n = (int) std::min<uint32_t>({ cparams.n_ubatch, n_ctx_seq(), 2048 });
+    if (getenv("GGML_SCHED_STAGE_MIN_TOKENS") != nullptr || expert_bytes == 0 || n < 64) {
+        return expert_bytes == 0 ? -1 : prev;
+    }
+    auto set_min_tokens = [&](int t) {
+        synchronize();
+        for (auto * s : scheds) {
+            ggml_backend_sched_stage_set_min_tokens(s, t);
+        }
+        share_gen++; // split the graphs again
+    };
+    std::vector<llama_token> tokens(n);
+    const uint32_t n_vocab = model.vocab.n_tokens();
+    for (int i = 0; i < n; i++) {
+        tokens[i] = (llama_token) ((i * 2654435761u + 977u) % n_vocab);
+    }
+    struct run_t { double us, cpu_us; uint64_t jobs; bool ok; };
+    auto run = [&](int n_tokens, int min_tokens) {
+        set_min_tokens(min_tokens);
+        auto stats = [&](int64_t & cpu_us, uint64_t & jobs) {
+            cpu_us = 0;
+            jobs = 0;
+            for (auto * s : scheds) {
+                int64_t c; uint64_t j;
+                ggml_backend_sched_stage_stats(s, &c, &j);
+                cpu_us += c;
+                jobs += j;
+            }
+        };
+        int64_t c0, c1;
+        uint64_t j0, j1;
+        stats(c0, j0);
+        const int64_t t0 = ggml_time_us();
+        const bool ok = decode(llama_batch_get_one(tokens.data(), n_tokens)) == 0;
+        synchronize();
+        const int64_t t1 = ggml_time_us();
+        stats(c1, j1);
+        llama_memory_clear(get_memory(), true);
+        return run_t { double(t1 - t0), double(c1 - c0), j1 - j0, ok };
+    };
+    // the first prompt after the warmup pays one-time costs (Qwen 3.8: 2 s), so it is not measured
+    run(std::min(256, n/2), std::numeric_limits<int>::max());
+    const run_t half = run(n/2, std::numeric_limits<int>::max());
+    const run_t cpu  = run(n, std::numeric_limits<int>::max());
+    const int n_max = (int) cparams.n_ubatch + 1; // never streams
+    double slope = (cpu.cpu_us - half.cpu_us) / (n - n/2);
+    if (slope <= 0) {
+        slope = cpu.cpu_us / n;
+    }
+    const double e0 = cpu.cpu_us - slope*n;
+    double rate = 0;
+    int n_gpu = 0;
+    for (auto & b : backends) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(b.get());
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU &&
+                std::find(stage_blocked.begin(), stage_blocked.end(), dev) == stage_blocked.end()) {
+            rate = std::max(rate, llama_stage_link_rate(dev));
+            n_gpu++;
+        }
+    }
+    // optimistic: every GPU streams at the best rate
+    const double s_link = rate > 0 ? expert_bytes / (rate * n_gpu) : 0;
+    int threshold = n_max;
+    const char * how = "link";
+    run_t gpu = { 0, 0, 0, true };
+    run_t gpu_half = gpu;
+    if (!half.ok || !cpu.ok || cpu.cpu_us <= 0) {
+        threshold = prev;
+        how = "failed";
+    } else if (s_link < 3 * (e0 + slope*cparams.n_ubatch)) {
+        // n first: the first streamed run also allocates the ring, which then counts against streaming
+        gpu      = run(n, 1);
+        gpu_half = run(n/2, 1);
+        if (!gpu.ok || !gpu_half.ok || gpu.jobs == 0) {
+            threshold = prev;
+            how = gpu.ok && gpu_half.ok ? "nothing streams" : "failed";
+        } else {
+            const double s      = gpu.us - (cpu.us - cpu.cpu_us);
+            const double s_half = gpu_half.us - (half.us - half.cpu_us);
+            const double s_slope = (s - s_half) / (n - n/2);
+            const double s0 = s - s_slope*n;
+            if (e0 + slope*(n/2) >= s_half) {
+                // the CPU falls behind on the flat part
+                threshold = std::max(1, (int) std::ceil((s_half - e0) / slope));
+            } else if (slope > s_slope) {
+                // e(t) - s(t) = (e0 - s0) + (slope - s_slope) t, negative at n/2: the CPU falls behind from its root on
+                threshold = std::min(n_max, (int) std::ceil((s0 - e0) / (slope - s_slope)));
+            }
+            how = "measured";
+        }
+    }
+    set_min_tokens(threshold);
+    stage_min_tokens = threshold;
+    LLAMA_LOG_INFO("%s: staging threshold %d tokens (%s, %d = never): %d and %d tokens: experts on the CPU %.0f and %.0f ms "
+            "(runs %.0f and %.0f ms), streamed runs %.0f and %.0f ms; link %.1f GB/s for %.1f GiB of experts\n", __func__,
+            threshold, how, n_max, n/2, n, half.cpu_us/1e3, cpu.cpu_us/1e3, half.us/1e3, cpu.us/1e3, gpu_half.us/1e3, gpu.us/1e3,
+            rate/1e3, expert_bytes/(1u << 30));
+    return threshold;
 }
 
 // pack sampler outputs into as few sequences as possible before using sequences without samplers
@@ -5121,6 +5285,10 @@ void llama_share_stage_allow(llama_context * ctx, const char * dev, bool allow) 
     if (ggml_backend_dev_t d = llama_share_find_dev(dev)) {
         ctx->share_stage_allow(d, allow);
     }
+}
+
+int32_t llama_share_stage_calibrate(llama_context * ctx) {
+    return ctx->share_stage_calibrate();
 }
 
 bool llama_share_has_expert_cache(const llama_context * ctx) {

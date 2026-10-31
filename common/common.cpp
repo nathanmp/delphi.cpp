@@ -10,7 +10,7 @@
 #include "sampling.h"
 #include "speculative.h"
 #include "unicode.h"
-#include "../src/llama-ext.h" // llama_expert_cache_auto
+#include "../src/llama-ext.h" // llama_expert_cache_auto, llama_share_stage_calibrate
 
 #include <algorithm>
 #include <cinttypes>
@@ -1559,6 +1559,11 @@ static bool common_init_post_context(common_init_result * res, common_params & p
     if (params.speculative.types.empty() ||
             (params.speculative.types.size() == 1 && params.speculative.types[0] == COMMON_SPECULATIVE_TYPE_NONE)) {
         llama_expert_cache_auto(lctx);
+        // with GGML_SCHED_STAGE=1: the batch size from which the routed experts on the host stream to a GPU, measured with the
+        // expert cache in place (the hot experts make the CPU path 20 % faster)
+        if (params.warmup) {
+            llama_share_stage_calibrate(lctx);
+        }
     }
 
     return true;

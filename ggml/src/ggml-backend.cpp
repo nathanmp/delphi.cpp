@@ -3000,6 +3000,7 @@ struct ggml_backend_sched_stage {
     int split_weights = 1; // redirected weights per split (GGML_SCHED_STAGE_SPLIT_WEIGHTS)
     bool spread = false;   // GGML_SCHED_STAGE_SPREAD
     int min_tokens = 512;  // GGML_SCHED_STAGE_MIN_TOKENS
+    int64_t cpu_us = 0;    // time of the CPU splits (ggml_backend_sched_stage_stats)
     bool blocked[GGML_SCHED_MAX_BACKENDS] = {}; // ggml_backend_sched_stage_allow
 };
 
@@ -3380,10 +3381,11 @@ static bool ggml_backend_sched_stage_spreading(ggml_backend_sched_t sched) {
     return sched->stage != nullptr && sched->stage->spread;
 }
 
-// GGML_SCHED_STAGE_MIN_TOKENS (default 512): with staging on, a routed-expert multiply (MUL_MAT_ID) on host weights runs on the
-// CPU for a batch of fewer tokens, and on a GPU, which streams the experts, for a wider one. Streaming costs the same for any batch,
-// as all experts cross the link, so a short batch is faster on the CPU. The GPU is the one holding the batch's activations if it
-// can stage, else the first that can. 0 leaves the choice to the offload cost model. -1: not decided here.
+// GGML_SCHED_STAGE_MIN_TOKENS (default 512; llama measures it at warmup): with staging on, a routed-expert multiply (MUL_MAT_ID)
+// on host weights runs on the CPU for a batch of fewer tokens, and on a GPU, which streams the experts, for a wider one.
+// Streaming costs the same for any batch, as all experts cross the link, so a short batch is faster on the CPU. The GPU is the
+// one holding the batch's activations if it can stage, else the first that can. 0 leaves the choice to the offload cost model.
+// -1: not decided here.
 static int ggml_backend_sched_stage_route(ggml_backend_sched_t sched, const struct ggml_tensor * op,
         const struct ggml_tensor * weight, int cpu_backend_id) {
     const ggml_backend_sched_stage * stage = sched->stage;
@@ -3679,6 +3681,31 @@ size_t ggml_backend_sched_stage_release(ggml_backend_sched_t sched) {
         ggml_backend_sched_stage_release_ring(ring);
     }
     return freed;
+}
+
+int ggml_backend_sched_stage_get_min_tokens(ggml_backend_sched_t sched) {
+    return sched->stage != nullptr && sched->stage->enabled ? sched->stage->min_tokens : -1;
+}
+
+void ggml_backend_sched_stage_set_min_tokens(ggml_backend_sched_t sched, int min_tokens) {
+    if (sched->stage != nullptr) {
+        sched->stage->min_tokens = std::max(0, min_tokens);
+    }
+}
+
+void ggml_backend_sched_stage_stats(ggml_backend_sched_t sched, int64_t * cpu_us, uint64_t * n_jobs) {
+    *cpu_us = 0;
+    *n_jobs = 0;
+    if (sched->stage == nullptr) {
+        return;
+    }
+    *cpu_us = sched->stage->cpu_us;
+    for (const auto & w : sched->stage->workers) {
+        if (w != nullptr) {
+            std::lock_guard<std::mutex> lock(w->mutex);
+            *n_jobs += w->n_pushed;
+        }
+    }
 }
 
 void ggml_backend_sched_stage_allow(ggml_backend_sched_t sched, ggml_backend_t backend, bool allow) {
@@ -4595,7 +4622,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 // a captured graph without comparing the data pointers (ggml-cuda), so drop it
                 split->graph.uid = 0;
             }
+            // a CPU split computes on this thread: its time is the CPU expert time that the staging threshold weighs
+            const int64_t t_cpu = sched->stage != nullptr &&
+                    ggml_backend_dev_type(ggml_backend_get_device(split_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU ? ggml_time_us() : 0;
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+            if (t_cpu) {
+                sched->stage->cpu_us += ggml_time_us() - t_cpu;
+            }
             ggml_backend_sched_stage_release(sched, split_backend);
             ggml_exec_trace_backend_end();
             ggml_backend_sched_trace_span_end(

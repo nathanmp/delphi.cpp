@@ -25,7 +25,7 @@
 #include "mtmd.h"
 #include "mtmd-memory.h"
 #include "mtmd-helper.h"
-#include "../../src/llama-ext.h" // llama_expert_cache_auto
+#include "../../src/llama-ext.h" // llama_expert_cache_auto, llama_share_stage_calibrate
 
 #include <algorithm>
 #include <cstddef>
@@ -1614,6 +1614,9 @@ private:
                 }
                 // after the draft or MTP context and the slots hold their memory
                 llama_expert_cache_auto(ctx_tgt);
+                if (params_base.warmup) {
+                    llama_share_stage_calibrate(ctx_tgt);
+                }
             }
             return ok;
         }
