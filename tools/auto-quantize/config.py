@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import re
 from pathlib import Path
 
@@ -215,7 +216,8 @@ def load_config(path):
     allowed = {"schema", "model", "devices", "reserve", "imatrix", "primary_qtypes", "other_qtypes", "importance",
                "preserve_below_mib", "tie_gate_up", "primary_regex", "pins", "preserve_regex", "allow_requantize",
                "bindir", "runtime", "sampling", "search", "bounds", "cache_mib", "multi_gpu_speedup_percent", "timing", "quality",
-               "calibration", "imatrix_collect", "mtp", "runtime_reserve", "target_runtime", "lazy_type", "routing_curve"}
+               "calibration", "imatrix_collect", "mtp", "runtime_reserve", "target_runtime", "lazy_type", "routing_curve",
+               "quantize_threads"}
     unknown = set(cfg) - allowed
     if unknown:
         raise QuantError(f"unknown configuration keys: {sorted(unknown)}")
@@ -282,6 +284,14 @@ def load_config(path):
     # timing imports this module, so the GPU-only condition of timing.gpu_only is repeated here
     if sum(name != "RAM" for name in cfg["devices"]) > 1 and "RAM" not in cfg["devices"] and any(cfg["multi_gpu_speedup_percent"].values()):
         raise QuantError("GPU-only placement profiles the real layer split; multi_gpu_speedup_percent applies only to RAM-routed projections")
+    # llama-quantize is CPU-bound and also runs while a GPU measures a probe: every CPU but 8 (GPU driver threads and the
+    # measuring process) by default. DeepSeek V4.1 expert tensor to IQ4_KS on a 64-core EPYC: 42 s at 32 threads, 27 s at
+    # 56, 30 s at 56 next to a CMP 170HX probe session. The output does not depend on the thread count.
+    cfg.setdefault("quantize_threads", "auto")
+    if cfg["quantize_threads"] == "auto":
+        cfg["quantize_threads"] = max(1, len(os.sched_getaffinity(0)) - 8)
+    elif not isinstance(cfg["quantize_threads"], int) or isinstance(cfg["quantize_threads"], bool) or cfg["quantize_threads"] < 1:
+        raise QuantError("quantize_threads must be a positive integer or \"auto\"")
     cfg.setdefault("runtime", {})
     runtime = cfg["runtime"]
     defaults = {"threads": 32, "depth_tokens": 0, "batch": 2048, "ubatch": 512, "short_tokens": 128,

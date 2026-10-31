@@ -168,7 +168,7 @@ def encode(info, cfg, choices, imatrix, output, quality=None):
             main_file.write_text("".join(f"{t['name']}\n" for t in info["tensors"] if not is_lazy(t["name"])))
             command += ["--only-tensors", str(main_file)]
             lazy_source = Path(info["files"][-1]["path"])
-    command += [cfg["model"], str(partial_stem), "Q2_K", str(cfg["runtime"]["threads"])]
+    command += [cfg["model"], str(partial_stem), "Q2_K", str(cfg["quantize_threads"])]
     print(f"Encoding {output.name}", flush=True)
     expected = sum(tensor_bytes(t["shape"], types[t["name"]]) for t in info["tensors"] if not (split and is_lazy(t["name"])))
     try:

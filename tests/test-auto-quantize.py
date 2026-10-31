@@ -5,6 +5,7 @@ import copy
 import io
 import itertools
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -23,7 +24,7 @@ from calibrate import Fit, PatchWriter, anchor_qtypes, design, probe_qtypes
 from timing import Predictor, ProfileError, digest, measure_env, operation_times, profile_model, regions, signature, token_counts
 from auto_quantize import gpu_descriptions, require_identical_gpus, tensor_plan, verify_output, witness_choices
 import routing
-from calibrate import OFFLOAD_BATCH, SPLIT_MARGIN, full_offload_devices, perplexity_command, split_session
+from calibrate import OFFLOAD_BATCH, SPLIT_MARGIN, full_offload_devices, measure_gpu, perplexity_command, split_session
 import numpy as np
 from gguf import GGUFReader, GGUFWriter, GGMLQuantizationType
 
@@ -607,6 +608,14 @@ class Corpora(unittest.TestCase):
                 self.assertAlmostEqual(sum(e["weight"] for e in parsed["text"]), 1)
         self.assertEqual(parsed["text"][1]["bytes_per_token"], 3.2)
         self.assertAlmostEqual(parsed["text"][0]["weight"], 5 / 9)
+        write_json(path, base)
+        self.assertEqual(load_config(path)["quantize_threads"], max(1, len(os.sched_getaffinity(0)) - 8))
+        write_json(path, {**base, "quantize_threads": 12})
+        self.assertEqual(load_config(path)["quantize_threads"], 12)
+        for bad in (0, "many", True):
+            write_json(path, {**base, "quantize_threads": bad})
+            with self.assertRaises(QuantError):
+                load_config(path)
         for bad in ({"text": "a.txt:1,a.txt:2"}, {"text": "a.txt:0,b.txt"}, {"text": []}, {"text_seed": -1},
                     {"bytes_per_token": 0}, {"text": [{"path": "a.txt", "color": 1}, "b.txt"]}):
             write_json(path, {**base, "calibration": bad})
@@ -1319,6 +1328,20 @@ class GpuOnly(unittest.TestCase):
         self.assertIn("CUDA1, CUDA2 skipped", out.getvalue())
         self.assertEqual(full_offload_devices(config, ["CUDA0", "CUDA1"], 40 * gib), ["CUDA0", "CUDA1"])
         self.assertEqual(full_offload_devices(config, ["CUDA0", "ROCm0"], 139 * gib), ["CUDA0", "ROCm0"])  # size unknown
+
+    def test_first_calibration_device_measures_with_the_experts_in_ram(self):
+        # an R9700 outside the CMP deployment runs the teacher and the -cmoe session: its host link is 20x faster
+        gib = 1 << 30
+        config = cfg(devices={"CUDA0": 63 * gib, "CUDA1": 63 * gib, "RAM": 250 * gib}, bindir="/b", model="/m.gguf",
+                     calibration={"devices": ["ROCm1"]})
+        self.assertEqual(measure_gpu(config), "ROCm1")
+        self.assertEqual(measure_gpu(cfg(devices={"CUDA0": 1, "RAM": 1})), "CUDA0")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(full_offload_devices(config, ["ROCm1", "CUDA1"], 139 * gib), ["ROCm1"])
+        c = {"text": "t.txt", "chunks": 2, "context": 64, "batch": 0, "threads": 4}
+        with mock.patch("calibrate.lazy_args", return_value=[]):
+            self.assertIn("-cmoe", perplexity_command(config, c, "/m.gguf", "ROCm1", "teacher"))
+            self.assertNotIn("-cmoe", perplexity_command(config, c, "/m.gguf", "CUDA0", "teacher"))
 
     def test_measurement_commands_keep_experts_in_ram_and_profiling_uses_the_split(self):
         config = self.config([1, 1, 1], bindir="/b", model="/m.gguf", cache_mib=0,

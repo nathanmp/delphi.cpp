@@ -145,7 +145,7 @@ class PatchWriter:
             command += ["--imatrix", str(self.imatrix)]
         if self.cfg.get("allow_requantize", False):
             command += ["--allow-requantize"]
-        command += [self.cfg["model"], str(path), "Q2_K", str(self.cfg["runtime"]["threads"])]
+        command += [self.cfg["model"], str(path), "Q2_K", str(self.cfg["quantize_threads"])]
         run(command, path.with_suffix(".log"), self.cfg["runtime"]["env"])
 
     def write(self, tensors, path):
@@ -320,9 +320,17 @@ def design(groups, mid, top, c, anchors=()):
     return jobs
 
 
+def measure_gpu(cfg):
+    """The GPU of the teacher and of the session that keeps the routed experts in RAM: the first calibration device, else
+    the first GPU of the deployment. It need not be part of the deployment: the experts stream over its host link in every
+    pass, so a fast link pays (DeepSeek V4.1 floor, 2048 tokens: 38 s on a CMP 170HX at PCIe gen2 x2 with ~19 CPU cores
+    busy, 10.7 s on an R9700 at PCIe 4 x16 with ~2)."""
+    return (cfg.get("calibration", {}).get("devices") or [gpu(cfg)])[0]
+
+
 def ram_session(cfg, device):
     """A session on this device keeps the routed experts in RAM (-cmoe); the other devices hold every weight."""
-    return "," not in device and measure_cmoe(cfg) and (device == gpu(cfg) or gpu_only(cfg))
+    return "," not in device and measure_cmoe(cfg) and (device == measure_gpu(cfg) or gpu_only(cfg))
 
 
 def full_offload_devices(cfg, devices, floor_bytes):
@@ -335,7 +343,7 @@ def full_offload_devices(cfg, devices, floor_bytes):
     kept = [d for d in devices if ram_session(cfg, d) or fits(d)]
     dropped = [d for d in devices if d not in kept]
     if dropped:
-        kept = kept or [gpu(cfg)]
+        kept = kept or [measure_gpu(cfg)]
         print(f"Calibration devices {', '.join(dropped)} skipped: the floor ({floor_bytes / 2**30:.1f} GiB) does not fit "
               f"on them with {SPLIT_MARGIN >> 30} GiB to spare; sessions on {', '.join(kept)}", flush=True)
     return kept
@@ -683,9 +691,14 @@ def teacher_logits(cfg, c, output, timeout):
             raise QuantError(f"teacher logits in {output} come from a different calibration text; use a new output directory")
         if recorded.get("model") not in (None, file_identity(cfg["model"])):
             raise QuantError(f"teacher logits in {output} come from a different model; use a new output directory")
+        command = recorded.get("command", [])
+        device = command[command.index("--device") + 1] if "--device" in command else None
+        if device not in (None, measure_gpu(cfg)):
+            raise QuantError(f"teacher logits in {output} come from {device}, the probes run on {measure_gpu(cfg)}; "
+                             "use a new output directory (the KL would mix backends)")
         return teacher
     partial = output / "teacher.partial.kld"
-    command = perplexity_command(cfg, c, cfg["model"], gpu(cfg), partial, base=True)
+    command = perplexity_command(cfg, c, cfg["model"], measure_gpu(cfg), partial, base=True)
     print("Computing teacher logits from the source model", flush=True)
     run_direct(command, output / "teacher.tokens.f32", output / "teacher.log", measure_env(cfg), timeout)
     partial.replace(teacher)
@@ -725,12 +738,12 @@ def calibrate(data, cfg, output, encode, verify, timeout=7200, text_dir=None, sc
     if anchors:
         print(f"Anchor qtypes: {', '.join(anchors)}", flush=True)
     jobs = design(groups, mid, top, c, anchors)
-    devices = full_offload_devices(cfg, c["devices"] or [gpu(cfg)], Path(data["baseline"]["path"]).stat().st_size)
+    devices = full_offload_devices(cfg, c["devices"] or [measure_gpu(cfg)], Path(data["baseline"]["path"]).stat().st_size)
     members = {g["name"]: g["members"] for g in info["groups"]}
     writer = PatchWriter(cfg, info, data["imatrix"], Path(scratch or output), c["patch_mib"])
     # A uniform recipe holds every modelled tensor at the probe qtype next to the floor in the session. With routed
     # experts in RAM, it runs as a separate probe model instead when that copy does not fit in the available RAM.
-    ram = measure_cmoe(cfg) and (devices == [gpu(cfg)] or gpu_only(cfg))
+    ram = measure_cmoe(cfg) and (devices == [measure_gpu(cfg)] or gpu_only(cfg))
     free = available_ram()
 
     def separate(job):
@@ -877,7 +890,7 @@ def calibrate(data, cfg, output, encode, verify, timeout=7200, text_dir=None, sc
                        **file_identity(data["baseline"]["path"])},
              "teacher": {**teacher_identity, "text": {**file_identity(c["text"], content=True), **({"corpora": corpora} if corpora else {})},
                          "chunks": c["chunks"], "context": c["context"]},
-             "execution": {"devices": devices, "split_session": split[0] if split_jobs else None, "ram_routed": measure_cmoe(cfg) and (devices == [gpu(cfg)] or gpu_only(cfg)),
+             "execution": {"devices": devices, "split_session": split[0] if split_jobs else None, "ram_routed": measure_cmoe(cfg) and (devices == [measure_gpu(cfg)] or gpu_only(cfg)),
                            "numa": "off", "command": perplexity_command(cfg, c, "FLOOR", devices[0], "TEACHER"),
                            "env": env},
              "probe_qtypes": {"mid": mid, "top": top, "anchors": anchors}, "n_layer": n_layer, "roles": params,
