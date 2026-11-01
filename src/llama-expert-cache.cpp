@@ -935,8 +935,23 @@ void llama_expert_cache::op_pregate_hint(ggml_tensor * dst, int ith, int nth, vo
     }
 }
 
+bool llama_expert_cache::pregate_enabled() {
+    // LLAMA_MOE_PREGATE=0 turns it off; it also needs the CPU expert prefetch (GGML_CPU_EXPERT_PREFETCH)
+    static const bool enabled = [] {
+        const char * e = getenv("LLAMA_MOE_PREGATE");
+        if ((e != nullptr && atoi(e) == 0) || llama_expert_hint_get() == nullptr) {
+            return false;
+        }
+        ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        auto budget = dev ? (int (*)(void)) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev),
+                "ggml_backend_cpu_expert_prefetch_budget") : nullptr;
+        return budget != nullptr && budget() > 0;
+    }();
+    return enabled;
+}
+
 ggml_tensor * llama_expert_cache::build_pregate_hint(ggml_context * ctx, ggml_tensor * ids, int il) {
-    if (!layer(il) || llama_expert_hint_get() == nullptr) {
+    if (!layer(il) || !pregate_enabled()) {
         return nullptr;
     }
     GGML_ASSERT(ids->type == GGML_TYPE_F32);

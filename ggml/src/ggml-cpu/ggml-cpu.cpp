@@ -373,6 +373,11 @@ static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, s
     return status;
 }
 
+// the prefetch reads experts only with --numa tensors
+static int ggml_backend_cpu_expert_prefetch_budget(void) {
+    return ggml_numa_is_tensor_mode() ? ggml_cpu_expert_prefetch_budget() : 0;
+}
+
 // called by the scheduler before it waits for the inputs of a CPU split
 static void ggml_backend_cpu_prefetch_experts(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
@@ -1146,6 +1151,9 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (strcmp(name, "ggml_backend_cpu_numa_load_expert_tensor") == 0) {
         return (void *)ggml_numa_load_expert_tensor;
+    }
+    if (strcmp(name, "ggml_backend_cpu_expert_prefetch_budget") == 0) {
+        return (void *)ggml_backend_cpu_expert_prefetch_budget;
     }
     if (strcmp(name, "ggml_backend_cpu_expert_hint") == 0) {
         return (void *)ggml_cpu_expert_hint;

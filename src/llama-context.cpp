@@ -5350,11 +5350,11 @@ llama_share_usage llama_share_device_usage(const llama_context * ctx, const char
 
 size_t llama_share_stage_bytes(const llama_context * ctx) {
     const char * stage = getenv("GGML_SCHED_STAGE");
-    if (stage == nullptr || atoi(stage) == 0) {
+    if (stage != nullptr && atoi(stage) == 0) {
         return 0;
     }
     const char * slots_env = getenv("GGML_SCHED_STAGE_SLOTS");
-    const size_t n_slots = slots_env ? std::max(1, atoi(slots_env)) : 4;
+    const size_t n_slots = slots_env ? std::max(1, atoi(slots_env)) : 2;
     size_t largest = 0;
     for (const auto & l : ctx->get_model().layers) {
         for (const ggml_tensor * w : { l.ffn_gate_exps, l.ffn_up_exps, l.ffn_down_exps, l.ffn_gate_up_exps }) {

@@ -19,7 +19,7 @@ struct llama_model;
 // slots and maps but never changes a graph. Membership is rebuilt at the first small batch after a prompt, from the routing of
 // the most recent rows, and while a response decodes: every `every` small batches a worker copies the experts that entered the
 // window's top set to a device scratch on its own stream, and a later batch boundary packs them into the slots of the experts
-// that left it. A prompt that streams experts (GGML_SCHED_STAGE=1) borrows the top of the largest tier on each staging GPU for
+// that left it. A prompt that streams experts (staging, on unless GGML_SCHED_STAGE=0) borrows the top of the largest tier on each staging GPU for
 // the staging ring; the refresh after the prompt fills it again.
 struct llama_expert_cache {
     // Batches with more rows are prompt batches: they use the original routed experts (and only record their routing), unless
@@ -106,8 +106,10 @@ struct llama_expert_cache {
     // CPU op: records the routed ids (F32 [top_k, n_tokens]) unless warmup, and returns I32 ids with resident experts set to -1.
     ggml_tensor * build_cold_ids(ggml_context * ctx, ggml_tensor * ids, int il);
     // F32 [k, rows] experts that a pre-gate predicts for layer il: the CPU passes the cold ones to the CPU expert prefetch
-    // (LLAMA_MOE_PREGATE). Null when the CPU backend has no prefetch.
+    // (LLAMA_MOE_PREGATE). Null when the pre-gate is off.
     ggml_tensor * build_pregate_hint(ggml_context * ctx, ggml_tensor * ids, int il);
+    // the pre-gate is on (LLAMA_MOE_PREGATE, default on) and the CPU backend reads the hints ahead
+    static bool pregate_enabled();
     // CPU op: records the routed ids (I32 [top_k, n_tokens]) of a batch that does not use the arena. Null if not recorded.
     ggml_tensor * build_record(ggml_context * ctx, ggml_tensor * ids, int il);
     // CPU op: the sum over the expert slots of experts (F32 [n_embd, top_k, n_tokens]) times weights (F32 [1, top_k, n_tokens]),

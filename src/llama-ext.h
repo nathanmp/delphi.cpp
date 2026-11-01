@@ -53,7 +53,7 @@ LLAMA_API bool         llama_share_has_expert_cache(const struct llama_context *
 // An existing tier, or an auto-sized tier that will be allocated after all models are loaded.
 LLAMA_API bool         llama_share_has_cache_on_device(const struct llama_context * ctx, const char * dev);
 LLAMA_API const char * llama_share_home_device(const struct llama_context * ctx);
-// Device bytes of one staging ring (GGML_SCHED_STAGE=1): the slots that a tier on a staging GPU lends, or 0 without staging.
+// Device bytes of one staging ring (staging is on unless GGML_SCHED_STAGE=0): the slots that a tier on a staging GPU lends, or 0 without staging.
 LLAMA_API size_t llama_share_stage_bytes(const struct llama_context * ctx);
 // Device memory of the context on `dev`.
 struct llama_share_usage {

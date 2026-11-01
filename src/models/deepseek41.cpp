@@ -1619,8 +1619,7 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
 
         // delphi: the router of the next layer on this layer's router input predicts ~2/3 of its experts (2026-11-01). The CPU
         // reads the cold ones of them while the GPU runs the next attention. Only on one GPU: the ids travel in this layer's packet
-        static const bool pregate = [] { const char * e = getenv("LLAMA_MOE_PREGATE"); return e && atoi(e) != 0; }();
-        if (pregate && expert_cache && il + 1 < n_layer && expert_cache->layer(il) && expert_cache->layer(il + 1) &&
+        if (expert_cache && llama_expert_cache::pregate_enabled() && il + 1 < n_layer && expert_cache->layer(il) && expert_cache->layer(il + 1) &&
                 expert_cache->backend(il) == expert_cache->backend(il + 1) && cur->ne[1] <= llama_expert_cache::max_rows &&
                 ubatch.embd == nullptr) {
             // the top-k of the raw logits: the norm weights, the gating and the bias change the prediction by < 1 point

@@ -4397,11 +4397,12 @@ private:
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
                         if (do_checkpoint) {
                             static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
-                            // LLAMA_SERVER_CKPT_TAIL_UBATCH=0 drops the 4 + n_ubatch break: with DeepSeek V4.1 CED, each prompt
-                            // batch that ends with a full ubatch runs the decoder window again, which the next batch then discards
+                            // delphi: the 4 + n_ubatch break is off by default (LLAMA_SERVER_CKPT_TAIL_UBATCH=1 turns it on): with
+                            // DeepSeek V4.1 CED, each prompt batch that ends with a full ubatch runs the decoder window again, which
+                            // the next batch then discards, and GLM gains nothing from it. The checkpoint 4 tokens before the end stays
                             static const bool tail_ubatch = [] {
                                 const char * env = getenv("LLAMA_SERVER_CKPT_TAIL_UBATCH");
-                                return env == nullptr || atoi(env) != 0;
+                                return env != nullptr && atoi(env) != 0;
                             }();
 
                             bool should_break = false;

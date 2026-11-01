@@ -2313,7 +2313,7 @@ static void ggml_mmid_piece(
     }
 }
 
-// Expert prefetch for --numa tensors decode (GGML_CPU_EXPERT_PREFETCH=<experts per MUL_MAT_ID>, 0 = off).
+// Expert prefetch for --numa tensors decode (GGML_CPU_EXPERT_PREFETCH=<experts per MUL_MAT_ID>, default 6, 0 = off).
 // The CPU MUL_MAT_ID records which experts had rows in its last two calls. Before the inputs of the next CPU split
 // arrive (the GPU still runs the dense part of the layer), each worker reads the rows of the predicted experts that it
 // computes in the IQK static split, so that the expert kernel finds them in L2/L3 and DRAM is used while it is idle.
@@ -2363,11 +2363,12 @@ static void ggml_cpu_pf_print_stats(void) {
             ggml_cpu_pf_stat_split_us/(double) MAX(1, ggml_cpu_pf_stat_waits));
 }
 
-static int ggml_cpu_expert_prefetch_budget(void) {
+int ggml_cpu_expert_prefetch_budget(void) {
     static int budget = -1;
     if (budget < 0) {
+        // 6 experts per MUL_MAT_ID fit the GPU attention of a DeepSeek V4.1 layer on an R9700 (~580 us at 48 threads)
         const char * s = getenv("GGML_CPU_EXPERT_PREFETCH");
-        budget = s ? MAX(0, atoi(s)) : 0;
+        budget = s ? MAX(0, atoi(s)) : 6;
         const char * d = getenv("GGML_CPU_EXPERT_PREFETCH_DRY");
         ggml_cpu_pf_dry = d && atoi(d) != 0;
         const char * st = getenv("GGML_CPU_EXPERT_PREFETCH_STATS");

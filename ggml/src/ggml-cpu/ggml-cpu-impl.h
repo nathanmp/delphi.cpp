@@ -559,6 +559,8 @@ void ggml_numa_tp_row_range_for_node(
 bool ggml_numa_load_expert_tensor(struct ggml_tensor * tensor, const void * data, size_t size);
 // reads the rows of the experts that the MUL_MAT_IDs of `graph` will likely use (GGML_CPU_EXPERT_PREFETCH)
 bool ggml_cpu_prefetch_experts(struct ggml_cgraph * graph, int n_threads, struct ggml_threadpool * threadpool);
+// experts per MUL_MAT_ID that the prefetch reads (GGML_CPU_EXPERT_PREFETCH), 0 when off
+int ggml_cpu_expert_prefetch_budget(void);
 // the experts that the next MUL_MAT_ID of src0_data will likely use, most likely first (a pre-gate)
 void ggml_cpu_expert_hint(const void * src0_data, const int32_t * experts, int n);
 // GGML_CPU_EXPERT_PREFETCH_STATS: the CPU backend calls these around a graph

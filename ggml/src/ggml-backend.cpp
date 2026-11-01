@@ -1031,7 +1031,7 @@ struct ggml_backend_sched {
     // delphi: copy the inputs of a split in the graph order of their producers (GGML_SCHED_INPUT_ORDER=0 disables)
     bool input_order;
 
-    // delphi: staging ring for host weights that splits copy whole to a device (GGML_SCHED_STAGE=1), NULL when off
+    // delphi: staging ring for host weights that splits copy whole to a device (on unless GGML_SCHED_STAGE=0), NULL when off
     struct ggml_backend_sched_stage * stage;
 
     int debug;
@@ -2745,7 +2745,7 @@ static bool ggml_backend_sched_splits_share_memory(ggml_backend_sched_t sched, i
            ggml_backend_supports_buft(sched->backends[backend_a], sched->bufts[backend_b]);
 }
 
-// delphi: staging ring (GGML_SCHED_STAGE=1).
+// delphi: staging ring (on unless GGML_SCHED_STAGE=0).
 //
 // A host weight that a split copies whole to a device (an offloaded expert tensor in a wide prefill batch) is
 // otherwise copied when the host reaches that split, in the order of the compute stream, so the link and the device
@@ -2984,7 +2984,7 @@ struct ggml_backend_sched_stage_worker {
 
 struct ggml_backend_sched_stage {
     bool enabled = true;
-    int  n_slots = 4;
+    int  n_slots = 2;  // each slot is one layer's expert tensor in VRAM, which the expert cache does not get
     int  n_bounce = 4;
     size_t chunk_size = 64u << 20;
     bool use_bounce = true;
@@ -3002,7 +3002,7 @@ struct ggml_backend_sched_stage {
     ggml_backend_sched_stage_lend_t lend = nullptr;
     void * lend_user = nullptr;
     int split_weights = 1; // redirected weights per split (GGML_SCHED_STAGE_SPLIT_WEIGHTS)
-    bool spread = false;   // GGML_SCHED_STAGE_SPREAD
+    bool spread = true;    // GGML_SCHED_STAGE_SPREAD
     int min_tokens = 512;  // GGML_SCHED_STAGE_MIN_TOKENS
     int64_t cpu_us = 0;    // time of the CPU splits (ggml_backend_sched_stage_stats)
     bool blocked[GGML_SCHED_MAX_BACKENDS] = {}; // ggml_backend_sched_stage_allow
@@ -3125,8 +3125,9 @@ static void ggml_backend_sched_stage_wait_issued(ggml_backend_sched_stage_worker
 }
 
 static ggml_backend_sched_stage * ggml_backend_sched_stage_new(ggml_backend_sched_t sched) {
+    // delphi: on by default (GGML_SCHED_STAGE=0 turns it off). It does nothing without routed experts in host memory
     const char * env = getenv("GGML_SCHED_STAGE");
-    if (env == nullptr || atoi(env) == 0) {
+    if (env != nullptr && atoi(env) == 0) {
         return nullptr;
     }
     auto * stage = new ggml_backend_sched_stage;
@@ -3191,7 +3192,9 @@ static ggml_backend_sched_stage * ggml_backend_sched_stage_new(ggml_backend_sche
         n_dev++;
     }
     if (n_dev == 0) {
-        GGML_LOG_WARN("%s: GGML_SCHED_STAGE=1, but no backend supports staging\n", __func__);
+        if (env != nullptr) {
+            GGML_LOG_WARN("%s: GGML_SCHED_STAGE=1, but no backend supports staging\n", __func__);
+        }
         stage->enabled = false;
     }
     // one layer's routed gate/up/down per split, while another split's weights can still upload
