@@ -336,6 +336,22 @@ public:
         return ext[(--it)->second].tok;
     }
 
+    // the cell of sequence seq_id at position p, or -1 if there is none
+    // when several cells share that position, the one with the lowest index wins
+    int32_t seq_pos_cell(llama_seq_id seq_id, llama_pos p) const {
+        assert(seq_id >= 0);
+        assert(seq_id < LLAMA_MAX_SEQ);
+
+        const auto & sp = seq_pos[seq_id];
+
+        auto it = sp.lower_bound({ p, 0 });
+        if (it == sp.end() || it->first != p) {
+            return -1;
+        }
+
+        return (int32_t) it->second;
+    }
+
     // note: call only if the cell is not empty and the seq_id is not in the cell
     void seq_add(uint32_t i, llama_seq_id seq_id) {
         assert(i < pos.size());

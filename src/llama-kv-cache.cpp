@@ -1464,6 +1464,25 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
     return llama_kv_cache_set_k_rows(ctx, layers[ikv].k, k_cur, k_idxs, get_size());
 }
 
+ggml_tensor * llama_kv_cache::cpy_k_cols(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, int64_t col0) const {
+    const int32_t ikv = map_layer_ids.at(il);
+
+    for (const auto & m : mirrors) {
+        GGML_ASSERT(m.ikv != ikv && "a layer with mirrors is written through cpy_k_mirrored");
+    }
+
+    ggml_tensor * k = layers[ikv].k;
+
+    GGML_ASSERT(ggml_is_contiguous(k));
+    GGML_ASSERT(k_cur->ne[2] == 1 && k_cur->ne[3] == 1);
+    GGML_ASSERT(col0 >= 0 && col0 + k_cur->ne[0] <= k->ne[0]);
+
+    // the streams follow each other, so one row stride covers the rows of all of them
+    ggml_tensor * dst = ggml_view_2d(ctx, k, k_cur->ne[0], k->ne[1]*k->ne[2], k->nb[1], ggml_row_size(k->type, col0));
+
+    return ggml_set_rows(ctx, dst, k_cur, k_idxs);
+}
+
 void llama_kv_cache::cpy_k_mirrored(ggml_context * ctx, ggml_cgraph * gf, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const {
     GGML_UNUSED(sinfo);
 
@@ -2917,6 +2936,10 @@ ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) cons
 
 ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {
     return kv->cpy_k(ctx, k_cur, k_idxs, il, sinfos[i_cur]);
+}
+
+ggml_tensor * llama_kv_cache_context::cpy_k_cols(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, int64_t col0) const {
+    return kv->cpy_k_cols(ctx, k_cur, k_idxs, il, col0);
 }
 
 void llama_kv_cache_context::cpy_k_mirrored(ggml_context * ctx, ggml_cgraph * gf, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {

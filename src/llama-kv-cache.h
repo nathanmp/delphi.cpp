@@ -203,6 +203,10 @@ public:
     // cpy_k aborts for a layer with mirrors, so that no write path leaves a mirror stale.
     void cpy_k_mirrored(ggml_context * ctx, ggml_cgraph * gf, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
 
+    // delphi: write rows of k_cur [n, n_rows] into columns [col0, col0 + n) of the K rows at the global indices k_idxs (I32 or
+    // I64, s*kv_size + cell); the other columns of the rows do not change. The returned view covers all rows of all streams.
+    ggml_tensor * cpy_k_cols(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, int64_t col0) const;
+
     //
     // preparation API
     //
@@ -459,6 +463,9 @@ public:
 
     // delphi: see llama_kv_cache::cpy_k_mirrored
     void cpy_k_mirrored(ggml_context * ctx, ggml_cgraph * gf, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;
+
+    // delphi: see llama_kv_cache::cpy_k_cols
+    ggml_tensor * cpy_k_cols(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, int64_t col0) const;
 
     // create destination indices for each head of the current batch for where it would be written in the KV cache
     // the indices address the global KV cache (not per stream) - this is not relevant for the user of this API, but
