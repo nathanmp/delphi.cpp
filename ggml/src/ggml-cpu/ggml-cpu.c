@@ -2313,6 +2313,285 @@ static void ggml_mmid_piece(
     }
 }
 
+// Expert prefetch for --numa tensors decode (GGML_CPU_EXPERT_PREFETCH=<experts per MUL_MAT_ID>, 0 = off).
+// The CPU MUL_MAT_ID records which experts had rows in its last two calls. Before the inputs of the next CPU split
+// arrive (the GPU still runs the dense part of the layer), each worker reads the rows of the predicted experts that it
+// computes in the IQK static split, so that the expert kernel finds them in L2/L3 and DRAM is used while it is idle.
+#define GGML_CPU_PF_MAX_AS 512
+#define GGML_CPU_PF_WORDS  (GGML_CPU_PF_MAX_AS/64)
+#define GGML_CPU_PF_SLOTS  1024
+#define GGML_CPU_PF_MAX_NY 16
+#define GGML_CPU_PF_MAX_HINT 64 // larger batches repack the experts (IQK), with another row split
+
+struct ggml_cpu_pf_entry {
+    const void * key; // src0->data
+    uint64_t bits[2][GGML_CPU_PF_WORDS];
+    int last;   // index of the newest set in bits
+    int n_recs; // 0, 1 or 2 valid sets
+    int32_t hint[GGML_CPU_PF_MAX_HINT]; // experts that a pre-gate predicts for the next call (ggml_cpu_expert_hint)
+    int n_hint;
+    int32_t pf[GGML_CPU_PF_MAX_HINT];   // the experts read for the next call, for the statistics
+    int n_pf;
+};
+
+static struct ggml_cpu_pf_entry ggml_cpu_pf_table[GGML_CPU_PF_SLOTS];
+static _Thread_local const struct ggml_compute_params * ggml_cpu_tls_params = NULL;
+
+// statistics, written by the main thread or worker 0 only
+static int64_t ggml_cpu_pf_stat_hits, ggml_cpu_pf_stat_used, ggml_cpu_pf_stat_pred, ggml_cpu_pf_stat_recs;
+static int64_t ggml_cpu_pf_stat_calls, ggml_cpu_pf_stat_us, ggml_cpu_pf_stat_bytes;
+// the wait for the split inputs after a prefetch: near 0 means that the prefetch took longer than the GPU work before the split
+static int64_t ggml_cpu_pf_end_us, ggml_cpu_pf_stat_wait_us, ggml_cpu_pf_stat_waits, ggml_cpu_pf_stat_short;
+static int64_t ggml_cpu_pf_stat_split_us; // compute time of the CPU splits after a prefetch
+static bool    ggml_cpu_pf_dry;   // GGML_CPU_EXPERT_PREFETCH_DRY=1: predict, but do not read (measures the window)
+static bool    ggml_cpu_pf_stats; // GGML_CPU_EXPERT_PREFETCH_STATS=1: print the statistics now and then, and at the exit
+
+
+static void ggml_cpu_pf_print_stats(void) {
+    const double recs = (double) MAX(1, ggml_cpu_pf_stat_recs);
+    const double calls = (double) MAX(1, ggml_cpu_pf_stat_calls);
+    fprintf(stderr, "cpu expert prefetch: %lld of %lld used experts predicted (%.1f %%), per MUL_MAT_ID %.1f used, %.1f predicted; "
+            "%lld prefetch calls, %.1f us and %.1f MiB per call\n",
+            (long long) ggml_cpu_pf_stat_hits, (long long) ggml_cpu_pf_stat_used,
+            100.0*ggml_cpu_pf_stat_hits/MAX(1, ggml_cpu_pf_stat_used),
+            ggml_cpu_pf_stat_used/recs, ggml_cpu_pf_stat_pred/recs,
+            (long long) ggml_cpu_pf_stat_calls, ggml_cpu_pf_stat_us/calls, ggml_cpu_pf_stat_bytes/1048576.0/calls);
+    fprintf(stderr, "cpu expert prefetch%s: input wait after the prefetch %.1f us mean, %lld of %lld waits below 20 us, "
+            "split compute %.1f us mean\n", ggml_cpu_pf_dry ? " (dry)" : "",
+            ggml_cpu_pf_stat_wait_us/(double) MAX(1, ggml_cpu_pf_stat_waits),
+            (long long) ggml_cpu_pf_stat_short, (long long) ggml_cpu_pf_stat_waits,
+            ggml_cpu_pf_stat_split_us/(double) MAX(1, ggml_cpu_pf_stat_waits));
+}
+
+static int ggml_cpu_expert_prefetch_budget(void) {
+    static int budget = -1;
+    if (budget < 0) {
+        const char * s = getenv("GGML_CPU_EXPERT_PREFETCH");
+        budget = s ? MAX(0, atoi(s)) : 0;
+        const char * d = getenv("GGML_CPU_EXPERT_PREFETCH_DRY");
+        ggml_cpu_pf_dry = d && atoi(d) != 0;
+        const char * st = getenv("GGML_CPU_EXPERT_PREFETCH_STATS");
+        ggml_cpu_pf_stats = st && atoi(st) != 0;
+        if (budget > 0 && ggml_cpu_pf_stats) {
+            atexit(ggml_cpu_pf_print_stats);
+        }
+    }
+    return budget;
+}
+
+static struct ggml_cpu_pf_entry * ggml_cpu_pf_find(const void * key, bool insert) {
+    const size_t h = (size_t) ((((uintptr_t) key >> 6) * 0x9E3779B97F4A7C15ull) >> 54);
+    for (int i = 0; i < GGML_CPU_PF_SLOTS; i++) {
+        struct ggml_cpu_pf_entry * e = &ggml_cpu_pf_table[(h + i) & (GGML_CPU_PF_SLOTS - 1)];
+        if (e->key == key) {
+            return e;
+        }
+        if (e->key == NULL) {
+            if (!insert) {
+                return NULL;
+            }
+            e->key = key;
+            return e;
+        }
+    }
+    return NULL;
+}
+
+// the predicted experts in priority order: in both of the last two calls, then in the last one, then in the one before
+static int ggml_cpu_pf_select(const struct ggml_cpu_pf_entry * e, int n_as, int budget, int32_t * out) {
+    const uint64_t * a = e->bits[e->last];
+    const uint64_t * b = e->bits[e->last ^ 1];
+    const bool has_b = e->n_recs > 1;
+    int n = 0;
+    for (int pass = 0; pass < (has_b ? 3 : 1) && n < budget; pass++) {
+        for (int w = 0; w < (n_as + 63)/64 && n < budget; w++) {
+            uint64_t m = pass == 0 ? (has_b ? a[w] & b[w] : a[w]) : pass == 1 ? a[w] & ~b[w] : b[w] & ~a[w];
+            while (m != 0 && n < budget) {
+                const int bit = __builtin_ctzll(m);
+                m &= m - 1;
+                if (w*64 + bit < n_as) {
+                    out[n++] = w*64 + bit;
+                }
+            }
+        }
+    }
+    return n;
+}
+
+static void ggml_cpu_pf_record(const void * key, const int64_t * counts, int n_as, bool stats) {
+    struct ggml_cpu_pf_entry * e = ggml_cpu_pf_find(key, true);
+    if (e == NULL || n_as > GGML_CPU_PF_MAX_AS) {
+        return;
+    }
+    if (stats && e->n_pf > 0) {
+        for (int i = 0; i < e->n_pf; i++) {
+            ggml_cpu_pf_stat_hits += counts[e->pf[i]] > 0;
+        }
+        for (int i = 0; i < n_as; i++) {
+            ggml_cpu_pf_stat_used += counts[i] > 0;
+        }
+        ggml_cpu_pf_stat_pred += e->n_pf;
+        ggml_cpu_pf_stat_recs++;
+    }
+    e->n_pf = 0;
+    e->n_hint = 0; // a hint is for one call
+    e->last ^= 1;
+    memset(e->bits[e->last], 0, sizeof(e->bits[e->last]));
+    for (int i = 0; i < n_as; i++) {
+        if (counts[i] > 0) {
+            e->bits[e->last][i/64] |= 1ull << (i%64);
+        }
+    }
+    e->n_recs = MIN(2, e->n_recs + 1);
+}
+
+// The experts that the next MUL_MAT_ID of src0 will likely use, most likely first. They replace the history for that call.
+void ggml_cpu_expert_hint(const void * src0_data, const int32_t * experts, int n) {
+    if (ggml_cpu_expert_prefetch_budget() <= 0) {
+        return;
+    }
+    struct ggml_cpu_pf_entry * e = ggml_cpu_pf_find(src0_data, true);
+    if (e == NULL) {
+        return;
+    }
+    e->n_hint = MIN(n, GGML_CPU_PF_MAX_HINT);
+    memcpy(e->hint, experts, e->n_hint*sizeof(int32_t));
+}
+
+struct ggml_cpu_pf_item {
+    const char * base; // expert matrix
+    size_t       nb01;
+    int64_t      ne01;
+};
+
+struct ggml_cpu_pf_job {
+    int n_items;
+    struct ggml_cpu_pf_item * items;
+};
+
+static volatile uint64_t ggml_cpu_pf_sink;
+
+static void ggml_cpu_pf_run(struct ggml_tensor * dst, int ith, int nth, void * userdata) {
+    GGML_UNUSED(dst); GGML_UNUSED(ith); GGML_UNUSED(nth);
+    const struct ggml_cpu_pf_job * job = (const struct ggml_cpu_pf_job *) userdata;
+    const struct ggml_compute_params * p = ggml_cpu_tls_params;
+    if (p == NULL || p->numa_n_threads <= 0) {
+        return;
+    }
+    uint64_t acc = 0;
+    for (int i = 0; i < job->n_items; i++) {
+        const struct ggml_cpu_pf_item * it = &job->items[i];
+        int64_t s, e;
+        ggml_numa_tp_row_range_for_node((uint32_t) p->numa_node, it->ne01, GGML_NUMA_TP_PLAIN_ALIGN, &s, &e);
+        // the split of iqk_mul_mat_moe (no repack): ceil(rows/workers) rows per worker of the node
+        const int64_t per = (e - s + p->numa_n_threads - 1)/p->numa_n_threads;
+        const int64_t r0 = MIN(e, s + p->numa_rank*per);
+        const int64_t r1 = MIN(e, r0 + per);
+        const char * x  = it->base + r0*it->nb01;
+        const char * xe = it->base + r1*it->nb01;
+        for (; x + 256 <= xe; x += 256) {
+            acc += *(const uint64_t *) x + *(const uint64_t *) (x + 64) + *(const uint64_t *) (x + 128) + *(const uint64_t *) (x + 192);
+        }
+        for (; x < xe; x += 64) {
+            acc += *(const uint8_t *) x;
+        }
+    }
+    if (acc == 1) {
+        ggml_cpu_pf_sink = acc; // keeps the loads
+    }
+}
+
+// Run by the CPU backend before the inputs of a split are copied. Returns false when nothing was prefetched.
+bool ggml_cpu_prefetch_experts(struct ggml_cgraph * graph, int n_threads, struct ggml_threadpool * threadpool) {
+    const int budget = ggml_cpu_expert_prefetch_budget();
+    if (budget <= 0 || !ggml_numa_is_tensor_mode() || n_threads < (int) ggml_numa_get_node_count()) {
+        return false;
+    }
+    const int64_t t0 = ggml_time_us();
+
+    struct ggml_cpu_pf_item items[256];
+    int n_items = 0;
+    size_t bytes = 0;
+    for (int i = 0; i < graph->n_nodes; i++) {
+        const struct ggml_tensor * node = graph->nodes[i];
+        if (node->op != GGML_OP_MUL_MAT_ID || node->src[0] == NULL || node->src[2] == NULL ||
+            (node->src[0]->flags & GGML_TENSOR_FLAG_NUMA_EXPERT) == 0) {
+            continue;
+        }
+        if (node->src[2]->ne[1] > GGML_CPU_PF_MAX_NY) {
+            continue;
+        }
+        const struct ggml_tensor * src0 = node->src[0];
+        struct ggml_cpu_pf_entry * e = ggml_cpu_pf_find(src0->data, false);
+        if (e == NULL || (e->n_recs == 0 && e->n_hint == 0) || src0->ne[2] > GGML_CPU_PF_MAX_AS) {
+            continue;
+        }
+        int32_t pred[GGML_CPU_PF_MAX_AS];
+        int np;
+        if (e->n_hint > 0) {
+            np = MIN(budget, e->n_hint);
+            memcpy(pred, e->hint, np*sizeof(int32_t));
+        } else {
+            np = ggml_cpu_pf_select(e, (int) src0->ne[2], budget, pred);
+        }
+        e->n_pf = MIN(np, GGML_CPU_PF_MAX_HINT);
+        memcpy(e->pf, pred, e->n_pf*sizeof(int32_t));
+        for (int j = 0; j < np && n_items < (int) (sizeof(items)/sizeof(items[0])); j++) {
+            items[n_items++] = (struct ggml_cpu_pf_item) { (const char *) src0->data + pred[j]*src0->nb[2], src0->nb[1], src0->ne[1] };
+            bytes += src0->nb[2];
+        }
+    }
+    if (n_items == 0) {
+        return false;
+    }
+
+    if (ggml_cpu_pf_dry) {
+        n_items = 0;
+    }
+    struct ggml_cpu_pf_job job = { n_items, items };
+    _Alignas(64) char mem[16384];
+    GGML_ASSERT(2*ggml_tensor_overhead() + ggml_graph_overhead_custom(4, false) <= sizeof(mem));
+    struct ggml_init_params ip = { sizeof(mem), mem, true };
+    struct ggml_context * ctx = ggml_init(ip);
+    struct ggml_tensor * t = ggml_custom_4d(ctx, GGML_TYPE_F32, 1, 1, 1, 1, NULL, 0, ggml_cpu_pf_run, GGML_N_TASKS_MAX, &job);
+    struct ggml_cgraph * gf = ggml_new_graph_custom(ctx, 4, false);
+    ggml_build_forward_expand(gf, t);
+    struct ggml_cplan cplan = ggml_graph_plan(gf, n_threads, threadpool);
+    GGML_ASSERT(cplan.work_size == 0);
+    ggml_graph_compute(gf, &cplan);
+    ggml_free(ctx);
+
+    ggml_cpu_pf_stat_calls++;
+    ggml_cpu_pf_stat_bytes += bytes;
+    if (ggml_cpu_pf_stats) {
+        ggml_cpu_pf_end_us = ggml_time_us();
+        ggml_cpu_pf_stat_us += ggml_cpu_pf_end_us - t0;
+    }
+    return true;
+}
+
+// called when the CPU backend starts a graph: returns the start time when the graph follows a prefetch, else 0
+int64_t ggml_cpu_prefetch_note_compute(void) {
+    if (ggml_cpu_pf_end_us == 0) {
+        return 0;
+    }
+    const int64_t now = ggml_time_us();
+    const int64_t w = now - ggml_cpu_pf_end_us;
+    ggml_cpu_pf_stat_wait_us += w;
+    ggml_cpu_pf_stat_waits++;
+    ggml_cpu_pf_stat_short += w < 20;
+    ggml_cpu_pf_end_us = 0;
+    return now;
+}
+
+// called when that graph is done
+void ggml_cpu_prefetch_note_compute_end(int64_t t_start) {
+    ggml_cpu_pf_stat_split_us += ggml_time_us() - t_start;
+    if (ggml_cpu_pf_stat_waits % 65536 == 0) {
+        ggml_cpu_pf_print_stats();
+    }
+}
+
 // `fuse_up` and `fuse_dst` are the up-projection MUL_MAT_ID node and the GLU node of a
 // fused MoE up+gate subgraph, or NULL for a plain MUL_MAT_ID. When set, `dst` supplies the
 // gate weights and every other shape, and the routed rows are written to `fuse_dst`
@@ -2579,6 +2858,13 @@ static void ggml_compute_forward_mul_mat_id_impl(
 
     if (prof) {
         ggml_moe_prof_add(GGML_MOE_PROF_BARRIER, ggml_time_us() - prof_t_barrier);
+    }
+
+    if (ith == 0 && numa_tensors && ggml_cpu_expert_prefetch_budget() > 0) {
+        ggml_cpu_pf_record(src0->data, matrix_row_counts, (int) n_as, true);
+        if (fuse_up) {
+            ggml_cpu_pf_record(fuse_up->src[0]->data, matrix_row_counts, (int) n_as, false);
+        }
     }
 
     // column split: this node owns rows [numa_row0_start, numa_row0_end) of every expert, and its workers share that range
@@ -4516,6 +4802,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         /*.numa_node_leader =*/ state->numa_node_leader,
         /*.use_ref    =*/ cplan->use_ref,
     };
+    ggml_cpu_tls_params = &params;
 
 #ifdef GGML_USE_OPENMP
     GGML_PRINT_DEBUG("thread #%d compute-start cplan %p\n", state->ith, (const void *)cplan);

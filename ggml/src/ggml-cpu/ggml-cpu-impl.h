@@ -557,6 +557,13 @@ uint32_t ggml_numa_get_node_count(void);
 void ggml_numa_tp_row_range_for_node(
         uint32_t node, int64_t n_rows, int64_t align, int64_t * row_start, int64_t * row_end);
 bool ggml_numa_load_expert_tensor(struct ggml_tensor * tensor, const void * data, size_t size);
+// reads the rows of the experts that the MUL_MAT_IDs of `graph` will likely use (GGML_CPU_EXPERT_PREFETCH)
+bool ggml_cpu_prefetch_experts(struct ggml_cgraph * graph, int n_threads, struct ggml_threadpool * threadpool);
+// the experts that the next MUL_MAT_ID of src0_data will likely use, most likely first (a pre-gate)
+void ggml_cpu_expert_hint(const void * src0_data, const int32_t * experts, int n);
+// GGML_CPU_EXPERT_PREFETCH_STATS: the CPU backend calls these around a graph
+int64_t ggml_cpu_prefetch_note_compute(void);
+void ggml_cpu_prefetch_note_compute_end(int64_t t_start);
 
 // Column split: every node computes every expert, but only a row range of it.
 // `shares` are relative weights, and the ranges tile [0, n_rows) with no gap and no overlap.

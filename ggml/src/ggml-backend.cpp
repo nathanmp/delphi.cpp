@@ -3735,11 +3735,44 @@ static void ggml_backend_sched_worker_ready(ggml_backend_sched_t sched, int spli
     }
 }
 
+// The GPU work before a CPU split is queued: the CPU backend can read the experts it will likely use while it waits for
+// the inputs of the split (GGML_CPU_EXPERT_PREFETCH)
+static void ggml_backend_sched_cpu_prefetch(ggml_backend_t backend, struct ggml_cgraph * graph) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (dev == nullptr || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+        return;
+    }
+    typedef void (*prefetch_fn_t)(ggml_backend_t, struct ggml_cgraph *);
+    static prefetch_fn_t prefetch_fn = (prefetch_fn_t) ggml_backend_reg_get_proc_address(
+            ggml_backend_dev_backend_reg(dev), "ggml_backend_cpu_prefetch_experts");
+    if (prefetch_fn != nullptr) {
+        prefetch_fn(backend, graph);
+    }
+}
+
+// A CPU split waits for the GPU split before it. The experts of the next CPU split are read in that time: the CPU split
+// of the experts itself follows a small CPU split (the routing), and when it starts, the GPU work before it is done.
+static void ggml_backend_sched_cpu_prefetch_next(ggml_backend_sched_t sched, int split_id) {
+    ggml_backend_t backend = sched->backends[sched->splits[split_id].backend_id];
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (dev == nullptr || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU || ggml_backend_is_meta(backend)) {
+        return;
+    }
+    for (int j = split_id + 1; j < sched->n_splits; j++) {
+        if (sched->backends[sched->splits[j].backend_id] == backend) {
+            ggml_backend_sched_cpu_prefetch(backend, &sched->splits[j].graph);
+            return;
+        }
+    }
+}
+
 static void ggml_backend_sched_worker_run(ggml_backend_sched_worker * w) {
     ggml_backend_sched_t sched = w->sched;
     ggml_exec_trace_set_thread_context(w->trace_ctx);
     ggml_backend_t backend = sched->backends[w->backend_id];
     struct ggml_backend_sched_split * split = &sched->splits[w->split_id];
+
+    ggml_backend_sched_cpu_prefetch_next(sched, w->split_id);
 
     for (int b : w->pull_wait) {
         ggml_backend_event_wait(backend, w->pull_events[b]);
@@ -4241,6 +4274,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+
+        // before any wait for the previous splits (a split of a backend worker prefetches on the worker)
+        if (!workers_on || sched->workers[split_backend_id] == nullptr) {
+            ggml_backend_sched_cpu_prefetch_next(sched, split_id);
+        }
 
         if (workers_on) {
             ggml_backend_sched_worker * w = sched->workers[split_backend_id];

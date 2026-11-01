@@ -347,6 +347,7 @@ static bool ggml_backend_cpu_graph_is_small(const struct ggml_cgraph * cgraph) {
 static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
 
+    const int64_t pf_t0 = ggml_cpu_prefetch_note_compute();
     const int n_threads = ggml_backend_cpu_graph_is_small(cgraph) ? 1 : cpu_ctx->n_threads;
     struct ggml_cplan cplan = ggml_graph_plan(cgraph, n_threads, cpu_ctx->threadpool);
 
@@ -365,7 +366,17 @@ static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, s
     cplan.abort_callback_data = cpu_ctx->abort_callback_data;
     cplan.use_ref             = cpu_ctx->use_ref;
 
-    return ggml_graph_compute(cgraph, &cplan);
+    const enum ggml_status status = ggml_graph_compute(cgraph, &cplan);
+    if (pf_t0 != 0) {
+        ggml_cpu_prefetch_note_compute_end(pf_t0);
+    }
+    return status;
+}
+
+// called by the scheduler before it waits for the inputs of a CPU split
+static void ggml_backend_cpu_prefetch_experts(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
+    struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
+    ggml_cpu_prefetch_experts(cgraph, cpu_ctx->n_threads, cpu_ctx->threadpool);
 }
 
 static double ggml_backend_cpu_measure_memory_bandwidth(int n_threads) {
@@ -1135,6 +1146,12 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (strcmp(name, "ggml_backend_cpu_numa_load_expert_tensor") == 0) {
         return (void *)ggml_numa_load_expert_tensor;
+    }
+    if (strcmp(name, "ggml_backend_cpu_expert_hint") == 0) {
+        return (void *)ggml_cpu_expert_hint;
+    }
+    if (strcmp(name, "ggml_backend_cpu_prefetch_experts") == 0) {
+        return (void *)ggml_backend_cpu_prefetch_experts;
     }
     if (strcmp(name, "ggml_backend_cpu_numa_buffer_type") == 0) {
         return (void *)ggml_backend_cpu_numa_buffer_type;
