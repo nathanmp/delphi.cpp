@@ -239,7 +239,10 @@ std::vector<std::string> common_arg::get_env() const {
         // for compatibility, we need to add LLAMA_ARG_NO_ variant
         std::string neg_env = env;
         string_replace_all(neg_env, "LLAMA_ARG_", "LLAMA_ARG_NO_");
-        result.push_back(neg_env);
+        // delphi: a name without the LLAMA_ARG_ prefix has no negative variant
+        if (neg_env != env) {
+            result.push_back(neg_env);
+        }
     }
     return result;
 }
