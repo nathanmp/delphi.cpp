@@ -1004,6 +1004,31 @@ static bool dsv41_verify_compact_enabled(
     return n_tps >= 2 && n_tps <= 16;
 }
 
+// DSpark verification on long contexts. The dense fallback copies the whole compressed stream
+// next to the raw window on every layer and fills a mask as wide as the stream, so its cost
+// grows with the context although each query reads only top_k rows. Instead, gather the rows
+// that each query selected and give each query its own sequence in one attention call: the
+// K of a query is the raw window followed by its own rows. This costs n_query*(n_raw + top_k)
+// rows whatever the context. One stream only, as the raw window is repeated per query.
+// LLAMA_DSV41_VERIFY_GATHER_MIN: the smallest compressed stream (rows) that takes this path;
+// 0 disables it.
+static bool dsv41_verify_gather_enabled(
+        int64_t n_comp,
+        int64_t n_query,
+        int64_t n_stream,
+        ggml_type k_type) {
+    static const int64_t min_comp = [] {
+        const char * env = std::getenv("LLAMA_DSV41_VERIFY_GATHER_MIN");
+        return env ? (int64_t) std::atoll(env) : (int64_t) 4096;
+    }();
+
+    if (min_comp <= 0 || n_comp < min_comp || n_stream != 1 || n_query < 2 || n_query > 16) {
+        return false;
+    }
+
+    return k_type == GGML_TYPE_F16 || k_type == GGML_TYPE_F32;
+}
+
 // Prefill issues far too many queries for one attention call per query. Pass the
 // per-query selections as indices and let FlashAttention dereference the cache rows
 // inside the kernel, like build_attn_sparse does. Only the CUDA/HIP indexed kernel
@@ -1270,12 +1295,56 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
     const int64_t n_stream = raw_k->ne[3];
     const bool use_compact = !split && top_k != nullptr && cparams.flash_attn &&
             dsv41_compact_attn_enabled(n_comp, top_k->ne[0], nt, n_stream);
-    const bool use_verify_compact = !split && !use_compact && top_k != nullptr && cparams.flash_attn &&
+    const bool use_verify_gather = !split && !use_compact && top_k != nullptr && cparams.flash_attn &&
+            raw_k->type == comp_k->type && dsv41_verify_gather_enabled(n_comp, nt, n_stream, comp_k->type);
+    const bool use_verify_compact = !split && !use_compact && !use_verify_gather && top_k != nullptr && cparams.flash_attn &&
             dsv41_verify_compact_enabled(nt, n_stream);
-    const bool use_prefill_indexed = !split && !use_compact && !use_verify_compact && top_k != nullptr &&
+    const bool use_prefill_indexed = !split && !use_compact && !use_verify_gather && !use_verify_compact && top_k != nullptr &&
             dsv41_prefill_indexed_enabled(hparams, cparams.flash_attn, n_comp, top_k->ne[0], nt, n_stream);
 
-    if (use_compact) {
+    if (use_verify_gather) {
+        // Each query becomes a sequence of its own (dimension 3 of K and of the mask), so that
+        // build_attn_mha splits the queries the same way and returns them in token order.
+        const int64_t n_raw = raw_k->ne[2];
+        const int64_t n_selected = top_k->ne[0];
+        const int64_t n_rows = n_raw + n_selected;
+
+        GGML_ASSERT(top_k->ne[1] == nt && top_k->ne[2] == 1 && top_k->ne[3] == 1);
+        GGML_ASSERT(raw_mask->ne[0] == n_raw && raw_mask->ne[1] == nt &&
+                raw_mask->ne[2] == 1 && raw_mask->ne[3] == 1);
+        GGML_ASSERT(inp_comp.kq_mask->ne[0] == n_comp && inp_comp.kq_mask->ne[1] == nt &&
+                inp_comp.kq_mask->ne[2] == 1 && inp_comp.kq_mask->ne[3] == 1);
+
+        ggml_tensor * top_k_rows = ggml_reshape_2d(ctx0, top_k, n_selected*nt, 1);
+        ggml_tensor * comp_rows = ggml_view_3d(ctx0, comp_k,
+                comp_k->ne[0], n_comp, 1, comp_k->nb[2], comp_k->nb[3], 0);
+        ggml_tensor * comp_selected = ggml_get_rows(ctx0, comp_rows, top_k_rows);
+        comp_selected = ggml_reshape_4d(ctx0, comp_selected, comp_k->ne[0], 1, n_selected, nt);
+        if (comp_selected->type != comp_k->type) {
+            comp_selected = ggml_cast(ctx0, comp_selected, comp_k->type);
+        }
+        cb(comp_selected, "comp_k_selected", il);
+
+        ggml_tensor * raw_rep = ggml_repeat(ctx0, raw_k,
+                ggml_new_tensor_4d(ctx0, raw_k->type, raw_k->ne[0], 1, n_raw, nt));
+        ggml_tensor * gather_k = ggml_concat(ctx0, raw_rep, comp_selected, 2);
+        cb(gather_k, "k_verify_gather", il);
+
+        // the validity of the selected rows, for top-k fill entries; see the decode path
+        ggml_tensor * mask_rows = ggml_reshape_3d(ctx0, inp_comp.kq_mask, 1, n_comp, nt);
+        ggml_tensor * comp_valid = ggml_get_rows(ctx0, mask_rows, ggml_reshape_2d(ctx0, top_k, n_selected, nt));
+        comp_valid = ggml_reshape_4d(ctx0, comp_valid, n_selected, 1, 1, nt);
+        if (comp_valid->type != raw_mask->type) {
+            comp_valid = ggml_cast(ctx0, comp_valid, raw_mask->type);
+        }
+        ggml_tensor * raw_mask_q = ggml_reshape_4d(ctx0,
+                ggml_is_contiguous(raw_mask) ? raw_mask : ggml_cont(ctx0, raw_mask), n_raw, 1, 1, nt);
+        ggml_tensor * gather_mask = ggml_concat(ctx0, raw_mask_q, comp_valid, 0);
+        cb(gather_mask, "kq_verify_gather_mask", il);
+
+        out = build_attn_mha(q, gather_k, gather_k, nullptr, gather_mask, layer.attn_sinks,
+                nullptr, n_rows, kq_scale, il);
+    } else if (use_compact) {
         const int64_t n_raw = raw_k->ne[2];
         const int64_t n_selected = top_k->ne[0];
         const int64_t n_compact = n_raw + n_selected;
