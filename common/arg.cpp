@@ -1357,6 +1357,22 @@ void common_params_apply_spec_args(common_params & params, llama_example ex, con
     });
 }
 
+// delphi: sets an environment variable that a performance option controls
+static void delphi_setenv(const char * name, const std::string & value) {
+#ifdef _WIN32
+    _putenv_s(name, value.c_str());
+#else
+    setenv(name, value.c_str(), 1);
+#endif
+}
+
+// handlers of the options that only set their environment variable (common_arg takes plain function pointers)
+#define DELPHI_ARG_INT(ENV, MIN) [](common_params &, int value) { \
+        if (value < (MIN)) { throw std::invalid_argument("invalid value"); } \
+        delphi_setenv(ENV, std::to_string(value)); }
+#define DELPHI_ARG_BOOL(ENV) [](common_params &, bool value) { delphi_setenv(ENV, value ? "1" : "0"); }
+#define DELPHI_ARG_STR(ENV)  [](common_params &, const std::string & value) { delphi_setenv(ENV, value); }
+
 // delphi: the context options that POST /tune/context changes by creating the context again
 static bool common_arg_is_ctx_runtime(const std::string & arg) {
     static const std::set<std::string> names = {
@@ -2961,6 +2977,114 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             llm_add_n_cpu_ffn_overrides(value, LLM_FFN_DENSE_REGEX, params.tensor_buft_overrides);
         }
     ).set_env("LLAMA_ARG_N_CPU_FFN"));
+
+    // delphi: performance options. Each one sets the environment variable that the code reads, which is also its env name,
+    // so a command-line value takes precedence over the environment.
+    add_opt(common_arg(
+        {"--moe-cache"}, "auto|MIB",
+        "GPU memory for the expert cache, which keeps the most used routed experts of CPU layers on the GPU (default: auto)\n"
+        "auto: the free memory of the layer GPUs at the first decode; MIB: a size; 0: no cache",
+        [](common_params &, const std::string & value) {
+            if (value != "auto" && (value.empty() || value.find_first_not_of("0123456789") != std::string::npos)) {
+                throw std::invalid_argument("expected auto or a size in MiB");
+            }
+            delphi_setenv("LLAMA_MOE_CACHE_MIB", value);
+        }
+    ).set_env("LLAMA_MOE_CACHE_MIB"));
+    add_opt(common_arg(
+        {"--moe-cache-margin"}, "MIB[,DEV:MIB,...]",
+        "GPU memory that the auto expert cache leaves free, for all GPUs and per device (default: 1024)",
+        DELPHI_ARG_STR("LLAMA_MOE_CACHE_AUTO_MARGIN_MIB")
+    ).set_env("LLAMA_MOE_CACHE_AUTO_MARGIN_MIB"));
+    add_opt(common_arg(
+        {"--moe-cache-roles"}, "DEV:ROLE,...",
+        "expert-cache role of each GPU: rotate (follows the routing), static (the hottest experts), pinned (static and never\n"
+        "lent to staging) or off (default: rotate)",
+        DELPHI_ARG_STR("LLAMA_MOE_CACHE_ROLES")
+    ).set_env("LLAMA_MOE_CACHE_ROLES"));
+    add_opt(common_arg(
+        {"--moe-cache-async"}, "N",
+        "experts uploaded per decode-time refresh of the expert cache (default: 64)",
+        DELPHI_ARG_INT("LLAMA_MOE_CACHE_ASYNC_EXPERTS", 1)
+    ).set_env("LLAMA_MOE_CACHE_ASYNC_EXPERTS"));
+    add_opt(common_arg(
+        {"--moe-cache-refresh-max"}, "N",
+        "experts uploaded in the refresh after a prompt; the decode-time refreshes upload the rest (default: -1, all)",
+        DELPHI_ARG_INT("LLAMA_MOE_CACHE_REFRESH_MAX", -1)
+    ).set_env("LLAMA_MOE_CACHE_REFRESH_MAX"));
+    add_opt(common_arg(
+        {"--moe-cache-window"}, "N",
+        "routed rows per layer that decide which experts the cache keeps (default: 256)",
+        DELPHI_ARG_INT("LLAMA_MOE_CACHE_WINDOW", 0)
+    ).set_env("LLAMA_MOE_CACHE_WINDOW"));
+    add_opt(common_arg(
+        {"--moe-stage"},
+        {"--no-moe-stage"},
+        "stream the routed experts in host memory to the GPUs for long prompts, instead of running them on the CPU (default: enabled)",
+        DELPHI_ARG_BOOL("GGML_SCHED_STAGE")
+    ).set_env("GGML_SCHED_STAGE"));
+    add_opt(common_arg(
+        {"--moe-stage-min-tokens"}, "N",
+        "smallest prompt batch that streams the experts (default: measured at startup)",
+        DELPHI_ARG_INT("GGML_SCHED_STAGE_MIN_TOKENS", 0)
+    ).set_env("GGML_SCHED_STAGE_MIN_TOKENS"));
+    add_opt(common_arg(
+        {"--moe-stage-slots"}, "N",
+        "streaming buffers per GPU, each the size of one layer's expert tensor (default: 2)",
+        DELPHI_ARG_INT("GGML_SCHED_STAGE_SLOTS", 1)
+    ).set_env("GGML_SCHED_STAGE_SLOTS"));
+    add_opt(common_arg(
+        {"--moe-stage-spread"},
+        {"--no-moe-stage-spread"},
+        "spread the streamed experts of a prompt over all staging GPUs (default: enabled)",
+        DELPHI_ARG_BOOL("GGML_SCHED_STAGE_SPREAD")
+    ).set_env("GGML_SCHED_STAGE_SPREAD"));
+    add_opt(common_arg(
+        {"--moe-stage-devices"}, "DEV,...|none",
+        "GPUs that stream experts (default: the expert-cache GPUs)",
+        DELPHI_ARG_STR("LLAMA_MOE_STAGE_DEVICES")
+    ).set_env("LLAMA_MOE_STAGE_DEVICES"));
+    add_opt(common_arg(
+        {"--cpu-expert-prefetch"}, "N",
+        "with --numa tensors: while a GPU runs attention, the CPU reads N experts per layer that it will likely need next\n"
+        "into its caches (default: 6, 0 = off)",
+        DELPHI_ARG_INT("GGML_CPU_EXPERT_PREFETCH", 0)
+    ).set_env("GGML_CPU_EXPERT_PREFETCH"));
+    add_opt(common_arg(
+        {"--moe-pregate"},
+        {"--no-moe-pregate"},
+        "predict the experts of the next layer with its router, for --cpu-expert-prefetch (DeepSeek V4.1; default: enabled)",
+        DELPHI_ARG_BOOL("LLAMA_MOE_PREGATE")
+    ).set_env("LLAMA_MOE_PREGATE"));
+    add_opt(common_arg(
+        {"--moe-shared-overlap"},
+        {"--no-moe-shared-overlap"},
+        "run the shared expert on the GPU while the CPU runs the routed experts (DeepSeek V4.1; default: enabled)",
+        DELPHI_ARG_BOOL("LLAMA_MOE_SHARED_OVERLAP")
+    ).set_env("LLAMA_MOE_SHARED_OVERLAP"));
+    add_opt(common_arg(
+        {"--engram-readers"}, "N",
+        "threads that read engram rows from disk ahead of their layer (default: 8, 0 = read in the graph)",
+        DELPHI_ARG_INT("LLAMA_ENGRAM_PREFETCH", 0)
+    ).set_env("LLAMA_ENGRAM_PREFETCH"));
+    add_opt(common_arg(
+        {"--kv-mirror"},
+        {"--no-kv-mirror"},
+        "keep a copy of the shared DeepSeek V4.1 KV rows on each GPU that reads them (default: enabled)",
+        DELPHI_ARG_BOOL("LLAMA_KV_MIRROR")
+    ).set_env("LLAMA_KV_MIRROR"));
+    add_opt(common_arg(
+        {"--graph-alt-slots"}, "N",
+        "compute graphs kept for batch sizes other than the last one, so that switching sizes does not rebuild them\n"
+        "(default: 4, or more for the speculative widths)",
+        DELPHI_ARG_INT("LLAMA_GRAPH_ALT_SLOTS", 0)
+    ).set_env("LLAMA_GRAPH_ALT_SLOTS"));
+    add_opt(common_arg(
+        {"--ckpt-tail-ubatch"},
+        {"--no-ckpt-tail-ubatch"},
+        "also save a prompt checkpoint one ubatch before the end of the prompt (default: disabled)",
+        DELPHI_ARG_BOOL("LLAMA_SERVER_CKPT_TAIL_UBATCH")
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_SERVER_CKPT_TAIL_UBATCH"));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",
