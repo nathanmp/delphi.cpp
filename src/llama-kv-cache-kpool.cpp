@@ -71,6 +71,7 @@ struct llama_kpool_cache::impl {
     struct entry {
         int32_t slot;
         bool cached;
+        uint64_t gen = 0; // the prepare_stream call that last named this pool
     };
 
     struct layer {
@@ -89,6 +90,7 @@ struct llama_kpool_cache::impl {
     bool mtp_index_reuse = false;
 
     std::vector<std::unordered_map<pool_id, entry, pool_id_hash>> maps;
+    uint64_t gen = 0;
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
     std::vector<layer> layers;
     std::unordered_map<int32_t, int32_t> map_layer_ids;
@@ -301,11 +303,25 @@ llama_kpool_cache::stream_plan llama_kpool_cache::prepare_stream(
         map.clear();
     }
 
-    std::unordered_set<pool_id, impl::pool_id_hash> current(ids.begin(), ids.end());
-    GGML_ASSERT(current.size() == ids.size() && "pool identities within a stream must be unique");
+    // stamp the pools that are still named, then drop the rest: one lookup per pool, where a set
+    // of the current pools would be rebuilt on every decode step
+    // pointers, not iterators: a rehash in the emplace below keeps elements in place but not iterators
+    static thread_local std::vector<impl::entry *> found;
+    found.assign(ids.size(), nullptr);
 
+    const uint64_t gen = ++pimpl->gen;
+    for (size_t i = 0; i < ids.size(); ++i) {
+        auto it = map.find(ids[i]);
+        if (it != map.end()) {
+            GGML_ASSERT(it->second.gen != gen && "pool identities within a stream must be unique");
+            it->second.gen = gen;
+            found[i] = &it->second;
+        }
+    }
+
+    // erase leaves the other elements in place, so the pointers in found stay valid
     for (auto it = map.begin(); it != map.end();) {
-        if (current.find(it->first) == current.end()) {
+        if (it->second.gen != gen) {
             it = map.erase(it);
         } else {
             ++it;
@@ -333,13 +349,15 @@ llama_kpool_cache::stream_plan llama_kpool_cache::prepare_stream(
         return (int32_t) next_free++;
     };
 
-    for (const pool_id & id : ids) {
-        auto it = map.find(id);
-        if (it == map.end()) {
-            it = map.emplace(id, impl::entry { take_free(), false }).first;
+    for (size_t i = 0; i < ids.size(); ++i) {
+        impl::entry * e = found[i];
+        if (e == nullptr) {
+            auto [nit, inserted] = map.emplace(ids[i], impl::entry { take_free(), false, gen });
+            GGML_ASSERT(inserted && "pool identities within a stream must be unique");
+            e = &nit->second;
         }
-        result.slots.push_back(it->second.slot);
-        result.cached.push_back(it->second.cached ? 1 : 0);
+        result.slots.push_back(e->slot);
+        result.cached.push_back(e->cached ? 1 : 0);
     }
 
     result.scratch.reserve(n_scratch);
@@ -749,9 +767,11 @@ void llama_kv_cache_set_input_kpool(
     }
 
     // -1 marks a cell with no usable pool; host side only, never copied into cell_pool
-    std::vector<int32_t>   pool_of(n_kv);
-    std::vector<int32_t>   filled(n_pools);
-    std::vector<llama_pos> pos_at;
+    static thread_local std::vector<int32_t>   pool_of;
+    static thread_local std::vector<int32_t>   filled;
+    static thread_local std::vector<llama_pos> pos_at;
+    pool_of.resize(n_kv);
+    filled.resize(n_pools);
 
     std::vector<int64_t> run_off(n_ps);
     std::vector<int64_t> run_len(n_ps);
@@ -766,12 +786,15 @@ void llama_kv_cache_set_input_kpool(
         char    * cur_cand_mask  = dst_cand_mask ? dst_cand_mask + s*(n_padq*n_kv)*mask_ts : nullptr;
         float   * cur_pool_bias  = dst_pool_bias ? dst_pool_bias + s*(n_tps*n_pools) : nullptr;
 
+        // the members of a valid pool are its row of cur_pool_cells, so they need no copy
         struct valid_pool {
             llama_kpool_cache::pool_id id;
             int32_t packed;
-            std::vector<int32_t> members;
         };
-        std::vector<valid_pool> valid_pools;
+        // reused between calls: at long context a fresh table per decode step is a large
+        // allocation, and the page faults of a fresh mapping cost more than the loop
+        static thread_local std::vector<valid_pool> valid_pools;
+        valid_pools.clear();
 
         std::fill(cur_pool_cells, cur_pool_cells + r*n_pools, 0);
         if (cur_pool_bias != nullptr) {
@@ -936,7 +959,6 @@ void llama_kv_cache_set_input_kpool(
                     valid_pool item;
                     item.id = { seq_of_pool, b_base + p };
                     item.packed = (int32_t) (run_off[ps] + p);
-                    item.members.assign(part_pool_cells + p*r, part_pool_cells + (p + 1)*r);
                     valid_pools.push_back(std::move(item));
                 }
             }
@@ -983,8 +1005,27 @@ void llama_kv_cache_set_input_kpool(
                     cur[n_tps + ii] = (float) run_off[ps];
                 }
 
+                const int64_t bo_tail = tail_start/r - b_base;
+
                 if (!cur_sel && !cur_cand && !cur_tail_cells) {
                     // nothing per cell to write (device-built masks)
+                } else if (!cur_sel && !cur_cand && bo_tail >= 0 && bo_tail < n_run) {
+                    // only the tail cells: the pool table already holds them, so skip the
+                    // scan of every cell. A slot is set when a cell of this sequence holds its position.
+                    for (llama_pos p = tail_start; p <= q; ++p) {
+                        const int32_t j = part_pool_cells[bo_tail*r + p%r];
+                        if (pos_at[j] != p) {
+                            continue;
+                        }
+                        const int64_t ti = p - tail_start;
+                        GGML_ASSERT(ti >= 0 && ti < n_tail_pad);
+                        cur_tail_cells[ti] = j;
+                        if (mask_f16) {
+                            ((ggml_fp16_t *) cur_tail_mask)[ti] = kpool_mask_of<ggml_fp16_t>::from(0.0f);
+                        } else {
+                            ((float *) cur_tail_mask)[ti] = 0.0f;
+                        }
+                    }
                 } else if (mask_f16) {
                     kpool_mask_row((ggml_fp16_t *) cur_sel, (ggml_fp16_t *) cur_cand,
                             cur_tail_cells, (ggml_fp16_t *) cur_tail_mask,
@@ -1075,7 +1116,8 @@ void llama_kv_cache_set_input_kpool(
                     const size_t chosen = u < uncached.size() ? uncached[u] : fallback;
                     int32_t * row = cur_update_cells + u*r;
                     if (chosen != SIZE_MAX) {
-                        std::copy(valid_pools[chosen].members.begin(), valid_pools[chosen].members.end(), row);
+                        const int32_t * members = cur_pool_cells + (int64_t) valid_pools[chosen].packed*r;
+                        std::copy(members, members + r, row);
                         cur_update_dst[u] = plan.slots[chosen];
                     } else {
                         std::fill(row, row + r, 0);
