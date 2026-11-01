@@ -10,7 +10,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "gguf-py"))
 
 try:
-    from conversion.deepseek import DeepseekV41Model
+    from conversion.deepseek import DeepseekV4Model, DeepseekV41Model
 except ModuleNotFoundError as exc:
     print(f"SKIP: converter dependency is unavailable: {exc}")
     sys.exit(77)
@@ -36,6 +36,24 @@ def make_model(**overrides):
     model.hparams.update(overrides)
     model.gguf_writer = RecordingWriter()
     return model
+
+
+class TestDeepseekChatTemplate(unittest.TestCase):
+    def test_default_follows_architecture_and_keeps_v4_variants(self):
+        for cls, directory, remote, expected in (
+            (DeepseekV4Model, "DeepSeek-V4", None, "deepseek-ai-DeepSeek-V4.jinja"),
+            (DeepseekV4Model, "DeepSeek-V4-0731", None, "deepseek-ai-DeepSeek-V4-Flash-0731.jinja"),
+            (DeepseekV4Model, "local", "deepseek-ai/DeepSeek-V4-Flash-0731", "deepseek-ai-DeepSeek-V4-Flash-0731.jinja"),
+            (DeepseekV41Model, "local", None, "deepseek-ai-DeepSeek-V4.1.jinja"),
+            (DeepseekV41Model, "local-0731", None, "deepseek-ai-DeepSeek-V4.1.jinja"),
+        ):
+            with self.subTest(architecture=cls.__name__, directory=directory, remote=remote):
+                model = object.__new__(cls)
+                model.dir_model = Path(directory)
+                model.remote_hf_model_id = remote
+                name = model._default_chat_template_name()
+                self.assertEqual(name, expected)
+                self.assertTrue((ROOT / "models" / "templates" / name).is_file())
 
 
 class TestDeepseekV41CandidateMetadata(unittest.TestCase):

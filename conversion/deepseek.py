@@ -562,13 +562,15 @@ class DeepseekV4Model(TextModel):
             logger.info("Skipping %d DeepSeek-V4 MTP tensor(s) for conversion v0", type(self)._skipped_mtp_tensors)
 
         # add a default chat template; if the model has a built-in template, it will be overridden later
-        model_id_hint = self.remote_hf_model_id or self.dir_model.name
-        is_0731 = "0731" in model_id_hint
-        template_name = "deepseek-ai-DeepSeek-V4-Flash-0731.jinja" if is_0731 else "deepseek-ai-DeepSeek-V4.jinja"
+        template_name = self._default_chat_template_name()
         template_path = Path(__file__).parent.parent / "models" / "templates" / template_name
         if template_path.is_file():
             with open(template_path, "r", encoding="utf-8") as f:
                 self.gguf_writer.add_chat_template(f.read())
+
+    def _default_chat_template_name(self) -> str:
+        model_id_hint = self.remote_hf_model_id or self.dir_model.name
+        return "deepseek-ai-DeepSeek-V4-Flash-0731.jinja" if "0731" in model_id_hint else "deepseek-ai-DeepSeek-V4.jinja"
 
     def index_tensors(self, remote_hf_model_id: str | None = None) -> dict[str, Callable[[], Tensor]]:
         type(self)._dsv4_main_layers = self.hparams["num_hidden_layers"]
@@ -1195,6 +1197,9 @@ class DeepseekV41Model(DeepseekV4Model):
     """
 
     model_arch = gguf.MODEL_ARCH.DEEPSEEK41
+
+    def _default_chat_template_name(self) -> str:
+        return "deepseek-ai-DeepSeek-V4.1.jinja"
 
     def _v41_flatten_hparams(self):
         """Promote the nested text_config to the top level.
