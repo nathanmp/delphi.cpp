@@ -1747,6 +1747,17 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     std::vector<std::pair<ggml_context *, llama_buf_map>> ctx_buf_maps;
     ctx_buf_maps.reserve(ml.ctx_map.size());
 
+    // --numa tensors: the routed-expert buffer type, whose buffers are locked only after the load (see below)
+    ggml_backend_buffer_type_t numa_buft = nullptr;
+    if (use_mlock) {
+        auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        auto * cpu_reg = cpu_dev ? ggml_backend_dev_backend_reg(cpu_dev) : nullptr;
+        auto * get_numa_buft = cpu_reg ? (ggml_backend_buffer_type_t (*)(void))
+            ggml_backend_reg_get_proc_address(cpu_reg, "ggml_backend_cpu_numa_buffer_type") : nullptr;
+        numa_buft = get_numa_buft ? get_numa_buft() : nullptr;
+    }
+    std::vector<ggml_backend_buffer_t> numa_mlock_bufs;
+
     // Ensure we have enough capacity for the maximum backend buffer we will potentially create
     const size_t n_max_backend_buffer = ml.ctx_map.size() * ml.files.size();
     pimpl->ctxs_bufs.reserve(n_max_backend_buffer);
@@ -1817,10 +1828,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
             }
             if (use_mlock && ggml_backend_buffer_is_host(buf)) {
-                pimpl->mlock_bufs.emplace_back(new llama_mlock);
-                auto & mlock_buf = pimpl->mlock_bufs.back();
-                mlock_buf->init   (ggml_backend_buffer_get_base(buf));
-                mlock_buf->grow_to(ggml_backend_buffer_get_size(buf));
+                // mlock faults every page in on this thread's node, before the --numa tensors loaders can first-touch
+                // their row ranges on their own nodes, so the routed-expert buffer is locked after the load
+                if (buft == numa_buft) {
+                    numa_mlock_bufs.push_back(buf);
+                } else {
+                    pimpl->mlock_bufs.emplace_back(new llama_mlock);
+                    auto & mlock_buf = pimpl->mlock_bufs.back();
+                    mlock_buf->init   (ggml_backend_buffer_get_base(buf));
+                    mlock_buf->grow_to(ggml_backend_buffer_get_size(buf));
+                }
             }
             bufs.emplace_back(buf);
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
@@ -1886,6 +1903,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // delphi: the last load_all_data call waits for the device uploads, unless skipped weights kept it from knowing it was last
     if (!ml.wait_uploads(params.progress_callback, params.progress_callback_user_data)) {
         return false;
+    }
+
+    for (ggml_backend_buffer_t buf : numa_mlock_bufs) {
+        pimpl->mlock_bufs.emplace_back(new llama_mlock);
+        auto & mlock_buf = pimpl->mlock_bufs.back();
+        mlock_buf->init   (ggml_backend_buffer_get_base(buf));
+        mlock_buf->grow_to(ggml_backend_buffer_get_size(buf));
     }
 
     if (use_mmap_buffer) {

@@ -595,6 +595,9 @@ struct ggml_threadpool {
 
     // --numa tensors only (numa_n_nodes is 0 otherwise)
     int numa_n_nodes;
+    int numa_graph_threads;                       // the worker count of the node ranks below (ggml_numa_prepare_workers)
+    uint32_t * numa_cpus;                         // [node*GGML_NUMA_MAX_CPUS + i]: the CPUs each node may use
+    uint32_t numa_node_cpus[GGML_NUMA_MAX_NODES];
     int numa_node_workers[GGML_NUMA_MAX_NODES];
     int numa_steal_order[GGML_NUMA_MAX_NODES][GGML_NUMA_MAX_NODES]; // the other nodes, nearest first
     struct ggml_numa_node_state * numa_state[GGML_NUMA_MAX_NODES];
@@ -2222,7 +2225,8 @@ static struct ggml_numa_mmid_layout ggml_numa_mmid_layout_of(const struct ggml_t
 // ggml_graph_compute. Every thread gets the same answer.
 static bool ggml_numa_mmid_node_local(const struct ggml_compute_params * params, size_t size) {
     const struct ggml_threadpool * tp = params->threadpool;
-    if (!ggml_numa_node_local_enabled() || !tp || tp->numa_n_nodes < 2 || params->nth != tp->n_threads ||
+    if (!ggml_numa_node_local_enabled() || !tp || tp->numa_n_nodes < 2 || params->nth != tp->numa_graph_threads ||
+            params->numa_n_threads == 0 ||
             (uint32_t) tp->numa_n_nodes != ggml_numa_get_node_count()) {
         return false;
     }
@@ -2331,7 +2335,9 @@ static void ggml_compute_forward_mul_mat_id_impl(
 
     const int ith = params->ith;
     const int nth = params->nth;
-    const bool numa_tensors = ggml_numa_is_tensor_mode() && (src0->flags & GGML_TENSOR_FLAG_NUMA_EXPERT) != 0;
+    // a graph with fewer workers than nodes has no node ranks (numa_n_threads 0) and uses the ordinary schedule
+    const bool numa_tensors = ggml_numa_is_tensor_mode() && params->numa_n_threads > 0 &&
+        (src0->flags & GGML_TENSOR_FLAG_NUMA_EXPERT) != 0;
     const int work_ith = numa_tensors ? params->numa_rank : ith;
     const int work_nth = numa_tensors ? params->numa_n_threads : nth;
     const uint32_t n_nodes = numa_tensors ? ggml_numa_get_node_count() : 1;
@@ -3876,6 +3882,47 @@ static void ggml_thread_cpumask_next(const bool * global_mask, bool * local_mask
     }
 }
 
+// --numa tensors: split the n_threads workers of the next graph over the nodes, in proportion to their CPUs. Workers
+// 0..n_threads-1 are the ones that run, so a split made for the whole pool would leave the later nodes without workers
+// and their rows of every expert without an owner. With fewer workers than nodes no worker gets a node rank, and
+// MUL_MAT_ID uses the ordinary schedule. Call only while no worker runs.
+static void ggml_numa_prepare_workers(struct ggml_threadpool * tp, int n_threads) {
+#if defined(__gnu_linux__)
+    if (!ggml_numa_is_tensor_mode() || tp->numa_cpus == NULL || tp->numa_graph_threads == n_threads) {
+        return;
+    }
+    struct ggml_compute_state * workers = tp->workers;
+    const uint32_t n_nodes = g_state.numa.n_nodes;
+    tp->numa_graph_threads = n_threads;
+
+    uint32_t node_workers[GGML_NUMA_MAX_NODES] = {0};
+    const bool split = (uint32_t) n_threads >= n_nodes;
+    if (split) {
+        GGML_ASSERT(ggml_numa_partition_workers(tp->numa_node_cpus, n_nodes, n_threads, node_workers));
+    }
+
+    uint32_t ith = 0;
+    for (uint32_t node = 0; node < n_nodes; ++node) {
+        tp->numa_node_workers[node] = (int) node_workers[node];
+        const uint32_t * cpus = tp->numa_cpus + (size_t) node*GGML_NUMA_MAX_CPUS;
+        const uint32_t n_ranks = split ? node_workers[node] : (ith < (uint32_t) n_threads ? 1 : 0);
+        for (uint32_t rank = 0; rank < n_ranks; ++rank, ++ith) {
+            const uint32_t cpu = cpus[rank % tp->numa_node_cpus[node]];
+            workers[ith].numa_node        = (int) node;
+            workers[ith].numa_cpu         = (int) cpu;
+            workers[ith].numa_rank        = split ? (int) rank : 0;
+            workers[ith].numa_n_threads   = split ? (int) node_workers[node] : 0;
+            workers[ith].numa_node_leader = split && rank == 0;
+            memset(workers[ith].cpumask, 0, sizeof(workers[ith].cpumask));
+            workers[ith].cpumask[cpu] = true;
+        }
+    }
+#else
+    UNUSED(tp);
+    UNUSED(n_threads);
+#endif
+}
+
 static void ggml_numa_assign_workers(
         const struct ggml_threadpool_params * tpp,
         struct ggml_compute_state * workers) {
@@ -3884,15 +3931,9 @@ static void ggml_numa_assign_workers(
     }
 
 #if defined(__gnu_linux__)
-    if ((uint32_t) tpp->n_threads < g_state.numa.n_nodes) {
-        GGML_ABORT("--numa tensors needs at least one worker per active NUMA node (%d workers, %u nodes)",
-                tpp->n_threads, g_state.numa.n_nodes);
-    }
-
     const bool has_user_mask = ggml_thread_cpumask_is_valid(tpp->cpumask);
     uint32_t allowed_cpus[GGML_NUMA_MAX_NODES][GGML_NUMA_MAX_CPUS] = {{0}};
     uint32_t node_cpus[GGML_NUMA_MAX_NODES] = {0};
-    uint32_t node_workers[GGML_NUMA_MAX_NODES] = {0};
 
     for (uint32_t node = 0; node < g_state.numa.n_nodes; ++node) {
         const struct ggml_numa_node * topology = &g_state.numa.nodes[node];
@@ -3907,35 +3948,35 @@ static void ggml_numa_assign_workers(
         }
     }
 
-    GGML_ASSERT(ggml_numa_partition_workers(
-            node_cpus, g_state.numa.n_nodes, tpp->n_threads, node_workers));
+    // the pool keeps the CPU lists: a graph can run fewer workers than the pool has (cplan.n_threads is at most the
+    // largest task count of its nodes, and a context can plan decode with fewer threads than its pool), and then
+    // ggml_numa_prepare_workers splits that count over the nodes again
+    struct ggml_threadpool * tp = workers[0].threadpool;
+    const uint32_t n_nodes = g_state.numa.n_nodes;
+    tp->numa_cpus = (uint32_t *) calloc((size_t) n_nodes*GGML_NUMA_MAX_CPUS, sizeof(uint32_t));
+    GGML_ASSERT(tp->numa_cpus != NULL);
+    for (uint32_t node = 0; node < n_nodes; ++node) {
+        tp->numa_node_cpus[node] = node_cpus[node];
+        memcpy(tp->numa_cpus + (size_t) node*GGML_NUMA_MAX_CPUS, allowed_cpus[node], node_cpus[node]*sizeof(uint32_t));
+    }
+    tp->numa_graph_threads = -1;
+    ggml_numa_prepare_workers(tp, tpp->n_threads);
 
     uint32_t ith = 0;
-    for (uint32_t node = 0; node < g_state.numa.n_nodes; ++node) {
+    for (uint32_t node = 0; node < n_nodes && (uint32_t) tpp->n_threads >= n_nodes; ++node) {
         const uint32_t first = ith;
         GGML_LOG_INFO("numa tensors: node %u workers %u-%u CPUs",
-                g_state.numa.nodes[node].id, first, first + node_workers[node] - 1);
-        for (uint32_t rank = 0; rank < node_workers[node]; ++rank, ++ith) {
-            const uint32_t cpu = allowed_cpus[node][rank % node_cpus[node]];
-            workers[ith].numa_node        = node;
-            workers[ith].numa_cpu         = cpu;
-            workers[ith].numa_rank        = rank;
-            workers[ith].numa_n_threads   = node_workers[node];
-            workers[ith].numa_node_leader = rank == 0;
-            memset(workers[ith].cpumask, 0, sizeof(workers[ith].cpumask));
-            workers[ith].cpumask[cpu] = true;
-            GGML_LOG_CONT(" %u", cpu);
+                g_state.numa.nodes[node].id, first, first + tp->numa_node_workers[node] - 1);
+        for (int rank = 0; rank < tp->numa_node_workers[node]; ++rank, ++ith) {
+            GGML_LOG_CONT(" %d", workers[ith].numa_cpu);
         }
         GGML_LOG_CONT("\n");
     }
 
     // per-node state of MUL_MAT_ID, and the order in which a node takes pieces from the others: nearest first, and at
     // equal distance node+1, node+2, ... so that the nodes of one socket do not all go to the same node first
-    struct ggml_threadpool * tp = workers[0].threadpool;
-    const uint32_t n_nodes = g_state.numa.n_nodes;
     tp->numa_n_nodes = (int) n_nodes;
     for (uint32_t node = 0; node < n_nodes; ++node) {
-        tp->numa_node_workers[node] = (int) node_workers[node];
         tp->numa_state[node] = ggml_numa_node_state_alloc(node);
         if (!tp->numa_state[node]) {
             GGML_ABORT("--numa tensors: failed to allocate the state of NUMA node %u", g_state.numa.nodes[node].id);
@@ -3990,6 +4031,7 @@ void ggml_threadpool_free(struct ggml_threadpool* threadpool) {
     for (int node = 0; node < threadpool->numa_n_nodes; ++node) {
         ggml_numa_node_state_free(threadpool->numa_state[node]);
     }
+    free(threadpool->numa_cpus);
 
     const size_t workers_size = sizeof(struct ggml_compute_state) * n_threads;
     ggml_aligned_free(threadpool->workers, workers_size);
@@ -4744,6 +4786,8 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
         threadpool->ec               = GGML_STATUS_SUCCESS;
         threadpool->timeline_call    = -1;
         threadpool->numa_n_nodes     = 0;
+        threadpool->numa_graph_threads = -1;
+        threadpool->numa_cpus        = NULL;
         memset(threadpool->numa_state, 0, sizeof(threadpool->numa_state));
     }
 
@@ -4847,6 +4891,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
                 // update the number of threads from the actual number of threads that we got from OpenMP
                 n_threads = omp_get_num_threads();
                 atomic_store_explicit(&threadpool->n_graph, n_threads, memory_order_relaxed);
+                ggml_numa_prepare_workers(threadpool, n_threads);
             }
 
             // Apply thread CPU mask and priority
@@ -4861,6 +4906,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         }
     } else {
         atomic_store_explicit(&threadpool->n_graph, 1, memory_order_relaxed);
+        ggml_numa_prepare_workers(threadpool, 1);
         ggml_graph_compute_thread(&threadpool->workers[0]);
     }
 #else
@@ -4868,6 +4914,8 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         GGML_LOG_WARN("cplan requested more threads (%d) than available (%d)\n", n_threads, threadpool->n_threads);
         n_threads = threadpool->n_threads;
     }
+
+    ggml_numa_prepare_workers(threadpool, n_threads);
 
     // Kick all threads to start the new graph
     ggml_graph_compute_kickoff(threadpool, n_threads);
