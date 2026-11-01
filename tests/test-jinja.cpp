@@ -28,6 +28,7 @@ static void test_literals(testing & t);
 static void test_comments(testing & t);
 static void test_macros(testing & t);
 static void test_namespace(testing & t);
+static void test_dict(testing & t);
 static void test_tests(testing & t);
 static void test_string_methods(testing & t);
 static void test_array_methods(testing & t);
@@ -68,6 +69,7 @@ int main(int argc, char *argv[]) {
     t.test("comments", test_comments);
     t.test("macros", test_macros);
     t.test("namespace", test_namespace);
+    t.test("dict", test_dict);
     t.test("tests", test_tests);
     t.test("string methods", test_string_methods);
     t.test("array methods", test_array_methods);
@@ -1056,6 +1058,49 @@ static void test_macros(testing & t) {
         json::object(),
         "Dict {\n    root1: 1\n    root2: {\n        nest1: 1\n        nest2: {\n            nest3: 2\n        }\n    }\n}"
     );
+}
+
+static void test_dict(testing & t) {
+    test_template(t, "empty and keyword arguments",
+        "{{ dict() | tojson }} {{ dict(a=1, b='two') | tojson }}",
+        json::object(), "{} {\"a\": 1, \"b\": \"two\"}");
+    test_template(t, "copy and override preserve source and key order",
+        "{% set src = {'a': 1, 'b': 2} %}{% set copy = dict(src, a=3, c=4) %}"
+        "{{ src | tojson }} {{ copy | tojson }}",
+        json::object(), "{\"a\": 1, \"b\": 2} {\"a\": 3, \"b\": 2, \"c\": 4}");
+    test_template(t, "key value pairs and duplicate keys",
+        "{{ dict([('a', 1), ['b', 2], ['a', 3]], c=4) | tojson }}",
+        json::object(), "{\"a\": 3, \"b\": 2, \"c\": 4}");
+    test_template(t, "empty sequence",
+        "{{ dict([]) | tojson }}", json::object(), "{}");
+    test_template(t, "non-string keys",
+        "{{ dict([(1, 'one'), (none, 'nil')])[1] }}", json::object(), "one");
+    test_template(t, "shallow copy shares nested values",
+        "{% set src = {'items': [1]} %}{% set copy = dict(src) %}"
+        "{% set ignored = copy['items'].append(2) %}{{ src | tojson }}",
+        json::object(), "{\"items\": [1, 2]}");
+    test_template(t, "template variable shadows builtin",
+        "{% set dict = 'local' %}{{ dict }}", json::object(), "local");
+
+    if (!g_python_mode) {
+        t.test("invalid arguments", [](testing & t) {
+            for (const std::string & expr : {
+                     "dict(1)", "dict(none)", "dict({}, {})", "dict([['a']])",
+                     "dict([[1, 2, 3]])", "dict([[[], 1]])", "dict(a=1, a=2)",
+                 }) {
+                const std::string source = "{{ " + expr + " }}";
+                bool rejected = false;
+                try {
+                    jinja::context ctx(source);
+                    jinja::runtime runtime(ctx);
+                    runtime.execute(jinja::parse_from_tokens(jinja::lexer().tokenize(source)));
+                } catch (const std::exception &) {
+                    rejected = true;
+                }
+                t.assert_true(expr + " must fail", rejected);
+            }
+        });
+    }
 }
 
 static void test_namespace(testing & t) {
