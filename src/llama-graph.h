@@ -1497,6 +1497,10 @@ struct llm_graph_context {
 
     // expert-cache routing records, added after the outputs so their CPU split does not stall the GPU layers
     mutable std::vector<ggml_tensor *> deferred_records;
+    // the experts that a pre-gate predicts for layer moe_pregate_il, set by the model before build_moe_ffn: they travel in the
+    // packet of the expert cache to the CPU, which reads those experts ahead (LLAMA_MOE_PREGATE)
+    mutable ggml_tensor * moe_pregate    = nullptr;
+    mutable int           moe_pregate_il = -1;
     void build_deferred_records() const;
 
     //

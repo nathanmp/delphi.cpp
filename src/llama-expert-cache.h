@@ -52,6 +52,7 @@ struct llama_expert_cache {
         int64_t rows = 0;
         std::vector<float> heat;         // selections of every recorded row (halved now and then), for the static tiers
         int64_t heat_rows = 0;
+        const void * src_data[3] = {};   // the host gate/up/down experts (the keys of the CPU expert prefetch)
     };
 
     static std::unique_ptr<llama_expert_cache> create(const llama_model & model, const std::vector<ggml_backend_ptr> & backends,
@@ -104,6 +105,9 @@ struct llama_expert_cache {
 
     // CPU op: records the routed ids (F32 [top_k, n_tokens]) unless warmup, and returns I32 ids with resident experts set to -1.
     ggml_tensor * build_cold_ids(ggml_context * ctx, ggml_tensor * ids, int il);
+    // F32 [k, rows] experts that a pre-gate predicts for layer il: the CPU passes the cold ones to the CPU expert prefetch
+    // (LLAMA_MOE_PREGATE). Null when the CPU backend has no prefetch.
+    ggml_tensor * build_pregate_hint(ggml_context * ctx, ggml_tensor * ids, int il);
     // CPU op: records the routed ids (I32 [top_k, n_tokens]) of a batch that does not use the arena. Null if not recorded.
     ggml_tensor * build_record(ggml_context * ctx, ggml_tensor * ids, int il);
     // CPU op: the sum over the expert slots of experts (F32 [n_embd, top_k, n_tokens]) times weights (F32 [1, top_k, n_tokens]),
@@ -170,6 +174,7 @@ private:
     void push_maps(const std::vector<bool> & changed);
     void forget(const tier & t) const;
     static void op_cold_ids(ggml_tensor * dst, int ith, int nth, void * userdata);
+    static void op_pregate_hint(ggml_tensor * dst, int ith, int nth, void * userdata);
     static void op_record(ggml_tensor * dst, int ith, int nth, void * userdata);
     static void op_prefill_plan(ggml_tensor * dst, int ith, int nth, void * userdata);
     static void op_prefill_ready(ggml_tensor * dst, int ith, int nth, void * userdata);

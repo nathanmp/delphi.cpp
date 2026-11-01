@@ -1617,6 +1617,19 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
             }
         }
 
+        // delphi: the router of the next layer on this layer's router input predicts ~2/3 of its experts (2026-11-01). The CPU
+        // reads the cold ones of them while the GPU runs the next attention. Only on one GPU: the ids travel in this layer's packet
+        static const bool pregate = [] { const char * e = getenv("LLAMA_MOE_PREGATE"); return e && atoi(e) != 0; }();
+        if (pregate && expert_cache && il + 1 < n_layer && expert_cache->layer(il) && expert_cache->layer(il + 1) &&
+                expert_cache->backend(il) == expert_cache->backend(il + 1) && cur->ne[1] <= llama_expert_cache::max_rows &&
+                ubatch.embd == nullptr) {
+            // the top-k of the raw logits: the norm weights, the gating and the bias change the prediction by < 1 point
+            // (0.670 vs 0.673 top-6 recall), and each kernel costs a few us on the GPU
+            moe_pregate = ggml_argsort_top_k(ctx0, ggml_mul_mat(ctx0, model.layers[il + 1].ffn_gate_inp, cur), hparams.n_expert_used());
+            moe_pregate_il = il + 1;
+            cb(moe_pregate, "ffn_moe_pregate", il);
+        }
+
         ggml_tensor * moe_out = build_moe_ffn(cur,
                 layer.ffn_gate_inp,
                 layer.ffn_up_exps,

@@ -2653,8 +2653,29 @@ ggml_tensor * llm_graph_context::build_moe_ffn_cache(
         packet = ggml_concat(ctx0, packet, ggml_reshape_1d(ctx0, w, ggml_nelements(w)), 0);
         name(packet, "packet_src", false);
     }
+    // the pre-gate of the next layer goes last, so that the views below keep their offsets
+    ggml_tensor * pregate = nullptr;
+    int64_t pregate_off = 0;
+    if (moe_pregate && moe_pregate_il == il + 1 && !prompt && moe_pregate->ne[1] == ids->ne[1]) {
+        pregate_off = ggml_nelements(packet);
+        // the cast reads the top-k view, so that no copy runs before it
+        auto * fp = ggml_reshape_1d(ctx0, ggml_cast(ctx0, moe_pregate, GGML_TYPE_F32), ggml_nelements(moe_pregate));
+        name(fp, "pregate_ids", false);
+        packet = ggml_concat(ctx0, packet, fp, 0);
+        name(packet, "packet_src", false);
+        pregate = moe_pregate;
+    }
+    moe_pregate = nullptr;
+    moe_pregate_il = -1;
     auto * input = ggml_dup(ctx0, packet);
     name(input, "packet", true);
+    if (pregate) {
+        auto * pv = ggml_view_2d(ctx0, input, pregate->ne[0], pregate->ne[1], pregate->ne[0] * sizeof(float), pregate_off * sizeof(float));
+        if (auto * hint = expert_cache->build_pregate_hint(ctx0, pv, il + 1)) {
+            name(hint, "pregate_hint", true);
+            ggml_build_forward_expand(gf, hint);
+        }
+    }
     auto * cx = ggml_view_3d(ctx0, input, cur->ne[0], 1, cur->ne[2], cur->ne[0] * sizeof(float), cur->ne[0] * sizeof(float), 0);
     auto * ci = expert_cache->build_cold_ids(ctx0,
             ggml_view_2d(ctx0, input, ids->ne[0], ids->ne[1], ids->ne[0] * sizeof(float), nx * sizeof(float)), il);

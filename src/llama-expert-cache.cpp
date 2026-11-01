@@ -474,6 +474,7 @@ std::unique_ptr<llama_expert_cache> llama_expert_cache::create(
                 throw std::runtime_error("expert-cache requires original host gate/up/down tensors of one geometry per projection");
             }
             c.shape[p] = w;
+            c.layers[il].src_data[p] = w->data;
             bytes += w->nb[2];
         }
         if ((ws[0]->type == GGML_TYPE_Q4_G128 && (ws[0]->ne[0] % 128 || ws[0]->ne[1] % 128)) ||
@@ -897,6 +898,50 @@ void llama_expert_cache::op_record(ggml_tensor * dst, int ith, int nth, void * u
     if (l.owner->dump) {
         l.owner->dump_record(l.il, 1, ids->ne[1], ids->ne[0], (const char *) ids->data, ids->nb[0], ids->nb[1], false);
     }
+}
+
+typedef void (*llama_expert_hint_fn)(const void * src0_data, const int32_t * experts, int n);
+
+static llama_expert_hint_fn llama_expert_hint_get() {
+    static const llama_expert_hint_fn fn = [] {
+        ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        return dev ? (llama_expert_hint_fn) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev),
+                "ggml_backend_cpu_expert_hint") : nullptr;
+    }();
+    return fn;
+}
+
+void llama_expert_cache::op_pregate_hint(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    GGML_UNUSED(nth);
+    if (ith != 0) { return; }
+    auto & l = *static_cast<entry *>(userdata);
+    if (l.owner->warmup) { return; }
+    const ggml_tensor * ids = dst->src[0];
+    // the cold experts of the prediction, the ones that more rows select first
+    int32_t cnt[LLAMA_MAX_EXPERTS] = {};
+    std::vector<int32_t> order;
+    for (int64_t r = 0; r < ids->ne[1]; ++r) {
+        for (int64_t j = 0; j < ids->ne[0]; ++j) {
+            const int32_t e = (int32_t) *reinterpret_cast<const float *>((const char *) ids->data + r * ids->nb[1] + j * ids->nb[0]);
+            if (e < 0 || e >= (int32_t) l.cold.size() || e >= (int32_t) (sizeof(cnt)/sizeof(cnt[0])) || l.cold[e] < 0) { continue; }
+            if (cnt[e]++ == 0) { order.push_back(e); }
+        }
+    }
+    std::stable_sort(order.begin(), order.end(), [&](int32_t a, int32_t b) { return cnt[a] > cnt[b]; });
+    for (int p = 0; p < 3; ++p) {
+        if (l.src_data[p]) {
+            llama_expert_hint_get()(l.src_data[p], order.data(), (int) order.size());
+        }
+    }
+}
+
+ggml_tensor * llama_expert_cache::build_pregate_hint(ggml_context * ctx, ggml_tensor * ids, int il) {
+    if (!layer(il) || llama_expert_hint_get() == nullptr) {
+        return nullptr;
+    }
+    GGML_ASSERT(ids->type == GGML_TYPE_F32);
+    ggml_tensor * args[] = { ids };
+    return ggml_custom_4d(ctx, GGML_TYPE_I32, 1, 1, 1, 1, args, 1, op_pregate_hint, 1, &layers[il]);
 }
 
 ggml_tensor * llama_expert_cache::build_cold_ids(ggml_context * ctx, ggml_tensor * ids, int il) {
