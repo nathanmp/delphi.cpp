@@ -570,7 +570,8 @@ static bool ggml_backend_cpu_get_op_cost(
             GGML_LOG_INFO("CPU offload calibration: threads = %d, memory = %.2f GB/s\n",
                     n_threads, cpu_ctx->offload_memory_bytes_per_second/1.0e9);
         }
-        if (cpu_ctx->offload_dot_operations_per_second[weight->type] <= 0.0) {
+        // -1: measured, no vector dot rate for this type (no from_float); 0: not measured yet
+        if (cpu_ctx->offload_dot_operations_per_second[weight->type] == 0.0) {
             char key[128];
             snprintf(key, sizeof(key), "cpu vec_dot ops/s type=%s", ggml_type_name(weight->type));
             double measured = 0.0;
@@ -580,12 +581,11 @@ static bool ggml_backend_cpu_get_op_cost(
                     ggml_backend_offload_calibration_store(key, measured);
                 }
             }
-            cpu_ctx->offload_dot_operations_per_second[weight->type] = measured;
+            cpu_ctx->offload_dot_operations_per_second[weight->type] = measured > 0.0 ? measured : -1.0;
             GGML_LOG_INFO("CPU offload calibration: type = %s, vector dot = %.2f GOPS/thread\n",
-                    ggml_type_name(weight->type),
-                    cpu_ctx->offload_dot_operations_per_second[weight->type]/1.0e9);
+                    ggml_type_name(weight->type), measured/1.0e9);
         }
-        dot_operations_per_second = cpu_ctx->offload_dot_operations_per_second[weight->type];
+        dot_operations_per_second = std::max(0.0, cpu_ctx->offload_dot_operations_per_second[weight->type]);
         if (op->op == GGML_OP_MUL_MAT_ID && op->src[1] != nullptr && op->src[2] != nullptr) {
             const struct ggml_backend_cpu_context::offload_mul_mat_id_shape shape = {
                 /*.rows   =*/ weight->ne[0],

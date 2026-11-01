@@ -1186,7 +1186,11 @@ static int ggml_backend_sched_cost_offload(
         if (preferred_gpu_backend_id >= 0 && candidate != preferred_gpu_backend_id) {
             continue;
         }
+        // a GPU takes only the batches its offload_op accepts (32 tokens or more by default): below that, the selected-expert
+        // path waits for the expert ids on every op, which the modeled fixed cost does not include (Qwen 3.8 decode with the
+        // experts on the CPU: 13 instead of 26 t/s)
         has_candidate |= ggml_backend_supports_op(sched->backends[candidate], op) &&
+                ggml_backend_offload_op(sched->backends[candidate], op) &&
                 ggml_backend_has_op_cost(sched->backends[candidate]);
     }
     if (!has_candidate) {
@@ -1208,7 +1212,7 @@ static int ggml_backend_sched_cost_offload(
         if (preferred_gpu_backend_id >= 0 && candidate != preferred_gpu_backend_id) {
             continue;
         }
-        if (!ggml_backend_supports_op(sched->backends[candidate], op)) {
+        if (!ggml_backend_supports_op(sched->backends[candidate], op) || !ggml_backend_offload_op(sched->backends[candidate], op)) {
             continue;
         }
         struct ggml_backend_op_cost gpu = {};
