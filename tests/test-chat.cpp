@@ -7293,7 +7293,7 @@ static void test_deepseek_v41_encoding() {
         auto chat = inputs;
         chat.chat_template_kwargs[option.first] = option.second;
         auto parser = make_peg_parser(tmpls.get(), chat);
-        assert_equals("<｜Assistant｜></think>", parser.params_.generation_prompt);
+        assert_equals(std::string("<｜Assistant｜></think>"), parser.params_.generation_prompt);
         assert_not_contains(parser.params_.prompt, "Reasoning Effort:");
         assert_msg_equals(simple_assist_msg("Answer"), parser.parse("Answer", false), true);
     }
@@ -7302,7 +7302,7 @@ static void test_deepseek_v41_encoding() {
     thinking_override.enable_thinking = false;
     thinking_override.chat_template_kwargs["thinking_mode"] = "\"thinking\"";
     auto thinking_parser = make_peg_parser(tmpls.get(), thinking_override);
-    assert_equals("<｜Assistant｜><think>", thinking_parser.params_.generation_prompt);
+    assert_equals(std::string("<｜Assistant｜><think>"), thinking_parser.params_.generation_prompt);
     assert_msg_equals(simple_assist_msg("Answer", "Reason"), thinking_parser.parse("Reason</think>Answer", false), true);
 
     for (const auto & option : std::vector<std::pair<std::string, int>>{

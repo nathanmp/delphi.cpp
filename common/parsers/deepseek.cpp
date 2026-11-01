@@ -112,7 +112,7 @@ static common_chat_params common_chat_params_init_deepseek(const common_chat_tem
         { COMMON_CHAT_ROLE_USER, "<｜User｜>" },
     };
     if (is_v4_1) {
-        data.message_delimiters.push_back({ COMMON_CHAT_ROLE_SYSTEM, "<｜System｜>" });
+        data.message_delimiters.add(COMMON_CHAT_ROLE_SYSTEM, "<｜System｜>");
     }
 
     data.prompt = common_chat_template_direct_apply_impl(
@@ -288,9 +288,12 @@ static common_chat_params common_chat_params_init_deepseek(const common_chat_tem
             parser.build_grammar(builder, data.grammar_lazy);
         });
 
-        data.grammar_triggers = {
-            { COMMON_GRAMMAR_TRIGGER_TYPE_WORD, FC_START },
-        };
+        // the sampler reads the triggers only for a lazy grammar
+        if (data.grammar_lazy) {
+            data.grammar_triggers = {
+                { COMMON_GRAMMAR_TRIGGER_TYPE_WORD, FC_START },
+            };
+        }
     }
 
     return data;
