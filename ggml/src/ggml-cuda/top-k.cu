@@ -294,10 +294,14 @@ static void top_k_radix_cuda(
     constexpr int BLOCK_SIZE = 256;
     constexpr int RADIX_BITS = 8;
     constexpr int NBINS = 1 << RADIX_BITS;
-    const int blocks_per_row = std::min((ncols + 1023) / 1024, 64);
+    constexpr int MAX_BLOCKS_PER_ROW = 64;
+    const int blocks_per_row = std::min((ncols + 1023) / 1024, MAX_BLOCKS_PER_ROW);
 
+    // delphi: the scratch is sized for the most blocks, so that its size does not follow ncols. With the legacy pool (HIP), a
+    // DeepSeek V4.1 prompt asked for a larger histogram every ubatch as the compressed stream grew; each size stayed cached,
+    // the pool filled the GPU near 90K tokens, and the flush that followed freed memory that captured graphs still used.
     ggml_cuda_pool_alloc<top_k_radix_state> states_alloc(pool, nrows);
-    ggml_cuda_pool_alloc<int> histograms_alloc(pool, (size_t) nrows * blocks_per_row * NBINS);
+    ggml_cuda_pool_alloc<int> histograms_alloc(pool, (size_t) nrows * MAX_BLOCKS_PER_ROW * NBINS);
     top_k_radix_state * states = states_alloc.get();
     int * histograms = histograms_alloc.get();
 
@@ -314,7 +318,8 @@ static void top_k_radix_cuda(
 
     const int chunk = (((ncols + blocks_per_row - 1) / blocks_per_row) + BLOCK_SIZE - 1) / BLOCK_SIZE * BLOCK_SIZE;
     const int gather_blocks = (ncols + chunk - 1) / chunk;
-    ggml_cuda_pool_alloc<int2> counts_alloc(pool, (size_t) nrows * gather_blocks);
+    GGML_ASSERT(gather_blocks <= MAX_BLOCKS_PER_ROW);
+    ggml_cuda_pool_alloc<int2> counts_alloc(pool, (size_t) nrows * MAX_BLOCKS_PER_ROW);
     const dim3 gather_grid(gather_blocks, nrows);
     top_k_radix_gather_count<BLOCK_SIZE><<<gather_grid, BLOCK_SIZE, 0, stream>>>(src, states, counts_alloc.get(), ncols, chunk);
     top_k_radix_gather_write<BLOCK_SIZE><<<gather_grid, BLOCK_SIZE, 0, stream>>>(

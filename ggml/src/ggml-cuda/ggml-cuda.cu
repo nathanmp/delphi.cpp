@@ -452,6 +452,9 @@ const ggml_cuda_device_info & ggml_cuda_info() {
 // #define DEBUG_CUDA_MALLOC
 
 // buffer pool for cuda (legacy)
+// delphi: the number of times a legacy pool freed its cached buffers to retry an allocation
+static std::atomic<uint64_t> ggml_cuda_pool_flushes{0};
+
 struct ggml_cuda_pool_leg : public ggml_cuda_pool {
     static const int MAX_BUFFERS = 256;
 
@@ -536,6 +539,8 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
                            device, look_ahead_size/1024.0/1024.0, cached_bytes/1024.0/1024.0);
             CUDA_CHECK(cudaDeviceSynchronize());
             clear_pool();
+            // delphi: captured graphs hold the addresses of the freed buffers (see ggml_backend_cuda_graph_compute)
+            ggml_cuda_pool_flushes.fetch_add(1, std::memory_order_relaxed);
             err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
             if (err == cudaSuccess) {
                 GGML_LOG_DEBUG(GGML_CUDA_NAME " pool[%d]: retry succeeded\n", device);
@@ -5766,6 +5771,25 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
     enum ggml_exec_trace_gpu_graph_reason fallback_reason = GGML_EXEC_TRACE_GPU_GRAPH_REASON_DISABLED;
+
+#ifdef USE_CUDA_GRAPH
+    // delphi: after a legacy pool freed its cached buffers, a captured graph would read and write freed memory (a memory fault
+    // on the next replay), so capture again
+    if (const uint64_t flushes = ggml_cuda_pool_flushes.load(std::memory_order_relaxed)) {
+        static std::mutex seen_mutex;
+        static std::unordered_map<const ggml_backend_cuda_context *, uint64_t> seen;
+        std::lock_guard<std::mutex> lock(seen_mutex);
+        uint64_t & last = seen[cuda_ctx];
+        if (last != flushes) {
+            if (!cuda_ctx->cuda_graphs.empty()) {
+                GGML_LOG_WARN("%s: a memory pool was flushed; capturing the graphs of %s again\n", __func__, cuda_ctx->name.c_str());
+            }
+            cuda_ctx->cuda_graphs.clear();
+            cuda_ctx->graph_key_by_uid.clear();
+            last = flushes;
+        }
+    }
+#endif
     uint32_t trace_dispatch_count = 0;
     uint64_t graph_key = 0;
 
