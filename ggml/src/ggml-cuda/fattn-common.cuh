@@ -746,8 +746,9 @@ static __global__ void flash_attn_mask_to_KV_max(
     KV_max[(gridDim.y + sequence)*ne31 + jt] = KV_min_sj < KV_max_sj ? KV_min_sj : 0;
 }
 
+// one list of n_kv_max cells per (sequence, tile of ncols1 queries): the cells any query of the tile sees, then -1
 void ggml_cuda_flash_attn_ext_compact_mask(
-        const ggml_tensor * mask, int32_t * indices, int32_t n_kv_max, cudaStream_t stream);
+        const ggml_tensor * mask, int32_t * indices, int32_t n_queries, int32_t ncols1, int32_t n_kv_max, cudaStream_t stream);
 
 template<int D, int ncols1, int ncols2> // D == head size
 __launch_bounds__(D, 1)
@@ -1129,16 +1130,19 @@ void launch_fattn(
     const int ntiles_z_gqa = ((gqa_ratio + ncols2 - 1) / ncols2);
     const int ntiles_dst   = ntiles_x * ntiles_z_gqa * K->ne[2] * Q->ne[3];
 
+    // a compacted list serves a tile of ncols1 queries, so it holds up to ncols1 times the cells of one query
     const int32_t n_kv_max = use_sparse ?
-        (sparse_indices ? sparse_indices->ne[0] : ggml_get_op_params_i32(KQV, 4)) : 0;
+        (sparse_indices ? sparse_indices->ne[0] :
+            (int32_t) std::min<int64_t>(K->ne[1], int64_t(ncols1)*ggml_get_op_params_i32(KQV, 4))) : 0;
     if (use_sparse) {
         GGML_ASSERT(mask != nullptr || sparse_indices != nullptr);
         GGML_ASSERT(n_kv_max > 0);
+        GGML_ASSERT(sparse_indices == nullptr || ncols1 == 1);
         if (!sparse_indices) {
             GGML_ASSERT(mask != nullptr);
-            const size_t mask_rows = size_t(mask->ne[1]) * mask->ne[3];
-            KV_max.alloc(size_t(n_kv_max) * mask_rows);
-            ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max.ptr, n_kv_max, main_stream);
+            const size_t n_lists = size_t(ntiles_x) * mask->ne[3];
+            KV_max.alloc(size_t(n_kv_max) * n_lists);
+            ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max.ptr, Q->ne[1], ncols1, n_kv_max, main_stream);
         }
     }
 

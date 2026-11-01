@@ -50,7 +50,8 @@ static int next_power_of_2(int x) {
 
 #endif                            // CUB_TOP_K_AVAILABLE
 
-#if !defined(GGML_CUDA_USE_CUB) && defined(GGML_USE_HIP)
+// delphi: CUDA takes the multi-block radix path for few wide rows (top_k_radix_use_multiblock)
+#if (!defined(GGML_CUDA_USE_CUB) && defined(GGML_USE_HIP)) || (!defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA))
 
 static __device__ __forceinline__ uint32_t top_k_float_to_ordered(float value) {
     const uint32_t bits = __float_as_uint(value);
@@ -247,8 +248,13 @@ static __global__ void top_k_radix_gather_write(
         const uint32_t key = col < col_end ? top_k_float_to_ordered(row_src[col]) : 0;
         const bool gt = col < col_end && key > prefix;
         const bool eq = col < col_end && key == prefix;
+#if defined(GGML_USE_HIP)
         const uint64_t m_gt = __ballot(gt);
         const uint64_t m_eq = __ballot(eq);
+#else
+        const uint64_t m_gt = __ballot_sync(0xFFFFFFFF, gt);
+        const uint64_t m_eq = __ballot_sync(0xFFFFFFFF, eq);
+#endif // defined(GGML_USE_HIP)
         if (lane == 0) {
             s_warp[0][warp] = __popcll(m_gt);
             s_warp[1][warp] = __popcll(m_eq);
@@ -315,7 +321,7 @@ static void top_k_radix_cuda(
             src, dst, states, counts_alloc.get(), ncols, k, chunk);
 }
 
-#endif // !defined(GGML_CUDA_USE_CUB) && defined(GGML_USE_HIP)
+#endif // (!defined(GGML_CUDA_USE_CUB) && defined(GGML_USE_HIP)) || (!defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA))
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
@@ -733,6 +739,13 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const bool supported_device = GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE;
     const int max_radix_cols = cc >= GGML_CUDA_CC_ADA_LOVELACE ? 49152 : 32768;
     if (use_radix_select && supported_device && k <= ncols && ncols <= max_radix_cols) {
+        // delphi: one block per row leaves most SMs idle when there are few rows; the multi-block path splits each
+        // row. test-backend-ops perf on a CMP 170HX, k = 512: 16384 x 1 51 -> 42 us, 32768 x 1 86 -> 46 us,
+        // 32768 x 16 91 -> 64 us, but 8192 x 1 35 -> 41 us and 32768 x 32 96 -> 112 us
+        if (ncols >= 12288 && nrows <= 16) {
+            top_k_radix_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
+            return;
+        }
         top_k_radix_select_nvidia(src0_d, dst_d, ncols, nrows, k, stream);
         return;
     }

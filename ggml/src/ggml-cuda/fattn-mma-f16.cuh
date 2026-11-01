@@ -1766,12 +1766,33 @@ static constexpr __host__ __device__ bool ggml_cuda_flash_attn_ext_mma_f16_may_u
 #if defined(GGML_USE_HIP)
     // delphi: RDNA WMMA tiles are at least 16 columns wide, so 512-wide heads take 16 heads per query
     // 256-wide heads (Qwen QSA, 12 heads per KV head) fill 12 of the 16 columns; the kernel masks the rest
+    // prefill: a tile of 16 queries x 4 heads gathers the union of the queries' selections
     return (DKQ == 512 && DV == 512 && ncols1 == 1 && ncols2 == 16) ||
-           (DKQ == 256 && DV == 256 && ncols1 == 1 && ncols2 == 16);
+           (DKQ == 256 && DV == 256 && ncols1 == 1 && ncols2 == 16) ||
+           (DKQ == 256 && DV == 256 && ncols1 == 16 && ncols2 == 4);
 #else
+    // 256-wide heads: Qwen QSA, from upstream #28770; a tile of 8 queries gathers the union of their selections
     return (DKQ == 512 && DV == 512 && ncols1 == 1 && ncols2 == 8) ||
-           (DKQ == 576 && DV == 512 && ncols1 == 1 && ncols2 == 16);
+           (DKQ == 576 && DV == 512 && ncols1 == 1 && ncols2 == 16) ||
+           (DKQ == 256 && DV == 256 && ncols1 == 1 && ncols2 == 8) ||
+           (DKQ == 256 && DV == 256 && ncols1 == 8 && ncols2 == 8);
 #endif // defined(GGML_USE_HIP)
+}
+
+// delphi: a compacted index list holds its rows first and -1 after them, so the KV tiles from the first one that starts with
+// -1 hold no rows. Direct index lists that are not compacted have no -1, so they keep every tile.
+static __device__ __forceinline__ int flash_attn_ext_f16_sparse_tiles(const int32_t * indices, const int iter_k, const int nbatch_fa) {
+    int lo = 0;
+    int hi = iter_k;
+    while (lo < hi) {
+        const int mid = (lo + hi)/2;
+        if (indices[mid*nbatch_fa] >= 0) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
 }
 
 template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool V_is_K_view, bool use_sparse>
@@ -1900,7 +1921,9 @@ static __global__ void flash_attn_ext_f16(
 
         const half2 * V_h2 = V_is_K_view ? K_h2 : (const half2 *) (V + nb23*sequence + nb22*z_KV);
         const float * sinks_f = sinks ? (const float *) sinks + zt_Q : nullptr;
-        const int32_t * indices = use_sparse ? sparse_indices + (int64_t(sequence % ne33)*ne31 + jt*ncols1)*ne11 : nullptr;
+        // one index list per (sequence, query tile), as the compaction writes them and as direct indices lie for ncols1 == 1;
+        // without a mask (ne33 == 0) the direct indices have one set of lists per sequence
+        const int32_t * indices = use_sparse ? sparse_indices + (int64_t(ne33 > 0 ? sequence % ne33 : sequence)*iter_j + jt)*ne11 : nullptr;
 
         const float slope = ncols2 == 1 ? get_alibi_slope(max_bias, zt_Q, n_head_log2, m0, m1) : 1.0f;
 
@@ -1910,6 +1933,9 @@ static __global__ void flash_attn_ext_f16(
         if (KV_max) {
             kb0_stop  = min(kb0_stop, KV_max[sequence*iter_j + jt] / nbatch_fa);
             kb0_first = max(kb0_start, min(KV_max[(ne03 + sequence)*iter_j + jt] / nbatch_fa, kb0_stop - 1));
+        }
+        if (use_sparse && mask) {
+            kb0_stop = min(kb0_stop, max(kb0_start + 1, flash_attn_ext_f16_sparse_tiles(indices, iter_k, nbatch_fa)));
         }
         constexpr bool is_fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
         if (kb0_start == 0) {
@@ -1956,13 +1982,16 @@ static __global__ void flash_attn_ext_f16(
 
     const half2 * V_h2 = V_is_K_view ? K_h2 : (const half2 *) (V + nb23*sequence + nb22*z_KV);
     const float * sinks_f = sinks ? (const float *) sinks + zt_Q : nullptr;
-    const int32_t * indices = use_sparse ? sparse_indices + (int64_t(sequence % ne33)*ne31 + jt*ncols1)*ne11 : nullptr;
+    const int32_t * indices = use_sparse ? sparse_indices + (int64_t(ne33 > 0 ? sequence % ne33 : sequence)*iter_j + jt)*ne11 : nullptr;
 
     const float slope = ncols2 == 1 ? get_alibi_slope(max_bias, zt_Q, n_head_log2, m0, m1) : 1.0f;
 
     if (KV_max) {
         kb0_stop  = min(kb0_stop, KV_max[sequence*iter_j + jt] / nbatch_fa);
         kb0_start = max(kb0_start, min(KV_max[(ne03 + sequence)*iter_j + jt] / nbatch_fa, kb0_stop - 1));
+    }
+    if (use_sparse && mask) {
+        kb0_stop = min(kb0_stop, max(kb0_start + 1, flash_attn_ext_f16_sparse_tiles(indices, iter_k, nbatch_fa)));
     }
 
     constexpr bool is_fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
@@ -1984,7 +2013,7 @@ static __global__ void flash_attn_ext_f16(
 #endif // defined(FLASH_ATTN_AVAILABLE) && (defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE))
 }
 
-bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ggml_backend_cuda_context & ctx, ggml_tensor * dst, int ncols1);
 
 template <int DKQ, int DV, int ncols1, int ncols2>
 void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -2037,7 +2066,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
         constexpr bool use_logit_softcap = false;
 #if !defined(GGML_USE_MUSA)
         if constexpr (ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, ncols1, ncols2)) {
-            if (ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ctx, dst)) {
+            if (ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ctx, dst, ncols1)) {
                 constexpr bool use_sparse_kernel = true;
                 fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, use_sparse_kernel>;
                 use_sparse = true;
