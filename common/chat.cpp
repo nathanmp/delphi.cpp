@@ -1177,6 +1177,12 @@ std::optional<common_chat_params> common_chat_try_specialized_template(
         return common_chat_params_init_minimax_m3(tmpl, params);
     }
 
+    // V4.1 uses spaced DSML tag names. Check this before the older DSML formats.
+    if (src.find("<｜DSML｜ calls>") != std::string::npos) {
+        LOG_DBG("Using specialized template: DeepSeek V4.1\n");
+        return common_chat_params_init_deepseek_v4_1(tmpl, params);
+    }
+
     // DeepSeek V3.2/V4 format detection: template defines dsml_token and uses it for tool calls.
     // The template source contains the token as a variable assignment, not as a literal in markup.
     // V3.2 names the tool call block "function_calls", V4 names it "tool_calls".

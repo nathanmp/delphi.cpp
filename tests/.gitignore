@@ -6,3 +6,6 @@
 ggml-common.h
 **/*.swp
 !peg-parser
+!data/
+!data/deepseek-v4.1/
+!data/deepseek-v4.1/LICENSE

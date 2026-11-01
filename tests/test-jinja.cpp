@@ -2,6 +2,8 @@
 #include <iostream>
 #include <random>
 #include <cstdlib>
+#include <fstream>
+#include <iterator>
 
 #include "json.h"
 #include "subproc.h"
@@ -28,6 +30,8 @@ static void test_literals(testing & t);
 static void test_comments(testing & t);
 static void test_macros(testing & t);
 static void test_namespace(testing & t);
+static void test_dict(testing & t);
+static void test_deepseek41_encoding(testing & t);
 static void test_tests(testing & t);
 static void test_string_methods(testing & t);
 static void test_array_methods(testing & t);
@@ -68,6 +72,8 @@ int main(int argc, char *argv[]) {
     t.test("comments", test_comments);
     t.test("macros", test_macros);
     t.test("namespace", test_namespace);
+    t.test("dict", test_dict);
+    t.test("DeepSeek V4.1 encoding", test_deepseek41_encoding);
     t.test("tests", test_tests);
     t.test("string methods", test_string_methods);
     t.test("array methods", test_array_methods);
@@ -1056,6 +1062,102 @@ static void test_macros(testing & t) {
         json::object(),
         "Dict {\n    root1: 1\n    root2: {\n        nest1: 1\n        nest2: {\n            nest3: 2\n        }\n    }\n}"
     );
+}
+
+static void test_dict(testing & t) {
+    test_template(t, "empty and keyword arguments",
+        "{{ dict() | tojson }} {{ dict(a=1, b='two') | tojson }}",
+        json::object(), "{} {\"a\": 1, \"b\": \"two\"}");
+    test_template(t, "copy and override preserve source and key order",
+        "{% set src = {'a': 1, 'b': 2} %}{% set copy = dict(src, a=3, c=4) %}"
+        "{{ src | tojson }} {{ copy | tojson }}",
+        json::object(), "{\"a\": 1, \"b\": 2} {\"a\": 3, \"b\": 2, \"c\": 4}");
+    test_template(t, "key value pairs and duplicate keys",
+        "{{ dict([('a', 1), ['b', 2], ['a', 3]], c=4) | tojson }}",
+        json::object(), "{\"a\": 3, \"b\": 2, \"c\": 4}");
+    test_template(t, "empty sequence",
+        "{{ dict([]) | tojson }}", json::object(), "{}");
+    test_template(t, "non-string keys",
+        "{{ dict([(1, 'one'), (none, 'nil')])[1] }}", json::object(), "one");
+    test_template(t, "shallow copy shares nested values",
+        "{% set src = {'items': [1]} %}{% set copy = dict(src) %}"
+        "{% set ignored = copy['items'].append(2) %}{{ src | tojson }}",
+        json::object(), "{\"items\": [1, 2]}");
+    test_template(t, "template variable shadows builtin",
+        "{% set dict = 'local' %}{{ dict }}", json::object(), "local");
+
+    if (!g_python_mode) {
+        t.test("copy preserves input marking and usage tracking", [](testing & t) {
+            const std::string source = "{{ dict(message, extra='literal').content }}";
+            jinja::context ctx(source);
+            ctx.is_get_stats = true;
+            jinja::global_from_json(ctx, json{{"message", {{"content", "input text"}}}}, true);
+            jinja::runtime runtime(ctx);
+            const auto result = runtime.execute(jinja::parse_from_tokens(jinja::lexer().tokenize(source)));
+            const auto parts = jinja::runtime::gather_string_parts(result);
+            t.assert_true("input marking survives copy", parts->as_string().all_parts_are_input());
+            const auto message = ctx.get_val("message");
+            t.assert_true("source container usage is recorded", message->stats.used);
+            t.assert_true("source content usage is recorded", message->at("content")->stats.used);
+        });
+        t.test("invalid arguments", [](testing & t) {
+            for (const std::string & expr : {
+                     "dict(1)", "dict(none)", "dict({}, {})", "dict([['a']])",
+                     "dict([[1, 2, 3]])", "dict([[[], 1]])", "dict(a=1, a=2)",
+                 }) {
+                const std::string source = "{{ " + expr + " }}";
+                bool rejected = false;
+                try {
+                    jinja::context ctx(source);
+                    jinja::runtime runtime(ctx);
+                    runtime.execute(jinja::parse_from_tokens(jinja::lexer().tokenize(source)));
+                } catch (const std::exception &) {
+                    rejected = true;
+                }
+                t.assert_true(expr + " must fail", rejected);
+            }
+        });
+    }
+}
+
+static void test_deepseek41_encoding(testing & t) {
+    auto read = [](const std::string & path) {
+        std::ifstream file(path, std::ios::binary);
+        if (!file) {
+            file = std::ifstream("../" + path, std::ios::binary);
+        }
+        if (!file) {
+            throw std::runtime_error("Cannot read fixture: " + path);
+        }
+        return std::string(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+    };
+    const auto tmpl = read("models/templates/deepseek-ai-DeepSeek-V4.1.jinja");
+    // Official 1017 fixtures, copied unchanged; see tests/data/deepseek-v4.1/LICENSE.
+    for (int i = 1; i <= 5; ++i) {
+        const auto stem = "tests/data/deepseek-v4.1/test_";
+        auto input = json::parse(read(stem + std::string("input_") + std::to_string(i) + ".json"));
+        json vars = input.is_array() ? json{{"messages", input}} : input;
+        if (!vars.contains("thinking_mode")) {
+            vars["thinking_mode"] = "chat";
+        }
+        if (vars.contains("tools")) {
+            vars["messages"][0]["tools"] = vars["tools"];
+            vars.erase("tools");
+        }
+        for (auto & message : vars["messages"]) {
+            if (message.contains("tool_calls")) {
+                for (auto & call : message["tool_calls"]) {
+                    auto & args = call["function"]["arguments"];
+                    if (args.is_string()) {
+                        args = json::parse(args.get<std::string>());
+                    }
+                }
+            }
+        }
+        vars["add_generation_prompt"] = vars["messages"].back()["role"] != "assistant";
+        test_template(t, "official fixture " + std::to_string(i), tmpl, vars,
+                      read(stem + std::string("output_") + std::to_string(i) + ".txt"));
+    }
 }
 
 static void test_namespace(testing & t) {
