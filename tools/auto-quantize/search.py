@@ -185,9 +185,6 @@ def memory(info, cfg, choices):
             "cache_groups": [{"types": list(key), **value} for key, value in groups.items()],
             "cache_hit_prior": hit_prior(info, cfg, slots, len(experts)),
             "cache_hit_source": hit_source(info, cfg, len(experts)),
-            "allocation_scope": "tensor payloads without lazy tables, cache banks/maps/scratch and supplied reserves; allocator/repack overhead needs witness validation; lazy tables sit on disk and use page cache as the system allows",
-            "secondary_gpus": "unassigned; percentages change speed predictions only" if not only else
-            "layers split contiguously over the GPUs in order (layer_split, last count includes the output); the input embedding stays on the host",
             **({"layer_split": split, "runtime_args": ["--device", ",".join(gpus(cfg)), "-sm", "layer", "-ts", ",".join(map(str, split))]}
                if only else {})}
 

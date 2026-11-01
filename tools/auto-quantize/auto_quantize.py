@@ -377,19 +377,7 @@ def plan(data, cfg, output):
                "source": data["model"]["identity"], "prepared": data,
                "search": result, "recipes": recipes, "timing_qualified": qualified, "timed": timed,
                "single_gpu_timing_qualified": data["timing_qualified"], "user_gpu_projection": projection,
-               "quality": quality_metadata(table),
-               "limitations": ["loss is the calibrated model's predicted KL against the teacher on the calibration text, not a bound" if table else "loss is a local source-relative proxy, not KLD or accuracy"]
-               + (["speed was not measured (loss-only weights)"] if not timed else [
-                               "uniform synthetic routing and fixed route frequencies",
-                               "link bandwidth and handoff latency are priors unless supplied",
-                               *(["cache hits come from the measured routing curve (an offline replay of the cache policy on a routing trace)"
-                                  if cfg.get("routing_curve") else
-                                  "cache hits use a uniform residency prior; no routing curve was measured for this model"]
-                                 if cfg["cache_mib"] else []),
-                               "tail ubatches use interpolation; trace integrity has not been certified",
-                               "the layers are split over the GPUs by memory (layer_split), with timings from operations measured on the first GPU and summed over the devices; pipeline overlap between GPUs is not modelled"
-                               if gpu_only(cfg) else
-                               "multiple GPUs use user throughput factors, without pooled capacity or a runtime layout"])}
+               "quality": quality_metadata(table)}
     payload["effective_cpu_decode_gb_s"] = (predictor.cpu_bytes_per_ms or 0) / 1e6 if timed else None
     write_json(outdir / "frontier.json", payload)
     print(f"{result['status']}: {len(recipes)} nondominated recipes; {result['evaluated']} evaluations")

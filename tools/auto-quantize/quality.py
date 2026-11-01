@@ -224,9 +224,7 @@ def load_quality(info, cfg, prepared):
 
 def quality_metadata(table):
     if table is None:
-        return {"metric": "sum_local_R", "units": "local source-relative error", "qualification": "proxy"}
-    return {"metric": METHOD, "units": "predicted KL against the teacher on the calibration text",
+        return {"metric": "sum_local_R", "qualification": "proxy"}
+    return {"metric": METHOD, "qualification": "calibrated",
             "table": table["identity"], "execution": table["execution"], "teacher": table["teacher"],
-            "floor_kl": table["floor"]["kl"], "fit": {k: table["fit"][k] for k in ("chi2_dof", "passes")},
-            "scope": "the recorded calibration text, teacher and execution policy",
-            "ceiling": "max_loss constrains the predicted KL; it is a model estimate, not a bound"}
+            "floor_kl": table["floor"]["kl"], "fit": {k: table["fit"][k] for k in ("chi2_dof", "passes")}}
