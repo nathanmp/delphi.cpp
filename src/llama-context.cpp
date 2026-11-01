@@ -3572,6 +3572,22 @@ void llama_context::expert_cache_auto() {
             ggml_backend_sched_stage_release(slot.sched.get());
         }
     }
+    // A staging slot holds one host expert tensor, and on a cache GPU the tier lends it. A GPU whose tier can not lend one
+    // slot (a long context or a draft model left little memory) does not stage, else the first long prompt that the
+    // scheduler sends there aborts.
+    size_t stage_slot = 0;
+    for (const auto & [tname, t] : model.tensors_by_name) {
+        if (t->buffer != nullptr && ggml_backend_buffer_is_host(t->buffer) && tname.find("_exps.") != std::string::npos) {
+            stage_slot = std::max(stage_slot, ggml_nbytes(t));
+        }
+    }
+    auto stage_check = [&](ggml_backend_dev_t dev, size_t tier_bytes) {
+        if (stage_slot > 0 && tier_bytes < stage_slot) {
+            LLAMA_LOG_WARN("%s: %s does not stage experts: its expert cache holds %.0f MiB, less than one %.0f MiB staging slot\n",
+                    __func__, ggml_backend_dev_name(dev), tier_bytes / 1048576.0, stage_slot / 1048576.0);
+            share_stage_allow(dev, false);
+        }
+    };
     // tiers on the GPUs of the cached layers only, unless LLAMA_MOE_CACHE_AUTO_REMOTE=1 (a tier on another GPU costs a copy to it
     // and back per layer)
     for (const auto & d : model.devices) {
@@ -3587,12 +3603,14 @@ void llama_context::expert_cache_auto() {
         if (!budget) {
             LLAMA_LOG_INFO("%s: expert cache auto: %s has %.0f MiB free, no tier\n", __func__, ggml_backend_dev_name(d.dev),
                     free / 1048576.0);
+            stage_check(d.dev, 0);
             continue;
         }
         const int id = share_add_tier(d.dev, budget);
         LLAMA_LOG_INFO("%s: expert cache auto: %s %.0f MiB free, %.0f MiB reserve, %.0f MiB refresh scratch, tier %d of up to %.0f MiB\n",
                 __func__, name.c_str(), free / 1048576.0, expert_device_policy.margin(name) / 1048576.0, scratch / 1048576.0, id,
                 budget / 1048576.0);
+        stage_check(d.dev, id >= 0 ? expert_cache->tier_bytes(id) : 0);
     }
 }
 
