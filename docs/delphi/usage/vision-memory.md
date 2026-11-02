@@ -13,7 +13,7 @@ If the weights and the workspace of a batch do not fit in the free memory with 2
 
 - Each encoding uploads the encoder weights (GLM 5.3: 1.1 GB, about 0.7 s on a PCIe 2.0 x4 CMP) and the language model reserves its compute buffers again at the next decode.
 - Images of one request are encoded in one batch, so they share one upload. Concurrent requests with images are encoded one after the other in the server loop; each has its own upload. Nothing else changes for requests without images.
-- Use `resident` when image latency matters more than VRAM.
+- Use `resident` when image latency matters more than VRAM: for example, when most requests carry images, or when the GPU has room for the model and the encoder together.
 
 ## Fitting
 
