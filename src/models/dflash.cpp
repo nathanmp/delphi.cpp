@@ -39,6 +39,11 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_HYPER_CONNECTION_COUNT, hparams.dsv4_hc_mult, false);
     if (hparams.dsv4_hc_mult > 0) {
         ml.get_key(LLM_KV_DSV41_SEMANTICS, hparams.dsv4_v41, false);
+        if (!hparams.dsv4_v41 && !ml.get_tensor_meta("output_hc_fn.weight")) {
+            // a V4 draft always has the hc_head; a V4.1 draft from another converter can lack the flag
+            LLAMA_LOG_WARN("%s: no dsv41_semantics key and no hc_head weights: using the V4.1 semantics\n", __func__);
+            hparams.dsv4_v41 = true;
+        }
         ml.get_key(LLM_KV_ATTENTION_Q_LORA_RANK,                hparams.n_lora_q);
         ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW,             hparams.n_swa);
         ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,    hparams.n_ff_exp_arr, hparams.n_layer_all);
