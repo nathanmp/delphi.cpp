@@ -319,9 +319,19 @@ llama_kpool_cache::stream_plan llama_kpool_cache::prepare_stream(
         }
     }
 
+    // Drop only the pools of the sequences that this ubatch names. Server slots share one stream, and each slot
+    // decodes in its own ubatch: dropping the other slots' pools here made all of them new again on their next
+    // ubatch (98 new pools for 4 update rows, which aborted).
     // erase leaves the other elements in place, so the pointers in found stay valid
+    static thread_local std::vector<llama_seq_id> seqs;
+    seqs.clear();
+    for (const auto & id : ids) {
+        if (std::find(seqs.begin(), seqs.end(), id.seq) == seqs.end()) {
+            seqs.push_back(id.seq);
+        }
+    }
     for (auto it = map.begin(); it != map.end();) {
-        if (it->second.gen != gen) {
+        if (it->second.gen != gen && std::find(seqs.begin(), seqs.end(), it->first.seq) != seqs.end()) {
             it = map.erase(it);
         } else {
             ++it;
