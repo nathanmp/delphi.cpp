@@ -15396,9 +15396,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 const ggml_tensor * w = op->src[2];
                 const ggml_tensor * m = op->src[3];
 
-                // the q/w/m types and the shape relationships between q, k, w, m and dst
-                // are already asserted in ggml_lightning_indexer()
-                if (!ggml_vk_lightning_indexer_k_type_supported(k->type) || !device->fp16) {
+                // the q/w types and the shape relationships between q, k, w, m and dst
+                // are already asserted in ggml_lightning_indexer(). The shader reads an F16 mask only.
+                if (!ggml_vk_lightning_indexer_k_type_supported(k->type) || !device->fp16 || m->type != GGML_TYPE_F16) {
                     return false;
                 }
 

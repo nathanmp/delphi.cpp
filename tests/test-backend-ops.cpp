@@ -9194,9 +9194,10 @@ struct test_lightning_indexer : public test_case {
     const int64_t nm; // ne[3] of mask
 
     const ggml_type type_K;
+    const bool counts; // I32 mask of visible counts instead of the F16 mask
 
     std::string vars() override {
-        return VARS_TO_STR7(hsk, nh, kv, nb, ns, nm, type_K);
+        return VARS_TO_STR8(hsk, nh, kv, nb, ns, nm, type_K, counts);
     }
 
     double max_nmse_err() override {
@@ -9208,8 +9209,9 @@ struct test_lightning_indexer : public test_case {
         return ((2 * hsk + 2) * nh + 1) * kv * nb * ns;
     }
 
-    test_lightning_indexer(int64_t hsk = 128, int64_t nh = 64, int64_t kv = 256, int64_t nb = 128, int64_t ns = 1, int64_t nm = 1, ggml_type type_K = GGML_TYPE_F16)
-        : hsk(hsk), nh(nh), kv(kv), nb(nb), ns(ns), nm(nm), type_K(type_K) {}
+    test_lightning_indexer(int64_t hsk = 128, int64_t nh = 64, int64_t kv = 256, int64_t nb = 128, int64_t ns = 1, int64_t nm = 1, ggml_type type_K = GGML_TYPE_F16,
+            bool counts = false)
+        : hsk(hsk), nh(nh), kv(kv), nb(nb), ns(ns), nm(nm), type_K(type_K), counts(counts) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsk, nh, nb, ns);
@@ -9224,8 +9226,12 @@ struct test_lightning_indexer : public test_case {
         ggml_set_param(w);
         ggml_set_name(w, "w");
 
-        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, nm);
-        ggml_set_param(m);
+        ggml_tensor * m = counts
+            ? ggml_new_tensor_4d(ctx, GGML_TYPE_I32, 1, nb, 1, nm)
+            : ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, nm);
+        if (!counts) {
+            ggml_set_param(m);
+        }
         ggml_set_name(m, "m");
 
         ggml_tensor * out = ggml_lightning_indexer(ctx, q, k, w, m);
@@ -9236,7 +9242,16 @@ struct test_lightning_indexer : public test_case {
 
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-            if (strcmp(t->name, "m") == 0) {
+            if (strcmp(t->name, "m") == 0 && counts) {
+                // from no visible row to all of them, so that both ends occur
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); ++i) {
+                    data[i] = (int32_t) ((i*7919 + 13) % (kv + 1));
+                }
+                data[0] = 0;
+                data[data.size() - 1] = (int32_t) kv;
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "m") == 0) {
                 init_tensor_kq_mask(t);
             } else {
                 init_tensor_uniform(t);
@@ -12466,6 +12481,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_lightning_indexer(128, 64, 65, 5, 1, 1, GGML_TYPE_F32));
     test_cases.emplace_back(new test_lightning_indexer(128, 32, 257, 7, 4, 1, GGML_TYPE_F32));
+    for (ggml_type type_K : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        for (int bs : { 1, 7, 512 }) {
+            for (int nh : { 32, 64 }) {
+                for (auto [ns, nm] : { std::pair{1, 1}, std::pair{4, 4}, std::pair{4, 1} }) {
+                    test_cases.emplace_back(new test_lightning_indexer(128, nh, 257, bs, ns, nm, type_K, true));
+                }
+            }
+        }
+    }
 
     test_cases.emplace_back(new test_kpool_expand(4, 7, 3, 4, 1, 1));
     test_cases.emplace_back(new test_interval_mask(GGML_TYPE_F16, 300, 7, 2));

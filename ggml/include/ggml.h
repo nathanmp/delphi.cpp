@@ -2716,6 +2716,7 @@ extern "C" {
     // k:       [n_embd_idx, 1,          n_kv,    ne3 ]
     // weights: [n_head_idx, n_batch,    1,       ne3 ] !! prescaled !!
     // mask:    [n_kv,       n_batch,    1,       ne33] !! f16 !!
+    //      or  [1,          n_batch,    1,       ne33] !! i32 !! visible counts: the result is -inf for kv >= mask
     // res:     [n_kv,       n_batch,    1,       ne3 ]
     //
     // broadcast:

@@ -858,6 +858,18 @@ static void dsv4_set_kq_mask(
     }
 }
 
+static void dsv4_set_n_vis(ggml_tensor * dst, const llama_kv_cache_dsv4_context::comp_plan & plan) {
+    if (!dst || !dst->buffer) {
+        return;
+    }
+
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_nelements(dst) == (int64_t) plan.n_visible.size());
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+
+    memcpy(dst->data, plan.n_visible.data(), plan.n_visible.size()*sizeof(int32_t));
+}
+
 static ggml_tensor * dsv4_build_raw_kq_mask(
         ggml_context * ctx,
         const llama_kv_cache_dsv4_raw_context * mctx,
@@ -973,6 +985,7 @@ static void dsv4_set_comp_inputs(
     dsv4_set_i64(inp.state_write_idxs, plan.state_write_idxs);
     dsv4_set_i32(inp.state_write_pos, plan.state_write_pos);
     dsv4_set_kq_mask(inp.kq_mask, plan, n_tokens, n_stream);
+    dsv4_set_n_vis(inp.n_vis, plan);
     dsv4_set_cand_pin(inp.cand_pin, plan, n_tokens, n_stream);
 
     if (debug || dsv4_compress_debug()) {
@@ -1071,6 +1084,10 @@ static void dsv4_build_comp_inputs(
         inp.kq_mask = ggml_new_tensor_4d(ctx, (strcmp(name, "lid") != 0 && cparams.flash_attn) || (strcmp(name, "lid") == 0 && cparams.fused_lid) ? GGML_TYPE_F16 : GGML_TYPE_F32, plan.n_kv, n_tokens/n_stream, 1, n_stream);
         ggml_set_input(inp.kq_mask);
         ggml_set_name(inp.kq_mask, (std::string("dsv4_") + name + "_kq_mask").c_str());
+
+        inp.n_vis = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, 1, n_tokens/n_stream, 1, n_stream);
+        ggml_set_input(inp.n_vis);
+        ggml_set_name(inp.n_vis, (std::string("dsv4_") + name + "_n_vis").c_str());
 
         // When all blocks fit in the top-k, the selection keeps all of them, so the pin is only built when there are more blocks. It depends only on n_kv, as kq_mask does, so graph reuse needs no check of its own.
         if (cand_block > 0 && plan.n_kv/cand_block > cand_topk) {

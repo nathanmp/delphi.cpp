@@ -6585,9 +6585,10 @@ struct ggml_tensor * ggml_lightning_indexer(
 
     GGML_ASSERT(       q->type == GGML_TYPE_F32);
     GGML_ASSERT( weights->type == GGML_TYPE_F32);
-    GGML_ASSERT(    mask->type == GGML_TYPE_F16);
+    // an I32 mask holds the number of visible kv rows of each batch row
+    GGML_ASSERT(    mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_I32);
     GGML_ASSERT(      q->ne[0] == k->ne[0]);
-    GGML_ASSERT(   mask->ne[0] == k->ne[2]);
+    GGML_ASSERT(   mask->ne[0] == (mask->type == GGML_TYPE_I32 ? 1 : k->ne[2]));
     GGML_ASSERT(      q->ne[1] == weights->ne[0]);
     GGML_ASSERT(      k->ne[1] == 1);
     GGML_ASSERT(   mask->ne[1] == q->ne[2]);
