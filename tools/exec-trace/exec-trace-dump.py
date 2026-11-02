@@ -130,7 +130,7 @@ class TraceError(Exception):
     pass
 
 
-def read_trace(path):
+def read_trace(path, *, kinds=None):
     data = path.read_bytes()
     if len(data) < HEADER.size:
         raise TraceError("file is shorter than the trace header")
@@ -152,6 +152,8 @@ def read_trace(path):
     for index in range(event_count):
         offset = header_size + index * event_size
         values = EVENT.unpack_from(data, offset)
+        if kinds is not None and values[9] not in kinds:
+            continue
         events.append({
             "timestamp_ns": values[0],
             "args": values[1:5],
