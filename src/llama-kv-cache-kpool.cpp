@@ -1102,8 +1102,15 @@ void llama_kv_cache_set_input_kpool(
                         uncached.push_back(i);
                     }
                 }
-                GGML_ASSERT(uncached.size() <= n_update &&
-                        "incremental pool-key update capacity is too small");
+                // More new pools than the graph has update rows for. Update the first n_update now. The others stay
+                // uncached in the map, so the next graph reserves rows for them (n_pending); until then their slots
+                // hold stale keys, for this ubatch only. This aborted before.
+                if (uncached.size() > n_update) {
+                    LLAMA_LOG_WARN("%s: %zu pools need their keys, the graph updates %zu (valid pools %zu, tokens %u, stream %u); "
+                            "the rest follow in the next ubatch\n", __func__, uncached.size(), n_update, valid_pools.size(),
+                            (unsigned) n_tps, (unsigned) (stream0 + s));
+                    uncached.resize(n_update);
+                }
 
                 // Inputs are laid out [r, n_update, n_stream]. Pad unused
                 // update rows by recomputing an existing valid pool; writing

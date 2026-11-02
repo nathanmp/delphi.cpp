@@ -592,6 +592,11 @@ static projector_type clip_projector_type_from_string(const std::string & str) {
             return pair.first;
         }
     }
+    // upstream names the GLM-5.3-Flash projector glm5v (files from the upstream converter, e.g. Unsloth's).
+    // It has the same tensors and the same clip.vision.swiglu_clamp key.
+    if (str == "glm5v") {
+        return PROJECTOR_TYPE_GLM5NEXT;
+    }
     return PROJECTOR_TYPE_UNKNOWN;
 }
 
