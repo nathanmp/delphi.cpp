@@ -6,6 +6,8 @@ Most of the variables below are read once, into a function-local `static`, and n
 
 Execution tracing has its own variables (`GGML_EXEC_TRACE*`); see `exec-trace-record.md`.
 
+Since 2026-11-01 the main performance settings are also command-line options (`--moe-cache*`, `--moe-stage*`, `--cpu-expert-prefetch`, `--[no-]moe-pregate`, `--[no-]moe-shared-overlap`, `--engram-readers`, `--[no-]kv-mirror`, `--graph-alt-slots`, `--[no-]ckpt-tail-ubatch`). Each option sets the variable named in its `--help` entry, and a command-line value takes precedence over the environment. The option is given in the tables below where one exists.
+
 ## Model loading
 
 | variable | default | effect |
@@ -36,10 +38,13 @@ Adapted from [DeepInfer](https://github.com/deepseek-ai/DeepInfer/tree/774ce244b
 
 | variable | default | effect |
 | --- | --- | --- |
-| `LLAMA_ENGRAM_PREFETCH` | `8` | Host reader count for Engram row lookup, capped at 32. `0` uses ordinary `GET_ROWS`. Read when the context is made. |
-| `LLAMA_MOE_SHARED_OVERLAP` | `1` | Submit the GPU shared FFN before cold CPU expert arithmetic. `0` uses the previous graph order. Read once per process. |
+| `LLAMA_ENGRAM_PREFETCH` (`--engram-readers`) | `8` | Host reader count for Engram row lookup, capped at 32. `0` uses ordinary `GET_ROWS`. Read when the context is made. |
+| `LLAMA_MOE_SHARED_OVERLAP` (`--[no-]moe-shared-overlap`) | `1` | Submit the GPU shared FFN before cold CPU expert arithmetic. `0` uses the previous graph order. Read once per process. |
+| `LLAMA_KV_MIRROR` (`--[no-]kv-mirror`) | `1` | Keep a copy of the reused compressed KV rows (layers 20-39 read layer 20) on each GPU that reads them. Needed for long contexts on 3 or more GPUs. |
+| `LLAMA_DSV41_VERIFY_GATHER_MIN` | `4096` | From this many compressed rows, each verify query attends to the raw window plus its own selected rows, so the cost does not grow with the context. `0` keeps the dense path, which runs out of memory after about 128K tokens at `-c 300000`. |
+| `LLAMA_SERVER_CKPT_TAIL_UBATCH` (`--[no-]ckpt-tail-ubatch`) | `0` | `1` also saves a server prompt checkpoint one ubatch before the end of the prompt. Off since 2026-11-01: it costs a decoder pass per DeepSeek V4.1 prompt and gave GLM nothing. |
 
-Both paths apply to batches of at most 16 tokens. Engram readers gather known token-history rows from supported host tables into owned buffers; the graph consumes the result at the original layer. They use a separate pool from the CPU experts and respect the application CPU mask. Larger batches, unsupported tables and eval callbacks use ordinary lookup. A context without a supported host Engram table creates no readers.
+The Engram readers and the shared overlap apply to batches of at most 16 tokens. Engram readers gather known token-history rows from supported host tables into owned buffers; the graph consumes the result at the original layer. They use a separate pool from the CPU experts and respect the application CPU mask. Larger batches, unsupported tables and eval callbacks use ordinary lookup. A context without a supported host Engram table creates no readers.
 
 Shared overlap requires the expert-cache path and shared weights on the layer GPU. The routing packet is copied to the CPU before the independent cached/shared GPU work is submitted. Routed expert selection, FFN arithmetic and the hyper-connection injection point are unchanged.
 
@@ -114,7 +119,7 @@ A per-round draft depth (the default conf mode of `draft-mtp`, see `speculative-
 | --- | --- | --- |
 | `LLAMA_KV_N_PAD` | unset: 256, 2048 with a per-round draft depth | the KV view grows in steps of this many cells (multiple of 256). A step makes the graphs of all widths stale. Set, it wins over the reservation of the conf mode: `256` gives the upstream step |
 | `GGML_CUDA_FA_KV_MAX_DECODE` | `1` | flash attention scans the mask for a fully masked tail also for fewer than 1024 query rows, so that the masked cells of a padded KV view cost nothing. `0`: upstream behavior. Outputs are identical |
-| `LLAMA_GRAPH_ALT_SLOTS` | `4`, n_max + 2 with a per-round draft depth | graphs kept for small batches (up to `LLAMA_GRAPH_ALT_MAX_TOKENS`, default 32, tokens); set, it wins |
+| `LLAMA_GRAPH_ALT_SLOTS` (`--graph-alt-slots`) | `4`, n_max + 2 with a per-round draft depth | graphs kept for small batches (up to `LLAMA_GRAPH_ALT_MAX_TOKENS`, default 32, tokens); set, it wins |
 | `LLAMA_GRAPH_BUILD_LOG` | off | `1` logs each graph build with the reuse check that failed, and its host times (build, scheduler allocation, first compute) |
 | `DELPHI_SPEC_PLOG` | off | a file name: the MTP draft writes the top-1 probability of each draft step and the accepted count per round (JSON lines), for offline replays of stop rules |
 
@@ -126,17 +131,18 @@ With routed experts in host memory (`-cmoe`, `-ncmoe`, `--numa tensors`), a wide
 
 | variable | default | effect |
 | --- | --- | --- |
-| `GGML_SCHED_STAGE` | `0` | `1` uploads offloaded host weights ahead of the splits that use them |
+| `GGML_SCHED_STAGE` (`--[no-]moe-stage`) | `1` | uploads offloaded host weights ahead of the splits that use them. `0` turns staging off. It allocates nothing without routed experts in host memory. A GPU whose expert-cache tier is smaller than one slot does not stage (logged at the first decode). Default on since 2026-11-01: DeepSeek V4.1 4K prefill 444 -> 637 t/s, decode unchanged |
+| `LLAMA_MOE_STAGE_DEVICES` (`--moe-stage-devices`) | the expert-cache GPUs | GPUs that stage, `DEV,...`, or `none` |
 | `GGML_SCHED_STAGE_REDIRECT` | `1` | kernels read staged inputs in their ring slots instead of a copy of them; the slot is freed once the split's work is queued. `0` copies each staged input from its slot first (about 3 ms per expert tensor) |
-| `GGML_SCHED_STAGE_SLOTS` | `4` | device slots, each the size of the largest staged tensor; more slots run further ahead and use more VRAM. MiMo V2.6 Flash with 3 slots gave NaN perplexity in 2 of 9 runs (cause unknown, later runs finite); 6 slots were always finite |
+| `GGML_SCHED_STAGE_SLOTS` (`--moe-stage-slots`) | `2` (`4` before 2026-11-01) | device slots, each the size of the largest staged tensor; more slots run further ahead and use more VRAM. MiMo V2.6 Flash with 3 slots gave NaN perplexity in 2 of 9 runs (cause unknown, later runs finite); 6 slots were always finite |
 | `GGML_SCHED_STAGE_BOUNCE` | `4` | pinned host bounce buffers; `0` uploads from the weights directly (pageable) |
 | `GGML_SCHED_STAGE_CHUNK_MB` | `64` | size of each bounce buffer |
 | `GGML_SCHED_STAGE_THREADS` | 8 / staging devices, at least 2 | memcpy threads per staging device that fill its bounce buffers |
 | `GGML_SCHED_STAGE_PIN` | `1` | run each device's staging threads on the CPUs next to that device (Linux) |
 | `GGML_SCHED_STAGE_REGISTER` | `0` | `1` page-locks the staged host weight buffers when the ring first stages from them, so uploads go straight from the weights to the device without the bounce buffers |
 | `GGML_SCHED_STAGE_STATS` | `0` | `1` prints where each staging thread spent its time when the scheduler is freed |
-| `GGML_SCHED_STAGE_SPREAD` | `0` | `1` with several staging devices: layer N's staged expert multiplies run on staging device N mod n, so each device's link uploads only its own layers' experts. MiMo V2.6 Flash 16K prefill on two R9700s (attention on ROCm1): 1150-1300 tokens/s, against 1060-1120 on one |
-| `GGML_SCHED_STAGE_MIN_TOKENS` | measured at warmup (`512` with `--no-warmup`) | routed-expert multiplies on host weights run on the CPU for batches of fewer tokens and on a staging GPU, which streams all experts, for wider ones (every expert crosses the link whatever the batch size). Without the variable, the server and cli measure it at warmup, after the expert cache is allocated: prompts of random tokens of n/2 and n tokens with the experts on the CPU and streamed (n = `-ub`, at most 2048), and the threshold is where the CPU expert time reaches the streamed cost (flat at the link time for short batches, rising with the GPU compute for long ones); when a 64 MiB copy to the GPUs shows that streaming takes 3 times the CPU time of a full ubatch, the experts stay on the CPU without the streamed prompts. This adds a few seconds to the startup at `-ub 1024` with 56 threads, about 25 s at `-ub 4096` with 16 (Qwen 3.8, R9700). `-lv 4` prints `staging threshold N tokens`; `-ub` + 1 means never. Setting the variable (also `0`) skips the measurement. MiMo V2.6 Flash, R9700s: 300 tokens 81-94 t/s with CPU experts; 2000 tokens 284-296 t/s streamed to one GPU, 427-462 with `GGML_SCHED_STAGE_SPREAD=1` on two. `0` leaves the choice to the offload cost model |
+| `GGML_SCHED_STAGE_SPREAD` (`--[no-]moe-stage-spread`) | `1` (`0` before 2026-11-01) | with several staging devices: layer N's staged expert multiplies run on staging device N mod n, so each device's link uploads only its own layers' experts. MiMo V2.6 Flash 16K prefill on two R9700s (attention on ROCm1): 1150-1300 tokens/s, against 1060-1120 on one |
+| `GGML_SCHED_STAGE_MIN_TOKENS` (`--moe-stage-min-tokens`) | measured at warmup (`512` with `--no-warmup`) | routed-expert multiplies on host weights run on the CPU for batches of fewer tokens and on a staging GPU, which streams all experts, for wider ones (every expert crosses the link whatever the batch size). Without the variable, the server and cli measure it at warmup, after the expert cache is allocated: prompts of random tokens of n/2 and n tokens with the experts on the CPU and streamed (n = `-ub`, at most 2048), and the threshold is where the CPU expert time reaches the streamed cost (flat at the link time for short batches, rising with the GPU compute for long ones); when a 64 MiB copy to the GPUs shows that streaming takes 3 times the CPU time of a full ubatch, the experts stay on the CPU without the streamed prompts. This adds a few seconds to the startup at `-ub 1024` with 56 threads, about 25 s at `-ub 4096` with 16 (Qwen 3.8, R9700). `-lv 4` prints `staging threshold N tokens`; `-ub` + 1 means never. Setting the variable (also `0`) skips the measurement. MiMo V2.6 Flash, R9700s: 300 tokens 81-94 t/s with CPU experts; 2000 tokens 284-296 t/s streamed to one GPU, 427-462 with `GGML_SCHED_STAGE_SPREAD=1` on two. `0` leaves the choice to the offload cost model |
 
 At the start of each graph, the scheduler lists the host weights that its splits will copy whole, in split order. Each staging device has its own background thread, which copies that device's weights in chunks into pinned host buffers, and the device copies each chunk into a slot on a separate stream, so the uploads of later layers overlap the computation of earlier ones. When the scheduler reaches the split, the device copies the slot into the split input. Expert tensors are staged only when the batch is wide enough that nearly every expert is used; for narrower batches the scheduler keeps copying only the used experts, and decode is unaffected. Supported on CUDA and ROCm devices.
 
@@ -214,6 +220,8 @@ Packed and grouped kernels add the same products in a different order from the o
 | `GGML_NUMA_NODE_LOCAL` | `1` | MUL_MAT_ID keeps each NUMA node's copy of the activations, its row map and its piece counters in that node's memory, and the workers of a node wait only for each other after they convert the activations. `0` uses the shared work buffer and waits for all nodes (previous behavior); it also turns off `GGML_NUMA_STEAL`. |
 | `GGML_NUMA_STEAL` | `1` | A worker that has no more pieces of its own node takes spare pieces of the experts that another node has not started, nearest node first. `0` keeps each node on its own rows. |
 | `GGML_CPU_NUMA_CHUNKS` | `2` | Pieces per worker of a node's rows of an expert. `0` gives each worker one static slice. |
+| `GGML_CPU_EXPERT_PREFETCH` (`--cpu-expert-prefetch`) | `6` | Only with `--numa tensors`: while a GPU runs attention, the CPU reads this many experts per layer that it will likely need next into its caches. `0` turns it off. DeepSeek V4.1 on 2 R9700: verify -6.8 %, decode +6.5 %. `GGML_CPU_EXPERT_PREFETCH_STATS=1` prints at exit how much of the GPU wait each read left; near 0 means the budget is too large |
+| `LLAMA_MOE_PREGATE` (`--[no-]moe-pregate`) | `1` | DeepSeek V4.1: run the next layer's router early to predict the experts for the prefetch. Off when the prefetch is off or not in `--numa tensors` mode |
 | `GGML_NUMA_TP_SHARES` | equal | Relative share of each node in the column split, for example `1,3`. It also sets where the weight rows are placed at load. |
 | `LLAMA_NUMA_HOST_INTERLEAVE` | `1` | With a GPU (CUDA or ROCm), the CPU compute buffer (activations and expert outputs of the CPU part) is pinned host memory with its pages interleaved over all NUMA nodes. `0` uses the GPU's plain pinned host memory, which is on the GPU's node only. |
 | `LLAMA_MOE_CACHE_REFILL_INTERLEAVE` | `0` | `1`: the pinned staging buffer of expert-cache refreshes is interleaved over all NUMA nodes instead of lying on the GPU's node. For NPS4. |
@@ -242,13 +250,15 @@ takes them back at the next refresh. So the cache and the staging slots do not n
 
 | variable | default | effect |
 | --- | --- | --- |
-| `LLAMA_MOE_CACHE_MIB` | `auto` | `auto` (or unset): when the model allows it, one tier per GPU of `--device`, of the GPU's free memory less `LLAMA_MOE_CACHE_AUTO_MARGIN_MIB`. The tiers are allocated when the server has loaded every model (draft and MTP included); other programs allocate them after the warmup. A number: one tier of that many MiB on the GPU of the layers. `0`: no cache. |
-| `LLAMA_MOE_CACHE_AUTO_MARGIN_MIB` | `1024` | memory left free on each GPU in auto mode, for buffers that grow later. The decode-time refresh scratch (3 slabs per `LLAMA_MOE_CACHE_ASYNC_EXPERTS` expert) is kept out of the tier in addition. |
+| `LLAMA_MOE_CACHE_MIB` (`--moe-cache`) | `auto` | `auto` (or unset): when the model allows it, one tier per GPU of `--device`, of the GPU's free memory less `LLAMA_MOE_CACHE_AUTO_MARGIN_MIB`. The tiers are allocated when the server has loaded every model (draft and MTP included); other programs allocate them after the warmup. A number: one tier of that many MiB on the GPU of the layers. `0`: no cache. |
+| `LLAMA_MOE_CACHE_AUTO_MARGIN_MIB` (`--moe-cache-margin`) | `1024` | memory left free on each GPU in auto mode, for buffers that grow later. The decode-time refresh scratch (3 slabs per `LLAMA_MOE_CACHE_ASYNC_EXPERTS` expert) is kept out of the tier in addition. |
 | `LLAMA_MOE_CACHE_TIERS` | none | more tiers, `<device>:<MiB>[,...]`, for example `ROCm0:16384` |
 | `LLAMA_MOE_CACHE_PROFILE` | none | expert frequencies (`tools/moe-static-cache/profile.py`), used until the window has rows |
-| `LLAMA_MOE_CACHE_WINDOW` | `256` | rows of routing that choose the hot experts; `0` keeps every row, negative never refreshes |
+| `LLAMA_MOE_CACHE_WINDOW` (`--moe-cache-window`) | `256` | rows of routing that choose the hot experts; `0` keeps every row, negative never refreshes |
 | `LLAMA_MOE_CACHE_EVERY` | `8` | small batches between decode-time refreshes (at most `LLAMA_MOE_CACHE_ASYNC_EXPERTS` experts each); `0` refreshes only after prompts |
-| `LLAMA_MOE_CACHE_ASYNC_EXPERTS` | `64` | experts per decode-time refresh. Each one needs 3 slabs of device scratch on every tier GPU and of pinned memory (DeepSeek V4.1: 18 MiB per expert). DeepSeek on 2 R9700: 32 36.8, 64 37.2, 96 37.9, 128 37.2, 192 36.7 t/s. |
+| `LLAMA_MOE_CACHE_ASYNC_EXPERTS` (`--moe-cache-async`) | `64` | experts per decode-time refresh. Each one needs 3 slabs of device scratch on every tier GPU and of pinned memory (DeepSeek V4.1: 18 MiB per expert). DeepSeek on 2 R9700: 32 36.8, 64 37.2, 96 37.9, 128 37.2, 192 36.7 t/s. |
+| `LLAMA_MOE_CACHE_REFRESH_MAX` (`--moe-cache-refresh-max`) | `-1` (all) | experts uploaded in the refresh after a prompt; the decode-time refreshes upload the rest. DeepSeek V4.1 uses 512 |
+| `LLAMA_MOE_CACHE_ROLES` (`--moe-cache-roles`) | `rotate` | role of each GPU's tier, `DEV:ROLE,...`: `rotate` follows the routing, `static` keeps the hottest experts, `pinned` is static and never lends slots to staging, `off` gives no tier |
 | `LLAMA_MOE_CACHE_PROMPT_ROWS` | `0` | prompt batches up to this many rows also run their hot experts on the GPU |
 | `LLAMA_MOE_CACHE_SHARED` | `0` | `1`: no tier of its own; tiers are leased at run time by the VRAM-sharing daemon. Turns auto mode off. |
 | `LLAMA_MMPROJ_DYNAMIC_GPU_MIB` | none | Optional limit on the device memory that each dynamic encoding may use (`--mmproj-memory dynamic`). `0` forces CPU encoding. See [vision memory](vision-memory.md). |
