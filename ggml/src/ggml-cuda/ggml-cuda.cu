@@ -3257,6 +3257,16 @@ static uint64_t ggml_cuda_graph_get_topo_key(const ggml_cgraph * cgraph) {
         ggml_cuda_graph_hash(hash, &node->op,   sizeof(node->op));
         ggml_cuda_graph_hash(hash, &node->type, sizeof(node->type));
         ggml_cuda_graph_hash(hash,  node->name, sizeof(node->name));
+#if defined(GGML_USE_HIP)
+        if (node->op == GGML_OP_CPY || node->op == GGML_OP_CONT || node->op == GGML_OP_DUP) {
+            const ggml_tensor * src = node->src[0];
+            const ggml_tensor * dst = node->op == GGML_OP_CPY ? node->src[1] : node;
+            // HIP uses different graph node classes for linear and pitched memcpy. Older runtimes can accept an
+            // update between these classes and retain the old copy. Such graphs must use separate executables.
+            const bool linear_copy = src->type == dst->type && ggml_is_contiguous(src) && ggml_is_contiguous(dst);
+            ggml_cuda_graph_hash(hash, &linear_copy, sizeof(linear_copy));
+        }
+#endif
     }
     return hash;
 }
@@ -3308,6 +3318,18 @@ static bool ggml_cuda_graph_update_required(
     }
 
     graph->uid = cgraph->uid;
+
+#if defined(GGML_USE_HIP)
+    const uint64_t topo_key = ggml_cuda_graph_get_topo_key(cgraph);
+    if (graph->topo_key != 0 && graph->topo_key != topo_key && graph->instance != nullptr) {
+        // An anchored graph key can survive a copy-layout change when shape caching is disabled.
+        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+        CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
+        graph->instance = nullptr;
+        res = true;
+    }
+    graph->topo_key = topo_key;
+#endif
 
     // Check if the graph size has changed
     if ((int)graph->node_props.size() != cgraph->n_nodes) {
