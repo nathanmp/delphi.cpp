@@ -181,6 +181,16 @@ ggml_status llama_dsv41_prefill_window::encode() {
         ctx.state_async_finish();
     }
     mctx.begin_window();
+    // without GGML_SCHED_STAGE_KEEP_SPREAD a staged expert multiply runs where the layer's activations are
+    const auto backend_of = [&](uint32_t il) -> ggml_backend_t {
+        ggml_backend_dev_t dev = ctx.model.dev_layer(il);
+        for (const auto & backend : ctx.backends) {
+            if (ggml_backend_get_device(backend.get()) == dev) {
+                return backend.get();
+            }
+        }
+        return nullptr;
+    };
     const int64_t start = ggml_time_us();
     size_t n_index = 0;
     ggml_backend_sched_stage_keep(ctx.sched.get(), retain);
@@ -205,7 +215,7 @@ ggml_status llama_dsv41_prefill_window::encode() {
                 // the next layer's bank uploads while this layer reads its own bank for the other chunks
                 const auto & next = ctx.model.layers[il + 1];
                 ggml_tensor * weights[3] = { next.ffn_gate_exps, next.ffn_up_exps, next.ffn_down_exps };
-                ggml_backend_sched_stage_prefetch(ctx.sched.get(), weights, 3);
+                ggml_backend_sched_stage_prefetch(ctx.sched.get(), backend_of(il + 1), weights, 3);
             }
             if (graph.top_k || graph.cand) {
                 // the next graph reuses the compute buffer

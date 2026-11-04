@@ -3011,6 +3011,9 @@ struct ggml_backend_sched_stage {
     void * lend_user = nullptr;
     int split_weights = 1; // redirected weights per split (GGML_SCHED_STAGE_SPLIT_WEIGHTS)
     bool spread = true;    // GGML_SCHED_STAGE_SPREAD
+    // GGML_SCHED_STAGE_KEEP_SPREAD (default 0): spread in keep mode too. A kept bank serves several graphs, so one link is enough,
+    // and on one GPU the activations do not cross to another for each layer.
+    bool keep_spread = false;
     int min_tokens = 512;  // GGML_SCHED_STAGE_MIN_TOKENS
     int64_t cpu_us = 0;    // time of the CPU splits (ggml_backend_sched_stage_stats)
     bool blocked[GGML_SCHED_MAX_BACKENDS] = {}; // ggml_backend_sched_stage_allow
@@ -3210,6 +3213,9 @@ static ggml_backend_sched_stage * ggml_backend_sched_stage_new(ggml_backend_sche
     if (const char * e = getenv("GGML_SCHED_STAGE_SPREAD")) {
         stage->spread = atoi(e) != 0;
     }
+    if (const char * e = getenv("GGML_SCHED_STAGE_KEEP_SPREAD")) {
+        stage->keep_spread = atoi(e) != 0;
+    }
     if (const char * e = getenv("GGML_SCHED_STAGE_MIN_TOKENS")) {
         stage->min_tokens = std::max(0, atoi(e));
     }
@@ -3380,7 +3386,7 @@ static int ggml_backend_sched_stage_spread(ggml_backend_sched_t sched, const str
         const struct ggml_tensor * weight, int backend_id) {
     ggml_backend_sched_stage * stage = sched->stage;
     int layer = -1;
-    if (stage == nullptr || !stage->spread || op->op != GGML_OP_MUL_MAT_ID || op->src[0] != weight ||
+    if (stage == nullptr || !stage->spread || (stage->keep && !stage->keep_spread) || op->op != GGML_OP_MUL_MAT_ID || op->src[0] != weight ||
             sscanf(weight->name, "blk.%d.", &layer) != 1 || layer < 0 ||
             !ggml_backend_sched_stage_redirects(sched, op, weight, backend_id)) {
         return backend_id;
@@ -3572,10 +3578,12 @@ static void ggml_backend_sched_stage_begin(ggml_backend_sched_t sched) {
         }
     }
 
-    const int wanted_slots = stage->keep ? std::max(3, stage->n_slots) : stage->n_slots;
+    // keep mode: a layer's gate/up/down stay, and the next layer's bank uploads beside them unless spread puts it on another ring
+    const bool keep_spread = stage->spread && stage->keep_spread;
+    const int wanted_slots = stage->keep ? std::max(keep_spread ? 3 : 6, stage->n_slots) : stage->n_slots;
     for (int b = 0; b < sched->n_backends; b++) {
         ggml_backend_sched_stage_ring & ring = stage->rings[b];
-        if (stage->keep && need[b] == 0 && ring.n_slots > 0 && ring.n_slots < wanted_slots) {
+        if (keep_spread && stage->keep && need[b] == 0 && ring.n_slots > 0 && ring.n_slots < wanted_slots) {
             // a ring that this graph does not use grows too, for the prefetch of a later layer
             need[b] = ring.slot_size;
         }
@@ -3756,12 +3764,13 @@ void ggml_backend_sched_stage_keep(ggml_backend_sched_t sched, bool keep) {
     }
 }
 
-void ggml_backend_sched_stage_prefetch(ggml_backend_sched_t sched, struct ggml_tensor * const * weights, int n_weights) {
+void ggml_backend_sched_stage_prefetch(ggml_backend_sched_t sched, ggml_backend_t backend, struct ggml_tensor * const * weights, int n_weights) {
     ggml_backend_sched_stage * stage = sched->stage;
-    if (stage == nullptr || !stage->keep || !stage->spread) {
+    if (stage == nullptr || !stage->keep) {
         return;
     }
     // the GPUs of ggml_backend_sched_stage_spread
+    const bool spread = stage->spread && stage->keep_spread;
     int gpus[GGML_SCHED_MAX_BACKENDS];
     int n = 0;
     for (int b = 0; b < sched->n_backends - 1; b++) {
@@ -3769,7 +3778,8 @@ void ggml_backend_sched_stage_prefetch(ggml_backend_sched_t sched, struct ggml_t
             gpus[n++] = b;
         }
     }
-    if (n < 2) {
+    const int backend_id = backend != nullptr ? ggml_backend_sched_backend_id(sched, backend) : -1;
+    if (spread ? n < 2 : backend_id < 0) {
         return;
     }
     for (int i = 0; i < n_weights; ++i) {
@@ -3778,7 +3788,7 @@ void ggml_backend_sched_stage_prefetch(ggml_backend_sched_t sched, struct ggml_t
         if (weight == nullptr || sscanf(weight->name, "blk.%d.", &layer) != 1 || layer < 0) {
             continue;
         }
-        const int b = gpus[layer % n];
+        const int b = spread ? gpus[layer % n] : backend_id;
         ggml_backend_sched_stage_ring & ring = stage->rings[b];
         if (ring.n_slots == 0 || !ggml_backend_sched_stage_whole(sched, nullptr, weight, b) ||
                 ggml_backend_buft_get_alloc_size(ggml_backend_get_default_buffer_type(sched->backends[b]), weight) > ring.slot_size) {
