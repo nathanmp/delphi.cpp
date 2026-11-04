@@ -4149,6 +4149,10 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
                                std::initializer_list<enum ggml_op>       ops,
                                std::initializer_list<enum ggml_unary_op> unary_ops,
                                bool                                      src1_quantized = false) {
+    // Custom HC matchers inspect candidate nodes before generic subgraph validation.
+    if (node_idx + (int) ops.size() > cgraph->n_nodes) {
+        return false;
+    }
 #ifndef NDEBUG
     const size_t num_unary = std::count(ops.begin(), ops.end(), GGML_OP_UNARY);
     GGML_ASSERT(unary_ops.size() == num_unary);
