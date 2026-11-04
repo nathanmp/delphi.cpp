@@ -10,6 +10,9 @@ extern "C" {
 
     #define GGML_BACKEND_API_VERSION 2
 
+    // Start a new group of immutable staged weights, or end retention. The caller synchronizes between graphs.
+    GGML_API void ggml_backend_sched_stage_keep(ggml_backend_sched_t sched, bool keep);
+
     //
     // Backend buffer type
     //

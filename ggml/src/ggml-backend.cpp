@@ -2911,6 +2911,7 @@ struct ggml_backend_sched_stage_item {
     int backend_id;
     int slot;                       // -1 until queued
     uint64_t seq;                   // job number of the upload
+    bool reused = false;
 };
 
 // GGML_SCHED_STAGE_TRACE=<file>: one line per upload job, "backend slot bytes queued start free issued" in microseconds on the clock
@@ -2956,6 +2957,10 @@ struct ggml_backend_sched_stage_ring {
     int n_slots = 0; // slots in use: GGML_SCHED_STAGE_SLOTS, or fewer when the memory for all of them is not available
     int next = 0;
 
+    const ggml_tensor * resident[GGML_SCHED_STAGE_MAX_SLOTS] = {};
+    uint64_t resident_seq[GGML_SCHED_STAGE_MAX_SLOTS] = {};
+    uint32_t readers[GGML_SCHED_STAGE_MAX_SLOTS] = {};
+
     // pinned host bounce buffers, used by the staging thread only; bounce == nullptr uploads from the weight directly
     ggml_backend_buffer_t bounce = nullptr;
     ggml_backend_event_t  chunk_ev[GGML_SCHED_STAGE_MAX_BOUNCE]  = {};
@@ -2984,6 +2989,7 @@ struct ggml_backend_sched_stage_worker {
 
 struct ggml_backend_sched_stage {
     bool enabled = true;
+    bool keep = false;
     int  n_slots = 2;  // each slot is one layer's expert tensor in VRAM, which the expert cache does not get
     int  n_bounce = 4;
     size_t chunk_size = 64u << 20;
@@ -3267,6 +3273,8 @@ static void ggml_backend_sched_stage_drop_slots(ggml_backend_sched_stage_ring & 
         ring.slots[s] = nullptr;
         ring.busy[s] = false;
         ring.free_recorded[s] = false;
+        ring.resident[s] = nullptr;
+        ring.readers[s] = 0;
     }
     ring.lent = false;
     ring.slot_size = 0;
@@ -3439,7 +3447,29 @@ static void ggml_backend_sched_stage_pump(ggml_backend_sched_t sched) {
     while (stage->n_queued < stage->items.size()) {
         ggml_backend_sched_stage_item & item = stage->items[stage->n_queued];
         ggml_backend_sched_stage_ring & ring = stage->rings[item.backend_id];
-        const int slot = ring.next;
+        int slot = ring.next;
+        if (stage->keep) {
+            for (int s = 0; s < ring.n_slots; ++s) {
+                if (ring.resident[s] == item.input) {
+                    item.slot = s;
+                    item.seq = ring.resident_seq[s];
+                    item.reused = true;
+                    ring.readers[s]++;
+                    ring.busy[s] = true;
+                    stage->n_queued++;
+                    break;
+                }
+            }
+            if (item.reused) {
+                continue;
+            }
+            for (int s = 0; s < ring.n_slots; ++s) {
+                if (!ring.busy[s] && !ring.resident[s]) {
+                    slot = s;
+                    break;
+                }
+            }
+        }
         if (ring.busy[slot]) {
             break;
         }
@@ -3456,6 +3486,9 @@ static void ggml_backend_sched_stage_pump(ggml_backend_sched_t sched) {
                     ggml_backend_sched_stage_trace_us(), item.input, unit });
             item.seq = w->n_pushed++;
         }
+        ring.resident[slot] = stage->keep ? item.input : nullptr;
+        ring.resident_seq[slot] = item.seq;
+        ring.readers[slot] = 1;
         w->cv_job.notify_one();
         ring.busy[slot] = true;
         ring.next = (slot + 1) % ring.n_slots;
@@ -3499,13 +3532,15 @@ static void ggml_backend_sched_stage_begin(ggml_backend_sched_t sched) {
         }
     }
 
+    const int wanted_slots = stage->keep ? std::max(3, stage->n_slots) : stage->n_slots;
     for (int b = 0; b < sched->n_backends; b++) {
         ggml_backend_sched_stage_ring & ring = stage->rings[b];
         // the uploads of interrupted items still complete in copy stream order before any later one
-        for (int s = 0; s < stage->n_slots; s++) {
+        for (int s = 0; s < GGML_SCHED_STAGE_MAX_SLOTS; s++) {
             ring.busy[s] = false;
+            ring.readers[s] = 0;
         }
-        if (need[b] <= ring.slot_size) {
+        if (need[b] == 0 || (need[b] <= ring.slot_size && ring.n_slots >= wanted_slots)) {
             continue;
         }
         ggml_backend_sched_stage_release_ring(ring);
@@ -3517,7 +3552,7 @@ static void ggml_backend_sched_stage_begin(ggml_backend_sched_t sched) {
         // graph is already split, and a redirected input has no memory but its slot, so giving up is not an option.
         const int n_min = std::min(stage->n_slots, stage->redirect ? stage->split_weights : 1);
         bool ok = false;
-        int n = stage->n_slots;
+        int n = wanted_slots;
         for (; n >= n_min && !ok; n--) {
             // lent memory first; the lender cannot lend part of the slots
             ring.lent = stage->lend != nullptr && stage->lend(stage->lend_user, backend, n, need[b], ring.slots);
@@ -3574,9 +3609,9 @@ static void ggml_backend_sched_stage_begin(ggml_backend_sched_t sched) {
                 }
             }
         }
-        if (ring.n_slots < stage->n_slots) {
+        if (ring.n_slots < wanted_slots) {
             GGML_LOG_WARN("%s: staging ring on %s: %d of %d slots of %.1f MiB, the memory for more is not available\n", __func__,
-                    ggml_backend_name(backend), ring.n_slots, stage->n_slots, need[b]/1048576.0);
+                    ggml_backend_name(backend), ring.n_slots, wanted_slots, need[b]/1048576.0);
         }
         GGML_LOG_INFO("%s: staging ring on %s: %d %s slots of %.1f MiB, %s\n", __func__, ggml_backend_name(backend),
                 ring.n_slots, ring.lent ? "lent" : "own", need[b]/1048576.0, ring.bounce != nullptr ? "pinned bounce buffers" : "direct uploads");
@@ -3615,7 +3650,7 @@ static bool ggml_backend_sched_stage_consume(
         // the split reads the slot in place; ggml_backend_sched_stage_release frees it after the split's work
         stage->holding.push_back({ input_cpy, input_cpy->data, item.backend_id, item.slot });
         input_cpy->data = ring.slots[item.slot];
-        if (ring.prepare != nullptr) {
+        if (ring.prepare != nullptr && !item.reused) {
             ring.prepare(split_backend, input_cpy);
         }
         stage->n_consumed++;
@@ -3627,7 +3662,8 @@ static bool ggml_backend_sched_stage_consume(
     }
     ggml_backend_event_record(ring.free[item.slot], split_backend);
     ring.free_recorded[item.slot] = true;
-    ring.busy[item.slot] = false;
+    GGML_ASSERT(ring.readers[item.slot] > 0);
+    ring.busy[item.slot] = --ring.readers[item.slot] != 0;
     stage->n_consumed++;
     ggml_backend_sched_stage_pump(sched);
     return true;
@@ -3643,11 +3679,33 @@ static void ggml_backend_sched_stage_release(ggml_backend_sched_t sched, ggml_ba
         ggml_backend_sched_stage_ring & ring = stage->rings[h.backend_id];
         ggml_backend_event_record(ring.free[h.slot], split_backend);
         ring.free_recorded[h.slot] = true;
-        ring.busy[h.slot] = false;
+        GGML_ASSERT(ring.readers[h.slot] > 0);
+        ring.busy[h.slot] = --ring.readers[h.slot] != 0;
         h.input_cpy->data = h.data;
     }
     stage->holding.clear();
     ggml_backend_sched_stage_pump(sched);
+}
+
+void ggml_backend_sched_stage_keep(ggml_backend_sched_t sched, bool keep) {
+    auto * stage = sched->stage;
+    if (!stage || (!keep && !stage->keep)) {
+        return;
+    }
+    ggml_backend_sched_stage_drain(stage);
+    ggml_backend_sched_synchronize(sched);
+    stage->keep = keep && stage->enabled && stage->redirect && sched->callback_eval == nullptr;
+    for (auto & ring : stage->rings) {
+        std::fill(std::begin(ring.resident), std::end(ring.resident), nullptr);
+        if (!stage->keep && ring.n_slots > stage->n_slots) {
+            for (int s = stage->n_slots; s < ring.n_slots; ++s) {
+                ggml_backend_buffer_free(ring.buffers[s]);
+                ring.buffers[s] = nullptr;
+            }
+            ring.n_slots = stage->n_slots;
+            ring.next %= ring.n_slots;
+        }
+    }
 }
 
 void ggml_backend_sched_set_stage_lender(ggml_backend_sched_t sched, ggml_backend_sched_stage_lend_t lend, void * user_data) {
