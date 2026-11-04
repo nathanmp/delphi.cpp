@@ -1,4 +1,4 @@
-# delphi.cpp: a hardware-aware fork of llama.cpp
+# delphi.cpp: a fork of llama.cpp
 
 ## Key Features
 
@@ -8,28 +8,30 @@
 * Bottleneck profiler.
 * Support for DeepSeek V4.1 Flash's Causal Encoder-Decoder architecture.
 * Support for ik_llama.cpp's IQn_K/IQn_KS tensors.
-* Highly experimental daemon that lets a GPU serve as an expert cache for 2 models (with RAM used as the backup when multiple models are actively being used).
 * Automatic model quantizer.
 * Automatic parameter tuner.
-* Lazily-loaded vision encoder. (Turn it off with `--mmproj-)
-* A ton of optimizations.
+* Lazily-loaded vision encoder. (Turn it off with `--mmproj-memory resident`)
+* A ton of optimizations, focused on AVX2 CPUs and RDNA4/SM_80 GPUs, and DeepSeek V4.1 Flash/GLM-5.3 Flash/Qwen 3.8 Flash Next.
 
 Refer to [docs/delphi/usage/environment-variables.md](docs/delphi/usage/environment-variables.md) for information about usage.
 
 ## Credits
 
-* [vcruz305](https://github.com/vcruz305/llama.cpp) for basic support for DeepSeek V4.1 Flash.
-* [DeepInfer](https://github.com/deepseek-ai/DeepInfer) for the Causal Encoder-Decoder architecture.
+* [llama.cpp](https://github.com/ggml-org/llama.cpp) for the underlying project.
 * [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp/) for IQn_K/KS tensors.
+* [vcruz305](https://github.com/vcruz305/llama.cpp) for support for DeepSeek V4.1 Flash.
+* [DeepInfer](https://github.com/deepseek-ai/DeepInfer) for the Causal Encoder-Decoder architecture.
 * [buun-llama-cpp](https://github.com/spiritbuun/buun-llama-cpp) for AVX2 improvements and design improvements for the expert cache.
 * [Strata](https://github.com/Niko1221/Strata) for design improvements for the expert cache.
-* [llama-cpp-rdna-boosts](https://github.com/stew675/llama-cpp-rdna-boosts) for the ring buffer used to speed up long-context prefill, adaptive speculative decoding, and some other RDNA4 improvements.
+* [llama-cpp-rdna-boosts](https://github.com/stew675/llama-cpp-rdna-boosts) for the ring buffer used to speed up long-context prefill, adaptive speculative decoding (WIP), and some other RDNA4 improvements.
 * [ubergarm](https://gist.github.com/ubergarm/edfeb3ff9c6ec8b49e88cdf627b0711a/) for default calibration data for the automatic quantizer.
-* [llama.cpp](https://github.com/ggml-org/llama.cpp) for the baseline project.
+* DeepSeek, Z.ai, and Alibaba for making local models.
 
 ## License
 
 MIT license. Go nuts with this.
+
+PRs are welcome. Support is on a best-effort basis. Untested on Windows. (If you're using Windows for local AI... why?)
 
 (The original README.md follows.)
 
