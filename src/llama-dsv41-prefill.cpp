@@ -12,8 +12,9 @@
 namespace {
 
 int window_mode() {
+    // on by default: 2 R9700 at -c 300000, 8K-32K prompts, +31-36% prefill throughput (2026-11-04)
     const char * env = std::getenv("LLAMA_DSV41_LAYER_BANK");
-    return env ? std::atoi(env) : 0;
+    return env ? std::atoi(env) : 1;
 }
 
 // Bytes of the device state of `n_tokens` rows: the F32 HC stream and the F32 pending mix, each aligned.
@@ -75,7 +76,8 @@ bool llama_dsv41_prefill_window::context_eligible(const llama_context & ctx, int
 }
 
 void llama_dsv41_prefill_window::reserve(llama_context & ctx) {
-    const uint32_t n_chunks = std::min<uint32_t>(4, ctx.cparams.n_batch / std::max<uint32_t>(ctx.cparams.n_ubatch, 1));
+    const uint32_t n_ubatch = std::max<uint32_t>(ctx.cparams.n_ubatch, 1);
+    const uint32_t n_chunks = std::min<uint32_t>(4, (ctx.cparams.n_batch + n_ubatch - 1) / n_ubatch);
     if (ctx.dsv41_prefill_state || n_chunks < 2 || !context_eligible(ctx, window_mode())) {
         return;
     }
@@ -106,16 +108,18 @@ std::unique_ptr<llama_dsv41_prefill_window> llama_dsv41_prefill_window::create(
     if (!mctx || mctx->get_ubatches().size() < 2 || mctx->get_ubatches().size() > 4) {
         return nullptr;
     }
-    int min_tokens = mode == 1 ? ggml_backend_sched_stage_get_min_tokens(ctx.sched.get()) : 1;
-    if (min_tokens <= 0) {
+    // The first chunk must stream its experts. A later chunk reads the banks that the first one made resident, so it can be
+    // shorter than the staging threshold (keep mode stages it anyway); it only has to be wider than the graphs of the
+    // alternative graph cache.
+    const int min_stage = mode == 1 ? ggml_backend_sched_stage_get_min_tokens(ctx.sched.get()) : 1;
+    if (min_stage <= 0) {
         return nullptr;
     }
     if (mode == 1 && ctx.cparams.cb_eval) {
         return nullptr;
     }
-    if (mode == 1) {
-        min_tokens = std::max<int>(min_tokens, ctx.graph_alt_max_tokens + 1);
-    }
+    const int min_rest = mode == 1 ? std::max<int>(1, ctx.graph_alt_max_tokens + 1) : 1;
+    const int min_first = std::max(min_stage, min_rest);
     const auto & ubatches = mctx->get_ubatches();
     const llama_seq_id seq = ubatches.front().seq_id_unq[0];
     llama_pos pos = ubatches.front().pos[0];
@@ -123,7 +127,7 @@ std::unique_ptr<llama_dsv41_prefill_window> llama_dsv41_prefill_window::create(
         const auto & batch = ubatches[i];
         if (!batch.token || batch.embd || batch.embd_tensor || batch.embd_h || batch.embd_h_tensor ||
                 batch.n_pos != 1 || batch.n_seqs_unq != 1 || batch.seq_id_unq[0] != seq ||
-                batch.n_tokens < (uint32_t) min_tokens) {
+                batch.n_tokens < (uint32_t) (i == 0 ? min_first : min_rest)) {
             return nullptr;
         }
         for (uint32_t row = 0; row < batch.n_tokens; ++row) {

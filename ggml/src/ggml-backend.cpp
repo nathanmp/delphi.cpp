@@ -3416,7 +3416,8 @@ static int ggml_backend_sched_stage_route(ggml_backend_sched_t sched, const stru
     if (stage == nullptr || !stage->enabled || stage->min_tokens <= 0 || op->op != GGML_OP_MUL_MAT_ID || op->src[0] != weight) {
         return -1;
     }
-    if (op->src[2]->ne[1] < stage->min_tokens) {
+    // keep mode (a layer-bank prefill window): a short chunk of the window reads the bank that its first chunk made resident
+    if (!stage->keep && op->src[2]->ne[1] < stage->min_tokens) {
         return cpu_backend_id;
     }
     int preferred = -1;

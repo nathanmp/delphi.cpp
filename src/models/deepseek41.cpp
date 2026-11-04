@@ -757,13 +757,15 @@ static int64_t dsv41_indexer_rows() {
     return rows;
 }
 
-// The queries of one chunk of the masked attention: LLAMA_DSV41_ATTN_ROWS. 0 (default) makes one mask for all queries
-// from the stream mask. A chunk holds a mask of rows * (n_raw + n_comp) values. Opt-in: one of three 49K-token prompts at
-// -c 65536 (512 rows, 2 R9700) failed with a memory fault in the HIP FlashAttention kernel, not yet explained.
+// The queries of one chunk of the masked attention: LLAMA_DSV41_ATTN_ROWS, default 1024. 0 makes one mask for all queries
+// from the stream mask. A chunk holds a mask of rows * (n_raw + n_comp) values. The 11-01 memory fault in the HIP
+// FlashAttention kernel (one of three 49K-token prompts at -c 65536, 512 rows) did not occur again after ddc27a07e (separate
+// linear and pitched HIP copy graphs). 2 R9700 at -c 300000: +20-22% prefill against the indexed path, 36 and 12 fewer
+// expert cache slots on ROCm0/ROCm1.
 static int64_t dsv41_attn_rows() {
     static const int64_t rows = [] {
         const char * env = std::getenv("LLAMA_DSV41_ATTN_ROWS");
-        return env ? (int64_t) std::atoll(env) : (int64_t) 0;
+        return env ? (int64_t) std::atoll(env) : (int64_t) 1024;
     }();
     return rows;
 }
@@ -1101,9 +1103,9 @@ static bool dsv41_verify_gather_enabled(
 // honors indices fast (the CPU kernel does too); Metal and Vulkan reject such ops and
 // fall back to the CPU. The dense fallback is faster on gfx1201, since its kernel skips
 // the masked rows (49K-token prompt, 2 R9700: 468 against 352 tokens/s), but its masks
-// are n_comp * n_query values: at -c 300000 they took 12 GiB of ROCm1. So the path is on
-// by default from a context of 128K (long_ctx), where it was measured, and mode 4 sets
-// it on everywhere.
+// are n_comp * n_query values: at -c 300000 they took 12 GiB of ROCm1. The chunked dense
+// path (dsv41_attn_rows()) bounds the masks, so this path is the default from a context of
+// 128K (long_ctx) only when LLAMA_DSV41_ATTN_ROWS=0. Mode 4 sets it on everywhere.
 static bool dsv41_prefill_indexed_enabled(
         const llama_hparams & hparams,
         bool long_ctx,
@@ -1113,7 +1115,7 @@ static bool dsv41_prefill_indexed_enabled(
         int64_t n_query,
         int64_t n_stream) {
     const char * env = std::getenv("LLAMA_DSV41_COMPACT_ATTN");
-    const int mode = env ? std::atoi(env) : (long_ctx ? 4 : 1);
+    const int mode = env ? std::atoi(env) : (long_ctx && dsv41_attn_rows() <= 0 ? 4 : 1);
 
     if (mode < 4 || !flash_attn || n_stream < 1 || n_query % n_stream != 0) {
         return false;
