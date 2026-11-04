@@ -1715,8 +1715,12 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
         GGML_ASSERT(inpL && pre_mix && inpL->ne[2] == n_tokens);
     }
 
-    ggml_tensor * top_k_in = first > 0 ? window->chunk->top_k.input(ctx0, res, "prefill_top_k") : nullptr;
-    ggml_tensor * cand_in = first > 0 ? window->chunk->cand.input(ctx0, res, "prefill_cand") : nullptr;
+    ggml_tensor * top_k_in = nullptr;
+    ggml_tensor * cand_in = nullptr;
+    if (first > 0) {
+        top_k_in = window->chunk->top_k_dev ? window->chunk->top_k_dev : window->chunk->top_k.input(ctx0, res, "prefill_top_k");
+        cand_in = window->chunk->cand_dev ? window->chunk->cand_dev : window->chunk->cand.input(ctx0, res, "prefill_cand");
+    }
     ggml_tensor * shared_top_k = top_k_in;
     ggml_tensor * shared_cand = cand_in;
 
@@ -1899,8 +1903,17 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
         // In place: every reader of the state of the previous layer comes before these copies in the graph.
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, inpL, window->chunk->hc));
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, pre_mix, window->chunk->mix));
-        window->top_k = shared_top_k != top_k_in ? keep(shared_top_k) : nullptr;
-        window->cand = shared_cand != cand_in ? keep(shared_cand) : nullptr;
+        // a new index selection replaces the chunk's one, in device state when it has room
+        const auto publish = [&](ggml_tensor * tensor, ggml_tensor *& slot) -> ggml_tensor * {
+            ggml_tensor * state = window->window->persist(slot, tensor);
+            if (!state) {
+                return keep(tensor);
+            }
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_is_contiguous(tensor) ? tensor : ggml_cont(ctx0, tensor), state));
+            return nullptr;
+        };
+        window->top_k = shared_top_k && shared_top_k != top_k_in ? publish(shared_top_k, window->chunk->top_k_dev) : nullptr;
+        window->cand = shared_cand && shared_cand != cand_in ? publish(shared_cand, window->chunk->cand_dev) : nullptr;
         return;
     }
 

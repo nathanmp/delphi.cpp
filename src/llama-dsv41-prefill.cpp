@@ -22,6 +22,12 @@ size_t state_bytes(const llama_hparams & hparams, int64_t n_tokens, size_t align
     return GGML_PAD(size_t(n_tokens * hparams.n_embd * hc) * sizeof(float), align) + GGML_PAD(size_t(n_tokens * hc) * sizeof(float), align);
 }
 
+// Room for the shared index selections of `n_tokens` rows: the I32 top-k and the F32 candidate block mask, whose block count
+// grows with the context; a window that needs more keeps them in host memory.
+size_t index_bytes(const llama_hparams & hparams, int64_t n_tokens, size_t align) {
+    return GGML_PAD(size_t(n_tokens * hparams.indexer_top_k) * sizeof(int32_t), align) + GGML_PAD(size_t(n_tokens) * 1024 * sizeof(float), align);
+}
+
 class prefill_input : public llm_graph_input_i {
 public:
     prefill_input(const llama_dsv41_prefill_tensor & src, ggml_tensor * dst) : src(src), dst(dst) {}
@@ -79,7 +85,8 @@ void llama_dsv41_prefill_window::reserve(llama_context & ctx) {
     if (!buft || ggml_backend_buft_is_host(buft)) {
         return;
     }
-    const size_t size = n_chunks * state_bytes(ctx.model.hparams, ctx.cparams.n_ubatch, ggml_backend_buft_get_alignment(buft));
+    const size_t align = ggml_backend_buft_get_alignment(buft);
+    const size_t size = n_chunks * (state_bytes(ctx.model.hparams, ctx.cparams.n_ubatch, align) + index_bytes(ctx.model.hparams, ctx.cparams.n_ubatch, align));
     ctx.dsv41_prefill_state.reset(ggml_backend_buft_alloc_buffer(buft, size));
     if (!ctx.dsv41_prefill_state) {
         LLAMA_LOG_WARN("dsv41-layer-bank: cannot allocate %.1f MiB of window state on %s; ordinary prefill\n", size / 1048576.0,
@@ -149,7 +156,7 @@ llama_dsv41_prefill_window::llama_dsv41_prefill_window(
         llama_context & ctx, llama_kv_cache_dsv4_context & mctx, bool retain) :
     ctx(ctx), mctx(mctx), retain(retain), chunks(mctx.get_ubatches().size()) {
     const auto & hparams = ctx.model.hparams;
-    ggml_init_params params = { 2 * chunks.size() * ggml_tensor_overhead(), nullptr, true };
+    ggml_init_params params = { 4 * chunks.size() * ggml_tensor_overhead(), nullptr, true };
     state_ctx.reset(ggml_init(params));
     ggml_backend_buffer_t buf = ctx.dsv41_prefill_state.get();
     const size_t align = ggml_backend_buffer_get_alignment(buf);
@@ -165,6 +172,29 @@ llama_dsv41_prefill_window::llama_dsv41_prefill_window(
         chunks[i].hc  = alloc(ggml_new_tensor_3d(state_ctx.get(), GGML_TYPE_F32, hparams.n_embd, hparams.dsv4_hc_mult, n_tokens), "prefill_hc", i);
         chunks[i].mix = alloc(ggml_new_tensor_2d(state_ctx.get(), GGML_TYPE_F32, hparams.dsv4_hc_mult, n_tokens), "prefill_mix", i);
     }
+    state_next = addr;
+    state_end = (char *) ggml_backend_buffer_get_base(buf) + ggml_backend_buffer_get_size(buf);
+}
+
+ggml_tensor * llama_dsv41_prefill_window::persist(ggml_tensor *& slot, const ggml_tensor * like) {
+    if (slot && slot->type == like->type && ggml_are_same_shape(slot, like)) {
+        return slot;
+    }
+    // a selection of another shape goes to host memory; the readers must not see the old one
+    if (slot) {
+        slot = nullptr;
+        return nullptr;
+    }
+    ggml_backend_buffer_t buf = ctx.dsv41_prefill_state.get();
+    const size_t align = ggml_backend_buffer_get_alignment(buf);
+    if (state_next + GGML_PAD(ggml_nbytes(like), align) > state_end) {
+        return nullptr;
+    }
+    slot = ggml_new_tensor(state_ctx.get(), like->type, GGML_MAX_DIMS, like->ne);
+    ggml_format_name(slot, "prefill_%s", like->name);
+    GGML_ASSERT(ggml_backend_tensor_alloc(buf, slot, state_next) == GGML_STATUS_SUCCESS);
+    state_next += GGML_PAD(ggml_nbytes(slot), align);
+    return slot;
 }
 
 llama_dsv41_prefill_window::~llama_dsv41_prefill_window() {
@@ -205,6 +235,7 @@ ggml_status llama_dsv41_prefill_window::encode() {
             graph.first = il;
             graph.last = il + 1;
             graph.chunk = &chunks[chunk++];
+            graph.window = this;
             ctx.dsv41_prefill_graph = &graph;
             ctx.n_outputs = 0;
             ggml_status status;
@@ -244,5 +275,6 @@ void llama_dsv41_prefill_window::decoder(size_t chunk) {
     graph.first = ctx.cparams.n_layer_prefill;
     graph.last = ctx.model.hparams.n_layer();
     graph.chunk = &chunks.at(chunk);
+    graph.window = this;
     ctx.dsv41_prefill_graph = &graph;
 }
