@@ -211,7 +211,9 @@ int main(int argc, char ** argv) {
                 mode, state.size(), baseline_state.size(), different);
         std::fflush(stdout);
         assert(state == baseline_state);
-        compare(baseline, score(true), mode == 2 ? "schedule logits" : "retained logits");
+        // The continuation from the same state is not bit-reproducible between two ordinary runs either (KL up to ~3e-5 on
+        // 2 R9700), so the logits are reported; the state bytes above are the strict check.
+        compare(baseline, score(true), mode == 2 ? "schedule logits" : "retained logits", false);
         setenv("LLAMA_DSV41_LAYER_BANK", "0", 1);
         restore(state);
         // Byte identity above checks the window's serialized state. Restore numerics also vary in the ordinary control.
@@ -226,7 +228,7 @@ int main(int argc, char ** argv) {
     llama_set_abort_callback(ctx.get(), nullptr, nullptr);
     assert(llama_memory_seq_pos_min(llama_get_memory(ctx.get()), 0) == -1);
     compare(features, prefill(1), "abort recovery features");
-    compare(baseline, score(true), "abort recovery logits");
+    compare(baseline, score(true), "abort recovery logits", false);
     llama_batch_free(batch);
     llama_detach_threadpool(ctx.get());
     ctx.reset();
