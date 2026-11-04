@@ -662,6 +662,11 @@ public:
     comp_input inp_hca;
     comp_input inp_lid;
 
+    // delphi: LLAMA_DSV41_LAYER_BANK: the input data of one prefill chunk, in the order of tensors(). The layer graphs of the
+    // chunk share it, as a full graph shares one set of inputs; a graph whose inputs are all in it does not compute them again.
+    std::vector<std::vector<uint8_t>> * cache = nullptr;
+    std::vector<ggml_tensor *> tensors() const;
+
     const llama_cparams cparams;
 
     const llama_kv_cache_dsv4_context * mctx;

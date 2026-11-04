@@ -1686,6 +1686,9 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
     ggml_tensor * inp = first == 0 ? build_inp_embd(model.tok_embd) : nullptr;
     ggml_tensor * inp_pos = build_inp_pos();
     llm_graph_input_dsv4 * inp_dsv4 = build_inp_dsv4();
+    if (window) {
+        inp_dsv4->cache = &window->chunk->inputs;
+    }
     llm_graph_input_dsv4_raw * inp_attn = inp_dsv4->get_raw();
     const auto ubatch_dec = inp_attn->mctx->decoder_ubatch(ubatch);
     const uint32_t n_skip = ubatch.n_tokens - ubatch_dec.n_tokens;

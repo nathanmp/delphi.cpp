@@ -29,6 +29,8 @@ struct llama_dsv41_prefill_chunk {
     // shared index selections, in host memory: only the index source layers write them
     llama_dsv41_prefill_tensor top_k;
     llama_dsv41_prefill_tensor cand;
+    // attention inputs (masks, cache indices), the same for every layer of the chunk
+    std::vector<std::vector<uint8_t>> inputs;
 };
 
 // One partial graph. Output tensors belong to that graph, not to the host checkpoint.

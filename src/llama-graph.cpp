@@ -1129,7 +1129,36 @@ void llm_graph_input_dsv4_raw::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+std::vector<ggml_tensor *> llm_graph_input_dsv4::tensors() const {
+    std::vector<ggml_tensor *> res = { inp_raw->self_k_idxs, inp_raw->self_k_idxs_dec, inp_raw->self_kq_mask,
+            inp_raw->self_kq_mask_dec, inp_raw->self_k_rot };
+    for (const comp_input * c : { &inp_csa, &inp_hca, &inp_lid }) {
+        res.insert(res.end(), { c->state_pos, c->state_persist_src_idxs, c->state_persist_dst_idxs, c->state_restore_src_idxs,
+                c->state_restore_dst_idxs, c->state_snapshot_src_idxs, c->state_snapshot_dst_idxs, c->state_read_idxs,
+                c->state_write_idxs, c->state_write_pos, c->kq_mask, c->n_vis, c->cand_pin, c->k_rot });
+    }
+    return res;
+}
+
 void llm_graph_input_dsv4::set_input(const llama_ubatch * ubatch) {
+    std::vector<ggml_tensor *> ts;
+    if (cache) {
+        ts = tensors();
+        bool hit = cache->size() == ts.size();
+        for (size_t i = 0; hit && i < ts.size(); ++i) {
+            hit = !ts[i] || !ts[i]->buffer || (*cache)[i].size() == ggml_nbytes(ts[i]);
+        }
+        if (hit) {
+            inp_raw->mctx = mctx->get_raw();
+            for (size_t i = 0; i < ts.size(); ++i) {
+                if (ts[i] && ts[i]->buffer) {
+                    ggml_backend_tensor_set(ts[i], (*cache)[i].data(), 0, (*cache)[i].size());
+                }
+            }
+            return;
+        }
+    }
+
     const auto & plan_csa = mctx->get_csa_plan(*ubatch);
     const auto & plan_hca = mctx->get_hca_plan(*ubatch);
     const auto & plan_lid = mctx->get_lid_plan(*ubatch);
@@ -1152,6 +1181,16 @@ void llm_graph_input_dsv4::set_input(const llama_ubatch * ubatch) {
 
     if (inp_lid.k_rot && inp_lid.k_rot->buffer) {
         mctx->get_lid()->set_input_k_rot(inp_lid.k_rot);
+    }
+
+    if (cache) {
+        cache->resize(ts.size());
+        for (size_t i = 0; i < ts.size(); ++i) {
+            if (ts[i] && ts[i]->buffer) {
+                (*cache)[i].resize(ggml_nbytes(ts[i]));
+                ggml_backend_tensor_get(ts[i], (*cache)[i].data(), 0, (*cache)[i].size());
+            }
+        }
     }
 }
 
