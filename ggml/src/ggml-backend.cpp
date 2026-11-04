@@ -2957,9 +2957,11 @@ struct ggml_backend_sched_stage_ring {
     int n_slots = 0; // slots in use: GGML_SCHED_STAGE_SLOTS, or fewer when the memory for all of them is not available
     int next = 0;
 
+    // ggml_backend_sched_stage_keep: the weight in each slot, which later graphs read without another upload
     const ggml_tensor * resident[GGML_SCHED_STAGE_MAX_SLOTS] = {};
     uint64_t resident_seq[GGML_SCHED_STAGE_MAX_SLOTS] = {};
     uint32_t readers[GGML_SCHED_STAGE_MAX_SLOTS] = {};
+    bool prepared[GGML_SCHED_STAGE_MAX_SLOTS] = {}; // ring.prepare ran on the slot after its last upload
 
     // pinned host bounce buffers, used by the staging thread only; bounce == nullptr uploads from the weight directly
     ggml_backend_buffer_t bounce = nullptr;
@@ -3275,6 +3277,7 @@ static void ggml_backend_sched_stage_drop_slots(ggml_backend_sched_stage_ring & 
         ring.free_recorded[s] = false;
         ring.resident[s] = nullptr;
         ring.readers[s] = 0;
+        ring.prepared[s] = false;
     }
     ring.lent = false;
     ring.slot_size = 0;
@@ -3441,6 +3444,57 @@ static ggml_backend_buffer_t ggml_backend_sched_stage_anchor(ggml_backend_sched_
     return ring.anchor;
 }
 
+// keep mode: a slot for a new upload, a free one first, then one whose weight no item of the current graph and no
+// weight in `skip` reads; -1 if there is none
+static int ggml_backend_sched_stage_evictable(const ggml_backend_sched_stage * stage, const ggml_backend_sched_stage_ring & ring,
+        struct ggml_tensor * const * skip = nullptr, int n_skip = 0) {
+    int stale = -1;
+    for (int s = 0; s < ring.n_slots; ++s) {
+        if (ring.busy[s]) {
+            continue;
+        }
+        if (ring.resident[s] == nullptr) {
+            return s;
+        }
+        bool used = false;
+        for (const auto & item : stage->items) {
+            used |= item.input == ring.resident[s];
+        }
+        for (int i = 0; i < n_skip; ++i) {
+            used |= skip[i] == ring.resident[s];
+        }
+        if (!used && stale < 0) {
+            stale = s;
+        }
+    }
+    return stale;
+}
+
+// queue the upload of a weight into a slot of its ring
+static uint64_t ggml_backend_sched_stage_push(ggml_backend_sched_t sched, int backend_id, int slot, const struct ggml_tensor * input) {
+    ggml_backend_sched_stage * stage = sched->stage;
+    ggml_backend_sched_stage_ring & ring = stage->rings[backend_id];
+    ggml_backend_sched_stage_worker * w = stage->workers[backend_id].get();
+    uint64_t seq;
+    {
+        std::lock_guard<std::mutex> lock(w->mutex);
+        // packed uploads only where the split reads the slot itself: a copied slot would be prepared (packed) again
+        size_t unit = ring.pack_unit != nullptr && stage->redirect && sched->callback_eval == nullptr ?
+                ring.pack_unit(stage->backends[backend_id], input) : 0;
+        if (unit > stage->chunk_size || ggml_nbytes(input) % std::max<size_t>(unit, 1) != 0) {
+            unit = 0; // a unit must fit a bounce buffer
+        }
+        w->jobs.push_back({ backend_id, slot, ring.free_recorded[slot], input->data, ggml_nbytes(input),
+                ggml_backend_sched_stage_trace_us(), input, unit });
+        seq = w->n_pushed++;
+    }
+    ring.resident[slot] = stage->keep ? input : nullptr;
+    ring.resident_seq[slot] = seq;
+    ring.prepared[slot] = false;
+    w->cv_job.notify_one();
+    return seq;
+}
+
 // queue uploads for the next items while their slots are free
 static void ggml_backend_sched_stage_pump(ggml_backend_sched_t sched) {
     ggml_backend_sched_stage * stage = sched->stage;
@@ -3449,47 +3503,29 @@ static void ggml_backend_sched_stage_pump(ggml_backend_sched_t sched) {
         ggml_backend_sched_stage_ring & ring = stage->rings[item.backend_id];
         int slot = ring.next;
         if (stage->keep) {
-            for (int s = 0; s < ring.n_slots; ++s) {
-                if (ring.resident[s] == item.input) {
-                    item.slot = s;
-                    item.seq = ring.resident_seq[s];
-                    item.reused = true;
-                    ring.readers[s]++;
-                    ring.busy[s] = true;
-                    stage->n_queued++;
-                    break;
-                }
+            int found = -1;
+            for (int s = 0; s < ring.n_slots && found < 0; ++s) {
+                found = ring.resident[s] == item.input ? s : -1;
             }
-            if (item.reused) {
+            if (found >= 0) {
+                item.slot = found;
+                item.seq = ring.resident_seq[found];
+                item.reused = true;
+                ring.readers[found]++;
+                ring.busy[found] = true;
+                stage->n_queued++;
                 continue;
             }
-            for (int s = 0; s < ring.n_slots; ++s) {
-                if (!ring.busy[s] && !ring.resident[s]) {
-                    slot = s;
-                    break;
-                }
+            slot = ggml_backend_sched_stage_evictable(stage, ring);
+            if (slot < 0) {
+                break;
             }
         }
         if (ring.busy[slot]) {
             break;
         }
-        ggml_backend_sched_stage_worker * w = stage->workers[item.backend_id].get();
-        {
-            std::lock_guard<std::mutex> lock(w->mutex);
-            // packed uploads only where the split reads the slot itself: a copied slot would be prepared (packed) again
-            size_t unit = ring.pack_unit != nullptr && stage->redirect && sched->callback_eval == nullptr ?
-                    ring.pack_unit(stage->backends[item.backend_id], item.input) : 0;
-            if (unit > stage->chunk_size || ggml_nbytes(item.input) % std::max<size_t>(unit, 1) != 0) {
-                unit = 0; // a unit must fit a bounce buffer
-            }
-            w->jobs.push_back({ item.backend_id, slot, ring.free_recorded[slot], item.input->data, ggml_nbytes(item.input),
-                    ggml_backend_sched_stage_trace_us(), item.input, unit });
-            item.seq = w->n_pushed++;
-        }
-        ring.resident[slot] = stage->keep ? item.input : nullptr;
-        ring.resident_seq[slot] = item.seq;
+        item.seq = ggml_backend_sched_stage_push(sched, item.backend_id, slot, item.input);
         ring.readers[slot] = 1;
-        w->cv_job.notify_one();
         ring.busy[slot] = true;
         ring.next = (slot + 1) % ring.n_slots;
         item.slot = slot;
@@ -3500,8 +3536,12 @@ static void ggml_backend_sched_stage_pump(ggml_backend_sched_t sched) {
 // collect the staged inputs of the graph, size the rings and queue the first uploads
 static void ggml_backend_sched_stage_begin(ggml_backend_sched_t sched) {
     ggml_backend_sched_stage * stage = sched->stage;
-    // an interrupted graph can leave jobs behind; let them reach the device before the slots are reused
-    ggml_backend_sched_stage_drain(stage);
+    // an interrupted graph can leave jobs behind; let them reach the device before the slots are reused. In keep mode the slots
+    // record their weights, so that the uploads of a prefetch continue while the next graph starts, and only a ring that
+    // changes its size drains.
+    if (!stage->keep) {
+        ggml_backend_sched_stage_drain(stage);
+    }
     stage->items.clear();
     stage->n_queued = 0;
     stage->n_consumed = 0;
@@ -3535,6 +3575,10 @@ static void ggml_backend_sched_stage_begin(ggml_backend_sched_t sched) {
     const int wanted_slots = stage->keep ? std::max(3, stage->n_slots) : stage->n_slots;
     for (int b = 0; b < sched->n_backends; b++) {
         ggml_backend_sched_stage_ring & ring = stage->rings[b];
+        if (stage->keep && need[b] == 0 && ring.n_slots > 0 && ring.n_slots < wanted_slots) {
+            // a ring that this graph does not use grows too, for the prefetch of a later layer
+            need[b] = ring.slot_size;
+        }
         // the uploads of interrupted items still complete in copy stream order before any later one
         for (int s = 0; s < GGML_SCHED_STAGE_MAX_SLOTS; s++) {
             ring.busy[s] = false;
@@ -3542,6 +3586,9 @@ static void ggml_backend_sched_stage_begin(ggml_backend_sched_t sched) {
         }
         if (need[b] == 0 || (need[b] <= ring.slot_size && (!stage->keep || ring.n_slots >= wanted_slots))) {
             continue;
+        }
+        if (stage->keep) {
+            ggml_backend_sched_stage_drain(stage);
         }
         ggml_backend_sched_stage_release_ring(ring);
         ggml_backend_t backend = sched->backends[b];
@@ -3650,8 +3697,9 @@ static bool ggml_backend_sched_stage_consume(
         // the split reads the slot in place; ggml_backend_sched_stage_release frees it after the split's work
         stage->holding.push_back({ input_cpy, input_cpy->data, item.backend_id, item.slot });
         input_cpy->data = ring.slots[item.slot];
-        if (ring.prepare != nullptr && !item.reused) {
+        if (ring.prepare != nullptr && !ring.prepared[item.slot]) {
             ring.prepare(split_backend, input_cpy);
+            ring.prepared[item.slot] = true;
         }
         stage->n_consumed++;
         return true;
@@ -3704,6 +3752,46 @@ void ggml_backend_sched_stage_keep(ggml_backend_sched_t sched, bool keep) {
             }
             ring.n_slots = stage->n_slots;
             ring.next %= ring.n_slots;
+        }
+    }
+}
+
+void ggml_backend_sched_stage_prefetch(ggml_backend_sched_t sched, struct ggml_tensor * const * weights, int n_weights) {
+    ggml_backend_sched_stage * stage = sched->stage;
+    if (stage == nullptr || !stage->keep || !stage->spread) {
+        return;
+    }
+    // the GPUs of ggml_backend_sched_stage_spread
+    int gpus[GGML_SCHED_MAX_BACKENDS];
+    int n = 0;
+    for (int b = 0; b < sched->n_backends - 1; b++) {
+        if (stage->rings[b].upload != nullptr && !stage->blocked[b]) {
+            gpus[n++] = b;
+        }
+    }
+    if (n < 2) {
+        return;
+    }
+    for (int i = 0; i < n_weights; ++i) {
+        const ggml_tensor * weight = weights[i];
+        int layer = -1;
+        if (weight == nullptr || sscanf(weight->name, "blk.%d.", &layer) != 1 || layer < 0) {
+            continue;
+        }
+        const int b = gpus[layer % n];
+        ggml_backend_sched_stage_ring & ring = stage->rings[b];
+        if (ring.n_slots == 0 || !ggml_backend_sched_stage_whole(sched, nullptr, weight, b) ||
+                ggml_backend_buft_get_alloc_size(ggml_backend_get_default_buffer_type(sched->backends[b]), weight) > ring.slot_size) {
+            continue;
+        }
+        bool resident = false;
+        for (int s = 0; s < ring.n_slots; ++s) {
+            resident |= ring.resident[s] == weight;
+        }
+        const int slot = resident ? -1 : ggml_backend_sched_stage_evictable(stage, ring, weights, n_weights);
+        if (slot >= 0) {
+            ggml_backend_sched_stage_push(sched, b, slot, weight);
+            ring.readers[slot] = 0;
         }
     }
 }

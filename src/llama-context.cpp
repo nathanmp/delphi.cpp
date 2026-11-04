@@ -3587,6 +3587,8 @@ void llama_context::expert_cache_auto() {
     // At the first decode every context of the process (draft, MTP) holds its memory, so what is free can go to the cache.
     // The margin is for buffers that grow later (graph reallocations, other processes). The decode-time refresh scratch is
     // allocated later on each tier GPU, so it is kept out of the tier too.
+    // before the tiers take the free memory
+    llama_dsv41_prefill_window::reserve(*this);
     if (!expert_cache || !expert_cache->auto_size) {
         return;
     }

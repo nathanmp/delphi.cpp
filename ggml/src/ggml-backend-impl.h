@@ -12,6 +12,9 @@ extern "C" {
 
     // Start a new group of immutable staged weights, or end retention. The caller synchronizes between graphs.
     GGML_API void ggml_backend_sched_stage_keep(ggml_backend_sched_t sched, bool keep);
+    // In keep mode: start the uploads of weights that a later graph reads (e.g. the experts of the next layer) into the slots
+    // that the current graph does not read. A weight without a free slot is not prefetched.
+    GGML_API void ggml_backend_sched_stage_prefetch(ggml_backend_sched_t sched, struct ggml_tensor * const * weights, int n_weights);
 
     //
     // Backend buffer type

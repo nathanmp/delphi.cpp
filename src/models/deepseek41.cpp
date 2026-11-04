@@ -1707,8 +1707,8 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
                 ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hc - 1, n_tokens), 0.0f), 0);
         cb(pre_mix, "hc_pre_init", -1);
     } else {
-        inpL = window->chunk->hc.input(ctx0, res, "prefill_hc");
-        pre_mix = window->chunk->mix.input(ctx0, res, "prefill_mix");
+        inpL = window->chunk->hc;
+        pre_mix = window->chunk->mix;
         GGML_ASSERT(inpL && pre_mix && inpL->ne[2] == n_tokens);
     }
 
@@ -1893,8 +1893,9 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
             ggml_build_forward_expand(gf, output);
             return output;
         };
-        window->hc = keep(inpL);
-        window->mix = keep(pre_mix);
+        // In place: every reader of the state of the previous layer comes before these copies in the graph.
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, inpL, window->chunk->hc));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, pre_mix, window->chunk->mix));
         window->top_k = shared_top_k != top_k_in ? keep(shared_top_k) : nullptr;
         window->cand = shared_cand != cand_in ? keep(shared_cand) : nullptr;
         return;

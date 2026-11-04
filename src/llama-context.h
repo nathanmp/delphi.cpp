@@ -260,6 +260,7 @@ struct llama_context {
 
 private:
     llama_dsv41_prefill_graph * dsv41_prefill_graph = nullptr;
+    ggml_backend_buffer_ptr dsv41_prefill_state; // LLAMA_DSV41_LAYER_BANK: HC state of a prefill window
     //
     // output
     //
