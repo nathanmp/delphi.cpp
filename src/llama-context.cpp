@@ -2243,6 +2243,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     const uint32_t trace_ubatch_id = ggml_exec_trace_enabled() ? ggml_exec_trace_ubatch_begin(
             ubatch.n_tokens, ubatch.n_seqs, ubatch.n_seqs_unq, n_outputs) : 0;
 
+    static const bool build_log = getenv("LLAMA_GRAPH_BUILD_LOG") != nullptr;
+    const int64_t t_apply_us0 = build_log ? ggml_time_us() : 0;
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -2258,7 +2260,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    static const bool build_log = getenv("LLAMA_GRAPH_BUILD_LOG") != nullptr;
+    const int64_t t_apply_us = build_log ? ggml_time_us() - t_apply_us0 : 0;
     int64_t t_build_us = -1;
     int64_t t_alloc_us = -1;
 
@@ -2360,12 +2362,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         gf_res_prev_threads = backend_n_threads;
     }
 
+    int64_t t_inputs_us = 0;
     // set the input data for the input tensors
     {
         //const auto t_start_us = ggml_time_us();
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
+        const int64_t t_inputs_us0 = build_log ? ggml_time_us() : 0;
         res->set_inputs(&ubatch);
+        t_inputs_us = build_log ? ggml_time_us() - t_inputs_us0 : 0;
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
@@ -2380,8 +2385,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
     if (build_log && t_build_us >= 0) {
         // host times; the first compute of a new graph includes its eager run or CUDA/HIP graph capture
-        LLAMA_LOG_WARN("graph build time: ctx %p n_tokens %u build %.2f alloc %.2f compute %.2f ms\n", (void *) this,
-                ubatch.n_tokens, t_build_us/1e3, t_alloc_us/1e3, (ggml_time_us() - t_compute_us0)/1e3);
+        LLAMA_LOG_WARN("graph build time: ctx %p n_tokens %u apply %.2f build %.2f alloc %.2f inputs %.2f compute %.2f ms\n", (void *) this,
+                ubatch.n_tokens, t_apply_us/1e3, t_build_us/1e3, t_alloc_us/1e3, t_inputs_us/1e3, (ggml_time_us() - t_compute_us0)/1e3);
     }
 
     ret = GGML_STATUS_SUCCESS;
