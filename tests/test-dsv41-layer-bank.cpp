@@ -148,6 +148,47 @@ int main(int argc, char ** argv) {
             assert(out);
         }
     };
+    const auto dump_vectors = [](const logits & values, const char * name) {
+        const char * path = std::getenv("LLAMA_LAYER_BANK_TEST_DUMP");
+        assert(path && !values.empty());
+        std::ofstream out(std::string(path) + "/" + name + ".bin", std::ios::binary);
+        const uint32_t shape[] = { uint32_t(values.size()), uint32_t(values[0].size()) };
+        out.write(reinterpret_cast<const char *>(shape), sizeof(shape));
+        for (const auto & row : values) {
+            assert(row.size() == shape[1]);
+            out.write(reinterpret_cast<const char *>(row.data()), row.size() * sizeof(float));
+        }
+        assert(out);
+    };
+
+    if (const char * env = std::getenv("LLAMA_LAYER_BANK_TEST_MODE")) {
+        const int mode = std::atoi(env);
+        assert(mode >= 0 && mode <= 2);
+        const auto fixed_features = prefill(mode);
+        const auto fixed_state = save();
+        const auto fixed_logits = score(true);
+        dump_vectors(fixed_features, "features");
+        dump(fixed_state, mode);
+        dump_vectors(fixed_logits, "logits");
+        if (mode == 1) {
+            llama_memory_clear(llama_get_memory(ctx.get()), true);
+            int calls = 0;
+            llama_set_abort_callback(ctx.get(), [](void * data) { return ++*static_cast<int *>(data) > 5; }, &calls);
+            assert(decode(0, prompt, false) == 2);
+            llama_set_abort_callback(ctx.get(), nullptr, nullptr);
+            assert(llama_memory_seq_pos_min(llama_get_memory(ctx.get()), 0) == -1);
+        }
+        compare(fixed_features, prefill(mode), "fixed-mode repeat features");
+        assert(save() == fixed_state);
+        const auto repeated = score(true);
+        dump_vectors(repeated, "logits-repeated");
+        compare(fixed_logits, repeated, "fixed-mode repeat control", false);
+        llama_batch_free(batch);
+        llama_detach_threadpool(ctx.get());
+        ctx.reset();
+        std::puts("fixed-mode capture complete");
+        return 0;
+    }
 
     const auto features = prefill(0);
     const auto baseline_state = save();
