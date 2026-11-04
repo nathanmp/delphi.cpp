@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <vector>
 
 using logits = std::vector<std::vector<float>>;
@@ -38,8 +39,15 @@ static void compare(const logits & expected, const logits & actual, const char *
         worst_nmse = std::max(worst_nmse, error / std::max(energy, 1e-30));
         const bool same_top = std::max_element(a.begin(), a.end()) - a.begin() == std::max_element(b.begin(), b.end()) - b.begin();
         if (kl >= 1e-5 || error / std::max(energy, 1e-30) >= 1e-6 || !same_top) {
+            double mean_delta = 0;
+            for (size_t i = 0; i < a.size(); ++i) { mean_delta += b[i] - a[i]; }
+            mean_delta /= a.size();
+            double centered_error = 0;
+            for (size_t i = 0; i < a.size(); ++i) { centered_error += std::pow(double(b[i]) - a[i] - mean_delta, 2); }
             std::fprintf(stderr, "%s row %zu: KL %.9g, NMSE %.9g, same top %d, strict %d\n",
                     name, row, kl, error / std::max(energy, 1e-30), same_top, strict);
+            std::fprintf(stderr, "max %.9g / %.9g, top probability %.9g, mean delta %.9g, centered NMSE %.9g\n",
+                    ma, mb, 1.0 / sa, mean_delta, centered_error / std::max(energy, 1e-30));
         }
         if (strict) {
             assert(kl < 1e-5 && error / std::max(energy, 1e-30) < 1e-6);
@@ -133,9 +141,17 @@ int main(int argc, char ** argv) {
         llama_memory_clear(llama_get_memory(ctx.get()), true);
         assert(llama_state_seq_set_data(ctx.get(), state.data(), state.size(), 0) == state.size());
     };
+    const auto dump = [](const std::vector<uint8_t> & state, int mode) {
+        if (const char * path = std::getenv("LLAMA_LAYER_BANK_TEST_DUMP")) {
+            std::ofstream out(std::string(path) + "/state-" + std::to_string(mode) + ".bin", std::ios::binary);
+            out.write(reinterpret_cast<const char *>(state.data()), state.size());
+            assert(out);
+        }
+    };
 
     const auto features = prefill(0);
     const auto baseline_state = save();
+    dump(baseline_state, 0);
     const auto baseline = score(true);
     const logits suffix(baseline.begin() + 1, baseline.end());
     restore(baseline_state);
@@ -145,10 +161,20 @@ int main(int argc, char ** argv) {
     for (int mode : {2, 1}) {
         compare(features, prefill(mode), mode == 2 ? "schedule features" : "retained features");
         const auto state = save();
+        dump(state, mode);
+        size_t different = 0;
+        for (size_t i = 0; i < std::min(state.size(), baseline_state.size()); ++i) {
+            different += state[i] != baseline_state[i];
+        }
+        std::printf("mode %d state image: %zu / %zu bytes, %zu differing bytes\n",
+                mode, state.size(), baseline_state.size(), different);
+        std::fflush(stdout);
+        assert(state == baseline_state);
         compare(baseline, score(true), mode == 2 ? "schedule logits" : "retained logits");
         setenv("LLAMA_DSV41_LAYER_BANK", "0", 1);
         restore(state);
-        compare(restored_baseline, score(false), "window state -> ordinary restored continuation");
+        // Byte identity above checks the window's serialized state. Restore numerics also vary in the ordinary control.
+        compare(restored_baseline, score(false), "window state -> ordinary restored continuation", false);
     }
 
     setenv("LLAMA_DSV41_LAYER_BANK", "1", 1);
