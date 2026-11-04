@@ -1570,11 +1570,13 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
         ggml_tensor * k_all = ggml_concat(ctx0, comp_k, raw_k, 2);
         cb(k_all, "k_all_indexed", il);
 
+        // Repeat in F32, then cast: the GPU REPEAT has no I32 kernel, and a CPU split in every layer stalls the GPU. The
+        // indices are far below 2^24, so F32 holds them exactly.
         ggml_tensor * raw_idx = ggml_arange(ctx0, (float) n_comp, (float) (n_comp + n_raw), 1.0f);
-        raw_idx = ggml_cast(ctx0, raw_idx, GGML_TYPE_I32);
         raw_idx = ggml_reshape_3d(ctx0, raw_idx, n_raw, 1, 1);
-        ggml_tensor * raw_idx_tpl = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, n_raw, n_tps, n_stream);
-        raw_idx = ggml_repeat(ctx0, raw_idx, raw_idx_tpl);
+        raw_idx = ggml_repeat_4d(ctx0, raw_idx, n_raw, n_tps, n_stream, 1);
+        raw_idx = ggml_cast(ctx0, raw_idx, GGML_TYPE_I32);
+        raw_idx = ggml_reshape_3d(ctx0, raw_idx, n_raw, n_tps, n_stream);
         cb(raw_idx, "raw_idx", il);
 
         ggml_tensor * comp_idx = ggml_reshape_3d(ctx0, top_k, n_selected, n_tps, n_stream);
