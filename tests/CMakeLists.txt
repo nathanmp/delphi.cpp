@@ -334,6 +334,7 @@ endif()
 llama_build(test-backend-ops.cpp)
 llama_build(test-stage-keep.cpp)
 llama_build(test-dsv41-layer-bank.cpp)
+llama_build(test-dsv41-fa-prefill.cpp)
 llama_build(test-cuda-hc-fusion-tail.cpp)
 
 # Explicit CPU/HIP plugin paths and one selected GPU are required; run this fixture manually.
