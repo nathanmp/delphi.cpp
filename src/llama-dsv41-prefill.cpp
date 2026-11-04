@@ -17,8 +17,8 @@ public:
 
     void set_input(const llama_ubatch *) override {
         if (dst->buffer) {
-            GGML_ASSERT(src.size == ggml_nbytes(dst));
-            ggml_backend_tensor_set(dst, src.data_ptr(), 0, src.size);
+            GGML_ASSERT(src.data.size() == ggml_nbytes(dst));
+            ggml_backend_tensor_set(dst, src.data.data(), 0, src.data.size());
         }
     }
 
@@ -29,12 +29,8 @@ private:
 
 }
 
-const void * llama_dsv41_prefill_tensor::data_ptr() const {
-    return host ? ggml_backend_buffer_get_base(host.get()) : data.data();
-}
-
 ggml_tensor * llama_dsv41_prefill_tensor::input(ggml_context * ctx, llm_graph_result * res, const char * name) const {
-    if (size == 0) {
+    if (data.empty()) {
         return nullptr;
     }
     auto * tensor = ggml_new_tensor(ctx, type, 4, ne.data());
@@ -44,32 +40,15 @@ ggml_tensor * llama_dsv41_prefill_tensor::input(ggml_context * ctx, llm_graph_re
     return tensor;
 }
 
-void llama_dsv41_prefill_tensor::store(ggml_tensor * tensor, ggml_backend_sched_t sched) {
+void llama_dsv41_prefill_tensor::store(ggml_tensor * tensor) {
     if (!tensor) {
         return;
     }
     GGML_ASSERT(ggml_is_contiguous(tensor));
     type = tensor->type;
     std::copy(tensor->ne, tensor->ne + 4, ne.begin());
-    size = ggml_nbytes(tensor);
-    if (host && ggml_backend_buffer_get_size(host.get()) < size) {
-        host.reset();
-    }
-    static const bool pin = [] {
-        const char * env = std::getenv("LLAMA_DSV41_LAYER_BANK_HOST_PIN");
-        return !env || std::atoi(env) != 0;
-    }();
-    if (pin && !host) {
-        auto * backend = ggml_backend_sched_get_tensor_backend(sched, tensor);
-        auto * buft = backend ? ggml_backend_dev_host_buffer_type(ggml_backend_get_device(backend)) : nullptr;
-        if (buft) {
-            host.reset(ggml_backend_buft_alloc_buffer(buft, size));
-        }
-    }
-    if (!host) {
-        data.resize(size);
-    }
-    ggml_backend_tensor_get(tensor, host ? ggml_backend_buffer_get_base(host.get()) : data.data(), 0, size);
+    data.resize(ggml_nbytes(tensor));
+    ggml_backend_tensor_get(tensor, data.data(), 0, data.size());
 }
 
 std::unique_ptr<llama_dsv41_prefill_window> llama_dsv41_prefill_window::create(
@@ -161,20 +140,19 @@ ggml_status llama_dsv41_prefill_window::encode() {
             }
             // Preserve the logical llama_decode timing transaction across internal graph boundaries.
             ggml_backend_sched_synchronize(ctx.sched.get());
-            graph.chunk->hc.store(graph.hc, ctx.sched.get());
-            graph.chunk->mix.store(graph.mix, ctx.sched.get());
-            graph.chunk->top_k.store(graph.top_k, ctx.sched.get());
-            graph.chunk->cand.store(graph.cand, ctx.sched.get());
+            graph.chunk->hc.store(graph.hc);
+            graph.chunk->mix.store(graph.mix);
+            graph.chunk->top_k.store(graph.top_k);
+            graph.chunk->cand.store(graph.cand);
             spill += ggml_nbytes(graph.hc) + ggml_nbytes(graph.mix);
         } while (mctx.next());
     }
     ggml_backend_sched_stage_keep(ctx.sched.get(), false);
     mctx.rewind_window();
     ctx.dsv41_prefill_graph = nullptr;
-    const char * storage = chunks[0].hc.host ? ggml_backend_buffer_name(chunks[0].hc.host.get()) : "pageable";
-    LLAMA_LOG_INFO("dsv41-layer-bank: %zu chunks x %u encoder layers, %s, %s checkpoints, %.3f GiB HC/mix spills, %.1f ms\n",
+    LLAMA_LOG_INFO("dsv41-layer-bank: %zu chunks x %u encoder layers, %s, %.3f GiB HC/mix spills, %.1f ms\n",
             chunks.size(), ctx.cparams.n_layer_prefill, retain ? "retained banks" : "schedule only",
-            storage, spill / double(1ULL << 30), (ggml_time_us() - start) / 1000.0);
+            spill / double(1ULL << 30), (ggml_time_us() - start) / 1000.0);
     return GGML_STATUS_SUCCESS;
 }
 

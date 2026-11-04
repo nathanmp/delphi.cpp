@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ggml-cpp.h"
+#include "ggml.h"
 
 #include <array>
 #include <cstdint>
@@ -16,12 +16,9 @@ struct llama_dsv41_prefill_tensor {
     ggml_type type = GGML_TYPE_F32;
     std::array<int64_t, 4> ne = {};
     std::vector<uint8_t> data;
-    ggml_backend_buffer_ptr host;
-    size_t size = 0;
 
-    const void * data_ptr() const;
     ggml_tensor * input(ggml_context * ctx, llm_graph_result * res, const char * name) const;
-    void store(ggml_tensor * tensor, ggml_backend_sched_t sched);
+    void store(ggml_tensor * tensor);
 };
 
 struct llama_dsv41_prefill_chunk {
