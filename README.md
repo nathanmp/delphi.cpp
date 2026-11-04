@@ -13,7 +13,7 @@
 * Lazily-loaded vision encoder. (Turn it off with `--mmproj-memory resident`)
 * A ton of optimizations, focused on AVX2 CPUs and RDNA4/SM_80 GPUs, and DeepSeek V4.1 Flash/GLM-5.3 Flash/Qwen 3.8 Flash Next.
 
-Refer to [docs/delphi/usage/environment-variables.md](docs/delphi/usage/environment-variables.md) for information about usage.
+Refer to [docs/delphi/usage](docs/delphi/usage) for information about how to use the project, and [docs/delphi/usage/environment-variables.md](docs/delphi/usage/environment-variables.md) for information about environment variables.
 
 ## Credits
 
