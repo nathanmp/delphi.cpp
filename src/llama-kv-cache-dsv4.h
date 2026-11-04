@@ -205,6 +205,8 @@ private:
 // Without CED, all layers use kv_swa_enc.
 class llama_kv_cache_dsv4_raw_context : public llama_memory_context_i {
 public:
+    void begin_window();
+    void rewind_window();
     using slot_info_vec_t = llama_kv_cache::slot_info_vec_t;
 
     llama_kv_cache_dsv4_raw_context(llama_kv_cache_dsv4 * cache);
@@ -262,6 +264,9 @@ private:
 
     const llama_kv_cache_dsv4 * cache;
 
+    bool window = false;
+    llama_kv_cache::metadata start_base, start_enc, start_dec;
+
     llama_kv_cache * kv_swa_enc = nullptr;
     llama_kv_cache * kv_swa_dec = nullptr;
 
@@ -293,6 +298,7 @@ private:
 // Keep a small context that exposes K tensors without generic apply() semantics.
 class llama_kv_cache_dsv4_comp_context {
 public:
+    void rewind() { i_cur = 0; }
     using slot_info_vec_t = llama_kv_cache::slot_info_vec_t;
 
     llama_kv_cache_dsv4_comp_context(llama_kv_cache * kv);
@@ -326,6 +332,9 @@ private:
 
 class llama_kv_cache_dsv4_context : public llama_memory_context_i {
 public:
+    const std::vector<llama_ubatch> & get_ubatches() const { return ubatches; }
+    void begin_window();
+    void rewind_window();
     using slot_info_vec_t = llama_kv_cache::slot_info_vec_t;
     using stream_copy_info = llama_kv_cache::stream_copy_info;
 

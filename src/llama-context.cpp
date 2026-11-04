@@ -1,4 +1,5 @@
 #include "llama-context.h"
+#include "llama-dsv41-prefill.h"
 #include "llama-engram.h"
 
 #include "ggml-cpuset.h"
@@ -2824,12 +2825,34 @@ int llama_context::decode(const llama_batch & batch_inp) {
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
 
+    auto prefill_window = llama_dsv41_prefill_window::create(*this, mctx.get());
+    if (prefill_window) {
+        ggml_status status;
+        try {
+            status = prefill_window->encode();
+        } catch (const std::bad_alloc &) {
+            LLAMA_LOG_ERROR("%s: failed to allocate the encoder window checkpoints\n", __func__);
+            status = GGML_STATUS_ALLOC_FAILED;
+        }
+        if (status != GGML_STATUS_SUCCESS) {
+            // Some encoder layers have overwritten their windows. No partial prefix can be reused after failure.
+            synchronize();
+            memory->seq_rm(mctx->get_ubatch().seq_id_unq[0], -1, -1);
+            return status == GGML_STATUS_ABORTED ? 2 : status == GGML_STATUS_ALLOC_FAILED ? -2 : -3;
+        }
+    }
+    size_t prefill_chunk = 0;
     do {
+        if (prefill_window) {
+            prefill_window->decoder(prefill_chunk++);
+        }
         const auto & ubatch = mctx->get_ubatch();
 
         // pre-record the largest prefill reservation ahead of a growing
         // multi-ubatch prefill, so later ubatches fit without reallocating
-        reserve_max_prefill(ubatch, mctx.get(), n_tokens_all, n_tokens_prev);
+        if (!prefill_window) {
+            reserve_max_prefill(ubatch, mctx.get(), n_tokens_all, n_tokens_prev);
+        }
 
         // count the outputs in this ubatch
         {
@@ -2852,6 +2875,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
 
         if (!res) {
+            if (prefill_window) {
+                synchronize();
+            }
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
             llama_pos pos_min[LLAMA_MAX_SEQ];
             for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
@@ -2869,9 +2895,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     continue;
                 }
 
-                LLAMA_LOG_WARN("%s: removing memory module entries for seq_id = %d, pos = [%d, +inf)\n", __func__, s, pos_min[s]);
+                const llama_pos remove_from = prefill_window ? -1 : pos_min[s];
+                LLAMA_LOG_WARN("%s: removing memory module entries for seq_id = %d, pos = [%d, +inf)\n", __func__, s, remove_from);
 
-                memory->seq_rm(s, pos_min[s], -1);
+                memory->seq_rm(s, remove_from, -1);
             }
 
             switch (status) {
@@ -4144,6 +4171,10 @@ llm_graph_params llama_context::graph_params(
     };
     params.share_gen = share_gen;
     params.samplers_gen = samplers_gen;
+    params.dsv41_prefill = dsv41_prefill_graph;
+    if (dsv41_prefill_graph && dsv41_prefill_graph->last <= (int) cparams.n_layer_prefill) {
+        std::fill(params.cparams.embeddings_layer_inp.begin(), params.cparams.embeddings_layer_inp.end(), false);
+    }
     return params;
 }
 

@@ -113,5 +113,12 @@ int main(int argc, char ** argv) {
         }
         ggml_backend_sched_stage_keep(staged.get(), false);
     }
-    std::puts("stage keep: 8 changed-input graphs, two weight generations, six uploads, GPU parity passed");
+    fill_weights(2);
+    for (int rep = 0; rep < 2; ++rep) {
+        const auto expected = run(oracle.get(), gpu_weights, rep + 8);
+        const auto actual = run(staged.get(), host_weights, rep + 8);
+        assert(expected == actual);
+        assert(jobs() == uint64_t(9 + 3 * rep));
+    }
+    std::puts("stage keep: retained groups and ordinary staging passed GPU parity and upload-count checks");
 }

@@ -1330,6 +1330,16 @@ const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
     return v_cells[seq_to_stream[seq_id]];
 }
 
+llama_kv_cache::metadata llama_kv_cache::save_metadata() const {
+    return { v_cells, v_heads };
+}
+
+void llama_kv_cache::restore_metadata(const metadata & state) {
+    GGML_ASSERT(state.cells.size() == v_cells.size() && state.heads.size() == v_heads.size());
+    v_cells = state.cells;
+    v_heads = state.heads;
+}
+
 static std::atomic<uint32_t> kv_n_pad_reserved{0};
 // largest batch (tokens) that uses the reserved step
 static constexpr size_t kv_n_pad_reserve_max_tokens = 64;

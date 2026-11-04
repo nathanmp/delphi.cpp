@@ -2163,6 +2163,26 @@ bool llama_kv_cache_dsv4_raw_context::next() {
     return true;
 }
 
+void llama_kv_cache_dsv4_raw_context::begin_window() {
+    start_base = cache->get_raw()->get_base()->save_metadata();
+    start_enc = kv_swa_enc->save_metadata();
+    if (kv_swa_dec) {
+        start_dec = kv_swa_dec->save_metadata();
+    }
+    window = true;
+}
+
+void llama_kv_cache_dsv4_raw_context::rewind_window() {
+    GGML_ASSERT(window && ctx_base_mem && !ubatches.empty());
+    cache->get_raw()->get_base()->restore_metadata(start_base);
+    kv_swa_enc->restore_metadata(start_enc);
+    if (kv_swa_dec) {
+        kv_swa_dec->restore_metadata(start_dec);
+    }
+    static_cast<llama_kv_cache_context *>(ctx_base_mem.get())->rewind();
+    i_next = 0;
+}
+
 bool llama_kv_cache_dsv4_raw_context::apply() {
     bool res = true;
 
@@ -2539,6 +2559,18 @@ llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
 }
 
 llama_kv_cache_dsv4_context::~llama_kv_cache_dsv4_context() = default;
+
+void llama_kv_cache_dsv4_context::begin_window() {
+    ctx_raw->begin_window();
+}
+
+void llama_kv_cache_dsv4_context::rewind_window() {
+    ctx_raw->rewind_window();
+    ctx_csa->rewind();
+    ctx_hca->rewind();
+    ctx_lid->rewind();
+    i_next = 0;
+}
 
 bool llama_kv_cache_dsv4_context::next() {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);

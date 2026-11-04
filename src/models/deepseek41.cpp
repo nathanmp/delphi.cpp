@@ -4,6 +4,7 @@
 #include "llama-kv-cache-dsv4.h"
 #include "llama-engram.h"
 #include "llama-expert-cache.h"
+#include "llama-dsv41-prefill.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -1679,31 +1680,44 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
 
     ggml_tensor * cur;
 
-    ggml_tensor * inp = build_inp_embd(model.tok_embd);
+    auto * window = params.dsv41_prefill;
+    const int first = window ? window->first : 0;
+    const int last = window ? window->last : n_layer;
+    ggml_tensor * inp = first == 0 ? build_inp_embd(model.tok_embd) : nullptr;
     ggml_tensor * inp_pos = build_inp_pos();
     llm_graph_input_dsv4 * inp_dsv4 = build_inp_dsv4();
     llm_graph_input_dsv4_raw * inp_attn = inp_dsv4->get_raw();
     const auto ubatch_dec = inp_attn->mctx->decoder_ubatch(ubatch);
     const uint32_t n_skip = ubatch.n_tokens - ubatch_dec.n_tokens;
-    ggml_tensor * inp_out_ids = build_inp_out_ids(n_skip);
+    ggml_tensor * inp_out_ids = last == n_layer ? build_inp_out_ids(n_skip) : nullptr;
     ggml_build_forward_expand(gf, inp_attn->self_kq_mask);
 
     const int64_t hc = hparams.dsv4_hc_mult;
-    ggml_tensor * inpL = ggml_reshape_3d(ctx0, inp, n_embd, 1, n_tokens);
-    inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hc, n_tokens, 1);
-    cb(inpL, "hc_init", -1);
+    ggml_tensor * inpL;
+    ggml_tensor * pre_mix;
+    if (first == 0) {
+        inpL = ggml_reshape_3d(ctx0, inp, n_embd, 1, n_tokens);
+        inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hc, n_tokens, 1);
+        cb(inpL, "hc_init", -1);
 
-    // Layer 0 has no previous sublayer to take a mix from, so the reference hands it a one-hot
-    // that selects the first copy.
-    ggml_tensor * pre_mix = ggml_concat(ctx0,
-            ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1,      n_tokens), 1.0f),
-            ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hc - 1, n_tokens), 0.0f), 0);
-    cb(pre_mix, "hc_pre_init", -1);
+        // Layer 0 has no previous sublayer to take a mix from, so the reference hands it a one-hot
+        // that selects the first copy.
+        pre_mix = ggml_concat(ctx0,
+                ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1,      n_tokens), 1.0f),
+                ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hc - 1, n_tokens), 0.0f), 0);
+        cb(pre_mix, "hc_pre_init", -1);
+    } else {
+        inpL = window->chunk->hc.input(ctx0, res, "prefill_hc");
+        pre_mix = window->chunk->mix.input(ctx0, res, "prefill_mix");
+        GGML_ASSERT(inpL && pre_mix && inpL->ne[2] == n_tokens);
+    }
 
-    ggml_tensor * shared_top_k = nullptr;
-    ggml_tensor * shared_cand  = nullptr;
+    ggml_tensor * top_k_in = first > 0 ? window->chunk->top_k.input(ctx0, res, "prefill_top_k") : nullptr;
+    ggml_tensor * cand_in = first > 0 ? window->chunk->cand.input(ctx0, res, "prefill_cand") : nullptr;
+    ggml_tensor * shared_top_k = top_k_in;
+    ggml_tensor * shared_cand = cand_in;
 
-    for (int il = 0; il < n_layer; ++il) {
+    for (int il = first; il < last; ++il) {
         ggml_tensor * full_cur = nullptr;
         if (il == (int) cparams.n_layer_prefill && n_skip > 0) {
             // Adapt DeepInfer's consumer boundary: retain full normalized inputs for
@@ -1867,6 +1881,23 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
         inpL = build_hc_post(cur, residual, post, comb, il);
         inpL = build_cvec(inpL, il);
         cb(inpL, "l_last", il);
+    }
+
+    if (last < n_layer) {
+        const auto keep = [&](ggml_tensor * tensor) {
+            if (!tensor) {
+                return tensor;
+            }
+            auto * output = ggml_is_contiguous(tensor) ? tensor : ggml_cont(ctx0, tensor);
+            ggml_set_output(output);
+            ggml_build_forward_expand(gf, output);
+            return output;
+        };
+        window->hc = keep(inpL);
+        window->mix = keep(pre_mix);
+        window->top_k = shared_top_k != top_k_in ? keep(shared_top_k) : nullptr;
+        window->cand = shared_cand != cand_in ? keep(shared_cand) : nullptr;
+        return;
     }
 
     if ((size_t) n_layer < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[n_layer]) {

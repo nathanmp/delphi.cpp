@@ -20,6 +20,8 @@
 #include <vector>
 
 struct llama_model;
+struct llama_dsv41_prefill_graph;
+class llama_dsv41_prefill_window;
 class llama_batch_allocr;
 
 class llama_io_read_i;
@@ -45,6 +47,7 @@ struct llama_memory_buffer {
 using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_buffer>;
 
 struct llama_context {
+    friend class llama_dsv41_prefill_window;
     // init scheduler and compute buffers, reserve worst-case graphs
     llama_context(
             const llama_model & model,
@@ -256,6 +259,7 @@ struct llama_context {
             int64_t                          t_loop_start);
 
 private:
+    llama_dsv41_prefill_graph * dsv41_prefill_graph = nullptr;
     //
     // output
     //

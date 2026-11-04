@@ -843,9 +843,14 @@ struct llm_graph_params {
     // delphi: generation of the context's sampler objects; a graph built with other sampler objects is rebuilt
     uint64_t samplers_gen = 0;
 
+    struct llama_dsv41_prefill_graph * dsv41_prefill = nullptr;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
+        if (dsv41_prefill || other.dsv41_prefill) {
+            return false;
+        }
         // first check the ubatch
         bool can_reuse_ubatch =
             ubatch.equal_seqs() == other.ubatch.equal_seqs() &&

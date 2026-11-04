@@ -3540,7 +3540,7 @@ static void ggml_backend_sched_stage_begin(ggml_backend_sched_t sched) {
             ring.busy[s] = false;
             ring.readers[s] = 0;
         }
-        if (need[b] == 0 || (need[b] <= ring.slot_size && ring.n_slots >= wanted_slots)) {
+        if (need[b] == 0 || (need[b] <= ring.slot_size && (!stage->keep || ring.n_slots >= wanted_slots))) {
             continue;
         }
         ggml_backend_sched_stage_release_ring(ring);

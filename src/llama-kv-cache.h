@@ -174,6 +174,14 @@ public:
 
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
 
+    // Host bookkeeping only. A layer-window executor restores this before another layer visits the same chunks.
+    struct metadata {
+        llama_kv_cells_vec cells;
+        std::vector<uint32_t> heads;
+    };
+    metadata save_metadata() const;
+    void restore_metadata(const metadata & state);
+
     // state_read, plus the cells the restored tokens were placed in
     // a cache that mirrors another one (the qwen4exp indexer) must not search for its own cells: two searches agree only by luck
     //   sinfos_out: if set, filled with the layout used; a stream with no cells leaves an empty entry
@@ -386,6 +394,7 @@ private:
 
 class llama_kv_cache_context : public llama_memory_context_i {
 public:
+    void rewind() { i_cur = 0; }
     // some shorthands
     using slot_info_vec_t  = llama_kv_cache::slot_info_vec_t;
     using stream_copy_info = llama_kv_cache::stream_copy_info;

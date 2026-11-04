@@ -333,6 +333,7 @@ endif()
 # TODO: make this test (and others) not link `libllama` as it is not needed [TAG_TESTS_LLAMA_LINK]
 llama_build(test-backend-ops.cpp)
 llama_build(test-stage-keep.cpp)
+llama_build(test-dsv41-layer-bank.cpp)
 
 # Explicit CPU/HIP plugin paths and one selected GPU are required; run this fixture manually.
 llama_build(test-cuda-copy-lifecycle.cpp)
