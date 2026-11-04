@@ -50,14 +50,6 @@ Shared overlap requires the expert-cache path and shared weights on the layer GP
 
 Teacher-forced checks at widths 1/2/3/4/5/8/16 and the width-17 fallback matched all 85 checked logit vectors bit for bit. Normal DSpark checks had equal acceptance counts. Both optimizations together improved repeated fixed-synthetic DSpark decode by about 4% on a tested hybrid CPU/GPU configuration; Engram benefit depends on page/cache state. Synthetic acceptance is performance-only evidence.
 
-## Backend sampling (`-bs`)
-
-| variable | default | set to | effect of the non-default value |
-| --- | --- | --- | --- |
-| `LLAMA_SAMPLER_RESERVE_ALWAYS` | off | `1` | Reserve the compute buffers again at each sampler change (upstream behavior) |
-
-The server keeps the sampler object of a slot between requests when the sampling parameters are equal and the chain has no grammar or reasoning-budget sampler (it is reset, not made again); otherwise it sets a new sampler object. A reservation recreates the scheduler and all its compute buffers, and with staging the staging slots: 0.6 s per request on GLM-5.3 and Qwen 3.8, 1.7 s on DeepSeek V4.1 (measured from the execution trace of the first prompt batch). By default, the context reserves again only when the sampler chains of the sequences (the sampler names in each chain) are not the same as at the last reservation. A new sampler object always causes a new graph, not the reuse of a graph that was built with the old object. A sampler parameter that changes a tensor size (for example a larger top-k) can make the compute buffer grow on the next batch.
-
 ## Multi-device scheduler
 
 These switches control how `ggml_backend_sched` copies and synchronizes split inputs between backends. They matter for models split by layers over several devices (`-sm layer`, pipeline parallelism). They change only copies and waits, never the computation, so outputs are identical with any setting.
@@ -94,14 +86,6 @@ Validation used a layer split over three NVIDIA GPUs on narrow PCIe links withou
 The RDNA4 direct path supports one sequence stream, F16 K/V, 256-wide heads, GQA ratio 12 and up to eight query rows. It requires a cache of at least 4096 rows and at least four times the selected width. Unsupported devices, cache formats and shapes keep masked attention; disabling FlashAttention also retains the selected-row mask.
 
 Passing indices avoids building and compacting a full-width selection mask. A repeated 32K-context decode suffix improved by about 5% on the tested Qwen deployment, with identical greedy tokens. The real-MTP input was repetitive and had full acceptance, so that result does not establish the gain on arbitrary requests. Small contexts and prefill widths keep the existing path. Summation order can change floating-point results.
-
-## ROCm libraries
-
-| variable | default | effect |
-| --- | --- | --- |
-| `ROCBLAS_USE_HIPBLASLT` | rocBLAS default (hipBLASLt on the R9700 here) | read by rocBLAS, not by delphi.cpp. `0` makes rocBLAS use its own Tensile kernels instead of hipBLASLt |
-
-hipBLASLt can pick a different kernel for the same GEMM in different processes, so results are not bitwise repeatable across runs. For MiMo V2.6 Flash, the F32 router SGEMM came out in two variants (largest difference 1.9e-5); top-k routing amplified this, and perplexity alternated between two values (5.3658 and 5.4084 on the first 8192-token chunk). With `ROCBLAS_USE_HIPBLASLT=0` every run gave the same result, so set it for A/B comparisons that expect bitwise equal outputs. It costs speed on F16 weights: Ling 3.0 tiny F16 pp4096 on an R9700 ran at 2780 instead of 5880 t/s. Qwen3.6-35B-A3B Q4_K_M, Gemma 4 31B Q6_K and MiMo two-GPU prefill ran at the same speed, and MiMo's first 16K request was faster (1280 instead of 1090 t/s), as hipBLASLt's first calls are slow.
 
 ## GPU graphs (CUDA and HIP)
 
@@ -141,7 +125,7 @@ With routed experts in host memory (`-cmoe`, `-ncmoe`, `--numa tensors`), a wide
 | `GGML_SCHED_STAGE_PIN` | `1` | run each device's staging threads on the CPUs next to that device (Linux) |
 | `GGML_SCHED_STAGE_REGISTER` | `0` | `1` page-locks the staged host weight buffers when the ring first stages from them, so uploads go straight from the weights to the device without the bounce buffers |
 | `GGML_SCHED_STAGE_STATS` | `0` | `1` prints where each staging thread spent its time when the scheduler is freed |
-| `GGML_SCHED_STAGE_SPREAD` (`--[no-]moe-stage-spread`) | `1` (`0` before 2026-11-01) | with several staging devices: layer N's staged expert multiplies run on staging device N mod n, so each device's link uploads only its own layers' experts. MiMo V2.6 Flash 16K prefill on two R9700s (attention on ROCm1): 1150-1300 tokens/s, against 1060-1120 on one |
+| `GGML_SCHED_STAGE_SPREAD` (`--[no-]moe-stage-spread`) | `1` (`0` before 2026-11-01) | with several staging devices: layer N's staged expert multiplies run on staging device N mod n, so each device's link uploads only its own layers' experts|
 | `GGML_SCHED_STAGE_MIN_TOKENS` (`--moe-stage-min-tokens`) | measured at warmup (`512` with `--no-warmup`) | routed-expert multiplies on host weights run on the CPU for batches of fewer tokens and on a staging GPU, which streams all experts, for wider ones (every expert crosses the link whatever the batch size). Without the variable, the server and cli measure it at warmup, after the expert cache is allocated: prompts of random tokens of n/2 and n tokens with the experts on the CPU and streamed (n = `-ub`, at most 2048), and the threshold is where the CPU expert time reaches the streamed cost (flat at the link time for short batches, rising with the GPU compute for long ones); when a 64 MiB copy to the GPUs shows that streaming takes 3 times the CPU time of a full ubatch, the experts stay on the CPU without the streamed prompts. This adds a few seconds to the startup at `-ub 1024` with 56 threads, about 25 s at `-ub 4096` with 16 (Qwen 3.8, R9700). `-lv 4` prints `staging threshold N tokens`; `-ub` + 1 means never. Setting the variable (also `0`) skips the measurement. MiMo V2.6 Flash, R9700s: 300 tokens 81-94 t/s with CPU experts; 2000 tokens 284-296 t/s streamed to one GPU, 427-462 with `GGML_SCHED_STAGE_SPREAD=1` on two. `0` leaves the choice to the offload cost model |
 
 At the start of each graph, the scheduler lists the host weights that its splits will copy whole, in split order. Each staging device has its own background thread, which copies that device's weights in chunks into pinned host buffers, and the device copies each chunk into a slot on a separate stream, so the uploads of later layers overlap the computation of earlier ones. When the scheduler reaches the split, the device copies the slot into the split input. Expert tensors are staged only when the batch is wide enough that nearly every expert is used; for narrower batches the scheduler keeps copying only the used experts, and decode is unaffected. Supported on CUDA and ROCm devices.
@@ -229,10 +213,6 @@ Packed and grouped kernels add the same products in a different order from the o
 
 The first two change only where data is kept and which thread computes a piece, so outputs are bitwise identical with any setting (checked on a MiMo V2.6 Flash layer at 1 to 512 tokens, with equal and 1:3 shares). Stealing applies to experts on the per-row and G128 paths (for example Q4_G128 and MXFP4), not to the IQK paths, which split statically. A stolen piece reads its weight rows from the other node's memory. `LLAMA_NUMA_HOST_INTERLEAVE` changes only where the buffer's pages are.
 
-Measured on MiMo V2.6 Flash (2x EPYC 7532, production deployment, -t 48, MTP decode and 128/300-token CPU prompts):
-node-local state gave prompts -5% at NPS1 and decode +2.7% at NPS4; stealing was neutral (no node was slowed by other
-load); the interleaved compute buffer gave decode +8.6% and prompts -13% / -25% at NPS4.
-
 ## GPU expert cache (routed experts in host memory)
 
 When the routed experts stay in host memory (`-cmoe`, `-ncmoe` with all layers, `-ot exps=CPU`) and the other layers are on
@@ -250,7 +230,7 @@ takes them back at the next refresh. So the cache and the staging slots do not n
 
 | variable | default | effect |
 | --- | --- | --- |
-| `LLAMA_MOE_CACHE_MIB` (`--moe-cache`) | `auto` | `auto` (or unset): when the model allows it, one tier per GPU of `--device`, of the GPU's free memory less `LLAMA_MOE_CACHE_AUTO_MARGIN_MIB`. The tiers are allocated when the server has loaded every model (draft and MTP included); other programs allocate them after the warmup. A number: one tier of that many MiB on the GPU of the layers. `0`: no cache. |
+| `LLAMA_MOE_CACHE_MIB` (`--moe-cache`) | `auto` | `auto` (or unset): when the model allows it, one tier per GPU of `--device`, of the GPU's free memory minus `LLAMA_MOE_CACHE_AUTO_MARGIN_MIB`. The tiers are allocated when the server has loaded every model (draft and MTP included); other programs allocate them after the warmup. A number: one tier of that many MiB on the GPU of the layers. `0`: no cache. |
 | `LLAMA_MOE_CACHE_AUTO_MARGIN_MIB` (`--moe-cache-margin`) | `1024` | memory left free on each GPU in auto mode, for buffers that grow later. The decode-time refresh scratch (3 slabs per `LLAMA_MOE_CACHE_ASYNC_EXPERTS` expert) is kept out of the tier in addition. |
 | `LLAMA_MOE_CACHE_TIERS` | none | more tiers, `<device>:<MiB>[,...]`, for example `ROCm0:16384` |
 | `LLAMA_MOE_CACHE_PROFILE` | none | expert frequencies (`tools/moe-static-cache/profile.py`), used until the window has rows |

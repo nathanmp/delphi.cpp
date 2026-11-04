@@ -1,3 +1,38 @@
+# delphi.cpp: a hardware-aware fork of llama.cpp
+
+## Key Features
+
+* Tensor splitting across NUMA nodes with `--numa tensors`.
+* GPU hot-expert cache. (Spare VRAM on any `--device` used is automatically allocated for the cache.)
+* Streaming routed experts into GPUs for long-context prefill. (Tuned automatically on warmup.)
+* Bottleneck profiler.
+* Support for DeepSeek V4.1 Flash's Causal Encoder-Decoder architecture.
+* Support for ik_llama.cpp's IQn_K/IQn_KS tensors.
+* Highly experimental daemon that lets a GPU serve as an expert cache for 2 models (with RAM used as the backup when multiple models are actively being used).
+* Automatic model quantizer.
+* Automatic parameter tuner.
+* Lazily-loaded vision encoder. (Turn it off with `--mmproj-)
+* A ton of optimizations.
+
+Refer to [docs/delphi/usage/environment-variables.md](docs/delphi/usage/environment-variables.md) for information about usage.
+
+## Credits
+
+* [vcruz305](https://github.com/vcruz305/llama.cpp) for basic support for DeepSeek V4.1 Flash.
+* [DeepInfer](https://github.com/deepseek-ai/DeepInfer) for the Causal Encoder-Decoder architecture.
+* [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp/) for IQn_K/KS tensors.
+* [buun-llama-cpp](https://github.com/spiritbuun/buun-llama-cpp) for AVX2 improvements and design improvements for the expert cache.
+* [Strata](https://github.com/Niko1221/Strata) for design improvements for the expert cache.
+* [llama-cpp-rdna-boosts](https://github.com/stew675/llama-cpp-rdna-boosts) for the ring buffer used to speed up long-context prefill, adaptive speculative decoding, and some other RDNA4 improvements.
+* [ubergarm](https://gist.github.com/ubergarm/edfeb3ff9c6ec8b49e88cdf627b0711a/) for default calibration data for the automatic quantizer.
+* [llama.cpp](https://github.com/ggml-org/llama.cpp) for the baseline project.
+
+## License
+
+MIT license. Go nuts with this.
+
+(The original README.md follows.)
+
 # llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
