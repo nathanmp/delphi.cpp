@@ -4962,11 +4962,12 @@ int32_t llama_relative_position_bucket(llama_pos x, llama_pos y, uint64_t n_buck
     return relative_bucket;
 }
 
-int64_t llm_graph_chunk_rows(int64_t rows, int64_t width, size_t elt) {
-    static const size_t limit = [] {
+int64_t llm_graph_chunk_rows(int64_t rows, int64_t width, size_t elt, int64_t default_mib) {
+    static const int64_t env_mib = [] {
         const char * env = std::getenv("LLAMA_CHUNK_MIB");
-        return (size_t) (env ? std::atoll(env) : 256) << 20;
+        return env ? (int64_t) std::atoll(env) : (int64_t) -1;
     }();
+    const size_t limit = (size_t) std::max<int64_t>(0, env_mib >= 0 ? env_mib : default_mib) << 20;
     if (limit == 0 || width <= 0 || rows <= 0 || (size_t) rows*width*elt <= limit) {
         return rows;
     }

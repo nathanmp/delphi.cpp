@@ -567,7 +567,9 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
             (int64_t) inp_kp->pool_cache->get_max_slots() : (int64_t) cparams.n_ctx/r + 2);
     // n_parts pieces of n_items, each at most the rows of llm_graph_chunk_rows() at the depth n_pools_max
     auto chunk_size = [](int64_t n_items, int64_t n_items_max, int64_t width_max) {
-        const int64_t c = llm_graph_chunk_rows(n_items_max, width_max, sizeof(float));
+        // 512 MiB: at -c 300000 -ub 1024 one chunk holds everything, so the graph is the one without chunks (two
+        // chunks there cost 2-3 % prefill at 100K-250K for 0.3-0.5 GiB per device)
+        const int64_t c = llm_graph_chunk_rows(n_items_max, width_max, sizeof(float), 512);
         const int64_t n_parts = std::min<int64_t>(n_items, (n_items_max + c - 1)/c);
         return (n_items + n_parts - 1)/n_parts;
     };
