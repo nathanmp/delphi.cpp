@@ -1529,3 +1529,9 @@ struct llm_graph_context {
 
 // TODO: better name
 int32_t llama_relative_position_bucket(llama_pos x, llama_pos y, uint64_t n_buckets, bool bidirectional);
+
+// The rows of one chunk of a tensor with `width` values of `elt` bytes per row, such as a sparse-attention score or mask
+// that grows with the depth of the stream: `rows` if that chunk is at most LLAMA_CHUNK_MIB (default 256, 0 = no limit),
+// else the largest power of two (at least 64, at most `rows`) within the limit. A fixed row count makes the compute
+// buffer grow with the context (DeepSeek V4.1, -c 1048576, 512 indexer rows: 2 GiB per score).
+int64_t llm_graph_chunk_rows(int64_t rows, int64_t width, size_t elt);

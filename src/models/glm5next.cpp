@@ -559,13 +559,34 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
     const int64_t n_selected = r*select_k;
     GGML_ASSERT(select_k > 0 && select_k <= n_pools);
 
+    // The number of chunks follows the deepest stream that the cache holds, not the current depth: then every graph
+    // has the same chunks as the worst-case graph that is reserved, and only their width shrinks with the depth.
+    // (With chunks from the current depth, the reserved graph at full depth had a different shape from the prompt
+    // graphs, and prefill at 100K of -c 300000 ran at half speed.)
+    const int64_t n_pools_max = std::max<int64_t>(n_pools, inp_kp->pool_cache != nullptr ?
+            (int64_t) inp_kp->pool_cache->get_max_slots() : (int64_t) cparams.n_ctx/r + 2);
+    // n_parts pieces of n_items, each at most the rows of llm_graph_chunk_rows() at the depth n_pools_max
+    auto chunk_size = [](int64_t n_items, int64_t n_items_max, int64_t width_max) {
+        const int64_t c = llm_graph_chunk_rows(n_items_max, width_max, sizeof(float));
+        const int64_t n_parts = std::min<int64_t>(n_items, (n_items_max + c - 1)/c);
+        return (n_items + n_parts - 1)/n_parts;
+    };
+
+    // The selection runs for n_chunk query rows at a time. Its score is F32 [n_pools, rows] and the device pool mask
+    // F16 [n_pools, rows]: both grow with the context times the rows (-c 1048576, -ub 4096: 4 GiB + 2 GiB per device).
+    // With more than one chunk, each chunk makes its own interval mask, so that the full mask is not kept for all the
+    // layers of the device. The single-row paths (temporal top-k, MTP selection sharing) never chunk.
+    const int64_t n_chunk = n_tps == 1 ? 1 : chunk_size(n_tps, n_tps, n_pools_max);
+    const bool chunked = n_chunk < n_tps;
+
+    ggml_backend_dev_t dev = layer.wo->buffer ?
+            ggml_backend_buft_get_device(ggml_backend_buffer_get_type(layer.wo->buffer)) : nullptr;
+
     // pool_valid & pool_visible: the host input, or one interval mask per device, so that no O(n_pools*n_tps)
     // input is uploaded (and copied once per pipeline copy). The device mask is F16 for the fused indexer.
     ggml_tensor * pool_bias     = inp_kp->pool_bias;     // F32 [n_pools, n_tps, n_stream]
     ggml_tensor * pool_bias_f16 = inp_kp->pool_bias_f16; // F16 [n_pools, n_tps, 1, n_stream]
-    if (inp_kp->pool_iv_cells != nullptr) {
-        ggml_backend_dev_t dev = layer.wo->buffer ?
-                ggml_backend_buft_get_device(ggml_backend_buffer_get_type(layer.wo->buffer)) : nullptr;
+    if (inp_kp->pool_iv_cells != nullptr && !chunked) {
         auto it = inp_kp->dev_pool_bias.find(dev);
         if (it == inp_kp->dev_pool_bias.end()) {
             ggml_tensor * bias = ggml_interval_mask(ctx0, inp_kp->pool_iv_cells, inp_kp->pool_iv_queries,
@@ -582,8 +603,6 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
             pool_bias_f16 = nullptr;
         }
     }
-    // either type serves the validity tests below (0 or -INFINITY)
-    ggml_tensor * pool_bias_any = pool_bias ? pool_bias : ggml_reshape_3d(ctx0, pool_bias_f16, n_pools, n_tps, n_stream);
 
     ggml_tensor * kg_rows = ggml_view_3d(ctx0, kbuf, 2*d_idx, n_kv, n_stream,
             kbuf->nb[2], kbuf->nb[3], 0);
@@ -610,18 +629,39 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
         return ggml_reshape_3d(ctx0, result, d_idx, n_group, n_stream);
     };
 
+    // Compress all the pools of `cells` [r*n_pools, n_stream]. The members are F32 [2*d_idx, r*n_pools] plus two
+    // transposed halves (-c 1048576: 1 GiB + 2 x 512 MiB in one piece), so do it for a chunk of pools at a time.
+    auto compress_all = [&](ggml_tensor * cells) {
+        const int64_t n_pc = chunk_size(n_pools, n_pools_max, r*2*d_idx);
+            if (n_pc >= n_pools) {
+            ggml_tensor * members = ggml_get_rows(ctx0, kg_rows, cells);
+            cb(members, "indexer_pool_members", il);
+            return compress_members(members, n_pools);
+        }
+        ggml_tensor * out = nullptr;
+        for (int64_t p0 = 0; p0 < n_pools; p0 += n_pc) {
+            const int64_t np = std::min<int64_t>(n_pc, n_pools - p0);
+            ggml_tensor * cells_c = ggml_view_2d(ctx0, cells, r*np, n_stream, cells->nb[1], p0*r*cells->nb[0]);
+            if (n_stream > 1) {
+                cells_c = ggml_cont(ctx0, cells_c);
+            }
+            ggml_tensor * members = ggml_get_rows(ctx0, kg_rows, cells_c);
+            cb(members, "indexer_pool_members", il);
+            ggml_tensor * part = compress_members(members, np);
+            out = out == nullptr ? part : ggml_concat(ctx0, out, part, 1);
+            // finish this chunk before the next one starts, so that their members do not live at the same time
+            ggml_build_forward_expand(gf, out);
+        }
+        return out;
+    };
+
     ggml_tensor * pool_k;
 
     if (inp_kp->pool_cache == nullptr) {
-        ggml_tensor * members = ggml_get_rows(ctx0, kg_rows, inp_kp->pool_cells);
-        cb(members, "indexer_pool_members", il);
-        pool_k = compress_members(members, n_pools);
+        pool_k = compress_all(inp_kp->pool_cells);
     } else if (inp_kp->rebuild_pool_cache) {
         // Prefill and invalidation rebuild every resident completed pool once.
-        ggml_tensor * members = ggml_get_rows(ctx0, kg_rows, inp_kp->pool_cells);
-        cb(members, "indexer_pool_members", il);
-
-        ggml_tensor * rebuilt = compress_members(members, n_pools);
+        ggml_tensor * rebuilt = compress_all(inp_kp->pool_cells);
         ggml_tensor * store_values = ggml_get_rows(ctx0, rebuilt, inp_kp->pool_store_src);
         ggml_tensor * cache_write = inp_kp->pool_cache->store(ctx0, store_values, inp_kp->pool_store_dst,
                 il, mctx_idx->get_stream_base(), n_stream);
@@ -665,88 +705,146 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
     w = ggml_scale(ctx0, w, 1.0f/sqrtf(float(d_idx*n_ihead)));
     cb(w, "indexer_weights", il);
 
-    ggml_tensor * pool_score = nullptr;
-
-    if (cparams.fused_lid) {
-        // pool_k stays f32 so the kernel takes its f32 path; f16 wmma would undo the prec
-        ggml_tensor * pool_kf = ggml_reshape_4d(ctx0, pool_k, d_idx, 1, n_pools, n_stream);
-
-        pool_score = ggml_lightning_indexer(ctx0, iq, pool_kf, w, pool_bias_f16);
-        cb(pool_score, "indexer_pool_score", il);
-
-        res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, pool_score, il});
-
-        pool_score = ggml_reshape_3d(ctx0, pool_score, n_pools, n_tps, n_stream);
-    } else {
-        ggml_tensor * kq = ggml_mul_mat(ctx0, pool_k, ggml_permute(ctx0, iq, 0, 2, 1, 3));
-
-        // the ReLU sits BETWEEN the per-head dot and the head weighting; either side differs
-        kq = ggml_cont(ctx0, ggml_permute(ctx0, kq, 2, 1, 0, 3));
-        ggml_tensor * score = ggml_relu(ctx0, kq);
-        cb(score, "indexer_score", il);
-
-        pool_score = ggml_sum_rows(ctx0, ggml_mul(ctx0, score, w));
-        pool_score = ggml_cont(ctx0, ggml_permute(ctx0, pool_score, 2, 1, 0, 3));
-        pool_score = ggml_reshape_3d(ctx0, pool_score, n_pools, n_tps, n_stream);
-
-        pool_score = ggml_add(ctx0, pool_score, pool_bias);
-        cb(pool_score, "indexer_pool_score", il);
-    }
-
-    // top-k over POOLS then expand, as in the reference: a cell-level top-k is wrong
-    // because relu ties span pool boundaries and ggml_top_k splits the pool it lands in
-    // {select_k, n_tps, n_stream} of POOL ordinals
-    ggml_tensor * sel;
-    // The temporal selector wins only once the cache reaches 24576 pools.
-    if (glm5next_temporal_topk_enabled() && inp_kp->pool_cache != nullptr && n_pools >= 24576 && n_tps == 1 &&
-            select_k == (int64_t) hparams.indexer_top_k/r) {
-        ggml_tensor * hint = inp_kp->pool_cache->get_topk_hint(
-                ctx0, il, select_k, mctx_idx->get_stream_base(), n_stream);
-        sel = ggml_cont(ctx0, ggml_top_k_hint(ctx0, pool_score, hint, (int) select_k));
-        ggml_build_forward_expand(gf, inp_kp->pool_cache->store_topk_hint(
-                ctx0, sel, il, mctx_idx->get_stream_base(), n_stream));
-    } else {
-        sel = ggml_cont(ctx0, ggml_top_k(ctx0, pool_score, (int) select_k));
-    }
-    cb(sel, "indexer_top_k_pools", il);
-
     const int64_t n_compact = GGML_PAD(n_selected + r - 1, 256);
     const bool direct_indexed = n_tps == 1 ? n_kv >= std::max<int64_t>(4096, 2*n_compact) :
             llama_kpool_indexed_attn_enabled(n_kv, n_tps);
-    if (glm5next_kpool_expand_enabled() && cparams.fused_lid &&
-            il < (int) hparams.n_layer() && direct_indexed) {
-        ggml_tensor * top_k = ggml_kpool_expand(ctx0, sel, inp_kp->pool_cells,
-                pool_bias_any, inp_kp->compact_tail_cells, inp_kp->compact_tail_mask, (int32_t) r);
-        cb(top_k, "indexer_top_k_compact", il);
+    const bool expand = glm5next_kpool_expand_enabled() && cparams.fused_lid &&
+            il < (int) hparams.n_layer() && direct_indexed;
+
+    // rows [q0, q0 + nq) of a tensor whose dimension `dim` is the query axis; a copy when the view is not contiguous
+    auto rows_of = [&](ggml_tensor * t, int dim, int64_t q0, int64_t nq) -> ggml_tensor * {
+        if (t == nullptr || !chunked) {
+            return t;
+        }
+        int64_t ne[4] = { t->ne[0], t->ne[1], t->ne[2], t->ne[3] };
+        ne[dim] = nq;
+        ggml_tensor * v = ggml_view_4d(ctx0, t, ne[0], ne[1], ne[2], ne[3], t->nb[1], t->nb[2], t->nb[3], q0*t->nb[dim]);
+        return n_stream > 1 ? ggml_cont(ctx0, v) : v;
+    };
+
+    ggml_tensor * top_k = nullptr;
+    ggml_tensor * selected_valid = nullptr;
+    for (int64_t q0 = 0; q0 < n_tps; q0 += n_chunk) {
+        const int64_t nq = std::min<int64_t>(n_chunk, n_tps - q0);
+
+        ggml_tensor * iq_c = rows_of(iq, 2, q0, nq);
+        ggml_tensor * w_c  = rows_of(w,  1, q0, nq);
+
+        ggml_tensor * bias_c     = rows_of(pool_bias,     1, q0, nq);
+        ggml_tensor * bias_f16_c = rows_of(pool_bias_f16, 1, q0, nq);
+        if (chunked && inp_kp->pool_iv_cells != nullptr) {
+            ggml_tensor * bias = ggml_interval_mask(ctx0, inp_kp->pool_iv_cells,
+                    rows_of(inp_kp->pool_iv_queries, 0, q0, nq), cparams.fused_lid ? GGML_TYPE_F16 : GGML_TYPE_F32);
+            cb(bias, "kpool_dev_pool_bias", il);
+            glm5next_pin(sched, bias, dev);
+            if (bias->type == GGML_TYPE_F16) {
+                bias_f16_c = bias;
+                bias_c     = nullptr;
+            } else {
+                bias_c     = ggml_reshape_3d(ctx0, bias, n_pools, nq, n_stream);
+                bias_f16_c = nullptr;
+            }
+        }
+        // either type serves the validity tests below (0 or -INFINITY)
+        ggml_tensor * bias_any_c = bias_c ? bias_c : ggml_reshape_3d(ctx0, bias_f16_c, n_pools, nq, n_stream);
+
+        ggml_tensor * pool_score = nullptr;
+
+        if (cparams.fused_lid) {
+            // pool_k stays f32 so the kernel takes its f32 path; f16 wmma would undo the prec
+            ggml_tensor * pool_kf = ggml_reshape_4d(ctx0, pool_k, d_idx, 1, n_pools, n_stream);
+
+            pool_score = ggml_lightning_indexer(ctx0, iq_c, pool_kf, w_c, bias_f16_c);
+            cb(pool_score, "indexer_pool_score", il);
+
+            res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, pool_score, il});
+
+            pool_score = ggml_reshape_3d(ctx0, pool_score, n_pools, nq, n_stream);
+        } else {
+            ggml_tensor * kq = ggml_mul_mat(ctx0, pool_k, ggml_permute(ctx0, iq_c, 0, 2, 1, 3));
+
+            // the ReLU sits BETWEEN the per-head dot and the head weighting; either side differs
+            kq = ggml_cont(ctx0, ggml_permute(ctx0, kq, 2, 1, 0, 3));
+            ggml_tensor * score = ggml_relu(ctx0, kq);
+            cb(score, "indexer_score", il);
+
+            pool_score = ggml_sum_rows(ctx0, ggml_mul(ctx0, score, w_c));
+            pool_score = ggml_cont(ctx0, ggml_permute(ctx0, pool_score, 2, 1, 0, 3));
+            pool_score = ggml_reshape_3d(ctx0, pool_score, n_pools, nq, n_stream);
+
+            pool_score = ggml_add(ctx0, pool_score, bias_c);
+            cb(pool_score, "indexer_pool_score", il);
+        }
+
+        // top-k over POOLS then expand, as in the reference: a cell-level top-k is wrong
+        // because relu ties span pool boundaries and ggml_top_k splits the pool it lands in
+        // {select_k, nq, n_stream} of POOL ordinals
+        ggml_tensor * sel;
+        // The temporal selector wins only once the cache reaches 24576 pools.
+        if (glm5next_temporal_topk_enabled() && inp_kp->pool_cache != nullptr && n_pools >= 24576 && n_tps == 1 &&
+                select_k == (int64_t) hparams.indexer_top_k/r) {
+            ggml_tensor * hint = inp_kp->pool_cache->get_topk_hint(
+                    ctx0, il, select_k, mctx_idx->get_stream_base(), n_stream);
+            sel = ggml_cont(ctx0, ggml_top_k_hint(ctx0, pool_score, hint, (int) select_k));
+            ggml_build_forward_expand(gf, inp_kp->pool_cache->store_topk_hint(
+                    ctx0, sel, il, mctx_idx->get_stream_base(), n_stream));
+        } else {
+            sel = ggml_cont(ctx0, ggml_top_k(ctx0, pool_score, (int) select_k));
+        }
+        cb(sel, "indexer_top_k_pools", il);
+
+        ggml_tensor * top_k_c;
+        ggml_tensor * valid_c = nullptr;
+        if (expand) {
+            top_k_c = ggml_kpool_expand(ctx0, sel, inp_kp->pool_cells, bias_any_c,
+                    rows_of(inp_kp->compact_tail_cells, 1, q0, nq), rows_of(inp_kp->compact_tail_mask, 1, q0, nq),
+                    (int32_t) r);
+            cb(top_k_c, "indexer_top_k_compact", il);
+        } else {
+            // Preserve whether each selected pool was actually eligible. top-k always
+            // returns its full width, so short or fragmented sequences can spill into
+            // -inf pool slots whose member table aliases cell zero. The dense scatter is
+            // naturally duplicate-free; direct compact attention needs this mask to make
+            // every expanded member of a spilled pool inert.
+            ggml_tensor * pool_valid = ggml_reshape_4d(
+                    ctx0, bias_any_c, 1, n_pools, nq, n_stream);
+            valid_c = ggml_get_rows(ctx0, pool_valid, sel);
+            valid_c = ggml_repeat_4d(
+                    ctx0, valid_c, r, select_k, nq, n_stream);
+            valid_c = ggml_reshape_3d(
+                    ctx0, valid_c, r*select_k, nq, n_stream);
+            valid_c = ggml_cast(ctx0, valid_c, GGML_TYPE_F16);
+            cb(valid_c, "indexer_top_k_mask", il);
+
+            // Expand pools to members: gather whole rows of `kpool` cells out of pool_cells.
+            // The query axis folds into the gather's row axis, which is what lets ONE
+            // ggml_get_rows serve every query, while the stream axis stays where get_rows wants
+            // it (src0 dim 2 is indexed by the index tensor's dim 1)
+            ggml_tensor * pc3      = ggml_reshape_3d(ctx0, inp_kp->pool_cells, r, n_pools, n_stream);
+            ggml_tensor * sel_flat = ggml_reshape_2d(ctx0, sel, select_k*nq, n_stream);
+
+            top_k_c = ggml_get_rows(ctx0, pc3, sel_flat);
+            GGML_ASSERT(top_k_c->type == GGML_TYPE_I32 && "pool_cells is I32, so the gather stays I32");
+            top_k_c = ggml_reshape_3d(ctx0, top_k_c, r*select_k, nq, n_stream);
+        }
+
+        top_k = top_k == nullptr ? top_k_c : ggml_concat(ctx0, top_k, top_k_c, 1);
+        if (valid_c != nullptr) {
+            selected_valid = selected_valid == nullptr ? valid_c : ggml_concat(ctx0, selected_valid, valid_c, 1);
+        }
+        if (chunked) {
+            // finish this chunk before the next one starts, so that their scores do not live at the same time
+            ggml_build_forward_expand(gf, top_k);
+            if (selected_valid != nullptr) {
+                ggml_build_forward_expand(gf, selected_valid);
+            }
+        }
+    }
+
+    if (expand) {
         *top_k_mask = nullptr;
         return top_k;
     }
-
-    // Preserve whether each selected pool was actually eligible. top-k always
-    // returns its full width, so short or fragmented sequences can spill into
-    // -inf pool slots whose member table aliases cell zero. The dense scatter is
-    // naturally duplicate-free; direct compact attention needs this mask to make
-    // every expanded member of a spilled pool inert.
-    ggml_tensor * pool_valid = ggml_reshape_4d(
-            ctx0, pool_bias_any, 1, n_pools, n_tps, n_stream);
-    ggml_tensor * selected_valid = ggml_get_rows(ctx0, pool_valid, sel);
-    selected_valid = ggml_repeat_4d(
-            ctx0, selected_valid, r, select_k, n_tps, n_stream);
-    selected_valid = ggml_reshape_3d(
-            ctx0, selected_valid, r*select_k, n_tps, n_stream);
-    selected_valid = ggml_cast(ctx0, selected_valid, GGML_TYPE_F16);
-    cb(selected_valid, "indexer_top_k_mask", il);
-
-    // Expand pools to members: gather whole rows of `kpool` cells out of pool_cells.
-    // The query axis folds into the gather's row axis, which is what lets ONE
-    // ggml_get_rows serve every query, while the stream axis stays where get_rows wants
-    // it (src0 dim 2 is indexed by the index tensor's dim 1)
-    ggml_tensor * pc3      = ggml_reshape_3d(ctx0, inp_kp->pool_cells, r, n_pools, n_stream);
-    ggml_tensor * sel_flat = ggml_reshape_2d(ctx0, sel, select_k*n_tps, n_stream);
-
-    ggml_tensor * top_k = ggml_get_rows(ctx0, pc3, sel_flat);
-    GGML_ASSERT(top_k->type == GGML_TYPE_I32 && "pool_cells is I32, so the gather stays I32");
-    top_k = ggml_reshape_3d(ctx0, top_k, r*select_k, n_tps, n_stream);
 
     // Step 0 of an MTP draft group seeds persistent selection buffers. The
     // cpy nodes also establish the write-before-attention dependency, so the

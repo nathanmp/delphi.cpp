@@ -757,26 +757,6 @@ static int64_t dsv41_indexer_rows() {
     return rows;
 }
 
-// The largest size of one chunk tensor (an indexer score, an attention mask): LLAMA_DSV41_CHUNK_MIB, default 256, 0 = no
-// limit. A chunk tensor holds rows * width values and the width grows with the depth of the stream, so a fixed row count
-// makes the compute buffer grow with the context (-c 1048576, 512 indexer rows: 2 GiB per score). At a depth where the
-// row count of LLAMA_DSV41_INDEXER_ROWS / LLAMA_DSV41_ATTN_ROWS is within the limit, it is used as it is.
-static int64_t dsv41_chunk_rows(int64_t rows, int64_t width, size_t elt) {
-    static const size_t limit = [] {
-        const char * env = std::getenv("LLAMA_DSV41_CHUNK_MIB");
-        return (size_t) (env ? std::atoll(env) : 256) << 20;
-    }();
-    if (limit == 0 || width <= 0 || rows <= 0 || (size_t) rows*width*elt <= limit) {
-        return rows;
-    }
-    // a power of two, so that the chunks of a ubatch keep the same shape; at least 64 rows
-    int64_t r = 64;
-    while (2*r <= rows && (size_t) (2*r)*width*elt <= limit) {
-        r *= 2;
-    }
-    return std::min(r, rows);
-}
-
 // The queries of one chunk of the masked attention: LLAMA_DSV41_ATTN_ROWS, default 1024. 0 makes one mask for all queries
 // from the stream mask. A chunk holds a mask of rows * (n_raw + n_comp) values. The 11-01 memory fault in the HIP
 // FlashAttention kernel (one of three 49K-token prompts at -c 65536, 512 rows) did not occur again after ddc27a07e (separate
@@ -923,7 +903,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_indexer_top_k(
         GGML_ASSERT(nr % n_stream == 0 && (n_stream == 1 || r0 == 0));
         const int64_t nr_s = nr/n_stream; // the rows of one stream
         const int64_t n_chunk = use_n_vis ?
-                std::min<int64_t>(nr_s, std::max<int64_t>(1, dsv41_chunk_rows(dsv41_indexer_rows(), n_comp, sizeof(float))/n_stream)) : nr_s;
+                std::min<int64_t>(nr_s, std::max<int64_t>(1, llm_graph_chunk_rows(dsv41_indexer_rows(), n_comp, sizeof(float))/n_stream)) : nr_s;
 
         ggml_tensor * top_k = nullptr;
         ggml_tensor * cand_all = nullptr;
@@ -1684,7 +1664,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
             GGML_ASSERT(inp_comp.n_vis->ne[1] == n_tps && inp_comp.n_vis->ne[3] == n_stream);
 
             ggml_tensor * ninf = ggml_fill(ctx0, ggml_new_tensor_4d(ctx0, raw_mask->type, 1, 1, 1, 1), -INFINITY);
-            const int64_t n_chunk = std::min<int64_t>(n_tps, dsv41_chunk_rows(dsv41_attn_rows(), n_raw + n_comp, ggml_type_size(raw_mask->type)));
+            const int64_t n_chunk = std::min<int64_t>(n_tps, llm_graph_chunk_rows(dsv41_attn_rows(), n_raw + n_comp, ggml_type_size(raw_mask->type)));
 
             out = nullptr;
             for (int64_t s = 0; s < n_stream; ++s) {

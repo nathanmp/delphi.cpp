@@ -4961,3 +4961,19 @@ int32_t llama_relative_position_bucket(llama_pos x, llama_pos y, uint64_t n_buck
 
     return relative_bucket;
 }
+
+int64_t llm_graph_chunk_rows(int64_t rows, int64_t width, size_t elt) {
+    static const size_t limit = [] {
+        const char * env = std::getenv("LLAMA_CHUNK_MIB");
+        return (size_t) (env ? std::atoll(env) : 256) << 20;
+    }();
+    if (limit == 0 || width <= 0 || rows <= 0 || (size_t) rows*width*elt <= limit) {
+        return rows;
+    }
+    // a power of two, so that the chunks of a ubatch keep the same shape
+    int64_t r = 64;
+    while (2*r <= rows && (size_t) (2*r)*width*elt <= limit) {
+        r *= 2;
+    }
+    return std::min(r, rows);
+}
