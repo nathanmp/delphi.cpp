@@ -23,10 +23,11 @@ size_t state_bytes(const llama_hparams & hparams, int64_t n_tokens, size_t align
     return GGML_PAD(size_t(n_tokens * hparams.n_embd * hc) * sizeof(float), align) + GGML_PAD(size_t(n_tokens * hc) * sizeof(float), align);
 }
 
-// Room for the shared index selections of `n_tokens` rows: the I32 top-k and the F32 candidate block mask, whose block count
-// grows with the context; a window that needs more keeps them in host memory.
+// Room for the shared index selections of `n_tokens` rows: the I32 top-k and the I32 kept candidate blocks; a window that
+// needs more keeps them in host memory.
 size_t index_bytes(const llama_hparams & hparams, int64_t n_tokens, size_t align) {
-    return GGML_PAD(size_t(n_tokens * hparams.indexer_top_k) * sizeof(int32_t), align) + GGML_PAD(size_t(n_tokens) * 1024 * sizeof(float), align);
+    return GGML_PAD(size_t(n_tokens * hparams.indexer_top_k) * sizeof(int32_t), align) +
+           GGML_PAD(size_t(n_tokens * hparams.dsv41_candidate_topk_blocks) * sizeof(int32_t), align);
 }
 
 class prefill_input : public llm_graph_input_i {

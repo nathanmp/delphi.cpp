@@ -34,7 +34,7 @@
 // it derives index keys from that shared latent rather than from a second compressor. See
 // build_attention_v41().
 //
-// The indexer picks in two levels. The candidate source keeps its best blocks of compressed positions (build_candidate_mask()), and the index sources after it pick positions only inside those blocks.
+// The indexer picks in two levels. The candidate source keeps its best blocks of compressed positions (build_candidate_keep()), and the index sources after it pick positions only inside those blocks.
 
 // mean over the hyper-connection copies; deepseek4.cpp keeps its own copy of this
 static ggml_tensor * dsv41_hc_mean(ggml_context * ctx, ggml_tensor * x) {
@@ -757,6 +757,26 @@ static int64_t dsv41_indexer_rows() {
     return rows;
 }
 
+// The largest size of one chunk tensor (an indexer score, an attention mask): LLAMA_DSV41_CHUNK_MIB, default 256, 0 = no
+// limit. A chunk tensor holds rows * width values and the width grows with the depth of the stream, so a fixed row count
+// makes the compute buffer grow with the context (-c 1048576, 512 indexer rows: 2 GiB per score). At a depth where the
+// row count of LLAMA_DSV41_INDEXER_ROWS / LLAMA_DSV41_ATTN_ROWS is within the limit, it is used as it is.
+static int64_t dsv41_chunk_rows(int64_t rows, int64_t width, size_t elt) {
+    static const size_t limit = [] {
+        const char * env = std::getenv("LLAMA_DSV41_CHUNK_MIB");
+        return (size_t) (env ? std::atoll(env) : 256) << 20;
+    }();
+    if (limit == 0 || width <= 0 || rows <= 0 || (size_t) rows*width*elt <= limit) {
+        return rows;
+    }
+    // a power of two, so that the chunks of a ubatch keep the same shape; at least 64 rows
+    int64_t r = 64;
+    while (2*r <= rows && (size_t) (2*r)*width*elt <= limit) {
+        r *= 2;
+    }
+    return std::min(r, rows);
+}
+
 // The queries of one chunk of the masked attention: LLAMA_DSV41_ATTN_ROWS, default 1024. 0 makes one mask for all queries
 // from the stream mask. A chunk holds a mask of rows * (n_raw + n_comp) values. The 11-01 memory fault in the HIP
 // FlashAttention kernel (one of three 49K-token prompts at -c 65536, 512 rows) did not occur again after ddc27a07e (separate
@@ -770,10 +790,10 @@ static int64_t dsv41_attn_rows() {
     return rows;
 }
 
-// The first level of the indexer: keep the candidate_topk_blocks blocks with the best score, where the score of a block is the best score of its positions. The result is a block mask [1, n_blocks, n_rows, n_stream] that holds 0 on the kept blocks and -inf on the others, so that a reader adds it to its score with a broadcast and never makes a mask as wide as the stream.
+// The first level of the indexer: keep the candidate_topk_blocks blocks with the best score, where the score of a block is the best score of its positions. The result is the kept block indices [n_keep, n_rows, n_stream] (I32). A reader makes the block mask of its own chunk of rows from them (build_candidate_mask()): a dense mask for all rows would be shared by all the layers after the source, and it grows with the context (-c 1048576, 4096 rows: 2 GiB).
 //
 // The reference also drops a kept block when its score is -inf, and pads the stream to a whole number of blocks. Neither is necessary here. A block with a -inf score has only positions that the query can not see, and those are -inf in the score of the reader too. The stream is padded to 256 rows, which the block size divides (load_arch_hparams()).
-ggml_tensor * llama_model_deepseek41::graph::build_candidate_mask(
+ggml_tensor * llama_model_deepseek41::graph::build_candidate_keep(
         ggml_tensor * score,
         ggml_tensor * cand_pin,
         int il) const {
@@ -805,10 +825,24 @@ ggml_tensor * llama_model_deepseek41::graph::build_candidate_mask(
     keep_idx = ggml_reshape_3d(ctx0, keep_idx, n_keep, n_rows, n_stream);
     cb(keep_idx, "cand_keep_idx", il);
 
-    // -inf on all blocks, then 0 on the kept ones
-    ggml_tensor * keep  = ggml_fill(ctx0, ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, n_blocks, n_rows, n_stream), -INFINITY);
-    ggml_tensor * zeros = ggml_fill(ctx0, ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, n_keep,   n_rows, n_stream), 0.0f);
-    keep = ggml_set_rows(ctx0, keep, zeros, keep_idx);
+    return keep_idx;
+}
+
+// The block mask [1, n_blocks, n_rows, n_stream] of the kept block indices [n_keep, n_rows, n_stream]: 0 on the kept blocks and -inf on the others, so that a reader adds it to its score with a broadcast.
+ggml_tensor * llama_model_deepseek41::graph::build_candidate_mask(
+        ggml_tensor * keep_idx,
+        int64_t n_blocks,
+        int il) const {
+    const int64_t n_keep   = keep_idx->ne[0];
+    const int64_t n_rows   = keep_idx->ne[1];
+    const int64_t n_stream = keep_idx->ne[2];
+
+    // repeats of one value: a new tensor of the mask size would be a graph leaf, which the allocator keeps for the whole graph
+    ggml_tensor * ninf  = ggml_fill(ctx0, ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, 1, 1, 1), -INFINITY);
+    ggml_tensor * zero  = ggml_fill(ctx0, ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, 1, 1, 1), 0.0f);
+    ggml_tensor * keep  = ggml_repeat_4d(ctx0, ninf, 1, n_blocks, n_rows, n_stream);
+    ggml_tensor * zeros = ggml_repeat_4d(ctx0, zero, 1, n_keep,   n_rows, n_stream);
+    keep = ggml_set_rows(ctx0, keep, zeros, ggml_is_contiguous(keep_idx) ? keep_idx : ggml_cont(ctx0, keep_idx));
     cb(keep, "cand_mask", il);
 
     return keep;
@@ -888,7 +922,8 @@ ggml_tensor * llama_model_deepseek41::graph::build_indexer_top_k(
         const bool use_n_vis = cparams.fused_lid && inp_comp.n_vis != nullptr;
         GGML_ASSERT(nr % n_stream == 0 && (n_stream == 1 || r0 == 0));
         const int64_t nr_s = nr/n_stream; // the rows of one stream
-        const int64_t n_chunk = use_n_vis ? std::min<int64_t>(nr_s, std::max<int64_t>(1, dsv41_indexer_rows()/n_stream)) : nr_s;
+        const int64_t n_chunk = use_n_vis ?
+                std::min<int64_t>(nr_s, std::max<int64_t>(1, dsv41_chunk_rows(dsv41_indexer_rows(), n_comp, sizeof(float))/n_stream)) : nr_s;
 
         ggml_tensor * top_k = nullptr;
         ggml_tensor * cand_all = nullptr;
@@ -942,17 +977,19 @@ ggml_tensor * llama_model_deepseek41::graph::build_indexer_top_k(
                     cand_pin = ggml_view_4d(ctx0, cand_pin, cand_pin->ne[0], nc, cand_pin->ne[2], cand_pin->ne[3],
                             cand_pin->nb[1], cand_pin->nb[2], cand_pin->nb[3], m0*cand_pin->nb[1]);
                 }
-                ggml_tensor * cand_c = build_candidate_mask(score, cand_pin, il);
+                ggml_tensor * cand_c = build_candidate_keep(score, cand_pin, il);
                 if (cand_c != nullptr) {
-                    cand_all = cand_all == nullptr ? cand_c : ggml_concat(ctx0, cand_all, cand_c, 2);
+                    cand_all = cand_all == nullptr ? cand_c : ggml_concat(ctx0, cand_all, cand_c, 1);
                 }
             } else if (cand_src >= 0 && il > cand_src && *shared_cand != nullptr) {
-                ggml_tensor * cand = *shared_cand;
+                ggml_tensor * keep_idx = *shared_cand;
                 if (nc != nt) {
-                    cand = ggml_view_4d(ctx0, cand, cand->ne[0], cand->ne[1], nc, cand->ne[3],
-                            cand->nb[1], cand->nb[2], cand->nb[3], m0*cand->nb[2]);
+                    keep_idx = ggml_view_3d(ctx0, keep_idx, keep_idx->ne[0], nc, keep_idx->ne[2],
+                            keep_idx->nb[1], keep_idx->nb[2], m0*keep_idx->nb[1]);
                 }
-                const int64_t n_blocks = cand->ne[1];
+                GGML_ASSERT(hparams.dsv41_candidate_block_size > 0 && score->ne[0] % hparams.dsv41_candidate_block_size == 0);
+                const int64_t n_blocks = score->ne[0]/hparams.dsv41_candidate_block_size;
+                ggml_tensor * cand = build_candidate_mask(keep_idx, n_blocks, il);
 
                 GGML_ASSERT(ggml_is_contiguous(score) && score->ne[2] == 1);
                 GGML_ASSERT(score->ne[0] % n_blocks == 0 && score->ne[1] == cand->ne[2] && score->ne[3] == cand->ne[3]);
@@ -967,6 +1004,15 @@ ggml_tensor * llama_model_deepseek41::graph::build_indexer_top_k(
 
             ggml_tensor * top_k_c = ggml_cont(ctx0, ggml_top_k(ctx0, score, n_top_k));
             top_k = top_k == nullptr ? top_k_c : ggml_concat(ctx0, top_k, top_k_c, 1);
+
+            // Put every consumer of this score into the graph before the next chunk. Otherwise the candidate masks are
+            // only reached through cand_all after the last chunk, and all the scores stay live at the same time.
+            if (n_chunk < nr_s) {
+                if (cand_src == il && cand_all != nullptr) {
+                    ggml_build_forward_expand(gf, cand_all);
+                }
+                ggml_build_forward_expand(gf, top_k);
+            }
         }
         if (cand_src == il) {
             *shared_cand = cand_all;
@@ -1638,7 +1684,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
             GGML_ASSERT(inp_comp.n_vis->ne[1] == n_tps && inp_comp.n_vis->ne[3] == n_stream);
 
             ggml_tensor * ninf = ggml_fill(ctx0, ggml_new_tensor_4d(ctx0, raw_mask->type, 1, 1, 1, 1), -INFINITY);
-            const int64_t n_chunk = std::min<int64_t>(n_tps, dsv41_attn_rows());
+            const int64_t n_chunk = std::min<int64_t>(n_tps, dsv41_chunk_rows(dsv41_attn_rows(), n_raw + n_comp, ggml_type_size(raw_mask->type)));
 
             out = nullptr;
             for (int64_t s = 0; s < n_stream; ++s) {
