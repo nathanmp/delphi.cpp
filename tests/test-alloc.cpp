@@ -657,6 +657,42 @@ static void run(const char * name, void (*f)()) {
     printf("PASSED\n");
 }
 
+// Two graphs with the same tensor sizes but other edges: the layout of the first (n1 in place of n0) must not be
+// reused for the second, which still reads n0 after n1
+static void test_reuse_layout_other_edges() {
+    dummy_backend backend = dummy_backend_init(1024);
+    ggml_gallocr_ptr galloc = ggml_gallocr_ptr(ggml_gallocr_new(&backend.buffer_type));
+
+    auto [ctx_a, graph_a, ctx_a_ptr] = make_context();
+    {
+        ggml_tensor * in = make_input_with_size(ctx_a, 64);
+        ggml_tensor * n0 = ggml_scale(ctx_a, in, 2.0f);
+        ggml_tensor * n1 = ggml_scale(ctx_a, n0, 2.0f); // can take the memory of n0
+        ggml_tensor * n2 = ggml_add(ctx_a, n1, n1);
+        assign_names(ctx_a);
+        ggml_set_output(n2);
+        ggml_build_forward_expand(graph_a, n2);
+        GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), graph_a));
+        check_all_allocated(graph_a);
+        check_no_overlap(graph_a);
+    }
+
+    auto [ctx_b, graph_b, ctx_b_ptr] = make_context();
+    {
+        ggml_tensor * in = make_input_with_size(ctx_b, 64);
+        ggml_tensor * n0 = ggml_scale(ctx_b, in, 2.0f);
+        ggml_tensor * n1 = ggml_scale(ctx_b, in, 2.0f);
+        ggml_tensor * n2 = ggml_add(ctx_b, n0, n1); // reads n0 after n1
+        assign_names(ctx_b);
+        ggml_set_output(n2);
+        ggml_build_forward_expand(graph_b, n2);
+        GGML_ASSERT(ggml_graph_n_nodes(graph_b) == ggml_graph_n_nodes(graph_a));
+        GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), graph_b));
+        check_all_allocated(graph_b);
+        check_no_overlap(graph_b);
+    }
+}
+
 int main() {
     run("test_max_size_too_many_tensors", test_max_size_too_many_tensors);
     run("test_max_size_tensor_too_large", test_max_size_tensor_too_large);
@@ -672,5 +708,6 @@ int main() {
     run("test_buffer_size_zero", test_buffer_size_zero);
     run("test_reallocation", test_reallocation);
     run("test_graph_optimize_alloc_dep", test_graph_optimize_alloc_dep);
+    run("test_reuse_layout_other_edges", test_reuse_layout_other_edges);
     return 0;
 }

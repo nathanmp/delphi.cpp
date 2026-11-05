@@ -462,6 +462,7 @@ struct hash_node {
     int buffer_id;
     struct buffer_address addr;
     bool allocated;
+    int topo; // position in the reserved graph: node i -> i + 1, leaf i -> -(i + 1), 0 = not in the graph
 };
 
 struct tensor_alloc {
@@ -472,11 +473,21 @@ struct tensor_alloc {
 
 struct leaf_alloc {
     struct tensor_alloc leaf;
+    int32_t flags;
 };
+
+// The layout of a reserved graph is reused for any graph whose tensors fit the sizes. Two graphs with the same
+// node and leaf sizes can still have different edges (e.g. backend samplers of several sequences, where only the
+// active one samples every output row): the reused layout then frees a tensor before its last reader. The
+// positions of the inputs of every node identify the edges, so a changed edge forces a new layout.
+#define GGML_GALLOCR_TOPO_UNKNOWN INT32_MIN
 
 struct node_alloc {
     struct tensor_alloc dst;
     struct tensor_alloc src[GGML_MAX_SRC];
+    int32_t src_topo[GGML_MAX_SRC]; // hash_node::topo of each source that the allocator places, else 0
+    int32_t view_topo;              // the same for view_src
+    int32_t flags;                  // GGML_TENSOR_FLAG_INPUT | GGML_TENSOR_FLAG_OUTPUT
 };
 
 struct ggml_gallocr {
@@ -584,6 +595,43 @@ typedef struct ggml_gallocr * ggml_gallocr_t;
 static struct hash_node * ggml_gallocr_hash_get(ggml_gallocr_t galloc, struct ggml_tensor * t) {
     size_t i = ggml_hash_find_or_insert(&galloc->hash_set, t);
     return &galloc->hash_values[i];
+}
+
+// the allocator places a tensor only when it has no data yet
+static bool ggml_gallocr_topo_tracked(const struct ggml_tensor * t) {
+    return t != NULL && t->data == NULL;
+}
+
+static int32_t ggml_gallocr_topo_of(ggml_gallocr_t galloc, struct ggml_tensor * t) {
+    if (!ggml_gallocr_topo_tracked(t)) {
+        return 0;
+    }
+    if (!ggml_hash_contains(&galloc->hash_set, t)) {
+        return GGML_GALLOCR_TOPO_UNKNOWN;
+    }
+    const int32_t topo = ggml_gallocr_hash_get(galloc, t)->topo;
+    return topo != 0 ? topo : GGML_GALLOCR_TOPO_UNKNOWN;
+}
+
+// whether t is at the recorded position of the new graph
+static bool ggml_gallocr_topo_matches(const struct ggml_cgraph * graph, const struct ggml_tensor * t, int32_t topo) {
+    if (topo == GGML_GALLOCR_TOPO_UNKNOWN) {
+        return true;
+    }
+    if (!ggml_gallocr_topo_tracked(t)) {
+        return topo == 0;
+    }
+    if (topo > 0) {
+        return topo <= graph->n_nodes && graph->nodes[topo - 1] == t;
+    }
+    if (topo < 0) {
+        return -topo <= graph->n_leafs && graph->leafs[-topo - 1] == t;
+    }
+    return false;
+}
+
+static int32_t ggml_gallocr_topo_flags(const struct ggml_tensor * t) {
+    return t->flags & (GGML_TENSOR_FLAG_INPUT | GGML_TENSOR_FLAG_OUTPUT);
 }
 
 static bool ggml_gallocr_is_own(ggml_gallocr_t galloc, struct ggml_tensor * t) {
@@ -854,9 +902,20 @@ static bool ggml_gallocr_reserve_n_impl(
         GGML_ASSERT(galloc->node_allocs != NULL);
     }
     galloc->n_nodes = graph->n_nodes;
+    for (int i = 0; i < graph->n_leafs; i++) {
+        ggml_gallocr_hash_get(galloc, graph->leafs[i])->topo = -(i + 1);
+    }
+    for (int i = 0; i < graph->n_nodes; i++) {
+        ggml_gallocr_hash_get(galloc, graph->nodes[i])->topo = i + 1;
+    }
     for (int i = 0; i < graph->n_nodes; i++) {
         struct ggml_tensor * node = graph->nodes[i];
         struct node_alloc * node_alloc = &galloc->node_allocs[i];
+        node_alloc->view_topo = ggml_gallocr_topo_of(galloc, node->view_src);
+        node_alloc->flags     = ggml_gallocr_topo_flags(node);
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            node_alloc->src_topo[j] = ggml_gallocr_topo_of(galloc, node->src[j]);
+        }
         if (node->view_src || node->data) {
             node_alloc->dst.buffer_id = -1;
             node_alloc->dst.addr = GGML_BUFFER_ADDRESS_INVALID;
@@ -890,6 +949,7 @@ static bool ggml_gallocr_reserve_n_impl(
     for (int i = 0; i < graph->n_leafs; i++) {
         struct ggml_tensor * leaf = graph->leafs[i];
         struct hash_node * hn = ggml_gallocr_hash_get(galloc, leaf);
+        galloc->leaf_allocs[i].flags = ggml_gallocr_topo_flags(leaf);
         if (leaf->view_src || leaf->data) {
             galloc->leaf_allocs[i].leaf.buffer_id = -1;
             galloc->leaf_allocs[i].leaf.addr = GGML_BUFFER_ADDRESS_INVALID;
@@ -1052,6 +1112,31 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
                 }
                 return true;
             }
+        }
+    }
+
+    // the same sizes with other edges: the layout would free tensors that the new graph still reads
+    for (int i = 0; i < graph->n_leafs; i++) {
+        if (ggml_gallocr_topo_flags(graph->leafs[i]) != galloc->leaf_allocs[i].flags) {
+            if (log_realloc) {
+                GGML_LOG_WARN("%s: leaf %d %s has other flags\n", __func__, i, graph->leafs[i]->name);
+            }
+            return true;
+        }
+    }
+    for (int i = 0; i < graph->n_nodes; i++) {
+        const struct ggml_tensor * node = graph->nodes[i];
+        const struct node_alloc * node_alloc = &galloc->node_allocs[i];
+        bool same = ggml_gallocr_topo_flags(node) == node_alloc->flags &&
+            ggml_gallocr_topo_matches(graph, node->view_src, node_alloc->view_topo);
+        for (int j = 0; j < GGML_MAX_SRC && same; j++) {
+            same = ggml_gallocr_topo_matches(graph, node->src[j], node_alloc->src_topo[j]);
+        }
+        if (!same) {
+            if (log_realloc) {
+                GGML_LOG_WARN("%s: node %d %s (%s) has other inputs or flags\n", __func__, i, node->name, ggml_op_desc(node));
+            }
+            return true;
         }
     }
 
