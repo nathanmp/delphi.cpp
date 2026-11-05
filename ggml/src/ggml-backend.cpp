@@ -2956,6 +2956,9 @@ struct ggml_backend_sched_stage_ring {
     size_t slot_size = 0;
     int n_slots = 0; // slots in use: GGML_SCHED_STAGE_SLOTS, or fewer when the memory for all of them is not available
     int next = 0;
+    // the slots that the last allocation wanted when it got fewer (0 if it got all): later graphs do not try again for
+    // as many, which would drain the ring and lend the expert cache again for every graph, until the slots are dropped
+    int short_of = 0;
 
     // ggml_backend_sched_stage_keep: the weight in each slot, which later graphs read without another upload
     const ggml_tensor * resident[GGML_SCHED_STAGE_MAX_SLOTS] = {};
@@ -3289,6 +3292,7 @@ static void ggml_backend_sched_stage_drop_slots(ggml_backend_sched_stage_ring & 
     ring.slot_size = 0;
     ring.n_slots = 0;
     ring.next = 0;
+    ring.short_of = 0;
 }
 
 static void ggml_backend_sched_stage_release_ring(ggml_backend_sched_stage_ring & ring) {
@@ -3451,11 +3455,15 @@ static ggml_backend_buffer_t ggml_backend_sched_stage_anchor(ggml_backend_sched_
     return ring.anchor;
 }
 
-// keep mode: a slot for a new upload, a free one first, then one whose weight no item of the current graph and no
-// weight in `skip` reads; -1 if there is none
+// keep mode: a slot for a new upload, a free one first, then one whose weight no item of the current graph from
+// item `from` on and no weight in `skip` reads; -1 if there is none. With `force`, when every free slot holds a weight
+// that a later item reads, the one read last: a ring with fewer slots than the graph's weights (the memory for more
+// was not available) uploads such a weight again instead of stalling.
 static int ggml_backend_sched_stage_evictable(const ggml_backend_sched_stage * stage, const ggml_backend_sched_stage_ring & ring,
-        struct ggml_tensor * const * skip = nullptr, int n_skip = 0) {
+        struct ggml_tensor * const * skip = nullptr, int n_skip = 0, size_t from = 0, bool force = false) {
     int stale = -1;
+    int last  = -1;
+    size_t last_use = 0;
     for (int s = 0; s < ring.n_slots; ++s) {
         if (ring.busy[s]) {
             continue;
@@ -3463,18 +3471,25 @@ static int ggml_backend_sched_stage_evictable(const ggml_backend_sched_stage * s
         if (ring.resident[s] == nullptr) {
             return s;
         }
-        bool used = false;
-        for (const auto & item : stage->items) {
-            used |= item.input == ring.resident[s];
+        size_t first_use = SIZE_MAX;
+        for (size_t i = from; i < stage->items.size() && first_use == SIZE_MAX; ++i) {
+            if (stage->items[i].input == ring.resident[s]) {
+                first_use = i;
+            }
         }
+        bool used = first_use != SIZE_MAX;
         for (int i = 0; i < n_skip; ++i) {
             used |= skip[i] == ring.resident[s];
         }
         if (!used && stale < 0) {
             stale = s;
         }
+        if (force && (last < 0 || first_use > last_use)) {
+            last = s;
+            last_use = first_use;
+        }
     }
-    return stale;
+    return stale >= 0 ? stale : last;
 }
 
 // queue the upload of a weight into a slot of its ring
@@ -3523,7 +3538,8 @@ static void ggml_backend_sched_stage_pump(ggml_backend_sched_t sched) {
                 stage->n_queued++;
                 continue;
             }
-            slot = ggml_backend_sched_stage_evictable(stage, ring);
+            // the items before this one have their slots, so only the later ones keep a weight
+            slot = ggml_backend_sched_stage_evictable(stage, ring, nullptr, 0, stage->n_queued + 1, true);
             if (slot < 0) {
                 break;
             }
@@ -3557,6 +3573,7 @@ static void ggml_backend_sched_stage_begin(ggml_backend_sched_t sched) {
     }
 
     size_t need[GGML_SCHED_MAX_BACKENDS] = { 0 };
+    int split_slots[GGML_SCHED_MAX_BACKENDS] = { 0 }; // most staged inputs of one split
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         const struct ggml_backend_sched_split * split = &sched->splits[split_id];
         for (int i = 0; i < split->n_inputs; i++) {
@@ -3566,6 +3583,14 @@ static void ggml_backend_sched_stage_begin(ggml_backend_sched_t sched) {
                 continue;
             }
             stage->items.push_back({ input, input_cpy, split_id, split->backend_id, -1, 0 });
+            // with GGML_SCHED_STAGE_REDIRECT a split holds a slot for each of its staged inputs until its work is queued
+            {
+                int n_split = 0;
+                for (const auto & it : stage->items) {
+                    n_split += it.split_id == split_id && it.backend_id == split->backend_id;
+                }
+                split_slots[split->backend_id] = std::max(split_slots[split->backend_id], n_split);
+            }
             if (stage->registrar) {
                 stage->registrar->add(input->buffer);
             }
@@ -3593,7 +3618,11 @@ static void ggml_backend_sched_stage_begin(ggml_backend_sched_t sched) {
             ring.busy[s] = false;
             ring.readers[s] = 0;
         }
-        if (need[b] == 0 || (need[b] <= ring.slot_size && (!stage->keep || ring.n_slots >= wanted_slots))) {
+        // a split that holds more slots than the ring has would wait for itself
+        const int n_hold = stage->redirect ? std::min(split_slots[b], GGML_SCHED_STAGE_MAX_SLOTS) : 1;
+        const int n_want = std::max(wanted_slots, n_hold);
+        if (need[b] == 0 || (need[b] <= ring.slot_size && ring.n_slots >= n_hold &&
+                (!stage->keep || ring.n_slots >= wanted_slots || ring.short_of >= n_want))) {
             continue;
         }
         if (stage->keep) {
@@ -3606,9 +3635,9 @@ static void ggml_backend_sched_stage_begin(ggml_backend_sched_t sched) {
         // Fewer slots when the memory for all of them is not there (an expert cache tier too small to lend them, next to a
         // draft model): a split holds at most split_weights slots at a time, so that many still run, with less overlap. The
         // graph is already split, and a redirected input has no memory but its slot, so giving up is not an option.
-        const int n_min = std::min(stage->n_slots, stage->redirect ? stage->split_weights : 1);
+        const int n_min = std::max(n_hold, 1);
         bool ok = false;
-        int n = wanted_slots;
+        int n = n_want;
         for (; n >= n_min && !ok; n--) {
             // lent memory first; the lender cannot lend part of the slots
             ring.lent = stage->lend != nullptr && stage->lend(stage->lend_user, backend, n, need[b], ring.slots);
@@ -3651,6 +3680,7 @@ static void ggml_backend_sched_stage_begin(ggml_backend_sched_t sched) {
         }
         ring.n_slots = n + 1;
         ring.slot_size = need[b];
+        ring.short_of = ring.n_slots < n_want ? n_want : 0;
 
         ggml_backend_buffer_type_t host_buft = stage->use_bounce ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
         if (host_buft != nullptr) {
@@ -3665,9 +3695,9 @@ static void ggml_backend_sched_stage_begin(ggml_backend_sched_t sched) {
                 }
             }
         }
-        if (ring.n_slots < wanted_slots) {
+        if (ring.n_slots < n_want) {
             GGML_LOG_WARN("%s: staging ring on %s: %d of %d slots of %.1f MiB, the memory for more is not available\n", __func__,
-                    ggml_backend_name(backend), ring.n_slots, wanted_slots, need[b]/1048576.0);
+                    ggml_backend_name(backend), ring.n_slots, n_want, need[b]/1048576.0);
         }
         GGML_LOG_INFO("%s: staging ring on %s: %d %s slots of %.1f MiB, %s\n", __func__, ggml_backend_name(backend),
                 ring.n_slots, ring.lent ? "lent" : "own", need[b]/1048576.0, ring.bounce != nullptr ? "pinned bounce buffers" : "direct uploads");
