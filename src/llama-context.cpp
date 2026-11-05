@@ -3046,7 +3046,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
-        extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
+        extract_layer_inputs(res, ubatch, n_tokens_prev);
 
         // extract nextn embeddings before
         // only meaningful in LLAMA_POOLING_TYPE_NONE (per-token); other pooling modes are ignored.
@@ -3374,7 +3374,12 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     return n_outputs_max;
 }
 
-void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens) {
+void llama_context::extract_layer_inputs(const llm_graph_result * res, const llama_ubatch & ubatch, size_t token_offset) {
+    const size_t n_tokens = ubatch.n_tokens;
+    // The rows go to their batch index: the readers (speculative drafts) index the features by batch row, and a split
+    // can reorder the tokens (equal splits interleave sequences, the DSV4 cache puts a long prompt first). Without the
+    // indices, the ubatches are in batch order.
+    const std::vector<int32_t> * idx = ubatch.data && ubatch.data->idx.size() == n_tokens ? &ubatch.data->idx : nullptr;
     for (uint32_t il = 0; il < cparams.embeddings_layer_inp.size(); ++il) {
         if (!cparams.embeddings_layer_inp[il]) {
             continue;
@@ -3398,7 +3403,21 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
 
         ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), t);
         GGML_ASSERT(backend != nullptr);
-        ggml_backend_tensor_get_async(backend, t, embd_layer_inp[il].data + dst_offset, 0, nbytes);
+        if (!idx) {
+            ggml_backend_tensor_get_async(backend, t, embd_layer_inp[il].data + dst_offset, 0, nbytes);
+            continue;
+        }
+        const size_t row_bytes = row_floats*sizeof(float);
+        for (size_t i0 = 0; i0 < n_tokens;) {
+            size_t i1 = i0 + 1;
+            while (i1 < n_tokens && (*idx)[i1] == (*idx)[i1 - 1] + 1) {
+                i1++;
+            }
+            const size_t dst = (size_t) (*idx)[i0]*row_floats;
+            GGML_ASSERT(dst + (i1 - i0)*row_floats <= embd_layer_inp[il].size);
+            ggml_backend_tensor_get_async(backend, t, embd_layer_inp[il].data + dst, i0*row_bytes, (i1 - i0)*row_bytes);
+            i0 = i1;
+        }
     }
 }
 

@@ -72,6 +72,9 @@ struct llama_ubatch {
         std::vector<int8_t>         output;
 
         std::vector<llama_seq_id> seq_id_data;
+
+        // the batch index of each token (ubatch_add); a split can reorder the tokens of a batch
+        std::vector<int32_t> idx;
     };
 
     // the llama_ubatch pointers above point to this data if set. otherwise - point to external non-owning data

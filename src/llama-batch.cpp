@@ -801,6 +801,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
     assert(n_tokens%n_seqs == 0);
 
     auto udata = std::make_shared<llama_ubatch::data_t>();
+    udata->idx = idxs;
 
     const int64_t n_embd_all = batch.embd ? (int64_t) n_tokens*n_embd : 0;
     const int64_t n_embd_h_all = batch.embd_h ? (int64_t) n_tokens*n_embd_h : 0;
