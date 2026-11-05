@@ -1222,6 +1222,13 @@ void llama_context::reserve_max_prefill(
     if (n_tokens_prev != 0 && variant == max_prefill_variant) {
         return;
     }
+    // Only plain hybrid memory gives a one-stream full-cache context. For other memories init_full() exposes all
+    // n_seq_max streams. A one-sequence ubatch against that context splits its rows over the streams, so the
+    // attention output does not reshape back to n_tokens rows (GGML_ASSERT in ggml_reshape_3d with -np 3 and a
+    // DSpark draft). The regular reservation already covers n_ubatch tokens over n_seq_max streams.
+    if ((mctx_hyb == nullptr || is_hyb_idx) && !cparams.kv_unified && cparams.n_seq_max > 1) {
+        return;
+    }
 
     auto mctx_max = (mctx_hyb != nullptr && !is_hyb_idx)
             ? memory->init_full_n_seq(1, n_kv_max, false)
