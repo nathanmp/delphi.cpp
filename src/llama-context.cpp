@@ -10,6 +10,7 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-kv-cache-dsv4.h"
 #include "llama-kv-cache-kpool.h"
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-idx.h"
@@ -43,6 +44,17 @@ static bool cpu_numa_tensor_mode() {
     auto * is_tensor_mode = (bool (*)(void))
         ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(cpu_dev), "ggml_backend_cpu_is_numa_tensor_mode");
     return is_tensor_mode && is_tensor_mode();
+}
+
+// DeepSeek V4.1 with parallel sequences in separate KV streams: the KV cache gives a long prompt its own ubatches (one
+// sequence, compacted decoder rows), and a ubatch of several sequences holds at most n_keep_dec tokens of each (see
+// llama_kv_cache_dsv4::init_batch). The largest multi-sequence ubatch, or 0 when that split does not apply.
+static uint32_t dsv4_multi_seq_tokens(const llama_cparams & cparams, const llama_memory_i * memory) {
+    if (cparams.kv_unified || cparams.n_seq_max <= 1) {
+        return 0;
+    }
+    const auto * kv = dynamic_cast<const llama_kv_cache_dsv4 *>(memory);
+    return kv ? kv->get_n_keep_dec() * cparams.n_seq_max : 0;
 }
 
 static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
@@ -945,7 +957,11 @@ void llama_context::sched_reserve() {
         uint32_t n_seqs_pp = n_seqs;
         uint32_t n_outputs_pp_first = n_outputs_pp;
 
-        if (model.arch == LLM_ARCH_GLM5NEXT && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT) {
+        if (dsv4_multi_seq_tokens(cparams, memory.get()) > 0) {
+            // a prompt ubatch has one sequence: reserve that shape over one stream
+            n_seqs_pp = 1;
+            mctx_pp = memory->init_full_n_seq(1);
+        } else if (model.arch == LLM_ARCH_GLM5NEXT && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT) {
             // The largest startup CUDA workspace occurs on an intermediate
             // prompt chunk: one sequence, a nearly-full ubatch, a two-ubatch
             // dense KV span, and no output rows. A full ubatch or even a
@@ -1093,6 +1109,15 @@ void llama_context::sched_reserve() {
                 break;
             }
             default:
+                if (const uint32_t n_multi = std::min(n_tokens, dsv4_multi_seq_tokens(cparams, memory.get())); n_multi > 0) {
+                    // the largest multi-sequence ubatch, then the one-sequence prompt ubatch
+                    gf = graph_reserve_extra(n_multi, n_seqs, std::min(n_multi, cparams.n_outputs_max), mctx.get());
+                    if (gf) {
+                        auto mctx_single = memory->init_full_n_seq(1);
+                        gf = graph_reserve_extra(n_tokens, 1, n_outputs_pp, mctx_single.get());
+                    }
+                    break;
+                }
                 gf = graph_reserve_extra(n_tokens, n_seqs, n_outputs_pp, mctx.get());
         };
 
@@ -1419,7 +1444,17 @@ bool llama_context::memory_update(bool optimize) {
         const uint32_t n_outputs_max = mtp_device_draft ?
                 n_tokens : std::min(n_tokens, cparams.n_outputs_max);
 
-        auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_max, mctx.get());
+        ggml_cgraph * gf = nullptr;
+        if (const uint32_t n_multi = std::min(n_tokens, dsv4_multi_seq_tokens(cparams, memory.get())); n_multi > 0 && !mtp_device_draft) {
+            // the shapes of sched_reserve: a full ubatch over several streams is larger and never occurs
+            gf = graph_reserve(n_multi, n_seqs, std::min(n_multi, cparams.n_outputs_max), mctx.get());
+            if (gf) {
+                auto mctx_single = memory->init_full_n_seq(1);
+                gf = graph_reserve(n_tokens, 1, n_outputs_max, mctx_single.get());
+            }
+        } else {
+            gf = graph_reserve(n_tokens, n_seqs, n_outputs_max, mctx.get());
+        }
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to reserve graph after the memory update\n", __func__);
         }
@@ -2855,6 +2890,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
     }
     size_t prefill_chunk = 0;
     do {
+        // a window covers the leading ubatches of one sequence; the ubatches after it run the full graph
+        const bool in_window = prefill_window && prefill_window->covers(prefill_chunk);
         if (prefill_window) {
             prefill_window->decoder(prefill_chunk++);
         }
@@ -2907,7 +2944,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     continue;
                 }
 
-                const llama_pos remove_from = prefill_window ? -1 : pos_min[s];
+                const llama_pos remove_from = in_window ? -1 : pos_min[s];
                 LLAMA_LOG_WARN("%s: removing memory module entries for seq_id = %d, pos = [%d, +inf)\n", __func__, s, remove_from);
 
                 memory->seq_rm(s, remove_from, -1);

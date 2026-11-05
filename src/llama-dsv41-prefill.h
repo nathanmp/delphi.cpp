@@ -56,14 +56,16 @@ public:
     static void reserve(llama_context & ctx);
 
     ggml_status encode();
+    // Set the decoder graph of window chunk `chunk`. A ubatch after the window runs the full graph.
     void decoder(size_t chunk);
+    bool covers(size_t chunk) const { return chunk < chunks.size(); }
 
     // `slot`, or a new device state tensor with the type and shape of `like`; nullptr if the state buffer has no room
     ggml_tensor * persist(ggml_tensor *& slot, const ggml_tensor * like);
 
 private:
     static bool context_eligible(const llama_context & ctx, int mode);
-    llama_dsv41_prefill_window(llama_context & ctx, llama_kv_cache_dsv4_context & mctx, bool retain);
+    llama_dsv41_prefill_window(llama_context & ctx, llama_kv_cache_dsv4_context & mctx, size_t n_chunks, bool retain);
 
     llama_context & ctx;
     llama_kv_cache_dsv4_context & mctx;

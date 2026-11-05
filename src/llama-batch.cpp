@@ -748,6 +748,27 @@ llama_ubatch llama_batch_allocr::split_seq(uint32_t n_ubatch) {
     return ubatch_add(idxs, 1, true);
 }
 
+llama_ubatch llama_batch_allocr::split_seq_id(uint32_t n_ubatch, llama_seq_id seq_id) {
+    seq_set_t cur_seq_set;
+    cur_seq_set.set(seq_id);
+
+    std::vector<int32_t> idxs;
+    for (uint32_t i = 0; i < used.size() && idxs.size() < n_ubatch; ++i) {
+        if (used[i] || seq_set[i] != cur_seq_set) {
+            continue;
+        }
+        idxs.push_back(i);
+        used[i] = true;
+        ++n_used;
+    }
+
+    if (idxs.empty()) {
+        return {};
+    }
+
+    return ubatch_add(idxs, 1, true);
+}
+
 void llama_batch_allocr::clear() {
     n_outputs = 0;
 

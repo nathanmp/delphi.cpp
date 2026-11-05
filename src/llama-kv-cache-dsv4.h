@@ -122,6 +122,12 @@ public:
 
     llama_memory_context_ptr init_full() override;
 
+    // a full cache with only the first n_seq streams in the graph views (the shape of a ubatch of n_seq sequences)
+    llama_memory_context_ptr init_full_n_seq(uint32_t n_seq, uint32_t n_kv = 0, bool kpool_rebuild = true) override;
+
+    // the decoder rows that a compacted prefill ubatch keeps; 0 without compacted prefill
+    uint32_t get_n_keep_dec() const;
+
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
     bool get_can_shift() const override;
@@ -209,7 +215,7 @@ public:
     void rewind_window();
     using slot_info_vec_t = llama_kv_cache::slot_info_vec_t;
 
-    llama_kv_cache_dsv4_raw_context(llama_kv_cache_dsv4 * cache);
+    llama_kv_cache_dsv4_raw_context(llama_kv_cache_dsv4 * cache, uint32_t n_seq = 0);
 
     llama_kv_cache_dsv4_raw_context(
             llama_kv_cache_dsv4 * cache,
@@ -301,7 +307,7 @@ public:
     void rewind() { i_cur = 0; }
     using slot_info_vec_t = llama_kv_cache::slot_info_vec_t;
 
-    llama_kv_cache_dsv4_comp_context(llama_kv_cache * kv);
+    llama_kv_cache_dsv4_comp_context(llama_kv_cache * kv, uint32_t n_seq = 0);
 
     llama_kv_cache_dsv4_comp_context(
             llama_kv_cache * kv,
@@ -389,7 +395,7 @@ public:
     llama_kv_cache_dsv4_context(llama_memory_status status);
 
     llama_kv_cache_dsv4_context(
-            llama_kv_cache_dsv4 * kv);
+            llama_kv_cache_dsv4 * kv, uint32_t n_seq = 0);
 
     llama_kv_cache_dsv4_context(
             llama_kv_cache_dsv4 * kv,

@@ -71,7 +71,7 @@ void llama_dsv41_prefill_tensor::store(ggml_tensor * tensor) {
 
 bool llama_dsv41_prefill_window::context_eligible(const llama_context & ctx, int mode) {
     return (mode == 1 || mode == 2) && ctx.model.arch == LLM_ARCH_DEEPSEEK41 && ctx.cparams.ced_compact &&
-            ctx.cparams.n_seq_max == 1 && !ctx.cparams.pipeline_parallel && !ctx.cparams.embeddings &&
+            !ctx.cparams.pipeline_parallel && !ctx.cparams.embeddings &&
             ctx.cparams.moe_split_n == 0 && ctx.cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT;
 }
 
@@ -105,7 +105,19 @@ std::unique_ptr<llama_dsv41_prefill_window> llama_dsv41_prefill_window::create(
         return nullptr;
     }
     auto * mctx = dynamic_cast<llama_kv_cache_dsv4_context *>(memory);
-    if (!mctx || mctx->get_ubatches().size() < 2 || mctx->get_ubatches().size() > 4) {
+    if (!mctx || mctx->get_ubatches().size() < 2) {
+        return nullptr;
+    }
+    // The window takes the leading ubatches of one sequence. With parallel sequences the KV cache puts the ubatches
+    // of a long prompt first (llama_kv_cache_dsv4::init_batch); the ubatches of the other sequences then run the full
+    // graph after the window.
+    const auto & ubatches_all = mctx->get_ubatches();
+    size_t n_chunks = 1;
+    while (n_chunks < ubatches_all.size() && ubatches_all[n_chunks].n_seqs_unq == 1 &&
+            ubatches_all[n_chunks].seq_id_unq[0] == ubatches_all[0].seq_id_unq[0]) {
+        n_chunks++;
+    }
+    if (n_chunks < 2 || n_chunks > 4) {
         return nullptr;
     }
     // The first chunk must stream its experts. A later chunk reads the banks that the first one made resident, so it can be
@@ -120,10 +132,10 @@ std::unique_ptr<llama_dsv41_prefill_window> llama_dsv41_prefill_window::create(
     }
     const int min_rest = mode == 1 ? std::max<int>(1, ctx.graph_alt_max_tokens + 1) : 1;
     const int min_first = std::max(min_stage, min_rest);
-    const auto & ubatches = mctx->get_ubatches();
+    const auto & ubatches = ubatches_all;
     const llama_seq_id seq = ubatches.front().seq_id_unq[0];
     llama_pos pos = ubatches.front().pos[0];
-    for (size_t i = 0; i < ubatches.size(); ++i) {
+    for (size_t i = 0; i < n_chunks; ++i) {
         const auto & batch = ubatches[i];
         if (!batch.token || batch.embd || batch.embd_tensor || batch.embd_h || batch.embd_h_tensor ||
                 batch.n_pos != 1 || batch.n_seqs_unq != 1 || batch.seq_id_unq[0] != seq ||
@@ -132,7 +144,7 @@ std::unique_ptr<llama_dsv41_prefill_window> llama_dsv41_prefill_window::create(
         }
         for (uint32_t row = 0; row < batch.n_tokens; ++row) {
             if (batch.pos[row] != pos++ || (batch.output && batch.output[row] &&
-                    (i + 1 != ubatches.size() || row + 1 != batch.n_tokens))) {
+                    (i + 1 != n_chunks || row + 1 != batch.n_tokens))) {
                 return nullptr;
             }
         }
@@ -147,18 +159,19 @@ std::unique_ptr<llama_dsv41_prefill_window> llama_dsv41_prefill_window::create(
         return nullptr;
     }
     size_t need = 0;
-    for (const auto & batch : ubatches) {
+    for (size_t i = 0; i < n_chunks; ++i) {
+        const auto & batch = ubatches[i];
         need += state_bytes(ctx.model.hparams, batch.n_tokens, ggml_backend_buffer_get_alignment(ctx.dsv41_prefill_state.get()));
     }
     if (need > ggml_backend_buffer_get_size(ctx.dsv41_prefill_state.get())) {
         return nullptr;
     }
-    return std::unique_ptr<llama_dsv41_prefill_window>(new llama_dsv41_prefill_window(ctx, *mctx, mode == 1));
+    return std::unique_ptr<llama_dsv41_prefill_window>(new llama_dsv41_prefill_window(ctx, *mctx, n_chunks, mode == 1));
 }
 
 llama_dsv41_prefill_window::llama_dsv41_prefill_window(
-        llama_context & ctx, llama_kv_cache_dsv4_context & mctx, bool retain) :
-    ctx(ctx), mctx(mctx), retain(retain), chunks(mctx.get_ubatches().size()) {
+        llama_context & ctx, llama_kv_cache_dsv4_context & mctx, size_t n_chunks, bool retain) :
+    ctx(ctx), mctx(mctx), retain(retain), chunks(n_chunks) {
     const auto & hparams = ctx.model.hparams;
     ggml_init_params params = { 4 * chunks.size() * ggml_tensor_overhead(), nullptr, true };
     state_ctx.reset(ggml_init(params));
@@ -259,7 +272,7 @@ ggml_status llama_dsv41_prefill_window::encode() {
                 graph.chunk->cand.store(graph.cand);
                 n_index++;
             }
-        } while (mctx.next());
+        } while (chunk < chunks.size() && mctx.next());
     }
     ggml_backend_sched_stage_keep(ctx.sched.get(), false);
     mctx.rewind_window();
@@ -275,6 +288,10 @@ ggml_status llama_dsv41_prefill_window::encode() {
 }
 
 void llama_dsv41_prefill_window::decoder(size_t chunk) {
+    if (!covers(chunk)) {
+        ctx.dsv41_prefill_graph = nullptr;
+        return;
+    }
     graph = {};
     graph.first = ctx.cparams.n_layer_prefill;
     graph.last = ctx.model.hparams.n_layer();

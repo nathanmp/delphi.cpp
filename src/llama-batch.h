@@ -131,6 +131,9 @@ public:
     // sequence-set-wise split - each ubatch contains a single sequence-set
     llama_ubatch split_seq(uint32_t n_ubatch);
 
+    // the next unused tokens (at most n_ubatch) that belong to seq_id alone
+    llama_ubatch split_seq_id(uint32_t n_ubatch, llama_seq_id seq_id);
+
     // a helper method for creating a well-defined ubatch of tokens
     // TODO: support embeddings if needed in the future
     llama_ubatch ubatch_reserve(uint32_t n_seq_tokens, uint32_t n_seqs);
