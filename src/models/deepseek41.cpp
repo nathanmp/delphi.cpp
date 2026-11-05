@@ -881,23 +881,25 @@ ggml_tensor * llama_model_deepseek41::graph::build_indexer_top_k(
                 w_r->ne[0], w_r->ne[1]/n_stream, w_r->ne[2], n_stream,
                 w_r->nb[1], w_r->nb[2]/n_stream, w_r->nb[3]/n_stream, 0);
 
-        // The score is F32 [n_comp, rows]. It grows with the context times the rows, so on long prompts it is the
-        // largest tensor of the graph. With one stream, build it for dsv41_indexer_rows() rows at a time: each chunk
-        // then reuses the memory of the chunk before it. The fused indexer takes the visible count of each row instead
-        // of the stream mask, which is as large as the score.
+        // The score is F32 [n_comp, rows, 1, streams]. It grows with the context times the rows, so on long prompts it
+        // is the largest tensor of the graph. Build it for dsv41_indexer_rows() rows at a time, split over the streams:
+        // each chunk then reuses the memory of the chunk before it. The fused indexer takes the visible count of each
+        // row instead of the stream mask, which is as large as the score.
         const bool use_n_vis = cparams.fused_lid && inp_comp.n_vis != nullptr;
-        const int64_t n_chunk = use_n_vis && n_stream == 1 ? std::min<int64_t>(nr, dsv41_indexer_rows()) : nr;
+        GGML_ASSERT(nr % n_stream == 0 && (n_stream == 1 || r0 == 0));
+        const int64_t nr_s = nr/n_stream; // the rows of one stream
+        const int64_t n_chunk = use_n_vis ? std::min<int64_t>(nr_s, std::max<int64_t>(1, dsv41_indexer_rows()/n_stream)) : nr_s;
 
         ggml_tensor * top_k = nullptr;
         ggml_tensor * cand_all = nullptr;
-        for (int64_t c0 = 0; c0 < nr; c0 += n_chunk) {
-            const int64_t nc = std::min<int64_t>(n_chunk, nr - c0);
+        for (int64_t c0 = 0; c0 < nr_s; c0 += n_chunk) {
+            const int64_t nc = std::min<int64_t>(n_chunk, nr_s - c0);
             const int64_t m0 = r0 + c0; // the first row of the chunk in the stream inputs
 
-            ggml_tensor * q_c = nc == nr ? idx_q : ggml_view_4d(ctx0, idx_q,
-                    idx_q->ne[0], idx_q->ne[1], nc, 1, idx_q->nb[1], idx_q->nb[2], idx_q->nb[3], c0*idx_q->nb[2]);
-            ggml_tensor * w_c = nc == nr ? w_r : ggml_view_4d(ctx0, w_r,
-                    w_r->ne[0], nc, 1, 1, w_r->nb[1], w_r->nb[2], w_r->nb[3], c0*w_r->nb[1]);
+            ggml_tensor * q_c = nc == nr_s ? idx_q : ggml_view_4d(ctx0, idx_q,
+                    idx_q->ne[0], idx_q->ne[1], nc, idx_q->ne[3], idx_q->nb[1], idx_q->nb[2], idx_q->nb[3], c0*idx_q->nb[2]);
+            ggml_tensor * w_c = nc == nr_s ? w_r : ggml_view_4d(ctx0, w_r,
+                    w_r->ne[0], nc, w_r->ne[2], w_r->ne[3], w_r->nb[1], w_r->nb[2], w_r->nb[3], c0*w_r->nb[1]);
 
             // the stream mask is F16 only when flash attention is on. it only ever holds 0 or -inf, so a
             // cast to the type that the score path needs is exact.
@@ -1620,43 +1622,65 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
         // stream and a top-k, make it for dsv41_attn_rows() queries at a time from the selections and the visible counts
         // alone, without the stream mask. Each chunk then reuses the memory of the chunk before it. The attention itself
         // is the same, so the HIP kernel still skips the masked rows.
-        const bool chunked = top_k != nullptr && inp_comp.n_vis != nullptr && n_stream == 1 && dsv41_attn_rows() > 0;
+        // With several streams (parallel sequences), make each stream on its own: its queries are one block of q, and
+        // its K is the concat of its own raw and compressed rows. A few queries (decode, verify) keep the multi-stream
+        // call, whose mask is small.
+        const bool chunked = top_k != nullptr && inp_comp.n_vis != nullptr && dsv41_attn_rows() > 0 &&
+                (n_stream == 1 || nt > 64);
         if (chunked) {
             const int64_t n_raw = raw_k->ne[2];
             const int64_t n_selected = top_k->ne[0];
-            const int64_t n_chunk = std::min<int64_t>(nt, dsv41_attn_rows());
+            const int64_t n_tps = nt/n_stream;
 
-            GGML_ASSERT(top_k->ne[1] == nt && top_k->ne[2] == 1 && top_k->ne[3] == 1);
-            GGML_ASSERT(raw_mask->ne[0] == n_raw && raw_mask->ne[1] == nt && raw_mask->ne[2] == 1 && raw_mask->ne[3] == 1);
+            GGML_ASSERT(nt % n_stream == 0);
+            GGML_ASSERT(top_k->ne[1] == n_tps && top_k->ne[2] == 1 && top_k->ne[3] == n_stream);
+            GGML_ASSERT(raw_mask->ne[0] == n_raw && raw_mask->ne[1] == n_tps && raw_mask->ne[2] == 1 && raw_mask->ne[3] == n_stream);
+            GGML_ASSERT(inp_comp.n_vis->ne[1] == n_tps && inp_comp.n_vis->ne[3] == n_stream);
 
             ggml_tensor * ninf = ggml_fill(ctx0, ggml_new_tensor_4d(ctx0, raw_mask->type, 1, 1, 1, 1), -INFINITY);
+            const int64_t n_chunk = std::min<int64_t>(n_tps, dsv41_attn_rows());
 
             out = nullptr;
-            for (int64_t c0 = 0; c0 < nt; c0 += n_chunk) {
-                const int64_t nc = std::min<int64_t>(n_chunk, nt - c0);
+            for (int64_t s = 0; s < n_stream; ++s) {
+                auto stream_view = [&](ggml_tensor * t) {
+                    return n_stream == 1 ? t : ggml_view_4d(ctx0, t, t->ne[0], t->ne[1], t->ne[2], 1,
+                            t->nb[1], t->nb[2], t->nb[3], s*t->nb[3]);
+                };
+                ggml_tensor * q_s = n_stream == 1 ? q : ggml_view_3d(ctx0, q, q->ne[0], q->ne[1], n_tps,
+                        q->nb[1], q->nb[2], s*n_tps*q->nb[2]);
+                ggml_tensor * k_s = n_stream == 1 ? k_all : ggml_concat(ctx0, stream_view(raw_k), stream_view(comp_k), 2);
+                ggml_tensor * top_k_s = stream_view(top_k);
+                ggml_tensor * n_vis_s = stream_view(inp_comp.n_vis);
+                ggml_tensor * raw_mask_s = stream_view(raw_mask);
 
-                ggml_tensor * q_c = nc == nt ? q : ggml_view_3d(ctx0, q, q->ne[0], q->ne[1], nc, q->nb[1], q->nb[2], c0*q->nb[2]);
-                ggml_tensor * top_k_c = nc == nt ? top_k : ggml_view_4d(ctx0, top_k, n_selected, nc, 1, 1,
-                        top_k->nb[1], top_k->nb[2], top_k->nb[3], c0*top_k->nb[1]);
-                ggml_tensor * n_vis_c = nc == nt ? inp_comp.n_vis : ggml_view_4d(ctx0, inp_comp.n_vis, 1, nc, 1, 1,
-                        inp_comp.n_vis->nb[1], inp_comp.n_vis->nb[2], inp_comp.n_vis->nb[3], c0*inp_comp.n_vis->nb[1]);
-                ggml_tensor * raw_mask_c = nc == nt ? raw_mask : ggml_view_4d(ctx0, raw_mask, n_raw, nc, 1, 1,
-                        raw_mask->nb[1], raw_mask->nb[2], raw_mask->nb[3], c0*raw_mask->nb[1]);
+                for (int64_t c0 = 0; c0 < n_tps; c0 += n_chunk) {
+                    const int64_t nc = std::min<int64_t>(n_chunk, n_tps - c0);
 
-                // -inf on all compressed rows, then the validity of the selected ones: 0, or -inf on a fill entry. The
-                // full mask is the repeat of one value: a new tensor of its size would be a graph leaf, which the
-                // allocator keeps for the whole graph, for every chunk of every layer.
-                ggml_tensor * comp_mask = ggml_repeat_4d(ctx0, ninf, 1, n_comp, nc, 1);
-                ggml_tensor * comp_valid = ggml_reshape_4d(ctx0, dsv41_comp_valid(ctx0, top_k_c, n_vis_c), 1, n_selected, nc, 1);
-                comp_mask = ggml_set_rows(ctx0, comp_mask, comp_valid, ggml_reshape_3d(ctx0, ggml_cont(ctx0, top_k_c), n_selected, nc, 1));
-                comp_mask = ggml_reshape_4d(ctx0, comp_mask, n_comp, nc, 1, 1);
+                    ggml_tensor * q_c = nc == n_tps ? q_s : ggml_view_3d(ctx0, q_s, q_s->ne[0], q_s->ne[1], nc,
+                            q_s->nb[1], q_s->nb[2], c0*q_s->nb[2]);
+                    ggml_tensor * top_k_c = nc == n_tps ? top_k_s : ggml_view_4d(ctx0, top_k_s, n_selected, nc, 1, 1,
+                            top_k_s->nb[1], top_k_s->nb[2], top_k_s->nb[3], c0*top_k_s->nb[1]);
+                    ggml_tensor * n_vis_c = nc == n_tps ? n_vis_s : ggml_view_4d(ctx0, n_vis_s, 1, nc, 1, 1,
+                            n_vis_s->nb[1], n_vis_s->nb[2], n_vis_s->nb[3], c0*n_vis_s->nb[1]);
+                    ggml_tensor * raw_mask_c = nc == n_tps ? raw_mask_s : ggml_view_4d(ctx0, raw_mask_s, n_raw, nc, 1, 1,
+                            raw_mask_s->nb[1], raw_mask_s->nb[2], raw_mask_s->nb[3], c0*raw_mask_s->nb[1]);
 
-                ggml_tensor * kq_mask = ggml_concat(ctx0, raw_mask_c, comp_mask, 0);
-                cb(kq_mask, "kq_mask", il);
+                    // -inf on all compressed rows, then the validity of the selected ones: 0, or -inf on a fill entry.
+                    // The full mask is the repeat of one value: a new tensor of its size would be a graph leaf, which
+                    // the allocator keeps for the whole graph, for every chunk of every layer.
+                    ggml_tensor * comp_mask = ggml_repeat_4d(ctx0, ninf, 1, n_comp, nc, 1);
+                    ggml_tensor * comp_valid = ggml_reshape_4d(ctx0, dsv41_comp_valid(ctx0, top_k_c, n_vis_c), 1, n_selected, nc, 1);
+                    comp_mask = ggml_set_rows(ctx0, comp_mask, comp_valid,
+                            ggml_reshape_3d(ctx0, ggml_cont(ctx0, top_k_c), n_selected, nc, 1));
+                    comp_mask = ggml_reshape_4d(ctx0, comp_mask, n_comp, nc, 1, 1);
 
-                ggml_tensor * out_c = build_attn_mha(q_c, k_all, k_all, nullptr, kq_mask, layer.attn_sinks,
-                        nullptr, n_kv_max, kq_scale, il);
-                out = out == nullptr ? out_c : ggml_concat(ctx0, out, out_c, 1);
+                    ggml_tensor * kq_mask = ggml_concat(ctx0, raw_mask_c, comp_mask, 0);
+                    cb(kq_mask, "kq_mask", il);
+
+                    ggml_tensor * out_c = build_attn_mha(q_c, k_s, k_s, nullptr, kq_mask, layer.attn_sinks,
+                            nullptr, n_kv_max, kq_scale, il);
+                    out = out == nullptr ? out_c : ggml_concat(ctx0, out, out_c, 1);
+                }
             }
         } else {
             ggml_tensor * comp_mask = top_k
