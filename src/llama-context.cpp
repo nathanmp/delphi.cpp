@@ -435,6 +435,12 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: causal_attn           = %d\n",   __func__, cparams.causal_attn);
     LLAMA_LOG_INFO("%s: flash_attn            = %s\n",   __func__, llama_flash_attn_type_name(params.flash_attn_type));
     LLAMA_LOG_INFO("%s: kv_unified            = %s\n",   __func__, cparams.kv_unified ? "true" : "false");
+    if (cparams.kv_unified && cparams.n_seq_max > 1 &&
+            (model.arch == LLM_ARCH_DEEPSEEK4 || model.arch == LLM_ARCH_DEEPSEEK41)) {
+        LLAMA_LOG_WARN("%s: %s with a unified KV cache reserves its compute buffers for all %u sequences at the full "
+                "context depth; without --kv-unified each sequence has its own KV stream and much smaller buffers\n",
+                __func__, llm_arch_name(model.arch), cparams.n_seq_max);
+    }
     LLAMA_LOG_INFO("%s: freq_base             = %.1f\n", __func__, cparams.rope_freq_base);
     LLAMA_LOG_INFO("%s: freq_scale            = %g\n",   __func__, cparams.rope_freq_scale);
     LLAMA_LOG_INFO("%s: n_rs_seq              = %u\n",   __func__, cparams.n_rs_seq);

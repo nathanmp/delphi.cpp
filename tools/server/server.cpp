@@ -9,6 +9,8 @@
 #include "build-info.h"
 #include "common.h"
 #include "fit.h"
+#include "ggml-cpp.h"
+#include "gguf.h"
 #include "llama.h"
 #include "log.h"
 
@@ -85,6 +87,30 @@ static server_http_context::handler_t ex_wrapper(server_http_context::handler_t 
     };
 }
 
+// general.architecture and <arch>.context_length of a GGUF file, empty and 0 when they cannot be read
+static std::pair<std::string, uint32_t> gguf_arch_ctx(const std::string & path) {
+    if (path.empty()) {
+        return {"", 0};
+    }
+    gguf_init_params gguf_params = {
+        /* .no_alloc = */ true,
+        /* .ctx      = */ nullptr,
+    };
+    gguf_context_ptr ctx(gguf_init_from_file(path.c_str(), gguf_params));
+    if (!ctx) {
+        return {"", 0};
+    }
+    const int64_t id = gguf_find_key(ctx.get(), "general.architecture");
+    if (id < 0 || gguf_get_kv_type(ctx.get(), id) != GGUF_TYPE_STRING) {
+        return {"", 0};
+    }
+    const std::string arch = gguf_get_val_str(ctx.get(), id);
+    const int64_t id_ctx = gguf_find_key(ctx.get(), (arch + ".context_length").c_str());
+    const uint32_t n_ctx_train = id_ctx >= 0 && gguf_get_kv_type(ctx.get(), id_ctx) == GGUF_TYPE_UINT32 ?
+            gguf_get_val_u32(ctx.get(), id_ctx) : 0;
+    return {arch, n_ctx_train};
+}
+
 int llama_server(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
@@ -150,10 +176,25 @@ int llama_server(common_params & params, int argc, char ** argv) {
         }
 
         if (params.n_parallel < 0) {
-            SRV_TRC("%s", "n_parallel is set to auto, using n_parallel = 4 and kv_unified = true\n");
-
             params.n_parallel = 4;
-            params.kv_unified = true;
+
+            // DeepSeek V4 limits its compute buffers per KV stream: one stream for all sequences reserves a graph of
+            // every sequence at the full context depth (20 GiB more on one device at 400K). Without -c, the slots share
+            // the training context as the unified pool would: the fit would otherwise give each slot all of it, and the
+            // KV cache would take the VRAM of the expert cache.
+            const auto [arch, n_ctx_train] = gguf_arch_ctx(params.model.path);
+            if (arch == "deepseek4" || arch == "deepseek41") {
+                params.kv_unified = false;
+                // -c 0 asks for the full context of each slot
+                if (params.n_ctx == 0 && n_ctx_train > 0 && (uint32_t) params.fit_params_min_ctx != UINT32_MAX) {
+                    params.n_ctx = (int32_t) n_ctx_train;
+                }
+                SRV_INF("n_parallel is set to auto, using n_parallel = 4 with a KV stream per slot for %s (context %d in total)\n",
+                        arch.c_str(), params.n_ctx);
+            } else {
+                SRV_TRC("%s", "n_parallel is set to auto, using n_parallel = 4 and kv_unified = true\n");
+                params.kv_unified = true;
+            }
         }
     }
 
