@@ -105,6 +105,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <thread>
 #include <vector>
 
 #if defined(__linux__)
@@ -7486,6 +7487,30 @@ static void ggml_backend_cuda_stage_d2d(ggml_backend_t backend, void * dst, cons
     CUDA_CHECK(cudaMemcpyAsync(dst, src, size, cudaMemcpyDeviceToDevice, cuda_ctx->stream()));
 }
 
+#ifdef GGML_USE_HIP
+// HIP before ROCm 7.2.1 fails hipEventSynchronize and hipEventQuery on an event whose last record was on a stream that is
+// now capturing, and invalidates that capture. Query only while no capture runs (ggml_cuda_lock_counter, which a capture
+// changes under ggml_cuda_lock) and poll: a blocking wait under the lock would hold off captures until the event completes.
+static void ggml_backend_cuda_stage_wait_free(ggml_backend_event_t free) {
+    for (;;) {
+        cudaError_t err;
+        {
+            std::unique_lock<std::mutex> lock(ggml_cuda_lock);
+            ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
+            err = cudaEventQuery((cudaEvent_t) free->context);
+        }
+        if (err == cudaSuccess) {
+            return;
+        }
+        if (err != cudaErrorNotReady) {
+            CUDA_CHECK(err);
+        }
+        (void) cudaGetLastError();
+        std::this_thread::sleep_for(std::chrono::microseconds(20));
+    }
+}
+#endif // GGML_USE_HIP
+
 static bool ggml_backend_cuda_stage_register(void * ptr, size_t size) {
     cudaError_t err = cudaHostRegister(ptr, size, cudaHostRegisterPortable | cudaHostRegisterReadOnly);
     if (err != cudaSuccess) {
@@ -7619,6 +7644,11 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_stage_d2d") == 0) {
         return (void *) ggml_backend_cuda_stage_d2d;
     }
+#ifdef GGML_USE_HIP
+    if (strcmp(name, "ggml_backend_stage_wait_free") == 0) {
+        return (void *) ggml_backend_cuda_stage_wait_free;
+    }
+#endif // GGML_USE_HIP
     if (strcmp(name, "ggml_backend_get_op_cost") == 0) {
         return (void *) ggml_backend_cuda_get_op_cost;
     }

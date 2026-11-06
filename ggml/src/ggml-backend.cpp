@@ -2945,6 +2945,7 @@ struct ggml_backend_sched_stage_ring {
     ggml_backend_stage_pack_host_t     pack_host     = nullptr;
     ggml_backend_stage_d2d_t     d2d     = nullptr;
     ggml_backend_stage_prepare_t prepare = nullptr;
+    ggml_backend_stage_wait_free_t wait_free = nullptr;
     ggml_backend_buffer_t        anchor  = nullptr; // buffer and placeholder data of redirected copies (see split_graph)
     ggml_backend_buffer_t buffers[GGML_SCHED_STAGE_MAX_SLOTS] = {}; // null when the slots are lent
     void *                slots[GGML_SCHED_STAGE_MAX_SLOTS]   = {}; // device memory of each slot
@@ -3030,8 +3031,13 @@ static void ggml_backend_sched_stage_run_job(
     const int64_t t_start = ggml_backend_sched_stage_trace_us();
     auto lap = [&](int64_t & acc) { const int64_t now = ggml_time_us(); acc += now - t; t = now; };
     if (job.wait_free) {
-        // a host wait: HIP rejects a copy stream wait on an event of the compute stream while that stream captures
-        ggml_backend_event_synchronize(ring.free[job.slot]);
+        // a host wait: HIP rejects a copy stream wait on an event of the compute stream while that stream captures.
+        // Older HIP also rejects the host wait then, which ring.wait_free avoids.
+        if (ring.wait_free != nullptr) {
+            ring.wait_free(ring.free[job.slot]);
+        } else {
+            ggml_backend_event_synchronize(ring.free[job.slot]);
+        }
     }
     lap(w->us_free);
     const int64_t t_free = ggml_backend_sched_stage_trace_us();
@@ -3181,6 +3187,10 @@ static ggml_backend_sched_stage * ggml_backend_sched_stage_new(ggml_backend_sche
         ring.upload = (ggml_backend_stage_upload_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_stage_upload");
         ring.d2d    = (ggml_backend_stage_d2d_t)    ggml_backend_reg_get_proc_address(reg, "ggml_backend_stage_d2d");
         ring.prepare = (ggml_backend_stage_prepare_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_stage_prepare");
+        ring.wait_free = (ggml_backend_stage_wait_free_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_stage_wait_free");
+        if (const char * e = getenv("GGML_SCHED_STAGE_WAIT_FREE"); e != nullptr && atoi(e) == 0) {
+            ring.wait_free = nullptr;
+        }
         ring.pack_unit     = (ggml_backend_stage_pack_unit_t)     ggml_backend_reg_get_proc_address(reg, "ggml_backend_stage_pack_unit");
         ring.upload_packed = (ggml_backend_stage_upload_packed_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_stage_upload_packed");
         ring.pack_host     = (ggml_backend_stage_pack_host_t)     ggml_backend_reg_get_proc_address(reg, "ggml_backend_stage_pack_host");

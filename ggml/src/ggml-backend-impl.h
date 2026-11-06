@@ -154,6 +154,11 @@ extern "C" {
     // a staged weight is ready for the split on the compute stream ("ggml_backend_stage_prepare", optional): the backend may
     // convert it in place on that stream, for example into the layout its kernels read. Its content is new for every use.
     typedef void (*ggml_backend_stage_prepare_t)(ggml_backend_t backend, struct ggml_tensor * weight);
+    // the staging thread's host wait for a slot's free event ("ggml_backend_stage_wait_free", optional). free was recorded on
+    // the compute stream, which can capture a graph during the wait. Some runtimes (HIP before ROCm 7.2.1) reject a host wait
+    // on an event whose last record was on a capturing stream, so a backend can wait in a way that does not overlap a capture.
+    // Without the hook, the scheduler calls ggml_backend_event_synchronize.
+    typedef void (*ggml_backend_stage_wait_free_t)(ggml_backend_event_t free);
     // page-lock a host range for direct uploads from every device ("ggml_backend_stage_register"), and undo it
     // ("ggml_backend_stage_unregister"); register returns false if the range could not be locked
     typedef bool (*ggml_backend_stage_register_t)  (void * ptr, size_t size);
