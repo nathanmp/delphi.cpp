@@ -3131,10 +3131,23 @@ static void ggml_backend_cuda_get_tensor_async_side(ggml_backend_t backend, cons
 
     cudaStream_t main_stream = cuda_ctx->stream();
     if (slot.size < size) {
+        // the snapshot buffer is allocated on first use, outside the reserved compute buffers: when the device is full,
+        // read on the compute stream instead of failing
+        void * dev = nullptr;
+        if (cudaMalloc(&dev, size) != cudaSuccess) {
+            (void) cudaGetLastError();
+            static std::atomic<bool> warned { false };
+            if (!warned.exchange(true)) {
+                GGML_LOG_WARN("%s: no memory for a %.1f MiB side-download buffer on CUDA%d; downloading on the compute stream\n",
+                        __func__, size / 1048576.0, cuda_ctx->device);
+            }
+            ggml_backend_cuda_get_tensor_async(backend, tensor, data, offset, size);
+            return;
+        }
         if (slot.dev != nullptr) {
             sd->retired.push_back(slot.dev);
         }
-        CUDA_CHECK(cudaMalloc(&slot.dev, size));
+        slot.dev = dev;
         slot.size = size;
         slot.used = false;
     }
