@@ -1816,6 +1816,25 @@ void llama_context::set_embeddings_nextn_host(bool value) {
     embd_nextn_host = value;
 }
 
+// delphi: optional backend procs that download layer features on a side stream, so that the PCIe transfer does not
+// hold up the next ubatch of the compute stream (ggml-cuda: ggml_backend_cuda_get_tensor_async_side)
+typedef void (*llama_get_tensor_async_side_t)(ggml_backend_t, const ggml_tensor *, void *, size_t, size_t);
+typedef void (*llama_side_join_t)(ggml_backend_t);
+
+static void * feature_side_proc(ggml_backend_t backend, const char * name) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    return reg ? ggml_backend_reg_get_proc_address(reg, name) : nullptr;
+}
+
+static llama_get_tensor_async_side_t feature_side_get(ggml_backend_t backend) {
+    return (llama_get_tensor_async_side_t) feature_side_proc(backend, "ggml_backend_get_tensor_async_side");
+}
+
+static llama_side_join_t feature_side_join(ggml_backend_t backend) {
+    return (llama_side_join_t) feature_side_proc(backend, "ggml_backend_side_join");
+}
+
 void llama_context::set_feature_handoff(bool enable) {
     std::lock_guard<std::mutex> lock(handoff_mutex);
     handoff_enabled = enable;
@@ -1852,6 +1871,7 @@ void llama_context::feature_handoff_acquire() {
         }
         slot.buf.reset(ggml_backend_buft_alloc_buffer(buft, need));
         GGML_ASSERT(slot.buf && "failed to allocate the feature hand-off buffer");
+        slot.pinned = buft != ggml_backend_cpu_buffer_type();
     }
 
     uint8_t * base = (uint8_t *) ggml_backend_buffer_get_base(slot.buf.get());
@@ -1881,7 +1901,12 @@ int32_t llama_context::feature_handoff_take() {
         return -1;
     }
 
-    // the feature copies of the last decode are queued on the backend streams; mark their end
+    // the feature copies of the last decode are queued on the backend streams (or side streams joined here); mark their end
+    for (auto & backend : backends) {
+        if (auto * join = feature_side_join(backend.get())) {
+            join(backend.get());
+        }
+    }
     if (slot.events.empty()) {
         slot.events.resize(backends.size());
         for (size_t i = 0; i < backends.size(); ++i) {
@@ -3382,6 +3407,8 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
 void llama_context::extract_layer_inputs(const llm_graph_result * res, const llama_ubatch & ubatch, size_t token_offset) {
     const size_t n_tokens = ubatch.n_tokens;
+    // pinned hand-off buffers can take side-stream downloads; feature_handoff_take joins them
+    const bool side_ok = handoff_enabled && handoff_slots[handoff_cur].pinned;
     // The rows go to their batch index: the readers (speculative drafts) index the features by batch row, and a split
     // can reorder the tokens (equal splits interleave sequences, the DSV4 cache puts a long prompt first). Without the
     // indices, the ubatches are in batch order.
@@ -3409,8 +3436,16 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, const lla
 
         ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), t);
         GGML_ASSERT(backend != nullptr);
+        auto * get_side = side_ok ? feature_side_get(backend) : nullptr;
+        auto get = [&](void * dst, size_t off, size_t size) {
+            if (get_side) {
+                get_side(backend, t, dst, off, size);
+            } else {
+                ggml_backend_tensor_get_async(backend, t, dst, off, size);
+            }
+        };
         if (!idx) {
-            ggml_backend_tensor_get_async(backend, t, embd_layer_inp[il].data + dst_offset, 0, nbytes);
+            get(embd_layer_inp[il].data + dst_offset, 0, nbytes);
             continue;
         }
         const size_t row_bytes = row_floats*sizeof(float);
@@ -3421,7 +3456,7 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, const lla
             }
             const size_t dst = (size_t) (*idx)[i0]*row_floats;
             GGML_ASSERT(dst + (i1 - i0)*row_floats <= embd_layer_inp[il].size);
-            ggml_backend_tensor_get_async(backend, t, embd_layer_inp[il].data + dst, i0*row_bytes, (i1 - i0)*row_bytes);
+            get(embd_layer_inp[il].data + dst, i0*row_bytes, (i1 - i0)*row_bytes);
             i0 = i1;
         }
     }

@@ -514,7 +514,8 @@ private:
         float *                             nextn = nullptr;
         std::vector<float *>                layer_inp;
         std::vector<ggml_backend_event_ptr> events; // per entry of `backends`, null where unsupported
-        bool                                taken = false;
+        bool                                taken  = false;
+        bool                                pinned = false; // buf is the output device's host buffer type
     };
     void feature_handoff_acquire(); // in decode, after output_reserve
 

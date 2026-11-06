@@ -1062,11 +1062,55 @@ static void ggml_cuda_xdev_stage_copy(
 
 #endif // GGML_CUDA_XDEV_STAGE_AVAILABLE
 
+// delphi: large device-to-host reads into pinned memory (layer features for speculative drafts) that should not hold up
+// the compute stream. The compute stream copies the tensor into a device slot (a device-to-device copy, tens of us), and
+// a side stream downloads the slot over PCIe while the compute stream goes on with the next ubatch; on the CMP 170HX a
+// 16 MiB download on the compute stream stalled the next ubatch for 20-40 ms. ggml_backend_cuda_side_join() orders
+// the downloads before later work of the compute stream, and synchronize() waits for them.
+struct ggml_cuda_side_download {
+    static constexpr int n_slots = 4;
+    struct slot {
+        void *      dev  = nullptr;
+        size_t      size = 0;
+        cudaEvent_t done = nullptr;
+        bool        used = false;
+    };
+    cudaStream_t stream   = nullptr;
+    cudaEvent_t  snapshot = nullptr;
+    slot         slots[n_slots];
+    int          next = 0;
+    cudaEvent_t  last = nullptr; // done event of the latest download not yet joined into the compute stream
+    std::vector<void *> retired; // slots that grew: their downloads may still run, and cudaFree would synchronize
+};
+
+static void ggml_cuda_side_download_free(int device, ggml_cuda_side_download * sd) {
+    if (sd == nullptr) {
+        return;
+    }
+    ggml_cuda_set_device(device);
+    CUDA_CHECK(cudaStreamSynchronize(sd->stream));
+    for (auto & slot : sd->slots) {
+        if (slot.dev != nullptr) {
+            CUDA_CHECK(cudaFree(slot.dev));
+        }
+        if (slot.done != nullptr) {
+            CUDA_CHECK(cudaEventDestroy(slot.done));
+        }
+    }
+    for (void * p : sd->retired) {
+        CUDA_CHECK(cudaFree(p));
+    }
+    CUDA_CHECK(cudaEventDestroy(sd->snapshot));
+    CUDA_CHECK(cudaStreamDestroy(sd->stream));
+    delete sd;
+}
+
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
     delete exec_trace_timer;
+    ggml_cuda_side_download_free(device, side_download);
     ggml_cuda_moe_int4_free_scratch(this);
     if (q8_1_cache_buf != nullptr) {
         ggml_cuda_set_device(device);
@@ -3054,6 +3098,72 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
 
+// delphi: like get_tensor_async, but downloads on a side stream (see ggml_cuda_side_download). The destination must be
+// pinned host memory. The data is complete after ggml_backend_cuda_side_join() and a later event or synchronization
+// of the compute stream, or after synchronize(). GGML_CUDA_SIDE_DOWNLOAD=0 queues every read on the compute stream.
+static void ggml_backend_cuda_get_tensor_async_side(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_SIDE_DOWNLOAD");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    if (!enabled || size < (1u << 20)) {
+        ggml_backend_cuda_get_tensor_async(backend, tensor, data, offset, size);
+        return;
+    }
+
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    cuda_ctx->xdev_copy_after = nullptr; // see ggml_cuda_xdev_stage_copy
+    ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+    GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+
+    ggml_cuda_set_device(cuda_ctx->device);
+    ggml_cuda_side_download *& sd = cuda_ctx->side_download;
+    if (sd == nullptr) {
+        sd = new ggml_cuda_side_download();
+        CUDA_CHECK(cudaStreamCreateWithFlags(&sd->stream, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaEventCreateWithFlags(&sd->snapshot, cudaEventDisableTiming));
+        for (auto & slot : sd->slots) {
+            CUDA_CHECK(cudaEventCreateWithFlags(&slot.done, cudaEventDisableTiming));
+        }
+    }
+    ggml_cuda_side_download::slot & slot = sd->slots[sd->next];
+    sd->next = (sd->next + 1) % ggml_cuda_side_download::n_slots;
+
+    cudaStream_t main_stream = cuda_ctx->stream();
+    if (slot.size < size) {
+        if (slot.dev != nullptr) {
+            sd->retired.push_back(slot.dev);
+        }
+        CUDA_CHECK(cudaMalloc(&slot.dev, size));
+        slot.size = size;
+        slot.used = false;
+    }
+    if (slot.used) {
+        // the slot is free once its previous contents are downloaded
+        CUDA_CHECK(cudaStreamWaitEvent(main_stream, slot.done, 0));
+    }
+    CUDA_CHECK(cudaMemcpyAsync(slot.dev, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToDevice, main_stream));
+    CUDA_CHECK(cudaEventRecord(sd->snapshot, main_stream));
+    CUDA_CHECK(cudaStreamWaitEvent(sd->stream, sd->snapshot, 0));
+    CUDA_CHECK(cudaMemcpyAsync(data, slot.dev, size, cudaMemcpyDeviceToHost, sd->stream));
+    CUDA_CHECK(cudaEventRecord(slot.done, sd->stream));
+    slot.used = true;
+    sd->last  = slot.done;
+}
+
+// delphi: orders the side downloads queued so far before the work queued on the compute stream from now on
+static void ggml_backend_cuda_side_join(ggml_backend_t backend) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_side_download * sd = cuda_ctx->side_download;
+    if (sd == nullptr || sd->last == nullptr) {
+        return;
+    }
+    ggml_cuda_set_device(cuda_ctx->device);
+    CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), sd->last, 0));
+    sd->last = nullptr;
+    cuda_ctx->xdev_copy_after = nullptr; // see ggml_cuda_xdev_stage_copy
+}
+
 static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data,
         size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
@@ -3145,6 +3255,10 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     cuda_ctx->xdev_copy_after = nullptr; // see ggml_cuda_xdev_stage_copy
 
     CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+    if (cuda_ctx->side_download != nullptr) {
+        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->side_download->stream));
+        cuda_ctx->side_download->last = nullptr;
+    }
 
     // Timing events are recorded on stream 0; this existing synchronization completes all of them.
     if (cuda_ctx->exec_trace_timer && cuda_ctx->curr_stream_no == 0) {
@@ -7606,6 +7720,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_copy_on") == 0) {
         return (void *) ggml_backend_cuda_copy_on;
+    }
+    if (strcmp(name, "ggml_backend_get_tensor_async_side") == 0) {
+        return (void *) ggml_backend_cuda_get_tensor_async_side;
+    }
+    if (strcmp(name, "ggml_backend_side_join") == 0) {
+        return (void *) ggml_backend_cuda_side_join;
     }
     if (strcmp(name, "ggml_backend_stage_register") == 0) {
         return (void *) ggml_backend_cuda_stage_register;

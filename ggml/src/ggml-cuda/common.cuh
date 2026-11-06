@@ -1578,6 +1578,8 @@ struct ggml_backend_cuda_context {
     // rest of the work queued on the compute stream. Cleared whenever other work is queued on the compute stream.
     cudaStream_t xdev_upload_stream = nullptr;
     cudaEvent_t  xdev_copy_after    = nullptr;
+    // delphi: device-to-host reads downloaded from a snapshot on a side stream (ggml_backend_get_tensor_async_side)
+    struct ggml_cuda_side_download * side_download = nullptr;
     // null unless GGML_EXEC_TRACE_GPU_TIMING is active; owned by this context
     ggml_cuda_exec_trace_timer * exec_trace_timer = nullptr;
 
