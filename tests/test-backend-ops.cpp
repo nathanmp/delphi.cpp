@@ -109,7 +109,20 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
             // per-row scale lives in front of the blocks, so the tensor cannot be treated
             // as one long row of blck_size-sized rows the way the generic path below does
             std::vector<uint8_t> dataq(ggml_nbytes(tensor));
-            ggml_quantize_chunk(tensor->type, data.data(), dataq.data(), 0, ggml_nrows(tensor), tensor->ne[0], im);
+            // whole rows per thread: IQ*_KS quantization of a 288-expert MoE tensor took minutes on one thread
+            const int64_t nrows = ggml_nrows(tensor);
+            const int64_t n_q_threads = std::min<int64_t>(std::max<int64_t>(N_THREADS/2, 1), nrows);
+            std::vector<std::future<void>> q_tasks;
+            for (int64_t i = 0; i < n_q_threads; i++) {
+                const int64_t r0 = i*nrows/n_q_threads;
+                const int64_t r1 = (i + 1)*nrows/n_q_threads;
+                q_tasks.push_back(std::async(std::launch::async, [&, r0, r1]() {
+                    ggml_quantize_chunk(tensor->type, data.data(), dataq.data(), r0*tensor->ne[0], r1 - r0, tensor->ne[0], im);
+                }));
+            }
+            for (auto & t : q_tasks) {
+                t.get();
+            }
             ggml_backend_tensor_set(tensor, dataq.data(), 0, dataq.size());
             return;
         }
