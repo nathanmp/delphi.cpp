@@ -3652,7 +3652,29 @@ private:
         int32_t off_next = 0;
         int32_t n_batch = llama_n_batch(ctx_tgt);
         for (int32_t off = 0; off < batch.size(); off = off_next) {
-            const int32_t n_tokens = std::min(n_batch, batch.size() - off);
+            int32_t n_tokens = std::min(n_batch, batch.size() - off);
+            // delphi: the draft ingests the last prompt batch synchronously, after the target has finished it; ending a
+            // prompt with a call of at most one ubatch lets the draft ingest the rest while the target runs that call.
+            // LLAMA_SPEC_TAIL_SPLIT=0 turns this off.
+            static const bool spec_tail_split = [] {
+                const char * env = getenv("LLAMA_SPEC_TAIL_SPLIT");
+                return env == nullptr || atoi(env) != 0;
+            }();
+            const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_tgt);
+            if (spec && spec_tail_split && n_tokens > n_ubatch) {
+                const int32_t split = off + ((n_tokens - 1) / n_ubatch) * n_ubatch;
+                bool has_prompt   = false;
+                bool early_output = false;
+                bool late_output  = false;
+                for (int32_t i = off; i < off + n_tokens; ++i) {
+                    has_prompt   |= batch.tokens[i].is_prompt;
+                    early_output |= batch.tokens[i].output && i < split;
+                    late_output  |= batch.tokens[i].output && i >= split;
+                }
+                if (has_prompt && late_output && !early_output) {
+                    n_tokens = split - off;
+                }
+            }
             try {
                 scoped_timer t(t_decode, n_decode);
                 // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()
