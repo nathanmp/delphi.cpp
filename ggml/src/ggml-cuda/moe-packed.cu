@@ -827,9 +827,6 @@ static __global__ void moe_packed_mm(const moe_packed_launch_args a, const int a
     static_assert(JW % 8 == 0, "bad tile width");
 
     extern __shared__ __align__(16) char smem[];
-    // A KS row scale applies to every QK_K block of one row tile. Cache one plane for each in-flight unit and copy it into the
-    // ordinary stage tail only after its async load has completed; this avoids rereading the global tail for every k chunk.
-    __shared__ __align__(16) char row_meta_cache[RM ? ST*RM : 1];
 
     // the table of the format, visible after the first __syncthreads of the loop
     __shared__ uint32_t tab_s[pq::tab_words > 0 ? pq::tab_words : 1];
@@ -901,18 +898,13 @@ static __global__ void moe_packed_mm(const moe_packed_launch_args a, const int a
                     src = srcc + 16*c;
                 } else if (c < (CH + LM)/16) {
                     src = srcb + 2*CH + 16*(c - CH/16);
+                } else if (RM != 0 && c < (CH + LM + RM)/16) {
+                    // the KS row scale plane of the row tile goes into the tail of every stage (an L2 hit after the first chunk)
+                    src = ld_meta + 16*(c - (CH + LM)/16);
                 } else {
                     continue;
                 }
                 cp_async_cg_16<0>(ggml_cuda_cvta_generic_to_shared(s + 16*c), src);
-            }
-            if constexpr (RM != 0) {
-                if (kc == 0) {
-                    char * cache = row_meta_cache + (q % ST)*RM;
-                    for (int c = threadIdx.x; c < RM/16; c += NW*WARP_SIZE) {
-                        cp_async_cg_16<0>(ggml_cuda_cvta_generic_to_shared(cache + 16*c), ld_meta + 16*c);
-                    }
-                }
             }
         } else {
             const char * srcw = ld_w + (int64_t) kc*MOE_PACKED_SA;
@@ -961,16 +953,6 @@ static __global__ void moe_packed_mm(const moe_packed_launch_args a, const int a
     for (int iter = 0; iter < n_iter; ++iter) {
         moe_cp_async_wait<ST - 2>();
         __syncthreads();
-        if constexpr (RM != 0) {
-            constexpr int CH = pq::chunk_bytes;
-            constexpr int LM = pq::sb_bytes - 2*CH;
-            char * s_meta = smem + (iter % ST)*SSTAGE + CH + LM;
-            const char * cache = row_meta_cache + ((iter/kc_n) % ST)*RM;
-            for (int c = threadIdx.x; c < RM/16; c += NW*WARP_SIZE) {
-                *(uint4 *) (s_meta + 16*c) = *(const uint4 *) (cache + 16*c);
-            }
-            __syncthreads();
-        }
         if (iter + ST - 1 < n_iter) {
             load_stage(iter + ST - 1);
         }
@@ -1227,24 +1209,37 @@ static void moe_packed_launch_magic(const moe_packed_launch_args & args, cudaStr
     }
 }
 
-// GGML_CUDA_MOE_PACKED_VARIANT: 0 = 8 warps, 4 stages; 1 = 8 warps, 3 stages; 2 = 4 warps, 3 stages; 3 = 4 warps, 4 stages.
-// Default: 4 warps and 3 stages, but 8 warps for the int8 formats above J=64, where the 4-warp i8 instances spill registers.
+// GGML_CUDA_MOE_PACKED_VARIANT: 0 = 8 warps, 4 stages; 1 = 8 warps, 3 stages; 2 = 4 warps, 3 stages; 3 = 4 warps, 4 stages;
+// 4 = 4 warps of 32 x J, 3 stages (each warp decodes its A fragments for all J columns).
+// Default: 4 warps and 3 stages, but 8 warps for the int8 formats above J=64, where the 4-warp i8 instances spill registers;
+// 32 x J warp tiles for the lossless formats (see MW4Q).
 template <int fmt, int J>
 static void moe_packed_launch_J(const moe_packed_launch_args & args, cudaStream_t stream) {
     // 8 warps: two warps per column range when a warp would get at least 8 columns, so each B fragment feeds two A fragments.
     constexpr int MW8 = J % 16 == 0 && J >= 32 ? 2 : 1;
     // 4 warps: 64 x J/2 or 32 x J warp tiles, fewer shared memory reads per mma.
     constexpr int MW4 = J % 16 == 0 && J >= 32 ? 4 : 2;
+    // delphi: the lossless formats decode their A fragments for every warp that reads them, so the 32 x J tile (each fragment
+    // decoded once per block) is faster at J = 32 and J = 64: CMP 170HX, E = 64, n = 228/456: IQ4_XS -11/-6 %, IQ4_KS
+    // -13/-11 %, IQ4_K -17/-12 %, MXFP4 -15/-10 %, Q4_K -4/+3 % (so Q4_K and the other scale+min formats keep 64 x J/2 at J = 64).
+    constexpr int MW4Q = [] {
+        if constexpr (moe_packed_is_q(fmt)) {
+            return moe_packed_q<fmt>::family == MOE_PACKED_FAMILY_DM && J > 32 ? MW4 : 2;
+        } else {
+            return MW4;
+        }
+    }();
     switch (moe_packed_variant()) {
         case 1:  moe_packed_launch_magic<fmt, J, 8, MW8, 3>(args, stream); break;
         case 2:  moe_packed_launch_magic<fmt, J, 4, MW4, 3>(args, stream); break;
         case 3:  moe_packed_launch_magic<fmt, J, 4, MW4, 4>(args, stream); break;
         case 0:  moe_packed_launch_magic<fmt, J, 8, MW8, 4>(args, stream); break;
+        case 4:  moe_packed_launch_magic<fmt, J, 4, 2, 3>(args, stream); break;
         default:
             if constexpr (fmt != GGML_CUDA_MOE_PACKED_F16 && J > 64) {
                 moe_packed_launch_magic<fmt, J, 8, MW8, 3>(args, stream);
             } else {
-                moe_packed_launch_magic<fmt, J, 4, MW4, 3>(args, stream);
+                moe_packed_launch_magic<fmt, J, 4, MW4Q, 3>(args, stream);
             }
             break;
     }
