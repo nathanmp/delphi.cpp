@@ -59,6 +59,111 @@ static void ggml_gen_hadamard(ggml_tensor * tensor) {
     }
 }
 
+// delphi: LLAMA_KV_RESIDENT_CELLS=<cells> or <dev>=<cells>[,<dev>=<cells>...] (for example CUDA2=700000).
+// Returns the resident cell count for the device, 0 if the cache on it stays all in VRAM.
+static uint32_t llama_kv_resident_cells(const char * dev_name) {
+    const char * env = getenv("LLAMA_KV_RESIDENT_CELLS");
+    if (env == nullptr || *env == '\0') {
+        return 0;
+    }
+    std::string spec(env);
+    if (spec.find('=') == std::string::npos) {
+        return (uint32_t) std::stoul(spec);
+    }
+    size_t pos = 0;
+    while (pos < spec.size()) {
+        size_t end = spec.find(',', pos);
+        if (end == std::string::npos) {
+            end = spec.size();
+        }
+        const std::string item = spec.substr(pos, end - pos);
+        const size_t eq = item.find('=');
+        if (eq != std::string::npos && item.substr(0, eq) == dev_name) {
+            return (uint32_t) std::stoul(item.substr(eq + 1));
+        }
+        pos = end + 1;
+    }
+    return 0;
+}
+
+// delphi: allocate the tensors of ctx in one buffer whose cells [n_resident, ne[1]) of each stream are pinned host
+// memory and the rest VRAM, at the same addresses (CUDA VMM). Kernels read the host cells over PCIe. Each tensor
+// starts on a mapping granule. Returns nullptr when the backend has no such buffers.
+static ggml_backend_buffer_t llama_kv_window_alloc(ggml_context * ctx, ggml_backend_buffer_type_t buft,
+        uint32_t n_resident, uint32_t kv_size, size_t & n_host) {
+    n_host = 0;
+
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    if (reg == nullptr) {
+        return nullptr;
+    }
+
+    using gran_fn_t  = size_t (*)(ggml_backend_buffer_type_t);
+    using alloc_fn_t = ggml_backend_buffer_t (*)(ggml_backend_buffer_type_t, size_t, const size_t *, int);
+
+    auto gran_fn  = (gran_fn_t)  ggml_backend_reg_get_proc_address(reg, "ggml_backend_kv_region_granularity");
+    auto alloc_fn = (alloc_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_kv_region_alloc");
+
+    const size_t g = gran_fn && alloc_fn ? gran_fn(buft) : 0;
+    if (g == 0) {
+        return nullptr;
+    }
+
+    auto up   = [g](size_t x) { return (x + g - 1)/g*g; };
+    auto down = [g](size_t x) { return x/g*g; };
+
+    std::vector<std::pair<ggml_tensor *, size_t>> offs;
+    std::vector<size_t> ranges;
+
+    size_t cur = 0;
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+        if (t->view_src != nullptr) {
+            continue;
+        }
+        const size_t off = cur;
+        const size_t sz  = ggml_backend_buft_get_alloc_size(buft, t);
+
+        if (t->ne[1] == (int64_t) kv_size) {
+            for (int64_t s = 0; s < t->ne[2]; ++s) {
+                const size_t b = up(off + s*t->nb[2] + (size_t) n_resident*t->nb[1]);
+                const size_t e = s + 1 == t->ne[2] ? up(off + sz) : down(off + s*t->nb[2] + (size_t) kv_size*t->nb[1]);
+                if (e > b) {
+                    ranges.push_back(b);
+                    ranges.push_back(e);
+                    n_host += e - b;
+                }
+            }
+        }
+
+        offs.emplace_back(t, off);
+        cur = up(off + sz);
+    }
+
+    ggml_backend_buffer_t buf = alloc_fn(buft, cur, ranges.data(), (int) (ranges.size()/2));
+    if (buf == nullptr) {
+        return nullptr;
+    }
+
+    char * base = (char *) ggml_backend_buffer_get_base(buf);
+    for (auto & [t, off] : offs) {
+        if (ggml_backend_tensor_alloc(buf, t, base + off) != GGML_STATUS_SUCCESS) {
+            ggml_backend_buffer_free(buf);
+            return nullptr;
+        }
+    }
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+        if (t->view_src != nullptr && t->buffer == nullptr) {
+            if (ggml_backend_view_init(t) != GGML_STATUS_SUCCESS) {
+                ggml_backend_buffer_free(buf);
+                return nullptr;
+            }
+        }
+    }
+
+    return buf;
+}
+
 //
 // llama_kv_cache
 //
@@ -81,7 +186,8 @@ llama_kv_cache::llama_kv_cache(
     const  layer_reuse_cb & reuse,
     const  layer_share_cb & share,
              const char *   name_tag,
-                   bool     mirror_reuse) :
+                   bool     mirror_reuse,
+                   bool     kv_window) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
     other(static_cast<llama_kv_cache *>(mem_other)),
@@ -331,7 +437,30 @@ llama_kv_cache::llama_kv_cache(
                 t->buffer = buf; // set dummy buffer for KV cache so that the backend scheduler won't try to allocate it
             }
         } else {
-            buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft); // real buffer
+            buf = nullptr;
+
+            const char * buft_dev = ggml_backend_buft_get_device(buft) ? ggml_backend_dev_name(ggml_backend_buft_get_device(buft)) : "";
+            const uint32_t n_resident = kv_window ? llama_kv_resident_cells(buft_dev) : 0;
+            if (n_resident > 0 && n_resident < kv_size) {
+                size_t n_host = 0;
+                buf = llama_kv_window_alloc(ctx.get(), buft, n_resident, kv_size, n_host);
+                if (buf) {
+                    for (auto & layer : layers) {
+                        if ((layer.k && layer.k->buffer == buf) || (layer.v && layer.v->buffer == buf)) {
+                            layer.n_resident = n_resident;
+                        }
+                    }
+                    LLAMA_LOG_INFO("%s: %10s KV window: cells [0, %u) in VRAM, [%u, %u) in host memory: %.2f MiB VRAM + %.2f MiB host\n",
+                            __func__, ggml_backend_buffer_name(buf), n_resident, n_resident, kv_size,
+                            (ggml_backend_buffer_get_size(buf) - n_host)/1024.0/1024.0, n_host/1024.0/1024.0);
+                } else {
+                    LLAMA_LOG_WARN("%s: %10s KV window not available, allocating the cache in VRAM\n", __func__, buft_dev);
+                }
+            }
+
+            if (!buf) {
+                buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft); // real buffer
+            }
         }
         if (!buf) {
             throw std::runtime_error("failed to allocate buffer for kv cache");
@@ -1402,6 +1531,30 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
             ggml_row_size(k->type, n_embd_k_gqa),
             ggml_row_size(k->type, n_embd_k_gqa*kv_size),
             ggml_row_size(k->type, n_embd_k_gqa*kv_size)*sinfo.s0);
+}
+
+bool llama_kv_cache::window_active(int32_t il) const {
+    const auto it = map_layer_ids.find(il);
+    if (it == map_layer_ids.end()) {
+        return false;
+    }
+    return layers[it->second].n_resident > 0;
+}
+
+ggml_tensor * llama_kv_cache::stage_k(ggml_context * ctx, ggml_tensor * k, int32_t il, uint32_t n_tokens) const {
+    if (!window_active(il)) {
+        return k;
+    }
+
+    static const uint32_t min_tokens = [] {
+        const char * env = getenv("LLAMA_KV_WINDOW_STAGE_MIN_TOKENS");
+        return env ? (uint32_t) atoi(env) : 64u;
+    }();
+    if (n_tokens < min_tokens) {
+        return k;
+    }
+
+    return ggml_cont(ctx, k);
 }
 
 ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
@@ -2938,6 +3091,14 @@ const llama_kv_cache * llama_kv_cache_context::get_kv() const {
 
 ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) const {
     return kv->get_k(ctx, il, n_kv, sinfos[i_cur]);
+}
+
+ggml_tensor * llama_kv_cache_context::stage_k(ggml_context * ctx, ggml_tensor * k, int32_t il, uint32_t n_tokens) const {
+    return kv->stage_k(ctx, k, il, n_tokens);
+}
+
+bool llama_kv_cache_context::window_active(int32_t il) const {
+    return kv->window_active(il);
 }
 
 ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) const {

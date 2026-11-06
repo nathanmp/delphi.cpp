@@ -83,6 +83,7 @@
 #include "ggml-cuda/kpool-expand.cuh"
 #include "ggml-cuda/interval-mask.cuh"
 #include "ggml-cuda/moe-int4-decode.cuh"
+#include "ggml-cuda/kv-region.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -1153,6 +1154,7 @@ struct ggml_backend_cuda_buffer_context {
     int device;
     void * dev_ptr = nullptr;
     std::string name;
+    void * region = nullptr; // delphi: VRAM + host memory mapping (kv-region.cu), freed instead of dev_ptr
 
     ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
         device(device), dev_ptr(dev_ptr),
@@ -1160,7 +1162,13 @@ struct ggml_backend_cuda_buffer_context {
     }
 
     ~ggml_backend_cuda_buffer_context() {
-        CUDA_CHECK(cudaFree(dev_ptr));
+        if (region) {
+            ggml_cuda_set_device(device);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            ggml_cuda_kv_region_free(region);
+        } else {
+            CUDA_CHECK(cudaFree(dev_ptr));
+        }
     }
 };
 
@@ -1338,6 +1346,33 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
     }
 
     ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(buft_ctx->device, dev_ptr);
+
+    return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
+}
+
+// delphi: a buffer of this type whose host_ranges (n pairs of byte offsets, granularity-aligned) are pinned host memory
+static size_t ggml_backend_cuda_kv_region_granularity(ggml_backend_buffer_type_t buft) {
+    if (!ggml_backend_buft_is_cuda(buft)) {
+        return 0;
+    }
+    return ggml_cuda_kv_region_granularity(((ggml_backend_cuda_buffer_type_context *) buft->context)->device);
+}
+
+static ggml_backend_buffer_t ggml_backend_cuda_kv_region_alloc(ggml_backend_buffer_type_t buft, size_t size, const size_t * host_ranges, int n) {
+    if (!ggml_backend_buft_is_cuda(buft)) {
+        return nullptr;
+    }
+    const int device = ((ggml_backend_cuda_buffer_type_context *) buft->context)->device;
+
+    void * base = nullptr;
+    void * region = ggml_cuda_kv_region_create(device, size, host_ranges, n, &base);
+    if (region == nullptr) {
+        GGML_LOG_ERROR("%s: mapping %.2f MiB on device %d failed\n", __func__, size / 1024.0 / 1024.0, device);
+        return nullptr;
+    }
+
+    ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(device, base);
+    ctx->region = region;
 
     return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
 }
@@ -7790,6 +7825,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_moe_packed_set_inplace") == 0) {
         return (void *)ggml_backend_cuda_moe_packed_set_inplace;
+    }
+    if (strcmp(name, "ggml_backend_kv_region_granularity") == 0) {
+        return (void *)ggml_backend_cuda_kv_region_granularity;
+    }
+    if (strcmp(name, "ggml_backend_kv_region_alloc") == 0) {
+        return (void *)ggml_backend_cuda_kv_region_alloc;
     }
     if (strcmp(name, "ggml_backend_cuda_moe_int4_set_mode") == 0) {
         return (void *)ggml_backend_cuda_moe_int4_set_mode;

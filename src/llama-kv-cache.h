@@ -116,7 +116,9 @@ public:
         // a model can hold more than one cache, so the tensor names have to stay unique
                  const char *   name_tag = "",
         // delphi: a reused layer whose reader sits on another device gets a copy of the storage on that device (see mirrors)
-                       bool     mirror_reuse = false);
+                       bool     mirror_reuse = false,
+        // delphi: LLAMA_KV_RESIDENT_CELLS may put the cells past a count in pinned host memory (see kv_window_alloc)
+                       bool     kv_window = false);
 
     ~llama_kv_cache() = default;
 
@@ -201,6 +203,16 @@ public:
 
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+
+    // delphi: k is a get_k view. When it reaches past the resident cells of a KV window and the ubatch is wide, return
+    // a contiguous copy in the compute buffer: the attention then reads each host cell once over PCIe, not once per
+    // block. Otherwise return k.
+    ggml_tensor * stage_k(ggml_context * ctx, ggml_tensor * k, int32_t il, uint32_t n_tokens) const;
+
+    // delphi: layer il has a KV window. The graph does not test the current depth against the resident cells: a graph
+    // shape that changes with the depth does not fit the reservation (recorded at full depth), and every ubatch
+    // then reallocates and synchronizes all devices (-c 1048576: prefill 2.5x slower)
+    bool window_active(int32_t il) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
@@ -279,6 +291,9 @@ private:
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
+
+        // delphi: cells from this index on are in pinned host memory (KV window), 0 = all in VRAM
+        uint32_t n_resident = 0;
     };
 
     bool v_trans = true;  // the value tensor is transposed
@@ -459,6 +474,8 @@ public:
 
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * stage_k(ggml_context * ctx, ggml_tensor * k, int32_t il, uint32_t n_tokens) const;
+    bool window_active(int32_t il) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
 
     // store k_cur and v_cur in the cache based on the provided head location

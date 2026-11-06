@@ -4473,7 +4473,11 @@ ggml_tensor * llm_graph_context::build_attn_sparse(
 
     const auto & kq_mask = inp->get_kq_mask();
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+    ggml_tensor * k_cache = mctx_cur->get_k(ctx0, il);
+    ggml_tensor * k = mctx_cur->stage_k(ctx0, k_cache, il, n_tokens);
+    // delphi: a narrow ubatch over a KV window gathers its selected cells into VRAM once per query row, instead of
+    // reading the host cells in place once per head
+    const bool window_gather = k == k_cache && mctx_cur->window_active(il);
     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
     ggml_tensor * cur;
@@ -4543,7 +4547,47 @@ ggml_tensor * llm_graph_context::build_attn_sparse(
     const bool use_mma_indexed_decode = is_decode && k->type == GGML_TYPE_F16 &&
         k->ne[2] >= std::max<int64_t>(4096, 2*n_compact);
 
-    if (compact_ready) {
+    if (window_gather) {
+        const int64_t n_kv     = k->ne[2];
+        const int64_t n_stream = k->ne[3];
+        const int64_t n_q      = top_k->ne[1];
+        const int64_t n_g      = n_compact*n_q;
+
+        GGML_ASSERT(k->ne[1] == 1);
+
+        ggml_tensor * idx = ggml_is_contiguous(compact_idx) ? compact_idx : ggml_cont(ctx0, compact_idx);
+        idx = ggml_reshape_2d(ctx0, idx, n_g, n_stream);
+
+        // the selection holds invalid cells (< 0 or >= n_kv) that the attention skips: gather a valid cell for them
+        // and keep them invalid in the new indices. Cell numbers are exact in f32 (< 2^24).
+        ggml_tensor * idx_f = ggml_cast(ctx0, idx, GGML_TYPE_F32);
+        ggml_tensor * inv   = ggml_add(ctx0,
+                ggml_step(ctx0, ggml_scale(ctx0, idx_f, -1.0f)),
+                ggml_step(ctx0, ggml_scale_bias(ctx0, idx_f, 1.0f, -(float) (n_kv - 1))));
+        idx = ggml_cast(ctx0, ggml_clamp(ctx0, idx_f, 0.0f, (float) (n_kv - 1)), GGML_TYPE_I32);
+
+        ggml_tensor * k_rows = ggml_view_3d(ctx0, k, k->ne[0], n_kv, n_stream, k->nb[2], k->nb[3], 0);
+        ggml_tensor * kg = ggml_get_rows(ctx0, k_rows, idx);
+        kg = ggml_cast(ctx0, kg, k->type);
+        kg = ggml_reshape_4d(ctx0, kg, k->ne[0], 1, n_g, n_stream);
+        cb(kg, "kv_window_gather", il);
+
+        ggml_tensor * vg = ggml_view_4d(ctx0, kg, v_cur->ne[0], kg->ne[1], kg->ne[2], kg->ne[3], kg->nb[1], kg->nb[2], kg->nb[3], 0);
+
+        // new index = position in the gather, or negative for an invalid cell
+        ggml_tensor * gidx = ggml_arange(ctx0, 0.0f, (float) n_g, 1.0f);
+        gidx = ggml_reshape_2d(ctx0, gidx, n_g, 1);
+        gidx = ggml_add(ctx0, ggml_scale(ctx0, inv, -(float) (n_g + 1)), gidx);
+        gidx = ggml_cast(ctx0, gidx, GGML_TYPE_I32);
+        gidx = ggml_reshape_3d(ctx0, gidx, n_compact, n_q, n_stream);
+
+        ggml_tensor * mask_g = nullptr;
+        if (!compact_ready) {
+            mask_g = ggml_reshape_4d(ctx0, compact_valid, n_compact, n_q, 1, n_stream);
+        }
+
+        cur = build_attn_mha(q, kg, vg, kq_b, mask_g, sinks, v_mla, n_compact, kq_scale, il, gidx);
+    } else if (compact_ready) {
         compact_idx = ggml_reshape_3d(ctx0, compact_idx, n_compact, top_k->ne[1], k->ne[3]);
         cur = build_attn_mha(q, k, v, kq_b, nullptr, sinks, v_mla,
                 n_compact, kq_scale, il, compact_idx);
