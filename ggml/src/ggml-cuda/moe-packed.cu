@@ -1160,6 +1160,7 @@ static __global__ void moe_packed_mm(const moe_packed_launch_args a, const int a
 #endif // defined(AMPERE_MMA_AVAILABLE) && defined(CP_ASYNC_AVAILABLE)
 }
 
+#ifdef GGML_CUDA_MOE_PACKED_TUNING
 // Also for the lossless formats, which have the same epilogue.
 static bool moe_packed_i8_magic() {
     static const bool magic = [] {
@@ -1176,6 +1177,23 @@ static int moe_packed_variant() {
     }();
     return variant;
 }
+#else
+// only the default kernels are compiled (see moe-packed.cuh)
+static bool moe_packed_i8_magic() {
+    static const bool warned = [] {
+        if (getenv("GGML_CUDA_MOE_PACKED_I8_MAGIC") != nullptr || getenv("GGML_CUDA_MOE_PACKED_VARIANT") != nullptr) {
+            GGML_LOG_WARN("ggml_cuda_moe_packed: GGML_CUDA_MOE_PACKED_I8_MAGIC and GGML_CUDA_MOE_PACKED_VARIANT need -DGGML_CUDA_MOE_PACKED_TUNING=ON\n");
+        }
+        return true;
+    }();
+    GGML_UNUSED(warned);
+    return true;
+}
+
+static int moe_packed_variant() {
+    return -1;
+}
+#endif // GGML_CUDA_MOE_PACKED_TUNING
 
 template <int fmt, int J, int NW, int MW, int ST, bool magic>
 static void moe_packed_launch_kernel(const moe_packed_launch_args & args, cudaStream_t stream) {
@@ -1202,11 +1220,16 @@ static void moe_packed_launch_kernel(const moe_packed_launch_args & args, cudaSt
 
 template <int fmt, int J, int NW, int MW, int ST>
 static void moe_packed_launch_magic(const moe_packed_launch_args & args, cudaStream_t stream) {
+#ifdef GGML_CUDA_MOE_PACKED_TUNING
     if (fmt != GGML_CUDA_MOE_PACKED_F16 && moe_packed_i8_magic()) {
         moe_packed_launch_kernel<fmt, J, NW, MW, ST, fmt != GGML_CUDA_MOE_PACKED_F16>(args, stream);
     } else {
         moe_packed_launch_kernel<fmt, J, NW, MW, ST, false>(args, stream);
     }
+#else
+    GGML_UNUSED(moe_packed_i8_magic());
+    moe_packed_launch_kernel<fmt, J, NW, MW, ST, fmt != GGML_CUDA_MOE_PACKED_F16>(args, stream);
+#endif // GGML_CUDA_MOE_PACKED_TUNING
 }
 
 // GGML_CUDA_MOE_PACKED_VARIANT: 0 = 8 warps, 4 stages; 1 = 8 warps, 3 stages; 2 = 4 warps, 3 stages; 3 = 4 warps, 4 stages;
@@ -1230,11 +1253,13 @@ static void moe_packed_launch_J(const moe_packed_launch_args & args, cudaStream_
         }
     }();
     switch (moe_packed_variant()) {
+#ifdef GGML_CUDA_MOE_PACKED_TUNING
         case 1:  moe_packed_launch_magic<fmt, J, 8, MW8, 3>(args, stream); break;
         case 2:  moe_packed_launch_magic<fmt, J, 4, MW4, 3>(args, stream); break;
         case 3:  moe_packed_launch_magic<fmt, J, 4, MW4, 4>(args, stream); break;
         case 0:  moe_packed_launch_magic<fmt, J, 8, MW8, 4>(args, stream); break;
         case 4:  moe_packed_launch_magic<fmt, J, 4, 2, 3>(args, stream); break;
+#endif // GGML_CUDA_MOE_PACKED_TUNING
         default:
             if constexpr (fmt != GGML_CUDA_MOE_PACKED_F16 && J > 64) {
                 moe_packed_launch_magic<fmt, J, 8, MW8, 3>(args, stream);
