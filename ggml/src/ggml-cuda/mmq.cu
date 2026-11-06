@@ -360,6 +360,15 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
     return false;
 #endif // GGML_CUDA_FORCE_CUBLAS
 
+    // delphi: GGML_CUDA_MMQ_MAX_DENSE_TOKENS=n sends dense (non-MoE) products of more than n columns to cuBLAS
+    static const int64_t mmq_max_dense = [] {
+        const char * s = getenv("GGML_CUDA_MMQ_MAX_DENSE_TOKENS");
+        return s != nullptr ? (int64_t) atoll(s) : (int64_t) -1;
+    }();
+    if (mmq_max_dense >= 0 && n_experts == 0 && ne11 > mmq_max_dense) {
+        return false;
+    }
+
     bool mmq_supported;
 
     switch (type) {
