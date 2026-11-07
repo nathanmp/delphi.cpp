@@ -4438,6 +4438,18 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
     return (llm_graph_input_kpool *) res->add_input(std::move(inp));
 }
 
+// a view of t with another element type of the same row size in bytes (no conversion: the bits are kept)
+static ggml_tensor * llm_graph_bitcast(ggml_context * ctx, ggml_tensor * t, ggml_type type, int64_t ne0) {
+    GGML_ASSERT(!ggml_is_quantized(t->type) && !ggml_is_quantized(type));
+    GGML_ASSERT(ne0*ggml_type_size(type) == t->ne[0]*ggml_type_size(t->type));
+    GGML_ASSERT(t->nb[0] == ggml_type_size(t->type));
+    ggml_tensor * v = ggml_view_4d(ctx, t, t->ne[0], t->ne[1], t->ne[2], t->ne[3], t->nb[1], t->nb[2], t->nb[3], 0);
+    v->type  = type;
+    v->ne[0] = ne0;
+    v->nb[0] = ggml_type_size(type);
+    return v;
+}
+
 ggml_tensor * llm_graph_context::build_attn_sparse(
         llm_graph_input_attn_k * inp,
         ggml_tensor * wo,
@@ -4592,8 +4604,15 @@ ggml_tensor * llm_graph_context::build_attn_sparse(
         }
 
         ggml_tensor * k_rows = ggml_view_3d(ctx0, k, k->ne[0], n_kv, n_stream, k->nb[2], k->nb[3], 0);
-        ggml_tensor * kg = ggml_get_rows(ctx0, k_rows, idx_g);
-        kg = ggml_cast(ctx0, kg, k->type);
+        ggml_tensor * kg = nullptr;
+        if ((k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_BF16) && k->ne[0] % 2 == 0) {
+            // copy the 16-bit rows as I32 pairs: get_rows keeps I32, so there is no F32 copy of the gather (at width
+            // 16: 72 MiB) and no cast back
+            ggml_tensor * k_i32 = llm_graph_bitcast(ctx0, k_rows, GGML_TYPE_I32, k->ne[0]/2);
+            kg = llm_graph_bitcast(ctx0, ggml_get_rows(ctx0, k_i32, idx_g), k->type, k->ne[0]);
+        } else {
+            kg = ggml_cast(ctx0, ggml_get_rows(ctx0, k_rows, idx_g), k->type);
+        }
         kg = ggml_reshape_4d(ctx0, kg, k->ne[0], 1, n_g, n_stream);
         cb(kg, "kv_window_gather", il);
 
