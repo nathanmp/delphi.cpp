@@ -1541,16 +1541,22 @@ bool llama_kv_cache::window_active(int32_t il) const {
     return layers[it->second].n_resident > 0;
 }
 
+uint32_t llama_kv_window_stage_min_tokens() {
+    // narrower ubatches gather their selected cells (DFlash2 verifies at most 16 rows); the gather buffers grow with
+    // the width (16 rows: about 127 MiB per GLM layer), the staging copy with the context (1M: 1 GiB per layer)
+    static const uint32_t min_tokens = [] {
+        const char * env = getenv("LLAMA_KV_WINDOW_STAGE_MIN_TOKENS");
+        return env ? (uint32_t) atoi(env) : 17u;
+    }();
+    return min_tokens;
+}
+
 ggml_tensor * llama_kv_cache::stage_k(ggml_context * ctx, ggml_tensor * k, int32_t il, uint32_t n_tokens) const {
     if (!window_active(il)) {
         return k;
     }
 
-    static const uint32_t min_tokens = [] {
-        const char * env = getenv("LLAMA_KV_WINDOW_STAGE_MIN_TOKENS");
-        return env ? (uint32_t) atoi(env) : 64u;
-    }();
-    if (n_tokens < min_tokens) {
+    if (n_tokens < llama_kv_window_stage_min_tokens()) {
         return k;
     }
 

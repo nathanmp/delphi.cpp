@@ -4564,19 +4564,42 @@ ggml_tensor * llm_graph_context::build_attn_sparse(
         ggml_tensor * inv   = ggml_add(ctx0,
                 ggml_step(ctx0, ggml_scale(ctx0, idx_f, -1.0f)),
                 ggml_step(ctx0, ggml_scale_bias(ctx0, idx_f, 1.0f, -(float) (n_kv - 1))));
-        idx = ggml_cast(ctx0, ggml_clamp(ctx0, idx_f, 0.0f, (float) (n_kv - 1)), GGML_TYPE_I32);
+        idx_f = ggml_clamp(ctx0, idx_f, 0.0f, (float) (n_kv - 1));
+        ggml_tensor * idx_i = ggml_cast(ctx0, idx_f, GGML_TYPE_I32);
+
+        ggml_tensor * pos = ggml_reshape_2d(ctx0, ggml_arange(ctx0, 0.0f, (float) n_g, 1.0f), n_g, 1); // position in the gather
+
+        // the query rows of a verify select mostly the same cells: read each cell over PCIe once. Every position
+        // writes its number into a per-cell map; the position that the map keeps for a cell gathers it, the others
+        // gather cell 0 (resident) and point the attention at the kept position. Which duplicate wins does not
+        // matter: they hold the same cell.
+        static const bool use_union = [] {
+            const char * env = getenv("LLAMA_KV_WINDOW_UNION");
+            return env == nullptr || atoi(env) != 0;
+        }();
+        ggml_tensor * idx_g = idx_i;
+        ggml_tensor * gidx  = pos;
+        if (use_union) {
+            ggml_tensor * map = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_kv, n_stream), -1.0f);
+            ggml_tensor * pos_s = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, pos, 1, n_g, 1), 1, n_g, n_stream, 1);
+            map = ggml_set_rows(ctx0, map, pos_s, idx_i);
+
+            ggml_tensor * win = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, map, idx_i), n_g, n_stream);
+            ggml_tensor * is_win = ggml_step(ctx0, ggml_scale_bias(ctx0, ggml_abs(ctx0, ggml_sub(ctx0, win, pos)), -1.0f, 0.5f));
+
+            idx_g = ggml_cast(ctx0, ggml_mul(ctx0, idx_f, is_win), GGML_TYPE_I32);
+            gidx  = win;
+        }
 
         ggml_tensor * k_rows = ggml_view_3d(ctx0, k, k->ne[0], n_kv, n_stream, k->nb[2], k->nb[3], 0);
-        ggml_tensor * kg = ggml_get_rows(ctx0, k_rows, idx);
+        ggml_tensor * kg = ggml_get_rows(ctx0, k_rows, idx_g);
         kg = ggml_cast(ctx0, kg, k->type);
         kg = ggml_reshape_4d(ctx0, kg, k->ne[0], 1, n_g, n_stream);
         cb(kg, "kv_window_gather", il);
 
         ggml_tensor * vg = ggml_view_4d(ctx0, kg, v_cur->ne[0], kg->ne[1], kg->ne[2], kg->ne[3], kg->nb[1], kg->nb[2], kg->nb[3], 0);
 
-        // new index = position in the gather, or negative for an invalid cell
-        ggml_tensor * gidx = ggml_arange(ctx0, 0.0f, (float) n_g, 1.0f);
-        gidx = ggml_reshape_2d(ctx0, gidx, n_g, 1);
+        // new index = position in the gather that holds the cell, or negative for an invalid cell
         gidx = ggml_add(ctx0, ggml_scale(ctx0, inv, -(float) (n_g + 1)), gidx);
         gidx = ggml_cast(ctx0, gidx, GGML_TYPE_I32);
         gidx = ggml_reshape_3d(ctx0, gidx, n_compact, n_q, n_stream);

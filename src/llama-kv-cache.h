@@ -17,6 +17,9 @@ struct llama_context;
 // llama_kv_cache
 //
 
+// delphi: KV window: ubatches of at least this many tokens copy a windowed layer to VRAM, narrower ones gather
+uint32_t llama_kv_window_stage_min_tokens();
+
 class llama_kv_cache : public llama_memory_i {
 public:
     struct stream_copy_info {

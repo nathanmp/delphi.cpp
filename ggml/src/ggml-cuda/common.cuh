@@ -1617,6 +1617,18 @@ struct ggml_backend_cuda_context {
         return capacity;
     }
 
+    // delphi: GGML_CUDA_GRAPH_CACHE_LARGE bounds the graphs of more than 256 nodes. Each executable holds device
+    // memory (GLM-5.3 Flash prefill on a CMP: about 4 MiB), and a prefill whose KV length grows every ubatch fills
+    // the bound with graphs that are not used again (64: about 0.3 GiB per device).
+    static size_t graph_cache_large_capacity() {
+        static const size_t capacity = [] {
+            const char * env = getenv("GGML_CUDA_GRAPH_CACHE_LARGE");
+            const long parsed = env ? atol(env) : 0;
+            return parsed > 0 ? (size_t) parsed : (size_t) 64;
+        }();
+        return capacity;
+    }
+
     ggml_cuda_graph * cuda_graph(uint64_t graph_key) {
         const int64_t time_now = ggml_time_us();
 
@@ -1649,7 +1661,7 @@ struct ggml_backend_cuda_context {
                     }
                 }
             }
-            if (n_large >= 64) {
+            if (n_large >= graph_cache_large_capacity()) {
                 cuda_graphs.erase(oldest_large);
             } else if (n_uncaptured >= graph_cache_capacity()/2) {
                 cuda_graphs.erase(oldest_uncaptured);

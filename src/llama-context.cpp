@@ -1037,6 +1037,19 @@ void llama_context::sched_reserve() {
         n_nodes_tg  = ggml_graph_n_nodes(gf);
     }
 
+    // delphi: with a KV window, the widest ubatch that gathers its selected cells (a speculative verify) holds the
+    // largest gather buffers; reserve it here, so that a context that does not fit fails at load, not at the first
+    // verify past the indexer threshold
+    {
+        const char * env = getenv("LLAMA_KV_RESIDENT_CELLS");
+        const uint32_t n_gather = std::min(cparams.n_ubatch, llama_kv_window_stage_min_tokens() - 1);
+        if (env != nullptr && *env != '\0' && n_gather > n_seqs) {
+            if (!graph_reserve_extra(n_gather, n_seqs, n_gather, mctx.get())) {
+                throw std::runtime_error("failed to allocate compute buffers for the KV window gather");
+            }
+        }
+    }
+
     // reserve again with pp graph to avoid ggml-alloc reallocations during inference
     {
         // TODO: the worst case graph is not always reached for `n_seqs > 1`
