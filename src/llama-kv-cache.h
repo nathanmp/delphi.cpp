@@ -120,8 +120,9 @@ public:
                  const char *   name_tag = "",
         // delphi: a reused layer whose reader sits on another device gets a copy of the storage on that device (see mirrors)
                        bool     mirror_reuse = false,
-        // delphi: LLAMA_KV_RESIDENT_CELLS may put the cells past a count in pinned host memory (see kv_window_alloc)
-                       bool     kv_window = false);
+        // delphi: the environment variable (LLAMA_KV_RESIDENT_CELLS for the attention KV) that may put the cells past a
+        // count in pinned host memory (see kv_window_alloc); nullptr: all cells in VRAM
+                 const char *   kv_window_env = nullptr);
 
     ~llama_kv_cache() = default;
 

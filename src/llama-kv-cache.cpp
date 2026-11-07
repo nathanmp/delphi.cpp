@@ -59,10 +59,10 @@ static void ggml_gen_hadamard(ggml_tensor * tensor) {
     }
 }
 
-// delphi: LLAMA_KV_RESIDENT_CELLS=<cells> or <dev>=<cells>[,<dev>=<cells>...] (for example CUDA2=700000).
+// delphi: <env>=<cells> or <dev>=<cells>[,<dev>=<cells>...] (for example LLAMA_KV_RESIDENT_CELLS=CUDA2=700000).
 // Returns the resident cell count for the device, 0 if the cache on it stays all in VRAM.
-static uint32_t llama_kv_resident_cells(const char * dev_name) {
-    const char * env = getenv("LLAMA_KV_RESIDENT_CELLS");
+static uint32_t llama_kv_resident_cells(const char * env_name, const char * dev_name) {
+    const char * env = getenv(env_name);
     if (env == nullptr || *env == '\0') {
         return 0;
     }
@@ -187,7 +187,7 @@ llama_kv_cache::llama_kv_cache(
     const  layer_share_cb & share,
              const char *   name_tag,
                    bool     mirror_reuse,
-                   bool     kv_window) :
+             const char *   kv_window_env) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
     other(static_cast<llama_kv_cache *>(mem_other)),
@@ -440,7 +440,7 @@ llama_kv_cache::llama_kv_cache(
             buf = nullptr;
 
             const char * buft_dev = ggml_backend_buft_get_device(buft) ? ggml_backend_dev_name(ggml_backend_buft_get_device(buft)) : "";
-            const uint32_t n_resident = kv_window ? llama_kv_resident_cells(buft_dev) : 0;
+            const uint32_t n_resident = kv_window_env ? llama_kv_resident_cells(kv_window_env, buft_dev) : 0;
             if (n_resident > 0 && n_resident < kv_size) {
                 size_t n_host = 0;
                 buf = llama_kv_window_alloc(ctx.get(), buft, n_resident, kv_size, n_host);

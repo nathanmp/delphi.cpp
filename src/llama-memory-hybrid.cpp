@@ -57,7 +57,7 @@ llama_memory_hybrid::llama_memory_hybrid(
         nullptr,
         "",
         false,
-        /* kv_window */ true
+        /* kv_window_env */ "LLAMA_KV_RESIDENT_CELLS"
     )),
     mem_recr(new llama_memory_recurrent(
         model,
@@ -83,10 +83,13 @@ llama_memory_hybrid::llama_memory_hybrid(
         LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells, %u x %u per cell, type = %s\n",
                 __func__, kv_size, n_head_idx, hparams_idx.n_embd_head_k_full, ggml_type_name(type_idx));
 
+        // the indexer cache is read only to compress pools: all of them after an invalidation, else the cells of the
+        // pools that a batch completes. Scoring reads the pool keys (mem_kpool, resident), so nearly all of this cache
+        // can sit in host memory (LLAMA_KV_IDX_RESIDENT_CELLS)
         return new llama_kv_cache(
             model, hparams_idx, type_idx, type_idx, v_trans, offload, unified,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
-            nullptr, filter_idx, nullptr, nullptr);
+            nullptr, filter_idx, nullptr, nullptr, "", false, "LLAMA_KV_IDX_RESIDENT_CELLS");
     }()),
     mem_kpool(filter_idx == nullptr || model.hparams.indexer_kpool == 0 ? nullptr :
         new llama_kpool_cache(
