@@ -4515,10 +4515,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_ADAPTIVE_MODE"));
     add_opt(common_arg(
         {"--spec-draft-n-min-adaptive"}, "N",
-        "lowest draft depth of --spec-draft-adaptive (default: 3 for bucket, 1 for cost/conf, 0 for block; set 1 to disable empty block prefixes)",
+        "lowest draft depth of --spec-draft-adaptive (0 selects the mode default: 3 for bucket, 1 for cost/conf, 0 for block; set 1 to disable empty block prefixes)",
         [](common_params & params, int value) {
-            if (value < 1) {
-                throw std::invalid_argument("--spec-draft-n-min-adaptive must be at least 1");
+            if (value < 0) {
+                throw std::invalid_argument("--spec-draft-n-min-adaptive must be non-negative");
             }
             params.speculative.draft.n_min_adaptive = value;
         }
