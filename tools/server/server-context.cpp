@@ -3442,7 +3442,8 @@ private:
         SRV_INF("speculative decoding reconfigured: types = %s, n_max = %d, adaptive = %s\n",
                 common_speculative_type_name_str(sp.types).c_str(), n_max,
                 !sp.draft.adaptive ? "off" : sp.draft.adaptive_mode == COMMON_SPECULATIVE_ADAPTIVE_COST ? "cost" :
-                    sp.draft.adaptive_mode == COMMON_SPECULATIVE_ADAPTIVE_CONF ? "conf" : "bucket");
+                    sp.draft.adaptive_mode == COMMON_SPECULATIVE_ADAPTIVE_CONF ? "conf" :
+                    sp.draft.adaptive_mode == COMMON_SPECULATIVE_ADAPTIVE_BLOCK ? "block" : "bucket");
         return true;
     }
 
@@ -3462,8 +3463,9 @@ private:
                 {"n_verify",         info.n_call_accept},
                 {"acc_rate_per_pos", info.acc_rate_per_pos},
                 {"depth",            info.depth},
+                {"depth_counts",     info.depth_counts},
             };
-            if (info.adaptive == "cost") {
+            if (info.adaptive == "cost" || info.adaptive == "block") {
                 j["cost"] = {
                     {"t_verify_ms", info.t_verify_ms},
                     {"t_round_ms",  info.t_round_ms},
@@ -3489,7 +3491,8 @@ private:
             {"n_max",         common_speculative_n_max(&sp)},
             {"n_max_launch",  spec_n_max_launch},
             {"adaptive",      !sp.draft.adaptive ? "off" : sp.draft.adaptive_mode == COMMON_SPECULATIVE_ADAPTIVE_COST ? "cost" :
-                    sp.draft.adaptive_mode == COMMON_SPECULATIVE_ADAPTIVE_CONF ? "conf" : "bucket"},
+                    sp.draft.adaptive_mode == COMMON_SPECULATIVE_ADAPTIVE_CONF ? "conf" :
+                    sp.draft.adaptive_mode == COMMON_SPECULATIVE_ADAPTIVE_BLOCK ? "block" : "bucket"},
             {"p_min",         sp.draft.p_min},
             {"draft_sampling", sp.draft.probabilistic ? "probabilistic" : "greedy"},
             {"draft_context", ctx_dft != nullptr},

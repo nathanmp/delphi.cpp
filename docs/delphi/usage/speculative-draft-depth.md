@@ -1,4 +1,4 @@
-# Draft depth of MTP speculative decoding
+# Adaptive speculative draft depth
 
 ## Default: confidence stop (conf mode)
 
@@ -24,9 +24,27 @@ The mode also reserves a graph per verify width (`LLAMA_GRAPH_ALT_SLOTS`) and gr
 
 The conf mode supports only `draft-mtp`. `cost` (per-request depth from a cost model) is also available but did not beat a fixed depth on GLM or Qwen.
 
+## DSpark: adaptive verification prefix (block mode)
+
+With `--spec-type draft-dspark`, add these options to let the server choose how much of each completed draft block to verify:
+
+```sh
+--spec-draft-adaptive-mode block --spec-draft-n-max 5 --spec-draft-n-min-adaptive 1 --parallel 1
+```
+
+DSpark still generates the full trained block. The controller uses its confidence head, calibrated acceptance and measured complete round times to choose a verification prefix. The maximum is clamped to the draft file's trained limit. Without an explicit maximum, block mode uses a cap of 7 before that clamp. The DeepSeek V4.1 Flash 1017 DSpark file tested here has five proposals.
+
+The example keeps at least one proposal. Set `--spec-draft-n-min-adaptive 0`, or omit the floor, to also allow an empty prefix. An empty prefix still pays for block generation, then emits one token through ordinary target decoding. `--no-spec-draft-adaptive` restores fixed verification depth. DSpark defaults to fixed depth 3.
+
+Block mode currently requires DSpark alone, a confidence head, one server slot and normal acceptance. Keep `--spec-draft-p-min` and `--spec-draft-n-min` at their default 0; use the adaptive floor to control the minimum prefix. This mode does not support DFlash, MTP, mixed drafters or synthetic acceptance.
+
+The controller learns costs and acceptance across requests. It makes bounded startup probes and occasional later probes. Round costs include drafting, target verification, feature ingest, sampling and checkpoint replay. Graph-build rounds are excluded from steady cost estimates. Timing-dependent depth and width-dependent numerics can change generated text, even with greedy sampling.
+
+Measured 2026-11-06 on DeepSeek V4.1 Flash (IQ4_KS target, Q8_0 draft, 300K context reservation) with two R9700s and routed experts in NUMA host RAM: four tasks (coding, math, biology and writing), temperature 1, three repetitions of 512 output tokens per task. With floor 1, aggregate decode rose from 32.73 to 34.05 tokens/s (+4.0%); individual repetition gains were 3.2-5.6%. A separate comparison allowing empty prefixes gained 3.3%, with more variation. The positive floor is the recommended starting setting. These were warm measurements; the test session's memory-lock limit prevented `mlock`. The result is specific to the tested weights, placement and workload.
+
 ## Changes at run time
 
-`POST /speculative` with `{"args": ["--spec-draft-n-max", "5", "--no-spec-draft-adaptive"]}` applies speculative options over those of the launch without a reload (the draft cannot be larger than at the launch). `GET /speculative` returns the active settings, the graph build counts and, for the conf mode, the verify times, the step time, the throughput and the calibration table.
+`POST /speculative` with `{"args": ["--spec-draft-n-max", "5", "--no-spec-draft-adaptive"]}` applies speculative options over those of the launch without a reload (the draft cannot be larger than at the launch). `GET /speculative` returns the active settings, the graph build counts and, for the conf mode, the verify times, the step time, the throughput and the calibration table. For block mode, it also returns prefix decision counts, live round costs and sample counts.
 
 ## Probabilistic draft sampling
 
