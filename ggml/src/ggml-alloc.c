@@ -593,11 +593,11 @@ static void ggml_gallocr_peak_print(ggml_gallocr_t galloc) {
             max_size += galloc->buf_tallocs[i]->chunks[c]->max_size;
         }
         qsort(pk->peak, pk->n_peak, sizeof(struct ggml_gallocr_live), ggml_gallocr_live_cmp);
-        GGML_LOG_INFO("gallocr peak: %s: %.1f MiB live in %d tensors, buffer %.1f MiB\n", ggml_backend_buft_name(galloc->bufts[i]),
+        GGML_LOG_WARN("gallocr peak: %s: %.1f MiB live in %d tensors, buffer %.1f MiB\n", ggml_backend_buft_name(galloc->bufts[i]),
                 pk->peak_sum/1048576.0, pk->n_peak, max_size/1048576.0);
         for (int j = 0; j < pk->n_peak && j < 16; j++) {
             const struct ggml_tensor * t = pk->peak[j].tensor;
-            GGML_LOG_INFO("gallocr peak:   %9.1f MiB %-12s %-32s [%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "] %s\n",
+            GGML_LOG_WARN("gallocr peak:   %9.1f MiB %-12s %-32s [%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "] %s\n",
                     pk->peak[j].size/1048576.0, ggml_op_desc(t), t->name, t->ne[0], t->ne[1], t->ne[2], t->ne[3], ggml_type_name(t->type));
         }
     }
@@ -1110,6 +1110,22 @@ static bool ggml_gallocr_reserve_n_impl(
             }
         }
         if (realloc) {
+            {
+                static int log_grow = -1;
+                if (log_grow < 0) {
+                    const char * env = getenv("GGML_GALLOC_REALLOC_LOG");
+                    log_grow = env != NULL && atoi(env) != 0;
+                }
+                size_t cur_size = galloc->buffers[i] ? ggml_vbuffer_size(galloc->buffers[i]) : 0;
+                if (log_grow && cur_size > 0) {
+                    GGML_LOG_WARN("%s: galloc %p buffer %d (%s) grows %.2f -> %.2f MiB, graph %d nodes, last %s ne %lld %lld %lld\n",
+                        __func__, (void *) galloc, i, ggml_backend_buft_name(galloc->bufts[i]), cur_size / 1048576.0, new_size / 1048576.0,
+                        graph->n_nodes, graph->n_nodes > 0 ? graph->nodes[graph->n_nodes-1]->name : "",
+                        graph->n_nodes > 0 ? (long long) graph->nodes[0]->ne[0] : 0LL,
+                        graph->n_nodes > 0 ? (long long) graph->nodes[0]->ne[1] : 0LL,
+                        graph->n_nodes > 0 ? (long long) graph->nodes[0]->ne[2] : 0LL);
+                }
+            }
 #ifndef NDEBUG
             {
                 size_t cur_size = galloc->buffers[i] ? ggml_vbuffer_size(galloc->buffers[i]) : 0;

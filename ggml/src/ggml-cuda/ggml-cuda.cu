@@ -453,6 +453,15 @@ const ggml_cuda_device_info & ggml_cuda_info() {
 
 // #define DEBUG_CUDA_MALLOC
 
+// delphi diag: GGML_CUDA_POOL_LOG=1 logs every pool growth with the op that asked for it, and the free memory at every
+// 8th graph instantiation (each executable holds about 7 KiB of device memory per kernel node; the driver keeps that
+// memory after cudaGraphExecDestroy, so the use follows the most nodes that were instantiated at one time)
+static thread_local const ggml_tensor * ggml_cuda_pool_log_op = nullptr;
+static bool ggml_cuda_pool_log_enabled() {
+    static const bool on = getenv("GGML_CUDA_POOL_LOG") != nullptr;
+    return on;
+}
+
 // buffer pool for cuda (legacy)
 // delphi: the number of times a legacy pool freed its cached buffers to retry an allocation
 static std::atomic<uint64_t> ggml_cuda_pool_flushes{0};
@@ -693,6 +702,13 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
 
             // add to the pool
             pool_size += reserve_size;
+            if (ggml_cuda_pool_log_enabled()) {
+                const ggml_tensor * t = ggml_cuda_pool_log_op;
+                GGML_LOG_WARN("cuda pool[%d]: grew to %.1f MiB (request %.1f MiB, in use %.1f MiB) for %s %s [%lld, %lld, %lld, %lld]\n",
+                        device, pool_size/1048576.0, size/1048576.0, pool_used/1048576.0,
+                        t ? ggml_op_desc(t) : "?", t ? t->name : "?",
+                        t ? (long long) t->ne[0] : 0LL, t ? (long long) t->ne[1] : 0LL, t ? (long long) t->ne[2] : 0LL, t ? (long long) t->ne[3] : 0LL);
+            }
 
             //printf("cuda pool[%d]: size increased to %llu MB (reserved %llu MB)\n",
             //       device, (unsigned long long) (pool_size/1024/1024),
@@ -2724,6 +2740,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 }
 
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
+    ggml_cuda_pool_log_op = dst;
     switch (dst->op) {
         case GGML_OP_ARGMAX:
             ggml_cuda_argmax(ctx, dst);
@@ -5881,6 +5898,21 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         if (instantiated) { // Create executable graph from captured graph.
             const int64_t prefill_inst_t0 = prefill_timelog ? ggml_time_us() : 0;
             CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+            if (ggml_cuda_pool_log_enabled()) {
+                static std::atomic<int> n_inst{0};
+                const int k = n_inst.fetch_add(1);
+                if (k % 8 == 0) {
+                    size_t free_b = 0, total_b = 0;
+                    cudaMemGetInfo(&free_b, &total_b);
+                    size_t n_g = 0, n_i = 0, n_nodes = 0;
+                    for (auto & [gk, g] : cuda_ctx->cuda_graphs) {
+                        n_g++;
+                        if (g->instance) { n_i++; n_nodes += g->num_nodes; }
+                    }
+                    GGML_LOG_WARN("graph diag: CUDA%d instantiation #%d: free %.0f MiB, cache %zu graphs, %zu instances, %zu nodes\n",
+                        cuda_ctx->device, k, free_b/1048576.0, n_g, n_i, n_nodes);
+                }
+            }
             if (prefill_timelog) {
                 GGML_LOG_INFO("%s: CUDA%d prefill graph: %d nodes, capture %.1f ms, instantiate %.1f ms\n",
                     __func__, cuda_ctx->device, cgraph->n_nodes,
