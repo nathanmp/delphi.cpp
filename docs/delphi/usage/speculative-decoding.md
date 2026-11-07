@@ -2,7 +2,7 @@
 
 Speculative decoding lets the model accept several tokens in one step. A small draft model, or a small head in the model itself, proposes the next tokens. The main model then checks all of them in one pass. Accepted tokens cost much less than normal decode steps.
 
-delphi.cpp ships three draft methods for its anchor models. Each method has its own setup. With MTP, the draft depth adapts by itself. DFlash2 and DSpark draft a fixed depth, 3 by default.
+delphi.cpp ships three draft methods for its anchor models. Each method has its own setup. With MTP, the draft depth adapts by itself. DFlash2 and DSpark verify a fixed depth, 3 by default. DSpark also has an opt-in adaptive verification prefix.
 
 - MTP uses the multi-token prediction layers that some models carry, such as Qwen 3.8 Flash Next.
 - DFlash2 uses a separate draft model for GLM-5.3 Flash.
@@ -47,6 +47,8 @@ It decoded at 39 to 40 tokens per second (measured 2026-11-01). `--graph-alt-slo
 
 `-c 300000` also works. It leaves less memory for the expert cache, so short replies decode at about 38 tokens per second instead of 40.
 
+For adaptive DSpark verification, add `--spec-draft-adaptive-mode block --spec-draft-n-max 5 --spec-draft-n-min-adaptive 1 --parallel 1`. The full trained block is still generated; the server selects its verification prefix from confidence and live costs. This configuration gained 4.0% across a four-task test at temperature 1. See [Adaptive speculative draft depth](speculative-draft-depth.md#dspark-adaptive-verification-prefix-block-mode) for the measurements and limits.
+
 DSpark draft files without the `dflash.dsv41_semantics` key and without the `output_hc_fn` weights, such as Unsloth's DeepSeek-V4.1-Flash-1017 draft, load as V4.1 drafts. The log warns about the missing key.
 
 ## Choosing the draft method
@@ -79,11 +81,11 @@ curl -X POST http://localhost:8080/speculative -H "Content-Type: application/jso
   -d '{"args": ["--spec-draft-n-max", "5", "--no-spec-draft-adaptive"]}'
 ```
 
-The new depth cannot be larger than the value the server started with. `GET /speculative` shows the active settings. For more detail, see [Draft depth of MTP speculative decoding](speculative-draft-depth.md).
+The new depth cannot be larger than the value the server started with. `GET /speculative` shows the active settings. For more detail, see [Adaptive speculative draft depth](speculative-draft-depth.md).
 
 ## Sampling with a draft
 
-By default the draft picks its top token. Pass `--spec-draft-sampling probabilistic` to sample from the draft distribution instead. The output distribution of the target model stays exact. This setting applies to `draft-simple` and `draft-mtp`. At a temperature above 0, it accepts more draft tokens for a fixed depth. It gave no gain with the adaptive depth. See [Draft depth of MTP speculative decoding](speculative-draft-depth.md) for the measurements.
+By default the draft picks its top token. Pass `--spec-draft-sampling probabilistic` to sample from the draft distribution instead. The output distribution of the target model stays exact. This setting applies to `draft-simple` and `draft-mtp`. At a temperature above 0, it accepts more draft tokens for a fixed depth. It gave no gain with the adaptive depth. See [Adaptive speculative draft depth](speculative-draft-depth.md) for the measurements.
 
 ## Limits
 
@@ -94,6 +96,6 @@ By default the draft picks its top token. Pass `--spec-draft-sampling probabilis
 
 ## Related pages
 
-- [Draft depth of MTP speculative decoding](speculative-draft-depth.md) gives the full depth rule and the measurements.
+- [Adaptive speculative draft depth](speculative-draft-depth.md) gives the full depth rule and the measurements.
 - [Auto-tune](auto-tune.md) tunes the draft depth and the n-gram settings for your prompts.
 - [Expert cache](expert-cache.md) and [Performance and placement](performance-and-placement.md) cover the other speed settings for MoE models.
