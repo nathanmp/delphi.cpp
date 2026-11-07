@@ -1,6 +1,9 @@
 #include "speculative.h"
 #include "speculative-adaptive.h"
+#include "speculative-block.h"
 #include "speculative-cost.h"
+
+#include <optional>
 
 #include "common.h"
 #include "ggml.h"
@@ -355,6 +358,7 @@ struct common_speculative_impl {
     // confidence stop (--spec-draft-adaptive-mode conf, speculative-cost.h); uses cost_tab for the verify times
     bool conf = false;
     common_speculative_conf conf_ctl;
+    std::optional<common_speculative_block> block_ctl;
 
     // keep draft token k of sequence s with top-1 probability p (true without the confidence stop)
     bool conf_keep(llama_seq_id s, int k, float p) {
@@ -1212,13 +1216,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         dflash2_seed.assign(n_seq, -1);
         mask_token_id = llama_vocab_mask(llama_model_get_vocab(model_dft));
 
-        if (is_dspark && this->params.p_min > 0.0f) {
+        if (is_dspark && (this->params.p_min > 0.0f ||
+                (this->params.adaptive && this->params.adaptive_mode == COMMON_SPECULATIVE_ADAPTIVE_BLOCK))) {
             char buf[16] = {};
             const bool has_conf =
                 llama_model_meta_val_str(model_dft, "dflash.has_confidence_head", buf, sizeof(buf)) < 0 ||
                 std::strcmp(buf, "true") == 0;
             if (!has_conf) {
-                throw std::runtime_error("DSpark draft has no confidence head: please set --spec-draft-p-min 0");
+                throw std::runtime_error("DSpark draft has no confidence head: disable confidence-based drafting");
             }
         }
 
@@ -1595,7 +1600,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             if (is_dspark) {
                 // DSpark: read from the first draft slot, truncate below the confidence threshold
-                const float * conf = params.p_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
+                const float * conf = params.p_min > 0.0f || block_ctl ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
+                std::vector<float> confidence;
                 // bonus-anchor drafts read the mask positions only, like DFlash
                 const int32_t i_draft_beg = sample_from_anchor ? 0 : 1;
                 for (int32_t i = i_draft_beg; i < n_block_tokens && (int32_t) result.size() < params.n_max; ++i) {
@@ -1605,6 +1611,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         break;
                     }
 
+                    if (block_ctl) {
+                        const float p = conf[(size_t) idx * n_embd_dec];
+                        confidence.push_back(std::isfinite(p) ? std::clamp(p, 0.0f, 1.0f) : 0.5f);
+                    }
                     common_sampler_sample(smpl, ctx_dft, idx, true);
 
                     const auto * cur_p = common_sampler_get_candidates(smpl, true);
@@ -1620,6 +1630,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     common_sampler_accept(smpl, id, true);
 
                     result.push_back(id);
+                }
+                if (block_ctl && !result.empty()) {
+                    result.resize(block_ctl->choose(cost_tab, confidence, n_min_adaptive, n_start));
                 }
             } else {
                 // greedily read the predicted block at this sequence's noise positions 1..n_block_tokens-1
@@ -2879,10 +2892,11 @@ void common_speculative_params_resolve(common_params_speculative & spec) {
     }
 
     const bool conf = d.adaptive && d.adaptive_mode == COMMON_SPECULATIVE_ADAPTIVE_CONF;
-    if (conf && !d.n_max_set) {
+    const bool block = d.adaptive && d.adaptive_mode == COMMON_SPECULATIVE_ADAPTIVE_BLOCK;
+    if ((conf || block) && !d.n_max_set) {
         d.n_max      = COMMON_SPECULATIVE_CONF_N_MAX_DEFAULT;
         d.n_max_auto = true;
-    } else if (!conf && d.n_max_auto) {
+    } else if (!conf && !block && d.n_max_auto) {
         d.n_max      = common_params_speculative_draft().n_max;
         d.n_max_auto = false;
     }
@@ -3306,10 +3320,15 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         }
     }
 
+    if (params.draft.adaptive && params.draft.adaptive_mode == COMMON_SPECULATIVE_ADAPTIVE_BLOCK &&
+            (n_seq != 1 || impls.size() != 1 || impls[0]->type != COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK || params.has_synth())) {
+        throw std::runtime_error("block adaptive mode requires draft-dspark alone, one slot and real acceptance");
+    }
     if (params.draft.adaptive) {
+        const bool block = params.draft.adaptive_mode == COMMON_SPECULATIVE_ADAPTIVE_BLOCK;
         const bool    cost  = params.draft.adaptive_mode == COMMON_SPECULATIVE_ADAPTIVE_COST;
         const bool    conf  = params.draft.adaptive_mode == COMMON_SPECULATIVE_ADAPTIVE_CONF;
-        const int32_t n_min = params.draft.n_min_adaptive > 0 ? params.draft.n_min_adaptive : (cost || conf ? 1 : 3);
+        const int32_t n_min = params.draft.n_min_adaptive > 0 ? params.draft.n_min_adaptive : (block ? 0 : cost || conf ? 1 : 3);
         for (auto & impl : impls) {
             switch (impl->type) {
                 case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:
@@ -3322,10 +3341,10 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                     continue; // n-gram speculators draft what they find
             }
             // n_max is the implementation's cap after its own limits (MTP heads, DFlash block size)
-            if (n_min < 1 || n_min > impl->n_max) {
+            if (n_min < (block ? 0 : 1) || n_min > impl->n_max) {
                 throw std::runtime_error(string_format(
-                        "invalid adaptive draft range for %s: n_min_adaptive=%d, n_max=%d (n_min_adaptive must be in [1, n_max])",
-                        common_speculative_type_to_str(impl->type).c_str(), n_min, impl->n_max));
+                        "invalid adaptive draft range for %s: n_min_adaptive=%d, n_max=%d (n_min_adaptive must be in [%d, n_max])",
+                        common_speculative_type_to_str(impl->type).c_str(), n_min, impl->n_max, block ? 0 : 1));
             }
             impl->adaptive       = true;
             impl->n_min_adaptive = n_min;
@@ -3349,6 +3368,10 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                 impl->cost_builds.assign(n_seq, 0);
                 impl->cost_settle.assign(n_seq, {});
             }
+            if (block) {
+                impl->block_ctl.emplace(impl->n_max);
+                impl->cost_tab.resize(impl->n_max);
+            }
             if (conf) {
                 if (impl->type != COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
                     throw std::runtime_error("--spec-draft-adaptive-mode conf supports only draft-mtp");
@@ -3358,7 +3381,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                 impl->conf_ctl.seqs.assign(n_seq, {});
             }
             SPC_TRC("adaptive draft depth for %s (%s): %d..%d, start %d\n", common_speculative_type_to_str(impl->type).c_str(),
-                    cost ? "cost" : conf ? "conf" : "bucket", impl->n_min_adaptive, impl->n_max,
+                    block ? "block" : cost ? "cost" : conf ? "conf" : "bucket", impl->n_min_adaptive, impl->n_max,
                     cost ? impl->cost_ctrl[0].n_cur : impl->adaptive_ctrl[0].n_cur);
         }
     }
@@ -3366,7 +3389,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
     // a per-round depth (conf mode, p_min) verifies every width 1..n_max + 1, and the draft context ingests as many: keep a
     // graph per width, else the alternate schedulers evict each other (LLAMA_GRAPH_ALT_SLOTS default 4)
     for (auto & impl : impls) {
-        const bool per_round = impl->conf || (params.draft.p_min > 0.0f && impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP);
+        const bool per_round = impl->block_ctl || impl->conf || (params.draft.p_min > 0.0f && impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP);
         if (!per_round) {
             continue;
         }
@@ -3378,7 +3401,9 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         }
         // every KV view step makes the graphs of all widths stale (GLM: ~30 ms per target width); 2048 measured best
         // on GLM (conf-7 +6 % vs the step 256; the masked cells cost ~0.5 ms per verify round)
-        llama_kv_cache_n_pad_reserve(2048);
+        if (!impl->block_ctl) {
+            llama_kv_cache_n_pad_reserve(2048);
+        }
     }
 
     if (impls.empty()) {
@@ -3494,6 +3519,9 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
             impl->cost_t_start[seq_id]    = 0;
             impl->cost_has_shadow[seq_id] = 0;
             impl->cost_settle[seq_id].left = 0; // the prompt in between is not part of any round
+        }
+        if (impl->block_ctl) {
+            impl->block_ctl->begin(impl->block_ctl->temperature);
         }
         if (impl->conf) {
             impl->conf_ctl.begin(seq_id);
@@ -3652,6 +3680,15 @@ void common_speculative_draft(common_speculative * spec) {
         }
     }
 
+    for (auto & impl : spec->impls) {
+        if (impl->block_ctl && dparams[0].drafting) {
+            if (impl->block_ctl->temperature != dparams[0].temp) {
+                impl->block_ctl->begin(dparams[0].temp);
+            }
+            impl->block_ctl->round(t_round_us, builds_round);
+        }
+    }
+
     std::vector<int32_t> n_max_caller;
     std::vector<char>    want_shadow;
     for (auto & impl : spec->impls) {
@@ -3661,7 +3698,7 @@ void common_speculative_draft(common_speculative * spec) {
             want_shadow.assign(dparams.size(), 0);
             for (size_t s = 0; s < dparams.size(); ++s) {
                 n_max_caller[s] = dparams[s].n_max;
-                int32_t depth = impl->cost ? impl->cost_ctrl[s].n_next : impl->conf ? impl->n_max : impl->adaptive_ctrl[s].n_cur;
+                int32_t depth = impl->cost ? impl->cost_ctrl[s].n_next : (impl->conf || impl->block_ctl) ? impl->n_max : impl->adaptive_ctrl[s].n_cur;
                 if (impl->cost && impl->cost_ctrl[s].shadow && (dparams[s].n_max <= 0 || dparams[s].n_max > depth)) {
                     // one more token than is verified, see speculative-cost.h
                     want_shadow[s] = 1;
@@ -3797,6 +3834,11 @@ static void common_speculative_adaptive_feedback(
     if (!impl->adaptive || impl->adaptive_n_last[seq_id] <= 0) {
         return;
     }
+    if (impl->block_ctl) {
+        impl->block_ctl->observe(impl->adaptive_n_last[seq_id], n_accepted);
+        impl->adaptive_n_last[seq_id] = 0;
+        return;
+    }
     if (impl->conf) {
         impl->conf_ctl.observe(seq_id, impl->adaptive_n_last[seq_id], n_accepted);
         impl->adaptive_n_last[seq_id] = 0;
@@ -3923,7 +3965,7 @@ int32_t common_speculative_cost_width(const common_speculative * spec) {
     int32_t n = 0;
     if (spec != nullptr) {
         for (const auto & impl : spec->impls) {
-            if (impl->cost || impl->conf) {
+            if (impl->cost || impl->conf || impl->block_ctl) {
                 n = std::max(n, impl->n_max + 1); // a draft of n_max is verified with n_max + 1 rows
             }
         }
@@ -3999,7 +4041,7 @@ void common_speculative_set_verify_times(common_speculative * spec, const std::v
         return;
     }
     for (auto & impl : spec->impls) {
-        if (impl->cost || impl->conf) {
+        if (impl->cost || impl->conf || impl->block_ctl) {
             impl->cost_tab.t_verify = t_verify;
         }
     }
@@ -4015,7 +4057,7 @@ std::vector<common_speculative_impl_info> common_speculative_get_info(const comm
         common_speculative_impl_info info;
         info.type           = common_speculative_type_to_str(impl->type);
         info.n_max          = impl->n_max;
-        info.adaptive       = impl->cost ? "cost" : impl->conf ? "conf" : impl->adaptive ? "bucket" : "";
+        info.adaptive       = impl->block_ctl ? "block" : impl->cost ? "cost" : impl->conf ? "conf" : impl->adaptive ? "bucket" : "";
         info.n_min_adaptive = impl->adaptive ? impl->n_min_adaptive : 0;
         info.n_gen_drafts   = impl->n_gen_drafts;
         info.n_acc_drafts   = impl->n_acc_drafts;
@@ -4026,7 +4068,9 @@ std::vector<common_speculative_impl_info> common_speculative_get_info(const comm
             info.acc_rate_per_pos.push_back(impl->n_call_accept > 0 ? (double) n / impl->n_call_accept : 0.0);
         }
         for (uint32_t s = 0; s < impl->n_seq; ++s) {
-            if (impl->cost) {
+            if (impl->block_ctl) {
+                info.depth.push_back(impl->block_ctl->depth);
+            } else if (impl->cost) {
                 info.depth.push_back(impl->cost_ctrl[s].n_cur);
             } else if (impl->conf) {
                 info.depth.push_back(impl->n_max);
@@ -4061,6 +4105,17 @@ std::vector<common_speculative_impl_info> common_speculative_get_info(const comm
                     info.conf_cal.push_back(impl->conf_ctl.hits[i][b]/std::max(1e-9, impl->conf_ctl.trials[i][b]));
                     info.conf_trials.push_back(impl->conf_ctl.trials[i][b]);
                 }
+            }
+        }
+        if (impl->block_ctl) {
+            const auto & ctl = *impl->block_ctl;
+            for (int n = 0; n <= impl->n_max; ++n) {
+                info.t_round_ms.push_back(1e3*ctl.cost(impl->cost_tab, n));
+                info.n_round.push_back(ctl.samples(n));
+                info.depth_counts.push_back(ctl.chosen[n]);
+            }
+            for (const auto v : impl->cost_tab.t_verify) {
+                info.t_verify_ms.push_back(1e3*v);
             }
         }
         res.push_back(std::move(info));

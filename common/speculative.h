@@ -174,6 +174,7 @@ struct common_speculative_impl_info {
     size_t n_call_accept = 0;
     std::vector<double> acc_rate_per_pos; // accepted tokens per verified draft, per position
 
+    std::vector<int32_t> depth_counts; // [depth] block policy decisions
     std::vector<int32_t> depth;           // [n_seq] current adaptive depth
 
     // cost mode

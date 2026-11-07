@@ -32,6 +32,7 @@
 // GGML_CUDA_MOE_PACKED_ROWTILE_OUTER=1 orders the units of a class launch by row tile first (activations are read once per row tile).
 // GGML_CUDA_MOE_PACKED_I8_MAGIC=0 converts the int32 sums of packed-i8 with I2F instead of an integer and an fp32 add (same results).
 // GGML_CUDA_MOE_PACKED_VARIANT=0..3 selects a fixed warp count and stage count for all J (moe-packed.cu), for comparison.
+// These two need a build with -DGGML_CUDA_MOE_PACKED_TUNING=ON: their kernels multiply the compile time of moe-packed.cu by about 8.
 
 enum ggml_cuda_moe_packed_fmt {
     GGML_CUDA_MOE_PACKED_NONE = 0,

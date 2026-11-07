@@ -255,6 +255,17 @@ static void test(void) {
     assert(params.speculative.draft.n_max == 123);
 
     {
+        common_params block_params;
+        argv = {"binary_name", "--spec-type", "draft-dspark", "--spec-draft-adaptive-mode", "block",
+                "--spec-draft-n-max", "5", "--spec-draft-n-min-adaptive", "0"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), block_params, LLAMA_EXAMPLE_SERVER));
+        assert(block_params.speculative.draft.adaptive);
+        assert(block_params.speculative.draft.adaptive_mode == COMMON_SPECULATIVE_ADAPTIVE_BLOCK);
+        assert(block_params.speculative.draft.n_min_adaptive == 0);
+        assert(block_params.speculative.draft.n_max == 5);
+    }
+
+    {
         common_params synth_params;
         argv = {"binary_name", "--spec-synth-len", "3.4"};
         assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), synth_params, LLAMA_EXAMPLE_SERVER));

@@ -15,7 +15,7 @@ The main delphi.cpp settings are also command-line options, and `llama-server --
 Reference pages for the settings:
 
 - [Runtime environment variables](environment-variables.md) lists every environment variable with its default.
-- [Draft depth of MTP speculative decoding](speculative-draft-depth.md) gives the full depth rule.
+- [Adaptive speculative draft depth](speculative-draft-depth.md) covers the MTP depth rule and adaptive DSpark verification.
 - [Vision memory](vision-memory.md) describes the vision memory modes in detail.
 - [Tune endpoints](tune-endpoints.md) describes the server routes that the auto-tuner uses.
 - [Server context checkpoints](server-checkpoints.md) describes how the server reuses prompt state for models with sliding-window or recurrent layers.
