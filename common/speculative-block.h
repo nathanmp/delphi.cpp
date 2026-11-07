@@ -23,6 +23,9 @@ struct common_speculative_block {
     uint64_t builds = 0;
     bool feedback = false;
     float temperature = NAN;
+    double tokens = 0.0;
+    double seconds = 0.0;
+    int emitted = 0;
 
     explicit common_speculative_block(int n = 0) : attempts(n + 1), chosen(n + 1), cap(n) {
         calibration.seqs.resize(1);
@@ -55,10 +58,15 @@ struct common_speculative_block {
             calibration = {};
             calibration.seqs.resize(1);
             temperature = temp;
+            tokens = seconds = 0.0;
         }
     }
 
     void round(int64_t now, uint64_t n_builds) {
+        if (start > 0 && feedback && now > start) {
+            tokens = 0.98*tokens + emitted;
+            seconds = 0.98*seconds + 1e-6*(now - start);
+        }
         if (start > 0 && feedback && n_builds == builds && now > start) {
             times.emplace_back(depth, 1e-6*(now - start));
             if (times.size() > WINDOW) {
@@ -75,14 +83,17 @@ struct common_speculative_block {
         floor = std::min(floor, n);
         int best = std::clamp(start_depth > 0 ? start_depth : 3, floor, n);
         if (tab.calibrated()) {
-            double q = 1.0, expected = 1.0, best_rate = -1.0;
+            double q = 1.0, expected = 1.0, best_value = -INFINITY;
             for (int k = 0; k < n; ++k) {
                 q *= calibration.cal(k, confidence[k]);
                 expected += q;
                 if (k + 1 >= floor) {
-                    const double rate = expected/cost(tab, k + 1);
-                    if (rate > best_rate) {
-                        best_rate = rate;
+                    // Average output/time across changing content is a ratio of sums. Once a live rate exists,
+                    // maximize expected output minus rate times cost, rather than each state's individual ratio.
+                    const double value = seconds > 0 ? expected - (tokens/seconds)*cost(tab, k + 1) :
+                                                       expected/cost(tab, k + 1);
+                    if (value > best_value) {
+                        best_value = value;
                         best = k + 1;
                     }
                 }
@@ -113,6 +124,7 @@ struct common_speculative_block {
         // A caller can shorten a draft for the remaining output budget. Positions after that bound are censored.
         depth = std::min(depth, drafted);
         calibration.observe(0, depth, std::min(accepted, depth));
+        emitted = std::min(accepted, depth) + 1;
         feedback = true;
     }
 };
