@@ -3321,7 +3321,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
     }
 
     if (params.draft.adaptive && params.draft.adaptive_mode == COMMON_SPECULATIVE_ADAPTIVE_BLOCK &&
-            (n_seq != 1 || params.types.size() != 1 || params.types[0] != COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK || params.has_synth())) {
+            (n_seq != 1 || impls.size() != 1 || impls[0]->type != COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK || params.has_synth())) {
         throw std::runtime_error("block adaptive mode requires draft-dspark alone, one slot and real acceptance");
     }
     if (params.draft.adaptive) {
