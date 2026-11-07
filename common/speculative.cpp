@@ -3328,7 +3328,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         const bool block = params.draft.adaptive_mode == COMMON_SPECULATIVE_ADAPTIVE_BLOCK;
         const bool    cost  = params.draft.adaptive_mode == COMMON_SPECULATIVE_ADAPTIVE_COST;
         const bool    conf  = params.draft.adaptive_mode == COMMON_SPECULATIVE_ADAPTIVE_CONF;
-        const int32_t n_min = params.draft.n_min_adaptive > 0 ? params.draft.n_min_adaptive : (cost || conf || block ? 1 : 3);
+        const int32_t n_min = params.draft.n_min_adaptive > 0 ? params.draft.n_min_adaptive : (block ? 0 : cost || conf ? 1 : 3);
         for (auto & impl : impls) {
             switch (impl->type) {
                 case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:
@@ -3341,10 +3341,10 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                     continue; // n-gram speculators draft what they find
             }
             // n_max is the implementation's cap after its own limits (MTP heads, DFlash block size)
-            if (n_min < 1 || n_min > impl->n_max) {
+            if (n_min < (block ? 0 : 1) || n_min > impl->n_max) {
                 throw std::runtime_error(string_format(
-                        "invalid adaptive draft range for %s: n_min_adaptive=%d, n_max=%d (n_min_adaptive must be in [1, n_max])",
-                        common_speculative_type_to_str(impl->type).c_str(), n_min, impl->n_max));
+                        "invalid adaptive draft range for %s: n_min_adaptive=%d, n_max=%d (n_min_adaptive must be in [%d, n_max])",
+                        common_speculative_type_to_str(impl->type).c_str(), n_min, impl->n_max, block ? 0 : 1));
             }
             impl->adaptive       = true;
             impl->n_min_adaptive = n_min;
@@ -4110,7 +4110,7 @@ std::vector<common_speculative_impl_info> common_speculative_get_info(const comm
         if (impl->block_ctl) {
             const auto & ctl = *impl->block_ctl;
             for (int n = 0; n <= impl->n_max; ++n) {
-                info.t_round_ms.push_back(n > 0 ? 1e3*ctl.cost(impl->cost_tab, n) : 0.0);
+                info.t_round_ms.push_back(1e3*ctl.cost(impl->cost_tab, n));
                 info.n_round.push_back(ctl.samples(n));
                 info.depth_counts.push_back(ctl.chosen[n]);
             }

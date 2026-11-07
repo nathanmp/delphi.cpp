@@ -22,6 +22,7 @@ struct common_speculative_block {
     int64_t start = 0;
     uint64_t builds = 0;
     bool feedback = false;
+    bool selected = false;
     float temperature = NAN;
     double tokens = 0.0;
     double seconds = 0.0;
@@ -54,6 +55,7 @@ struct common_speculative_block {
     void begin(float temp) {
         start = 0;
         feedback = false;
+        selected = false;
         if (temp != temperature) {
             calibration = {};
             calibration.seqs.resize(1);
@@ -63,6 +65,12 @@ struct common_speculative_block {
     }
 
     void round(int64_t now, uint64_t n_builds) {
+        // Empty drafts use the server's ordinary sampling path, which has no speculative accept callback. Reaching
+        // the next draft means that path emitted one token. begin() discards an unfinished or cancelled request.
+        if (selected && depth == 0) {
+            feedback = true;
+            emitted = 1;
+        }
         if (start > 0 && feedback && now > start) {
             tokens = 0.98*tokens + emitted;
             seconds = 0.98*seconds + 1e-6*(now - start);
@@ -76,6 +84,7 @@ struct common_speculative_block {
         start = now;
         builds = n_builds;
         feedback = false;
+        selected = false;
     }
 
     int choose(const common_speculative_cost_table & tab, const std::vector<float> & confidence, int floor, int start_depth) {
@@ -83,7 +92,12 @@ struct common_speculative_block {
         floor = std::min(floor, n);
         int best = std::clamp(start_depth > 0 ? start_depth : 3, floor, n);
         if (tab.calibrated()) {
-            double q = 1.0, expected = 1.0, best_value = -INFINITY;
+            double q = 1.0, expected = 1.0;
+            const double zero_cost = cost(tab, 0);
+            double best_value = floor == 0 ? (seconds > 0 ? expected - (tokens/seconds)*zero_cost : expected/zero_cost) : -INFINITY;
+            if (floor == 0) {
+                best = 0;
+            }
             for (int k = 0; k < n; ++k) {
                 q *= calibration.cal(k, confidence[k]);
                 expected += q;
@@ -110,6 +124,7 @@ struct common_speculative_block {
                 best = floor + probe++ % (n - floor + 1);
             }
         }
+        selected = true;
         depth = best;
         attempts[best]++;
         chosen[best]++;
@@ -118,7 +133,7 @@ struct common_speculative_block {
     }
 
     void observe(int drafted, int accepted) {
-        if (feedback || start == 0) {
+        if (!selected || feedback || start == 0) {
             return;
         }
         // A caller can shorten a draft for the remaining output budget. Positions after that bound are censored.

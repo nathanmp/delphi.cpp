@@ -74,7 +74,27 @@ static void test_probes_and_fallback() {
     puts("OK");
 }
 
+static void test_empty_prefix() {
+    auto tab = table();
+    common_speculative_block ctl(5);
+    ctl.begin(1.0f);
+    ctl.round(1000000, 0);
+    assert(ctl.choose(tab, {.1f, .1f, .1f, .1f, .1f}, 0, 0) == 0);
+    assert(ctl.calibration.seqs[0].p.empty());
+    // No accept callback is made by ordinary decoding. Count its token and full block cost on the next round.
+    ctl.round(1050000, 0);
+    assert(ctl.samples(0) == 1);
+    assert(ctl.tokens == 1);
+    assert(std::fabs(ctl.seconds - .05) < 1e-9);
+    assert(ctl.calibration.trials[0][0] == 0); // skipping a proposal does not reject it
+    assert(ctl.choose(tab, {.1f, .1f, .1f, .1f, .1f}, 0, 0) == 0);
+    ctl.begin(1.0f);
+    ctl.round(100000000, 0);
+    assert(ctl.samples(0) == 1); // cancellation/idle time is not an emitted token
+}
+
 int main() {
+    test_empty_prefix();
     test_prefix_and_costs();
     test_feedback_and_reset();
     test_probes_and_fallback();
