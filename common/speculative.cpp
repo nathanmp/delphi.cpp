@@ -2,6 +2,7 @@
 #include "speculative-adaptive.h"
 #include "speculative-block.h"
 #include "speculative-cost.h"
+#include "speculative-proposal.h"
 
 #include <optional>
 
@@ -1162,6 +1163,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     std::vector<std::mt19937> dflash2_rng;
     std::vector<int64_t>      dflash2_seed;
 
+    std::vector<common_speculative_proposal> dspark_proposals;
+
     // draft-dspark: the draft carries a Markov head and uses an anchor-first block layout
     const bool is_dspark;
 
@@ -1214,6 +1217,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         is_dflash2     = selector_top_k > 0;
         dflash2_rng.resize(n_seq);
         dflash2_seed.assign(n_seq, -1);
+        if (is_dspark) {
+            dspark_proposals.resize(n_seq);
+        }
         mask_token_id = llama_vocab_mask(llama_model_get_vocab(model_dft));
 
         if (is_dspark && (this->params.p_min > 0.0f ||
@@ -1338,6 +1344,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         // reseed per request rather than per round, or two identical requests differ
         dflash2_seed[seq_id] = -1;
+        if (is_dspark) {
+            dspark_proposals[seq_id].begin();
+        }
 
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
@@ -1599,6 +1608,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
 
             if (is_dspark) {
+                const bool sample = params.probabilistic && dp.result_q && dp.temp > 0.0f;
                 // DSpark: read from the first draft slot, truncate below the confidence threshold
                 const float * conf = params.p_min > 0.0f || block_ctl ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
                 std::vector<float> confidence;
@@ -1625,14 +1635,23 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                                 common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
                     }
 
-                    const llama_token id = cur_p->data[0].id;
+                    llama_token id = cur_p->data[0].id;
+                    if (sample) {
+                        // The graph conditions later logits on its greedy chain, not these draws. Treat its rows as
+                        // a factorized block proposal; rejection needs the exact q, not an autoregressive draft.
+                        id = dspark_proposals[seq_id].sample(*cur_p, dp.temp, dp.seed, dp.result_q->emplace_back());
+                    }
 
                     common_sampler_accept(smpl, id, true);
 
                     result.push_back(id);
                 }
                 if (block_ctl && !result.empty()) {
+                    // Graph confidence is independent of the sampled tokens, so this prefix choice does not bias q.
                     result.resize(block_ctl->choose(cost_tab, confidence, n_min_adaptive, n_start));
+                }
+                if (sample) {
+                    dp.result_q->resize(result.size());
                 }
             } else {
                 // greedily read the predicted block at this sequence's noise positions 1..n_block_tokens-1
@@ -1661,6 +1680,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             if (result.size() < (size_t) params.n_min) {
                 result.clear();
+                if (is_dspark && dp.result_q) {
+                    dp.result_q->clear();
+                }
             }
         }
     }
@@ -3755,7 +3777,7 @@ void common_speculative_draft(common_speculative * spec) {
                         result.resize(dp.n_max);
 
                         // the candidates are one per drafted token and must be cut with them
-                        if (dp.result_q) {
+                        if (dp.result_q && !dp.result_q->empty()) {
                             dp.result_q->resize(dp.n_max);
                         }
                     }
