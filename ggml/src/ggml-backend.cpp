@@ -2721,7 +2721,11 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
                     GGML_EXEC_TRACE_WAIT_API_BACKEND_SYNCHRONIZE);
         }
 
-        ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids);
+        // a failed reserve leaves a buffer unallocated, and allocating the graph in it then crashes
+        if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
+            GGML_LOG_ERROR("%s: failed to reserve the graph\n", __func__);
+            return false;
+        }
         sched->n_reserves++;
         if (!ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
             GGML_LOG_ERROR("%s: failed to allocate graph\n", __func__);
