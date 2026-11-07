@@ -119,6 +119,7 @@ endfunction()
 llama_build_and_test(test-quant-rules.cpp)
 llama_build_and_test(test-speculative-adaptive.cpp)
 llama_build_and_test(test-speculative-cost.cpp)
+llama_build_and_test(test-speculative-block.cpp)
 
 if (LLAMA_BUILD_TOOLS)
     llama_build_and_test(test-quant-damage.cpp)
