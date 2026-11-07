@@ -38,6 +38,7 @@
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/mmid-partial.cuh"
 #include "ggml-cuda/mmvq-q8-tc.cuh"
+#include "ggml-cuda/mm-dense-chunked.cuh"
 #include "ggml-cuda/moe-devsort.cuh"
 #include "ggml-cuda/moe-schedule.cuh"
 #include "ggml-cuda/moe-grouped.cuh"
@@ -2448,6 +2449,13 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
         return;
     }
+    // delphi: wide dense products as chunked dequantization + cuBLAS (mm-dense-chunked.cuh)
+    if (ggml_cuda_dense_chunked_supported(src0, src1, dst, cc)) {
+        ggml_exec_trace_dispatch(dst->op, GGML_CUDA_TRACE_BLAS,
+                GGML_EXEC_TRACE_DISPATCH_VARIANT_DEFAULT, cc, warp_size);
+        ggml_cuda_mul_mat_dense_chunked(ctx, src0, src1, dst);
+        return;
+    }
     if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
         if (ggml_exec_trace_observing()) {
             ggml_exec_trace_dispatch(dst->op, GGML_EXEC_TRACE_DISPATCH_GPU_MMQ,
@@ -2474,6 +2482,9 @@ static bool ggml_cuda_mul_mat_may_use_cublas(const ggml_tensor * dst, const int 
     if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11) ||
             ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
         return false;
+    }
+    if (ggml_cuda_dense_chunked_supported(src0, src1, dst, cc)) {
+        return true;
     }
     return !ggml_is_quantized(src0->type) ||
         (!ggml_cuda_should_use_mmvq(src0->type, cc, ne11, src0->ne[1]) && !ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0));
