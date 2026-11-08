@@ -1381,6 +1381,7 @@ struct ggml_cuda_graph {
     // Dispatch is chosen during capture; graph replay re-emits this fixed decision sequence without redispatching.
     std::vector<ggml_exec_trace_dispatch_record> trace_dispatches;
     size_t num_nodes = 0;
+    bool uses_device_args = true; // set from the captured graph; copies and events need no kernel argument block
     std::vector<cudaGraphNode_t> nodes;
     bool disable_due_to_gpu_arch = false;
     bool warmup_complete = false;
@@ -1598,7 +1599,7 @@ struct ggml_backend_cuda_context {
     // Graph keys hash every node, which dominates host time when a split mode submits many small
     // graphs per token. A uid is reassigned whenever a graph is rebuilt, so the key can be reused.
     std::unordered_map<uint64_t, uint64_t> graph_key_by_uid;
-    size_t graph_instance_limit = 0; // zero leaves the captured-executable count unrestricted
+    size_t graph_instance_limit = 0; // zero leaves the kernel-executable count unrestricted
     void graph_instance_prepare(uint64_t graph_key);
     // topologies whose shapes alternate: lending executables between them would only move the instantiation around
     std::unordered_set<uint64_t> graph_topo_no_lend;

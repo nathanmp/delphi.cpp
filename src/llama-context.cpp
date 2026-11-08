@@ -3753,8 +3753,8 @@ void llama_context::expert_cache_auto(llama_context * draft) {
                 for (uint32_t il = 0; il < ctx.model.hparams.n_layer(); ++il) {
                     layers += ctx.model.dev_layer(il) == dev;
                 }
-                // Budget four device splits per layer and alternate scheduler, with at least 64 executables.
-                // The backend bounds retained executables, so new request shapes cannot exceed this reserve.
+                // Budget four device splits per layer and alternate scheduler, with at least 64 kernel executables.
+                // The backend bounds retained kernel executables, so new request shapes cannot exceed this reserve.
                 const size_t limit = std::max<size_t>(64, 4*layers*std::max<uint32_t>(1, ctx.graph_alt_slots));
                 graph_budget[dev] += reserve(b.get(), limit);
             }
