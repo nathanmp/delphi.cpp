@@ -369,6 +369,8 @@ struct common_speculative_impl {
 
     virtual ~common_speculative_impl() = default;
 
+    virtual bool warmup() { return true; }
+
     virtual void begin(llama_seq_id seq_id, const llama_tokens & prompt) = 0;
 
     // `tgt` reads the target's feature outputs for `batch` (see common_speculative_tgt_features)
@@ -1296,21 +1298,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ !is_dflash2);
         llama_set_causal_attn(ctx_dft, causal_attn); // DFlash needs non-causal attention unless the model says otherwise
 
-        // The settings above change the graphs of both contexts (the target keeps the extracted layer inputs alive),
-        // so the next decode reserves larger compute buffers. Reserve them now: a context that does not fit then fails
-        // at load, not at the first request (GLM-5.3 Flash at -c 786432: +112 MiB on two CMPs). Not for DSpark yet: the
-        // DeepSeek expert cache sizes its tiers around these buffers, and that path is not validated with it.
-        if (!is_dspark) {
-            try {
-                llama_context_sched_reserve(ctx_tgt);
-                llama_context_sched_reserve(ctx_dft);
-            } catch (...) {
-                // the server continues without speculative decoding: give the target its own graphs back
-                for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
-                    llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], false);
-                }
-                throw;
+        // Reserve the feature-extraction and draft-sampling graphs before auto expert-cache sizing.
+        try {
+            llama_context_sched_reserve(ctx_tgt);
+            llama_context_sched_reserve(ctx_dft);
+        } catch (...) {
+            // The server can continue without speculative decoding.
+            for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+                llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], false);
             }
+            throw;
         }
     }
 
@@ -1329,6 +1326,55 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         llama_batch_free(batch);
         llama_batch_free(batch_inject);
+    }
+
+    bool warmup() override {
+        if (!is_dspark || n_seq < 2) {
+            return true;
+        }
+
+        auto * ctx_tgt = params.ctx_tgt;
+        auto * ctx_dft = params.ctx_dft;
+        const int32_t n_verify = std::min<int32_t>(n_max + 1, llama_n_ctx_seq(ctx_tgt));
+        const int32_t n_block = n_block_draft + (sample_from_anchor ? 0 : 1);
+        const int32_t capacity = std::max(n_verify, n_block) * n_seq;
+        llama_batch warm = llama_batch_init(capacity, 0, 1);
+        llama_tokens text = common_tokenize(ctx_tgt, "The committee reviewed the proposal and agreed on the new schedule.", false, false);
+        bool ok = !text.empty();
+
+        SPC_INF("warming DSpark for %u concurrent sequences before expert-cache sizing\n", n_seq);
+        // A single sequence does not exercise the draft's batched BLAS path. Each active-sequence count can also need separate compute buffers.
+        // Use the real feature-injection and noise-block graphs.
+        for (uint32_t ns = 1; ns <= n_seq && ok; ++ns) {
+            common_batch_clear(warm);
+            for (llama_seq_id seq = 0; seq < (llama_seq_id) ns; ++seq) {
+                for (int32_t i = 0; i < n_verify; ++i) {
+                    common_batch_add(warm, text[i % text.size()], i, { seq }, true);
+                }
+            }
+            ok = llama_decode(ctx_tgt, warm) == 0;
+            llama_synchronize(ctx_tgt);
+            if (ok) {
+                ok = process(warm, { ctx_tgt, -1 });
+            }
+            if (ok) {
+                common_batch_clear(warm);
+                for (llama_seq_id seq = 0; seq < (llama_seq_id) ns; ++seq) {
+                    for (int32_t i = 0; i < n_block; ++i) {
+                        common_batch_add(warm, i == 0 ? text[(n_verify - 1) % text.size()] : mask_token_id,
+                                n_verify + i, { seq }, true);
+                    }
+                }
+                ok = llama_decode(ctx_dft, warm) == 0;
+            }
+            llama_synchronize(ctx_dft);
+            llama_memory_clear(llama_get_memory(ctx_tgt), false);
+            llama_memory_clear(llama_get_memory(ctx_dft), false);
+        }
+        llama_batch_free(warm);
+        llama_perf_context_reset(ctx_tgt);
+        llama_perf_context_reset(ctx_dft);
+        return ok;
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
@@ -3462,6 +3508,17 @@ common_speculative * common_speculative_init(common_params_speculative & params,
     }
 
     return result.release();
+}
+
+bool common_speculative_warmup(common_speculative * spec) {
+    if (spec) {
+        for (auto & impl : spec->impls) {
+            if (!impl->warmup()) {
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 void common_speculative_free(common_speculative * spec) {

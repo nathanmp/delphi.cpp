@@ -1602,6 +1602,13 @@ private:
                 if (ctx_only) {
                     init_vram();
                 }
+                if (params_base.warmup) {
+                    if (!common_speculative_warmup(spec.get())) {
+                        SRV_ERR("%s", "failed to warm speculative decoding\n");
+                        return false;
+                    }
+                    llama_init->reset_samplers();
+                }
                 // after the draft or MTP context and the slots hold their memory
                 llama_expert_cache_auto(ctx_tgt);
                 if (params_base.warmup) {

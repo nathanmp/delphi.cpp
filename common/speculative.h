@@ -56,6 +56,9 @@ common_speculative_output_limits common_speculative_get_output_limits(
 
 common_speculative * common_speculative_init(common_params_speculative & params, uint32_t n_seq);
 
+// Warm request-time resources while the contexts are empty, before auto expert-cache sizing.
+bool common_speculative_warmup(common_speculative * spec);
+
 void common_speculative_free(common_speculative * spec);
 
 // Opt-in cycle ledger for observing speculative decoding (handoff 2 of the DFlash2 task). Off unless DELPHI_SPEC_LEDGER=<file> is
