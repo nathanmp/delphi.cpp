@@ -386,10 +386,29 @@ static void common_params_fit_impl(
         // buffers that appear after load) to host memory. The library reads the result from LLAMA_KV_WINDOW_HOST_MIB.
         const char * kvw = getenv("LLAMA_KV_RESIDENT_CELLS");
         if (kvw != nullptr && strcmp(kvw, "auto") == 0) {
+            // "<MiB>" for every device, or "[<MiB>,]<dev>=<MiB>,..." (the plain value is the default of the others)
             const char * wm = getenv("LLAMA_KV_WINDOW_MARGIN_MIB");
-            const int64_t window_margin = (wm ? std::atoll(wm) : 1024)*MiB;
+            auto window_margin_of = [&](const char * dev_name) -> int64_t {
+                int64_t mib = 1024;
+                const std::string val = wm ? wm : "";
+                size_t pos = 0;
+                while (pos < val.size()) {
+                    size_t end = val.find(',', pos);
+                    end = end == std::string::npos ? val.size() : end;
+                    const std::string item = val.substr(pos, end - pos);
+                    const size_t eq = item.find('=');
+                    if (eq == std::string::npos) {
+                        mib = std::atoll(item.c_str());
+                    } else if (item.substr(0, eq) == dev_name) {
+                        return std::atoll(item.c_str() + eq + 1)*MiB;
+                    }
+                    pos = end + 1;
+                }
+                return mib*MiB;
+            };
             std::string spec;
             for (size_t id = 0; id < nd; id++) {
+                const int64_t window_margin = window_margin_of(ggml_backend_dev_name(devs[id]));
                 const int64_t need = margins[id] + window_margin - projected_free_per_device[id];
                 if (need > 0) {
                     spec += std::string(spec.empty() ? "" : ",") + ggml_backend_dev_name(devs[id]) + "=" + std::to_string((need + MiB - 1)/MiB);

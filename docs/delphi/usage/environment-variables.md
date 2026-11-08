@@ -117,7 +117,7 @@ The KV window keeps the first cells of each KV stream in VRAM and puts the other
 | --- | --- | --- |
 | `LLAMA_KV_RESIDENT_CELLS` | unset (all cells in VRAM) | `auto`: the `--fit` dry run (on by default) measures the model with the window and moves the VRAM deficit of each device to host memory. `<cells>` or `<dev>=<cells>,...` (for example `CUDA0=65536,CUDA1=16384`): the cells per stream that stay in VRAM; a device that is not in the list keeps its cache in VRAM |
 | `LLAMA_KV_IDX_RESIDENT_CELLS` | unset; `4096` with `LLAMA_KV_RESIDENT_CELLS=auto` | the same for the per-cell indexer cache. The model reads it only to compress pools, so a small value costs little |
-| `LLAMA_KV_WINDOW_MARGIN_MIB` | `1024` | with `auto`: VRAM that each device keeps free in addition to the `--fit-target` margin, for the CUDA graphs and copy buffers that appear after load (about 0.65-1 GiB per device on GLM) |
+| `LLAMA_KV_WINDOW_MARGIN_MIB` | `1024` | with `auto`: VRAM that each device keeps free in addition to the `--fit-target` margin, for the CUDA graphs and copy buffers that appear after load (about 0.65-1 GiB per device on GLM) and for memory that the fit does not see (a dynamic `--mmproj`). `<MiB>` for every device, or `[<MiB>,]<dev>=<MiB>,...`, for example `1024,CUDA2=2560` |
 | `LLAMA_KV_WINDOW_STAGE_MIN_TOKENS` | `17` | tokens per stream from which a batch copies the whole layer cache to VRAM instead of the selected cells |
 | `LLAMA_KV_WINDOW_UNION` | `1` | a verify batch copies each selected cell once for all its tokens. `0` copies the cells of each token |
 
