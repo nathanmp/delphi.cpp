@@ -7,7 +7,7 @@
 
 // DSpark generates the full block before this policy selects a verification prefix. Costs are complete rounds,
 // measured from one draft start to the next, including feature ingest and checkpoint replay. There is no per-token
-// draft cost: shortening the prefix does not undo block generation. Initially restricted to one sequence/proposer.
+// draft cost: shortening the prefix does not undo block generation. One acceptance controller per sequence; batched timing is accounted for separately.
 struct common_speculative_block {
     static constexpr size_t WINDOW = 96;
     static constexpr int MIN_SAMPLES = 3;
@@ -64,18 +64,18 @@ struct common_speculative_block {
         }
     }
 
-    void round(int64_t now, uint64_t n_builds) {
+    void round(int64_t now, uint64_t n_builds, bool learn = true) {
         // Empty drafts use the server's ordinary sampling path, which has no speculative accept callback. Reaching
         // the next draft means that path emitted one token. begin() discards an unfinished or cancelled request.
         if (selected && depth == 0) {
             feedback = true;
             emitted = 1;
         }
-        if (start > 0 && feedback && now > start) {
+        if (learn && start > 0 && feedback && now > start) {
             tokens = 0.98*tokens + emitted;
             seconds = 0.98*seconds + 1e-6*(now - start);
         }
-        if (start > 0 && feedback && n_builds == builds && now > start) {
+        if (learn && start > 0 && feedback && n_builds == builds && now > start) {
             times.emplace_back(depth, 1e-6*(now - start));
             if (times.size() > WINDOW) {
                 times.pop_front();
@@ -141,5 +141,107 @@ struct common_speculative_block {
         calibration.observe(0, depth, std::min(accepted, depth));
         emitted = std::min(accepted, depth) + 1;
         feedback = true;
+    }
+};
+
+// Batched rounds have one wall time. Never assign that time to each sequence's prefix.
+struct common_speculative_block_batch {
+    struct sample { int slots, width; double seconds; };
+    std::deque<sample> times;
+    std::vector<int> active;
+    int64_t start = 0;
+    uint64_t builds = 0;
+    double tokens = 0, seconds = 0;
+    int rounds = 0;
+
+    void round(int64_t now, uint64_t graph_builds, const std::vector<int> & next,
+            const std::vector<common_speculative_block> & controllers) {
+        bool complete = start > 0 && active == next && now > start && builds == graph_builds;
+        int width = 0, emitted = 0;
+        for (int s : active) {
+            const auto & c = controllers[s];
+            complete &= c.selected && (c.feedback || c.depth == 0);
+            width += c.depth + 1;
+            emitted += c.feedback ? c.emitted : 1;
+        }
+        if (complete) {
+            const double elapsed = 1e-6*(now - start);
+            tokens = .98*tokens + emitted;
+            seconds = .98*seconds + elapsed;
+            times.push_back({(int) active.size(), width, elapsed});
+            if (times.size() > common_speculative_block::WINDOW) { times.pop_front(); }
+        }
+        if (active != next) { tokens = seconds = 0; }
+        active = next;
+        start = now;
+        builds = graph_builds;
+    }
+
+    double cost(const common_speculative_cost_table & tab, int slots, int width) const {
+        auto prior = [&](int w) {
+            const int last = (int) tab.t_verify.size() - 1;
+            if (last < 1) { return double(w); }
+            if (w <= last) { return tab.verify(w); }
+            // Startup measures one sequence only. Extrapolate until this total batch width has live observations.
+            const double slope = last > 1 ? std::max(1e-6, (tab.verify(last) - tab.verify(1))/(last - 1)) : tab.verify(1);
+            return tab.verify(last) + (w - last)*slope;
+        };
+        std::vector<double> own, residual;
+        for (const auto & v : times) {
+            if (v.slots != slots) { continue; }
+            residual.push_back(v.seconds - prior(v.width));
+            if (v.width == width) { own.push_back(v.seconds); }
+        }
+        return std::max(1e-6, own.size() >= common_speculative_block::MIN_SAMPLES ?
+                common_speculative_cost_table::median(own) : prior(width) + common_speculative_cost_table::median(residual));
+    }
+
+    void choose(const common_speculative_cost_table & tab, std::vector<common_speculative_block> & controllers,
+            const std::vector<std::vector<float>> & confidence, int floor, int initial) {
+        if (active.empty()) { return; }
+        std::vector<int> depths(controllers.size());
+        auto expected = [&](int s, int n) {
+            double value = 1, survival = 1;
+            for (int k = 0; k < n; ++k) {
+                survival *= controllers[s].calibration.cal(k, confidence[s][k]);
+                value += survival;
+            }
+            return value;
+        };
+        for (int s : active) {
+            depths[s] = std::clamp(initial > 0 ? initial : 3, std::min(floor, (int) confidence[s].size()), (int) confidence[s].size());
+        }
+        // Coordinate updates price a row against the whole batch and the total expected output.
+        for (int pass = 0; pass < 2; ++pass) {
+            for (int s : active) {
+                int others = 0;
+                double output = 0;
+                for (int peer : active) {
+                    if (peer != s) { others += depths[peer] + 1; output += expected(peer, depths[peer]); }
+                }
+                double best_value = -INFINITY;
+                for (int n = std::min(floor, (int) confidence[s].size()); n <= (int) confidence[s].size(); ++n) {
+                    const double total = output + expected(s, n);
+                    const double t = cost(tab, (int) active.size(), others + n + 1);
+                    const double value = seconds > 0 ? total - (tokens/seconds)*t : total/t;
+                    if (value > best_value) { best_value = value; depths[s] = n; }
+                }
+            }
+        }
+        // Probe one slot at a time, rather than force every slot through the same startup widths.
+        const int s_probe = active[rounds % active.size()];
+        if (rounds < (int) active.size()*(controllers[s_probe].cap + 1)*3 || rounds % 32 == 0) {
+            const int lo = std::min(floor, (int) confidence[s_probe].size());
+            depths[s_probe] = lo + (rounds/(int) active.size()) % ((int) confidence[s_probe].size() - lo + 1);
+        }
+        ++rounds;
+        for (int s : active) {
+            auto & c = controllers[s];
+            c.selected = true;
+            c.depth = depths[s];
+            c.attempts[c.depth]++;
+            c.chosen[c.depth]++;
+            c.calibration.seqs[0].p.assign(confidence[s].begin(), confidence[s].begin() + c.depth);
+        }
     }
 };
