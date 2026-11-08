@@ -3477,7 +3477,6 @@ static ggml_cuda_graph * ggml_cuda_graph_find_sibling(ggml_backend_cuda_context 
     ggml_cuda_graph * best = nullptr;
     for (auto & [key, other] : cuda_ctx->cuda_graphs) {
         if (other.get() == self || other->instance == nullptr || other->topo_key != self->topo_key ||
-                (self->graph != nullptr && other->uses_device_args != self->uses_device_args) ||
                 (int) other->node_props.size() != cgraph->n_nodes) {
             continue;
         }
@@ -3556,45 +3555,19 @@ static bool ggml_cuda_graph_update_required(
     return res;
 }
 
-static bool ggml_cuda_graph_uses_device_args(cudaGraph_t graph) {
-#if defined(GGML_USE_HIP)
-    size_t count = 0;
-    CUDA_CHECK(hipGraphGetNodes(graph, nullptr, &count));
-    std::vector<hipGraphNode_t> nodes(count);
-    CUDA_CHECK(hipGraphGetNodes(graph, nodes.data(), &count));
-    for (auto node : nodes) {
-        hipGraphNodeType type;
-        CUDA_CHECK(hipGraphNodeGetType(node, &type));
-        switch (type) {
-            case hipGraphNodeTypeMemcpy:
-            case hipGraphNodeTypeEmpty:
-            case hipGraphNodeTypeWaitEvent:
-            case hipGraphNodeTypeEventRecord:
-                break;
-            default:
-                return true; // kernels, child graphs and unknown node types are charged conservatively
-        }
-    }
-    return false;
-#else
-    GGML_UNUSED(graph);
-    return true;
-#endif
-}
-
 void ggml_backend_cuda_context::graph_instance_prepare(uint64_t graph_key) {
-    if (graph_instance_limit == 0 || !cuda_graphs.at(graph_key)->uses_device_args) {
+    if (graph_instance_limit == 0) {
         return;
     }
     size_t count = 0;
     for (const auto & entry : cuda_graphs) {
-        count += entry.second->instance != nullptr && entry.second->uses_device_args;
+        count += entry.second->instance != nullptr;
     }
     bool synced = false;
     while (count >= graph_instance_limit) {
         auto oldest = cuda_graphs.end();
         for (auto it = cuda_graphs.begin(); it != cuda_graphs.end(); ++it) {
-            if (it->first != graph_key && it->second->instance != nullptr && it->second->uses_device_args &&
+            if (it->first != graph_key && it->second->instance != nullptr &&
                     (oldest == cuda_graphs.end() || it->second->last_used_time < oldest->second->last_used_time)) {
                 oldest = it;
             }
@@ -5923,7 +5896,6 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
             graph->num_nodes = cgraph->n_nodes;
-            graph->uses_device_args = ggml_cuda_graph_uses_device_args(graph->graph);
             if (prefill_timelog) {
                 prefill_cap_us = ggml_time_us() - prefill_cap_t0;
             }
@@ -5977,13 +5949,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 if (k % 8 == 0) {
                     size_t free_b = 0, total_b = 0;
                     cudaMemGetInfo(&free_b, &total_b);
-                    size_t n_g = 0, n_i = 0, n_args = 0, n_nodes = 0;
+                    size_t n_g = 0, n_i = 0, n_nodes = 0;
                     for (auto & [gk, g] : cuda_ctx->cuda_graphs) {
                         n_g++;
-                        if (g->instance) { n_i++; n_args += g->uses_device_args; n_nodes += g->num_nodes; }
+                        if (g->instance) { n_i++; n_nodes += g->num_nodes; }
                     }
-                    GGML_LOG_WARN("graph diag: CUDA%d instantiation #%d: free %.0f MiB, cache %zu graphs, %zu instances (%zu kernel), %zu nodes\n",
-                        cuda_ctx->device, k, free_b/1048576.0, n_g, n_i, n_args, n_nodes);
+                    GGML_LOG_WARN("graph diag: CUDA%d instantiation #%d: free %.0f MiB, cache %zu graphs, %zu instances, %zu nodes\n",
+                        cuda_ctx->device, k, free_b/1048576.0, n_g, n_i, n_nodes);
                 }
             }
             if (prefill_timelog) {
@@ -7872,11 +7844,12 @@ static size_t ggml_backend_cuda_graph_reserve(ggml_backend_t backend, size_t max
     ctx->graph_instance_limit = std::max<size_t>(1, std::min(max_instances, ctx->graph_cache_capacity()));
     size_t live = 0;
     for (const auto & entry : ctx->cuda_graphs) {
-        live += entry.second->instance != nullptr && entry.second->uses_device_args;
+        live += entry.second->instance != nullptr;
     }
-    // Copy-only executables are kept outside the kernel-graph limit. Price its full capacity so that a change of graph node types is also covered.
+    // Some live executables contain only copies and have no device argument block.
+    // Reserve the full capacity so that replacing them with kernel graphs cannot consume memory assigned to the expert cache.
     const size_t bytes = ctx->graph_instance_limit*per_instance;
-    GGML_LOG_INFO("%s: %s reserves %.1f MiB for up to %zu kernel graph executables (%zu live, %.1f MiB each)\n",
+    GGML_LOG_INFO("%s: %s reserves %.1f MiB for up to %zu graph executables (%zu live, %.1f MiB each)\n",
             __func__, ctx->name.c_str(), bytes/1048576.0, ctx->graph_instance_limit, live, per_instance/1048576.0);
     return bytes;
 #else
