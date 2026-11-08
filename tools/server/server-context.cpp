@@ -1610,7 +1610,7 @@ private:
                     llama_init->reset_samplers();
                 }
                 // after the draft or MTP context and the slots hold their memory
-                llama_expert_cache_auto(ctx_tgt);
+                llama_expert_cache_auto(ctx_tgt, ctx_dft);
                 if (params_base.warmup) {
                     llama_share_stage_calibrate(ctx_tgt);
                 }

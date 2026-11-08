@@ -3555,6 +3555,37 @@ static bool ggml_cuda_graph_update_required(
     return res;
 }
 
+void ggml_backend_cuda_context::graph_instance_prepare(uint64_t graph_key) {
+    if (graph_instance_limit == 0) {
+        return;
+    }
+    size_t count = 0;
+    for (const auto & entry : cuda_graphs) {
+        count += entry.second->instance != nullptr;
+    }
+    bool synced = false;
+    while (count >= graph_instance_limit) {
+        auto oldest = cuda_graphs.end();
+        for (auto it = cuda_graphs.begin(); it != cuda_graphs.end(); ++it) {
+            if (it->first != graph_key && it->second->instance != nullptr &&
+                    (oldest == cuda_graphs.end() || it->second->last_used_time < oldest->second->last_used_time)) {
+                oldest = it;
+            }
+        }
+        GGML_ASSERT(oldest != cuda_graphs.end());
+        if (!synced) {
+            // HIP does not document deferred executable destruction. Forked streams join this stream.
+            CUDA_CHECK(cudaStreamSynchronize(stream()));
+            synced = true;
+        }
+        CUDA_CHECK(cudaGraphExecDestroy(oldest->second->instance));
+        oldest->second->instance = nullptr;
+        oldest->second->instance_lent = false;
+        oldest->second->trace_id = 0;
+        --count;
+    }
+}
+
 // With HIP, hipGraphExecUpdate grows about with the square of the node count (gfx1201: 0.7 ms at 150 nodes,
 // 6 ms at 500, 25 ms at 1000) and hipGraphInstantiate about linearly (1.2, 2.4, 4.7 ms). Decode graphs have
 // 450-2600 nodes, so a large graph is instantiated again instead of updated, and does not take over the
@@ -3576,6 +3607,7 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
         CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
         CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
         graph->instance = nullptr;
+        cuda_ctx->graph_instance_prepare(graph_key);
         CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
         graph->trace_id = ggml_exec_trace_next_gpu_graph_id();
         ggml_exec_trace_gpu_graph(GGML_EXEC_TRACE_GPU_GRAPH_UPDATE, graph->trace_id, graph->num_nodes,
@@ -3602,6 +3634,7 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
         (void)cudaGetLastError();
         CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
         graph->instance = nullptr;
+        cuda_ctx->graph_instance_prepare(graph_key);
         CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
         graph->trace_id = ggml_exec_trace_next_gpu_graph_id();
         ggml_exec_trace_gpu_graph(GGML_EXEC_TRACE_GPU_GRAPH_UPDATE, graph->trace_id, graph->num_nodes,
@@ -5908,6 +5941,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         const bool instantiated = graph->instance == nullptr;
         if (instantiated) { // Create executable graph from captured graph.
             const int64_t prefill_inst_t0 = prefill_timelog ? ggml_time_us() : 0;
+            cuda_ctx->graph_instance_prepare(graph_key);
             CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
             if (ggml_cuda_pool_log_enabled()) {
                 static std::atomic<int> n_inst{0};
@@ -7774,6 +7808,54 @@ static void ggml_backend_cuda_moe_set_expert_proc(ggml_backend_t backend, const 
 }
 #endif
 
+#if defined(GGML_USE_HIP) && defined(USE_CUDA_GRAPH)
+static __global__ void ggml_cuda_graph_memory_probe() {}
+#endif
+
+// Account for graph executables that will be created after the auto expert cache takes the remaining VRAM.
+static size_t ggml_backend_cuda_graph_reserve(ggml_backend_t backend, size_t max_instances) {
+#if defined(GGML_USE_HIP) && defined(USE_CUDA_GRAPH)
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    if (!ctx->any_cuda_graph_enabled()) {
+        return 0;
+    }
+    ggml_cuda_set_device(ctx->device);
+    CUDA_CHECK(cudaStreamSynchronize(ctx->stream()));
+
+    hipGraph_t probe = nullptr;
+    hipGraphNode_t node = nullptr;
+    hipGraphExec_t instance = nullptr;
+    hipKernelNodeParams params = {};
+    params.func = (void *) ggml_cuda_graph_memory_probe;
+    params.gridDim = dim3(1);
+    params.blockDim = dim3(1);
+    CUDA_CHECK(hipGraphCreate(&probe, 0));
+    CUDA_CHECK(hipGraphAddKernelNode(&node, probe, nullptr, 0, &params));
+    size_t before = 0, after = 0, total = 0;
+    CUDA_CHECK(cudaMemGetInfo(&before, &total));
+    CUDA_CHECK(hipGraphInstantiate(&instance, probe, nullptr, nullptr, 0));
+    CUDA_CHECK(cudaMemGetInfo(&after, &total));
+    CUDA_CHECK(hipGraphExecDestroy(instance));
+    CUDA_CHECK(hipGraphDestroy(probe));
+
+    // ROCm reserves at least a 2 MiB kernel-argument block per executable, even for a small split.
+    // A driver allocation reused by the probe can hide that cost from the free-memory delta.
+    const size_t per_instance = std::max<size_t>(2*1024*1024, before > after ? before - after : 0);
+    ctx->graph_instance_limit = std::max<size_t>(1, std::min(max_instances, ctx->graph_cache_capacity()));
+    size_t live = 0;
+    for (const auto & entry : ctx->cuda_graphs) {
+        live += entry.second->instance != nullptr;
+    }
+    const size_t remaining = ctx->graph_instance_limit > live ? ctx->graph_instance_limit - live : 0;
+    GGML_LOG_INFO("%s: %s reserves %.1f MiB for %zu more graph executables (limit %zu, %.1f MiB each)\n",
+            __func__, ctx->name.c_str(), remaining*per_instance/1048576.0, remaining, ctx->graph_instance_limit, per_instance/1048576.0);
+    return remaining*per_instance;
+#else
+    GGML_UNUSED_VARS(backend, max_instances);
+    return 0;
+#endif
+}
+
 // delphi: give the cached device memory of an idle backend back to the driver, so that another process can use it (VRAM sharing
 // between servers). Captured graphs hold the addresses of pool buffers, so they go too. No work may be queued or running.
 static void ggml_backend_cuda_trim(ggml_backend_t backend) {
@@ -7828,6 +7910,9 @@ static bool ggml_backend_cuda_copy_on(ggml_backend_t backend, const ggml_tensor 
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_cuda_graph_reserve") == 0) {
+        return (void *) ggml_backend_cuda_graph_reserve;
+    }
     if (strcmp(name, "ggml_backend_cuda_trim") == 0) {
         return (void *) ggml_backend_cuda_trim;
     }

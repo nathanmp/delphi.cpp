@@ -3723,7 +3723,7 @@ void llama_context::sched_set_workers_all() {
     }
 }
 
-void llama_context::expert_cache_auto() {
+void llama_context::expert_cache_auto(llama_context * draft) {
     // At the first decode every context of the process (draft, MTP) holds its memory, so what is free can go to the cache.
     // The margin is for buffers that grow later (graph reallocations, other processes). The decode-time refresh scratch is
     // allocated later on each tier GPU, so it is kept out of the tier too.
@@ -3734,6 +3734,36 @@ void llama_context::expert_cache_auto() {
     }
     expert_cache->auto_size = false;
     synchronize();
+    std::map<ggml_backend_dev_t, size_t> graph_budget;
+    const char * graph_env = getenv("LLAMA_MOE_CACHE_GRAPH_RESERVE");
+    if (graph_env == nullptr || atoi(graph_env) != 0) {
+        auto account_graphs = [&](llama_context & ctx) {
+            ctx.synchronize();
+            for (auto & b : ctx.backends) {
+                auto * dev = ggml_backend_get_device(b.get());
+                if (dev == nullptr || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+                    continue;
+                }
+                auto * reg = ggml_backend_dev_backend_reg(dev);
+                auto * reserve = reg ? (size_t (*)(ggml_backend_t, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_graph_reserve") : nullptr;
+                if (reserve == nullptr) {
+                    continue;
+                }
+                size_t layers = 0;
+                for (uint32_t il = 0; il < ctx.model.hparams.n_layer(); ++il) {
+                    layers += ctx.model.dev_layer(il) == dev;
+                }
+                // Budget four device splits per layer and alternate scheduler, with at least 64 executables.
+                // The backend bounds retained executables, so new request shapes cannot exceed this reserve.
+                const size_t limit = std::max<size_t>(64, 4*layers*std::max<uint32_t>(1, ctx.graph_alt_slots));
+                graph_budget[dev] += reserve(b.get(), limit);
+            }
+        };
+        account_graphs(*this);
+        if (draft && draft != this) {
+            account_graphs(*draft);
+        }
+    }
     // staging slots of their own go back, so that the rings borrow from the tiers instead
     ggml_backend_sched_stage_release(sched.get());
     for (auto & slot : graph_slots) {
@@ -3769,6 +3799,8 @@ void llama_context::expert_cache_auto() {
         const size_t scratch = expert_cache->async_scratch_bytes();
         size_t budget = expert_device_policy.auto_budget(name, free);
         budget = budget > scratch ? budget - scratch : 0;
+        const size_t graphs = graph_budget[d.dev];
+        budget = budget > graphs ? budget - graphs : 0;
         if (!budget) {
             LLAMA_LOG_INFO("%s: expert cache auto: %s has %.0f MiB free, no tier\n", __func__, ggml_backend_dev_name(d.dev),
                     free / 1048576.0);
@@ -3776,8 +3808,8 @@ void llama_context::expert_cache_auto() {
             continue;
         }
         const int id = share_add_tier(d.dev, budget);
-        LLAMA_LOG_INFO("%s: expert cache auto: %s %.0f MiB free, %.0f MiB reserve, %.0f MiB refresh scratch, tier %d of up to %.0f MiB\n",
-                __func__, name.c_str(), free / 1048576.0, expert_device_policy.margin(name) / 1048576.0, scratch / 1048576.0, id,
+        LLAMA_LOG_INFO("%s: expert cache auto: %s %.0f MiB free, %.0f MiB reserve, %.0f MiB refresh scratch, %.0f MiB graph reserve, tier %d of up to %.0f MiB\n",
+                __func__, name.c_str(), free / 1048576.0, expert_device_policy.margin(name) / 1048576.0, scratch / 1048576.0, graphs / 1048576.0, id,
                 budget / 1048576.0);
         stage_check(d.dev, id >= 0 ? expert_cache->tier_bytes(id) : 0);
     }
@@ -5449,6 +5481,10 @@ static ggml_backend_dev_t llama_share_find_dev(const char * name) {
 
 void llama_expert_cache_auto(llama_context * ctx) {
     ctx->expert_cache_auto();
+}
+
+void llama_expert_cache_auto(llama_context * ctx, llama_context * draft) {
+    ctx->expert_cache_auto(draft);
 }
 
 int32_t llama_share_add_tier(llama_context * ctx, const char * dev, size_t bytes) {

@@ -93,7 +93,7 @@ struct llama_context {
     // delphi: VRAM sharing between servers (llama-ext.h). Call between decodes, from the thread that decodes.
     int    share_add_tier(ggml_backend_dev_t dev, size_t bytes);
     // expert cache in auto mode: one tier per GPU of the model, of its free memory less a margin (once; no-op otherwise)
-    void   expert_cache_auto();
+    void   expert_cache_auto(llama_context * draft = nullptr);
     size_t share_drop_tier(int id);
     size_t share_release_compute();
     size_t share_release_memory();

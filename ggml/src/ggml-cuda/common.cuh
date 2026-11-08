@@ -1598,6 +1598,8 @@ struct ggml_backend_cuda_context {
     // Graph keys hash every node, which dominates host time when a split mode submits many small
     // graphs per token. A uid is reassigned whenever a graph is rebuilt, so the key can be reused.
     std::unordered_map<uint64_t, uint64_t> graph_key_by_uid;
+    size_t graph_instance_limit = 0; // zero leaves the captured-executable count unrestricted
+    void graph_instance_prepare(uint64_t graph_key);
     // topologies whose shapes alternate: lending executables between them would only move the instantiation around
     std::unordered_set<uint64_t> graph_topo_no_lend;
 
