@@ -944,6 +944,11 @@ std::string common_chat_template_direct_apply_impl(
     if (inp.contains("reasoning_effort") && inp["reasoning_effort"].is_string() && !inp["reasoning_effort"].empty()) {
         std::string reasoning_effort = inp["reasoning_effort"].get<std::string>();
         jinja::caps_apply_reasoning_effort(ctx, reasoning_effort);
+        // UI clients send numeric effort as a string; templates can require an integer.
+        auto numeric_effort = json::parse_no_throw(reasoning_effort);
+        if (numeric_effort.is_number_integer()) {
+            inp["reasoning_effort"] = numeric_effort;
+        }
     }
 
     jinja::global_from_json(ctx, inp, inputs.mark_input);

@@ -7306,7 +7306,8 @@ static void test_deepseek_v41_encoding() {
     assert_msg_equals(simple_assist_msg("Answer", "Reason"), thinking_parser.parse("Reason</think>Answer", false), true);
 
     for (const auto & option : std::vector<std::pair<std::string, int>>{
-             { "1", 1 }, { "42", 42 }, { "100", 100 }, { "\"low\"", 50 },
+             { "1", 1 }, { "42", 42 }, { "100", 100 },
+             { "\"1\"", 1 }, { "\"42\"", 42 }, { "\"75\"", 75 }, { "\"100\"", 100 }, { "\"low\"", 50 },
              { "\"high\"", 75 }, { "\"max\"", 100 }, { "\"medium\"", 75 },
          }) {
         auto budget = inputs;
@@ -7314,7 +7315,8 @@ static void test_deepseek_v41_encoding() {
         assert_contains(common_chat_templates_apply(tmpls.get(), budget).prompt,
                         "Reasoning Effort: " + std::to_string(option.second) + " (range 1-100");
     }
-    for (const char * value : { "0", "101", "true", "1.5", "\"invalid\"" }) {
+    for (const char * value : { "0", "101", "true", "1.5", "\"invalid\"", "\"0\"", "\"101\"",
+                               "\"1.5\"", "\"75junk\"", "\"true\"" }) {
         auto invalid = inputs;
         invalid.chat_template_kwargs["reasoning_effort"] = value;
         bool rejected = false;
@@ -7593,6 +7595,46 @@ static void test_reasoning_effort_caps() {
     assert_supports_effort("models/templates/Qwen-Qwen3-0.6B.jinja", false);
 }
 
+static void test_numeric_reasoning_effort_per_request() {
+    server_chat_params opt;
+    opt.tmpls = read_templates("models/templates/deepseek-ai-DeepSeek-V4.1.jinja");
+    opt.use_jinja = true;
+    opt.enable_thinking = true;
+    opt.chat_template_kwargs["reasoning_effort"] = R"("low")";
+
+    for (const auto & effort : std::vector<json>{ "1", "75", "100", 1, 75, 100, "low", "high", "max", "none" }) {
+        json body = {
+            { "messages", json::array({ json{ { "role", "user" }, { "content", "hello" } } }) },
+            { "reasoning_effort", effort },
+        };
+        std::vector<raw_buffer> out_files;
+        const std::string prompt = oaicompat_chat_params_parse(body, opt, out_files).at("prompt");
+        if (effort == "none") {
+            assert_not_contains(prompt, "Reasoning Effort:");
+            assert_contains(prompt, "<｜Assistant｜></think>");
+        } else {
+            const int budget = effort == "low" ? 50 : effort == "high" ? 75 : effort == "max" ? 100 :
+                               effort.is_string() ? std::stoi(effort.get<std::string>()) : effort.get<int>();
+            assert_contains(prompt, "Reasoning Effort: " + std::to_string(budget) + " (range 1-100");
+            assert_contains(prompt, "<｜Assistant｜><think>");
+        }
+    }
+    for (const auto & effort : std::vector<json>{ "0", "101", "75junk", 0, 101 }) {
+        json body = {
+            { "messages", json::array({ json{ { "role", "user" }, { "content", "hello" } } }) },
+            { "reasoning_effort", effort },
+        };
+        std::vector<raw_buffer> out_files;
+        bool rejected = false;
+        try {
+            oaicompat_chat_params_parse(body, opt, out_files);
+        } catch (const std::exception &) {
+            rejected = true;
+        }
+        assert_equals(true, rejected);
+    }
+}
+
 static void test_msg_diffs_compute() {
     LOG_DBG("%s\n", __func__);
     {
@@ -7754,6 +7796,7 @@ int main(int argc, char ** argv) {
         test_deepseek_v41_encoding();
         test_template_generation_prompt();
         test_reasoning_effort_caps();
+        test_numeric_reasoning_effort_per_request();
         test_reasoning_budget_tokens_per_request();
         test_reasoning_budget_message_per_request();
         test_template_output_peg_parsers(detailed_debug);
