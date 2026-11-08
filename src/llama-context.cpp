@@ -3735,13 +3735,19 @@ void llama_context::expert_cache_auto(llama_context * draft) {
     expert_cache->auto_size = false;
     synchronize();
     std::map<ggml_backend_dev_t, size_t> graph_budget;
+    for (const auto & d : model.devices) {
+        if (expert_cache->auto_device(d.dev)) {
+            graph_budget[d.dev] = 0;
+        }
+    }
     const char * graph_env = getenv("LLAMA_MOE_CACHE_GRAPH_RESERVE");
     if (graph_env == nullptr || atoi(graph_env) != 0) {
         auto account_graphs = [&](llama_context & ctx) {
             ctx.synchronize();
             for (auto & b : ctx.backends) {
                 auto * dev = ggml_backend_get_device(b.get());
-                if (dev == nullptr || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+                // A draft can use a GPU with no auto tier. Keep that device's executable policy unchanged.
+                if (dev == nullptr || graph_budget.find(dev) == graph_budget.end()) {
                     continue;
                 }
                 auto * reg = ggml_backend_dev_backend_reg(dev);
