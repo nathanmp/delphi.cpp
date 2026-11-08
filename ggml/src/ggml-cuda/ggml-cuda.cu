@@ -7846,10 +7846,12 @@ static size_t ggml_backend_cuda_graph_reserve(ggml_backend_t backend, size_t max
     for (const auto & entry : ctx->cuda_graphs) {
         live += entry.second->instance != nullptr;
     }
-    const size_t remaining = ctx->graph_instance_limit > live ? ctx->graph_instance_limit - live : 0;
-    GGML_LOG_INFO("%s: %s reserves %.1f MiB for %zu more graph executables (limit %zu, %.1f MiB each)\n",
-            __func__, ctx->name.c_str(), remaining*per_instance/1048576.0, remaining, ctx->graph_instance_limit, per_instance/1048576.0);
-    return remaining*per_instance;
+    // Some live executables contain only copies and have no device argument block.
+    // Reserve the full capacity so that replacing them with kernel graphs cannot consume memory assigned to the expert cache.
+    const size_t bytes = ctx->graph_instance_limit*per_instance;
+    GGML_LOG_INFO("%s: %s reserves %.1f MiB for up to %zu graph executables (%zu live, %.1f MiB each)\n",
+            __func__, ctx->name.c_str(), bytes/1048576.0, ctx->graph_instance_limit, live, per_instance/1048576.0);
+    return bytes;
 #else
     GGML_UNUSED_VARS(backend, max_instances);
     return 0;
