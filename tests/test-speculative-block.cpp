@@ -93,7 +93,40 @@ static void test_empty_prefix() {
     assert(ctl.samples(0) == 1); // cancellation/idle time is not an emitted token
 }
 
+static void test_parallel_batch() {
+    common_speculative_cost_table tab;
+    for (int w = 0; w <= 12; ++w) { tab.t_verify.push_back(.02 + .01*w); }
+    std::vector<common_speculative_block> slots(2, common_speculative_block(5));
+    for (auto & c : slots) { c.begin(1); c.round(1000000, 0, false); }
+    common_speculative_block_batch batch;
+    batch.rounds = 1001; // outside startup/periodic exploration
+    batch.round(1000000, 0, {0, 1}, slots);
+    const std::vector<std::vector<float>> confidence = {{1, 1, 1, 1, 1}, {0, 0, 0, 0, 0}};
+    batch.choose(tab, slots, confidence, 1, 3);
+    assert(slots[0].depth == 5 && slots[1].depth == 1);
+    slots[0].observe(5, 3);
+    slots[1].observe(1, 0);
+    assert(slots[0].calibration.trials[0][common_speculative_conf::bin(1)] == 1);
+    assert(slots[1].calibration.trials[0][common_speculative_conf::bin(1)] == 0);
+    batch.round(1100000, 0, {0, 1}, slots);
+    assert(batch.times.size() == 1 && batch.times.back().width == 8);
+    assert(std::abs(batch.cost(tab, 2, 8) - .1) < 1e-9);
+    for (auto & c : slots) { c.round(1100000, 0, false); assert(c.times.empty()); }
+    slots[1].begin(0); // a new request/temperature must not clear its peer's calibration
+    assert(slots[0].calibration.trials[0][common_speculative_conf::bin(1)] == 1);
+    batch.round(1200000, 0, {0}, slots); // a departure/incomplete batch supplies no cost sample
+    assert(batch.times.size() == 1 && batch.tokens == 0);
+    batch.start = 0; // prefill/new request invalidates an open timing interval
+    batch.round(9000000, 0, {0}, slots);
+    assert(batch.times.size() == 1);
+    assert(batch.cost(tab, 2, 50) > batch.cost(tab, 2, 12)); // no zero-cost tail beyond startup widths
+    batch.active = {0, 1};
+    batch.choose(tab, slots, {{}, {.5f}}, 3, 5); // remaining output budget bounds each slot independently
+    assert(slots[0].depth == 0 && slots[1].depth == 1);
+}
+
 int main() {
+    test_parallel_batch();
     test_empty_prefix();
     test_prefix_and_costs();
     test_feedback_and_reset();
