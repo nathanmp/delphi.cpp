@@ -225,6 +225,17 @@ void llama_kpool_cache::invalidate() {
     pimpl->mtp_index_reuse = false;
 }
 
+void llama_kpool_cache::invalidate(llama_seq_id seq_id) {
+    // without a unified cache, stream s holds sequence s only (llama_kv_cache::seq_to_stream)
+    if (seq_id < 0 || pimpl->n_stream == 1 || (uint32_t) seq_id >= pimpl->n_stream) {
+        invalidate();
+        return;
+    }
+    pimpl->maps[seq_id].clear();
+    pimpl->rebuild[seq_id] = true;
+    pimpl->mtp_index_reuse = false;
+}
+
 void llama_kpool_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     if (p0 >= 0 && p1 >= 0 && p0 >= p1) {
         return;

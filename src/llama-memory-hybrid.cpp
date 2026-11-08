@@ -5,10 +5,31 @@
 #include "llama-context.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 
 //
 // llama_memory_hybrid
 //
+
+// delphi: only the pooled sparse attention (glm5next, build_attn_sparse) stages or gathers the cells of a KV window.
+// Other models would read the host cells in place on every step, so they ignore the window variables.
+static const char * llama_kv_window_env(const llama_model & model, bool has_kpool, const char * env_name) {
+    const char * env = getenv(env_name);
+    if (env == nullptr || *env == '\0') {
+        // LLAMA_KV_RESIDENT_CELLS=auto also windows the indexer cache (llama_kv_resident_cells)
+        const char * attn = getenv("LLAMA_KV_RESIDENT_CELLS");
+        if (attn == nullptr || strcmp(attn, "auto") != 0 || strcmp(env_name, "LLAMA_KV_IDX_RESIDENT_CELLS") != 0) {
+            return nullptr;
+        }
+    }
+    if (!has_kpool) {
+        LLAMA_LOG_WARN("%s: %s is set, but %s has no KV window support (only the pooled sparse attention of glm5next): "
+                "the cache stays in VRAM\n", __func__, env_name, llm_arch_name(model.arch));
+        return nullptr;
+    }
+    return env_name;
+}
 
 llama_memory_hybrid::llama_memory_hybrid(
         const llama_model & model,
@@ -57,7 +78,8 @@ llama_memory_hybrid::llama_memory_hybrid(
         nullptr,
         "",
         false,
-        /* kv_window_env */ "LLAMA_KV_RESIDENT_CELLS"
+        /* kv_window_env */ llama_kv_window_env(model, filter_idx != nullptr && model.hparams.indexer_kpool > 0,
+                "LLAMA_KV_RESIDENT_CELLS")
     )),
     mem_recr(new llama_memory_recurrent(
         model,
@@ -89,7 +111,8 @@ llama_memory_hybrid::llama_memory_hybrid(
         return new llama_kv_cache(
             model, hparams_idx, type_idx, type_idx, v_trans, offload, unified,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
-            nullptr, filter_idx, nullptr, nullptr, "", false, "LLAMA_KV_IDX_RESIDENT_CELLS");
+            nullptr, filter_idx, nullptr, nullptr, "", false,
+            llama_kv_window_env(model, model.hparams.indexer_kpool > 0, "LLAMA_KV_IDX_RESIDENT_CELLS"));
     }()),
     mem_kpool(filter_idx == nullptr || model.hparams.indexer_kpool == 0 ? nullptr :
         new llama_kpool_cache(
@@ -255,7 +278,7 @@ void llama_memory_hybrid::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_ds
     mem_attn->seq_cp(seq_id_src, seq_id_dst, p0, p1);
     if (mem_idx) mem_idx->seq_cp(seq_id_src, seq_id_dst, p0, p1);
     if (mem_recr->has_layers()) mem_recr->seq_cp(seq_id_src, seq_id_dst, p0, p1);
-    if (mem_kpool) mem_kpool->invalidate();
+    if (mem_kpool) mem_kpool->invalidate(seq_id_dst);
 }
 
 void llama_memory_hybrid::seq_keep(llama_seq_id seq_id) {
@@ -269,14 +292,14 @@ void llama_memory_hybrid::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p
     mem_attn->seq_add(seq_id, p0, p1, shift);
     if (mem_idx) mem_idx->seq_add(seq_id, p0, p1, shift);
     if (mem_recr->has_layers()) mem_recr->seq_add(seq_id, p0, p1, shift);
-    if (mem_kpool) mem_kpool->invalidate();
+    if (mem_kpool) mem_kpool->invalidate(seq_id);
 }
 
 void llama_memory_hybrid::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
     mem_attn->seq_div(seq_id, p0, p1, d);
     if (mem_idx) mem_idx->seq_div(seq_id, p0, p1, d);
     if (mem_recr->has_layers()) mem_recr->seq_div(seq_id, p0, p1, d);
-    if (mem_kpool) mem_kpool->invalidate();
+    if (mem_kpool) mem_kpool->invalidate(seq_id);
 }
 
 llama_pos llama_memory_hybrid::seq_pos_min(llama_seq_id seq_id) const {
@@ -328,7 +351,7 @@ void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
         if (mem_idx) mem_idx->state_read(io, seq_id, flags);
     }
     mem_recr->state_read(io, seq_id, flags);
-    if (mem_kpool) mem_kpool->invalidate();
+    if (mem_kpool) mem_kpool->invalidate(seq_id);
 }
 
 llama_kv_cache * llama_memory_hybrid::get_mem_attn() const {

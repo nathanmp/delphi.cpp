@@ -1056,7 +1056,7 @@ void llama_context::sched_reserve() {
     {
         const char * env = getenv("LLAMA_KV_RESIDENT_CELLS");
         const uint32_t n_gather = std::min(cparams.n_ubatch, llama_kv_window_stage_min_tokens() - 1);
-        if (env != nullptr && *env != '\0' && n_gather > n_seqs) {
+        if (env != nullptr && *env != '\0' && model.arch == LLM_ARCH_GLM5NEXT && n_gather > n_seqs) {
             if (!graph_reserve_extra(n_gather, n_seqs, n_gather, mctx.get())) {
                 throw std::runtime_error("failed to allocate compute buffers for the KV window gather");
             }

@@ -109,6 +109,20 @@ A per-round draft depth (the default conf mode of `draft-mtp`, see `speculative-
 
 On GLM-5.3 Flash (3x CMP 170HX) a graph build of a target width costs about 2 ms (build) + 10 ms (allocation) + 20 ms (first run); with the step 256 the conf mode built 68 graphs per 2048-token request and lost to a fixed depth, with 2048 it was the fastest mode. The masked cells cost GLM's sparse attention about 0.5 ms per round at the step 2048. On Qwen 3.8 Flash Next (3x R9700) they cost 4.4 ms per round (44.0 instead of 39.6 ms) until the flash-attention scan skipped them.
 
+## KV window: long contexts with the KV cache partly in host memory (GLM, CUDA)
+
+The KV window keeps the first cells of each KV stream in VRAM and puts the other cells in pinned host memory at the same addresses (CUDA virtual memory management). Wide batches (prompts) copy the layer's cache to VRAM before attention; narrow batches (decode, speculative verify) copy only the cells that the sparse attention selects. This lets GLM-5.3 Flash serve 3 x 512K tokens, or one 1M-token context, on three 64 GiB GPUs. It applies only to models with the pooled sparse attention of glm5next; other models ignore the variables and log a warning. The device memory must support host-located `cuMemCreate` (tested on CMP 170HX).
+
+| variable | default | effect |
+| --- | --- | --- |
+| `LLAMA_KV_RESIDENT_CELLS` | unset (all cells in VRAM) | `auto`: the `--fit` dry run (on by default) measures the model with the window and moves the VRAM deficit of each device to host memory. `<cells>` or `<dev>=<cells>,...` (for example `CUDA0=65536,CUDA1=16384`): the cells per stream that stay in VRAM; a device that is not in the list keeps its cache in VRAM |
+| `LLAMA_KV_IDX_RESIDENT_CELLS` | unset; `4096` with `LLAMA_KV_RESIDENT_CELLS=auto` | the same for the per-cell indexer cache. The model reads it only to compress pools, so a small value costs little |
+| `LLAMA_KV_WINDOW_MARGIN_MIB` | `1024` | with `auto`: VRAM that each device keeps free in addition to the `--fit-target` margin, for the CUDA graphs and copy buffers that appear after load (about 0.65-1 GiB per device on GLM) |
+| `LLAMA_KV_WINDOW_STAGE_MIN_TOKENS` | `17` | tokens per stream from which a batch copies the whole layer cache to VRAM instead of the selected cells |
+| `LLAMA_KV_WINDOW_UNION` | `1` | a verify batch copies each selected cell once for all its tokens. `0` copies the cells of each token |
+
+Example: `LLAMA_KV_RESIDENT_CELLS=auto llama-server -m GLM-5.3-Flash.gguf -c 1572864 --parallel 3 ...` (no `--kv-unified`). On 3x CMP 170HX with DFlash2 the fit moved 0 / 4.8 / 5.5 GiB to host memory (CUDA0 / 1 / 2), and 3 concurrent 300K prompts completed. Decode with spilled cells is slower than with all cells in VRAM: the host link of a CMP 170HX reads 0.85-1.7 GB/s. Prompt-cache restores (`--cache-ram`) and slot files (`/slots?action=save|restore`) work with the window; outputs match the run without the window.
+
 ## Weight streaming (staging ring)
 
 With routed experts in host memory (`-cmoe`, `-ncmoe`, `--numa tensors`), a wide prompt batch can run the expert matrix multiplications on the GPU: the scheduler copies each expert tensor to the device when it reaches the split that uses it (op offload). That copy runs in turn with the device's computation, and a copy from ordinary (pageable) host memory also blocks the scheduler thread at well below the PCIe rate.

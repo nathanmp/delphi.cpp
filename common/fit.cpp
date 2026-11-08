@@ -7,6 +7,8 @@
 
 #include <array>
 #include <cassert>
+#include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <cinttypes>
 #include <set>
@@ -35,7 +37,10 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         uint32_t & hp_ngl,
         uint32_t & hp_n_ctx_train,
         uint32_t & hp_n_expert,
-        ggml_log_level log_level) {
+        ggml_log_level log_level,
+        const char * path_other = nullptr,
+        const llama_model_params * mparams_other = nullptr,
+        const llama_context_params * cparams_other = nullptr) {
     struct user_data_t {
         struct {
             ggml_log_callback callback;
@@ -63,9 +68,27 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         throw std::runtime_error("failed to load model");
     }
 
-    llama_context * ctx = llama_init_from_model(model, *cparams);
+    // delphi: a draft that reads the embeddings or output of the main model (DFlash, EAGLE3) needs a context of it
+    llama_model   * model_other = nullptr;
+    llama_context * ctx_other   = nullptr;
+    llama_context_params cparams_copy = *cparams;
+    if (path_other != nullptr) {
+        llama_model_params mparams_other_copy = *mparams_other;
+        mparams_other_copy.no_alloc  = true;
+        mparams_other_copy.load_mode = LLAMA_LOAD_MODE_NONE;
+        model_other = llama_model_load_from_file(path_other, mparams_other_copy);
+        ctx_other   = model_other ? llama_init_from_model(model_other, *cparams_other) : nullptr;
+        cparams_copy.ctx_other = ctx_other;
+    }
+    auto free_other = [&]() {
+        if (ctx_other)   { llama_free(ctx_other); }
+        if (model_other) { llama_model_free(model_other); }
+    };
+
+    llama_context * ctx = llama_init_from_model(model, cparams_copy);
     if (ctx == nullptr) {
         llama_model_free(model);
+        free_other();
         llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
         throw std::runtime_error("failed to create llama_context from model");
     }
@@ -148,6 +171,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
 
     llama_free(ctx);
     llama_model_free(model);
+    free_other();
     llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
 
     return ret;
@@ -220,8 +244,15 @@ static void common_params_fit_impl(
 
             dmds_t measured;
             try {
-                measured = common_get_device_memory_data_impl(
-                    extra->path_model, extra->mparams, extra->cparams, devs_extra, ngl_extra, nct_extra, nex_extra, log_level);
+                try {
+                    measured = common_get_device_memory_data_impl(
+                        extra->path_model, extra->mparams, extra->cparams, devs_extra, ngl_extra, nct_extra, nex_extra, log_level);
+                } catch (const std::runtime_error &) {
+                    // delphi: the draft may need a context of the main model (ctx_other), measure it with one
+                    measured = common_get_device_memory_data_impl(
+                        extra->path_model, extra->mparams, extra->cparams, devs_extra, ngl_extra, nct_extra, nex_extra, log_level,
+                        path_model, mparams, cparams);
+                }
             } catch (const std::runtime_error & e) {
                 // the extra model is optional, fit the main model alone rather than giving up
                 LOG_WRN("%s: failed to measure the memory of the extra model, fitting without it: %s\n", __func__, e.what());
@@ -349,6 +380,27 @@ static void common_params_fit_impl(
         assert(sum_free >= 0 && sum_projected_used >= 0);
         LOG_TRC("%s: projected to use %" PRId64 " MiB of device memory vs. %" PRId64 " MiB of free device memory\n",
             __func__, sum_projected_used/MiB, sum_free/MiB);
+
+        // delphi: LLAMA_KV_RESIDENT_CELLS=auto: the dry run measured the KV cache in VRAM with the window graphs; the
+        // window moves the deficit of each device (plus LLAMA_KV_WINDOW_MARGIN_MIB, default 1024, for the CUDA graphs and
+        // buffers that appear after load) to host memory. The library reads the result from LLAMA_KV_WINDOW_HOST_MIB.
+        const char * kvw = getenv("LLAMA_KV_RESIDENT_CELLS");
+        if (kvw != nullptr && strcmp(kvw, "auto") == 0) {
+            const char * wm = getenv("LLAMA_KV_WINDOW_MARGIN_MIB");
+            const int64_t window_margin = (wm ? std::atoll(wm) : 1024)*MiB;
+            std::string spec;
+            for (size_t id = 0; id < nd; id++) {
+                const int64_t need = margins[id] + window_margin - projected_free_per_device[id];
+                if (need > 0) {
+                    spec += std::string(spec.empty() ? "" : ",") + ggml_backend_dev_name(devs[id]) + "=" + std::to_string((need + MiB - 1)/MiB);
+                }
+                LOG_INF("%s: KV window: %s: %" PRId64 " MiB projected free, target %" PRId64 " MiB: %" PRId64 " MiB of the cache to host memory\n",
+                    __func__, ggml_backend_dev_name(devs[id]), projected_free_per_device[id]/MiB, (margins[id] + window_margin)/MiB,
+                    std::max<int64_t>(need, 0)/MiB);
+            }
+            setenv("LLAMA_KV_WINDOW_HOST_MIB", spec.c_str(), 1);
+            return;
+        }
         if (nd == 1) {
             if (projected_free_per_device[0] >= margins[0]) {
                 LOG_TRC("%s: will leave %" PRId64 " >= %" PRId64 " MiB of free device memory, no changes needed\n",

@@ -59,16 +59,11 @@ static void ggml_gen_hadamard(ggml_tensor * tensor) {
     }
 }
 
-// delphi: <env>=<cells> or <dev>=<cells>[,<dev>=<cells>...] (for example LLAMA_KV_RESIDENT_CELLS=CUDA2=700000).
-// Returns the resident cell count for the device, 0 if the cache on it stays all in VRAM.
-static uint32_t llama_kv_resident_cells(const char * env_name, const char * dev_name) {
-    const char * env = getenv(env_name);
-    if (env == nullptr || *env == '\0') {
-        return 0;
-    }
-    std::string spec(env);
+// delphi: the entry of <dev> in "<value>" or "<dev>=<value>[,<dev>=<value>...]"; empty if there is none
+static std::string llama_kv_window_dev_value(const char * spec_c, const char * dev_name) {
+    const std::string spec(spec_c);
     if (spec.find('=') == std::string::npos) {
-        return (uint32_t) std::stoul(spec);
+        return spec;
     }
     size_t pos = 0;
     while (pos < spec.size()) {
@@ -79,11 +74,79 @@ static uint32_t llama_kv_resident_cells(const char * env_name, const char * dev_
         const std::string item = spec.substr(pos, end - pos);
         const size_t eq = item.find('=');
         if (eq != std::string::npos && item.substr(0, eq) == dev_name) {
-            return (uint32_t) std::stoul(item.substr(eq + 1));
+            return item.substr(eq + 1);
         }
         pos = end + 1;
     }
-    return 0;
+    return "";
+}
+
+// delphi: the resident cells of a KV window (all cells past them are pinned host memory), 0 if the cache on the
+// device stays all in VRAM. <env> holds <cells>, "auto", or <dev>=<cells>[,<dev>=<cells>...] (for example
+// LLAMA_KV_RESIDENT_CELLS=CUDA0=65536,CUDA1=16384).
+// "auto" (LLAMA_KV_RESIDENT_CELLS only): the --fit dry run measures the model with the window on and writes the
+// VRAM deficit of each device to LLAMA_KV_WINDOW_HOST_MIB; the window moves that much of the cache to host memory.
+// With "auto", the indexer cache (LLAMA_KV_IDX_RESIDENT_CELLS unset) keeps LLAMA_KV_IDX_AUTO_CELLS cells resident.
+// cell_bytes: bytes of one cell over all streams and layers in the buffer.
+static constexpr uint32_t LLAMA_KV_IDX_AUTO_CELLS = 4096;
+
+static bool llama_kv_window_auto() {
+    const char * env = getenv("LLAMA_KV_RESIDENT_CELLS");
+    return env != nullptr && strcmp(env, "auto") == 0;
+}
+
+static uint32_t llama_kv_resident_cells(const char * env_name, const char * dev_name, uint32_t kv_size,
+        size_t cell_bytes, bool no_alloc) {
+    const char * env = getenv(env_name);
+    if (env == nullptr || *env == '\0') {
+        if (strcmp(env_name, "LLAMA_KV_IDX_RESIDENT_CELLS") == 0 && llama_kv_window_auto()) {
+            return LLAMA_KV_IDX_AUTO_CELLS;
+        }
+        return 0;
+    }
+    const std::string val = llama_kv_window_dev_value(env, dev_name);
+    if (val.empty()) {
+        return 0;
+    }
+    if (val != "auto") {
+        return (uint32_t) std::stoul(val);
+    }
+    if (no_alloc) {
+        // the dry run: turn the window on so that the compute buffers hold its stage and gather tensors, and count
+        // the whole cache as VRAM, so that the deficit that the fit finds is the part to move to host memory
+        return kv_size > 1 ? kv_size - 1 : 0;
+    }
+    const char * host = getenv("LLAMA_KV_WINDOW_HOST_MIB");
+    const std::string host_mib = host ? llama_kv_window_dev_value(host, dev_name) : "";
+    if (host_mib.empty()) {
+        if (host == nullptr) {
+            LLAMA_LOG_WARN("%s: %s=auto, but the fit (--fit on) did not size the window: the cache on %s stays in VRAM\n",
+                    __func__, env_name, dev_name);
+        }
+        return 0;
+    }
+    const size_t host_bytes = (size_t) std::stoull(host_mib)*1024*1024;
+    const uint64_t n_host_cells = cell_bytes > 0 ? (host_bytes + cell_bytes - 1)/cell_bytes : 0;
+    if (n_host_cells == 0) {
+        return 0;
+    }
+    if (n_host_cells + LLAMA_KV_IDX_AUTO_CELLS > kv_size) {
+        LLAMA_LOG_WARN("%s: %s: %.0f MiB of the cache must move to host memory, but %u cells stay resident at least\n",
+                __func__, dev_name, host_bytes/1048576.0, LLAMA_KV_IDX_AUTO_CELLS);
+        return std::min(LLAMA_KV_IDX_AUTO_CELLS, kv_size);
+    }
+    return (uint32_t) (kv_size - n_host_cells);
+}
+
+// delphi: bytes of one cell over all streams of the tensors in ctx that hold kv_size cells
+static size_t llama_kv_window_cell_bytes(ggml_context * ctx, uint32_t kv_size) {
+    size_t n = 0;
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+        if (t->view_src == nullptr && t->ne[1] == (int64_t) kv_size) {
+            n += t->nb[1]*t->ne[2];
+        }
+    }
+    return n;
 }
 
 // delphi: allocate the tensors of ctx in one buffer whose cells [n_resident, ne[1]) of each stream are pinned host
@@ -431,16 +494,28 @@ llama_kv_cache::llama_kv_cache(
     // allocate tensors and initialize the buffers to avoid NaNs in the padding
     for (auto & [buft, ctx] : ctx_map) {
         ggml_backend_buffer_t buf;
+        const char * buft_dev = ggml_backend_buft_get_device(buft) ? ggml_backend_dev_name(ggml_backend_buft_get_device(buft)) : "";
+        const bool   buft_gpu = ggml_backend_buft_get_device(buft) && !ggml_backend_buft_is_host(buft);
+        const size_t cell_bytes = llama_kv_window_cell_bytes(ctx.get(), kv_size);
+        const uint32_t n_resident = kv_window_env && buft_gpu ?
+            llama_kv_resident_cells(kv_window_env, buft_dev, kv_size, cell_bytes, hparams.no_alloc) : 0;
         if (hparams.no_alloc) {
             buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
             for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
                 t->buffer = buf; // set dummy buffer for KV cache so that the backend scheduler won't try to allocate it
             }
+            if (n_resident > 0 && n_resident < kv_size) {
+                // the dry run measures the graphs of the window and counts only its resident cells as VRAM
+                for (auto & layer : layers) {
+                    if ((layer.k && layer.k->buffer == buf) || (layer.v && layer.v->buffer == buf)) {
+                        layer.n_resident = n_resident;
+                    }
+                }
+                window_host_bytes[buf] = (size_t) (kv_size - n_resident)*cell_bytes;
+            }
         } else {
             buf = nullptr;
 
-            const char * buft_dev = ggml_backend_buft_get_device(buft) ? ggml_backend_dev_name(ggml_backend_buft_get_device(buft)) : "";
-            const uint32_t n_resident = kv_window_env ? llama_kv_resident_cells(kv_window_env, buft_dev) : 0;
             if (n_resident > 0 && n_resident < kv_size) {
                 size_t n_host = 0;
                 buf = llama_kv_window_alloc(ctx.get(), buft, n_resident, kv_size, n_host);
@@ -450,6 +525,7 @@ llama_kv_cache::llama_kv_cache(
                             layer.n_resident = n_resident;
                         }
                     }
+                    window_host_bytes[buf] = n_host;
                     LLAMA_LOG_INFO("%s: %10s KV window: cells [0, %u) in VRAM, [%u, %u) in host memory: %.2f MiB VRAM + %.2f MiB host\n",
                             __func__, ggml_backend_buffer_name(buf), n_resident, n_resident, kv_size,
                             (ggml_backend_buffer_get_size(buf) - n_host)/1024.0/1024.0, n_host/1024.0/1024.0);
@@ -865,12 +941,15 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() 
     for (const auto & [ctx, buf] : ctxs_bufs) {
         ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf.get());
 
+        // delphi: the host cells of a KV window are not device memory
+        const auto it = window_host_bytes.find(buf.get());
+        const size_t n_host = it == window_host_bytes.end() ? 0 : it->second;
         if (hparams.no_alloc) {
             GGML_ASSERT(ggml_backend_buffer_get_base(buf.get()) == nullptr);
-            ret[buft] += ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft);
+            ret[buft] += ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft) - n_host;
         } else {
             // GGML_ASSERT(ggml_backend_buffer_get_base(buf.get()) != nullptr); // multi_buffer does not have a defined base
-            ret[buft] += ggml_backend_buffer_get_size(buf.get());
+            ret[buft] += ggml_backend_buffer_get_size(buf.get()) - n_host;
         }
     }
 

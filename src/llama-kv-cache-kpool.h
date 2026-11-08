@@ -50,6 +50,8 @@ public:
 
     void clear(bool data);
     void invalidate();
+    // delphi: invalidate the pools of one sequence only; with one stream (unified) or seq_id < 0, all pools
+    void invalidate(llama_seq_id seq_id);
     void seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1);
 
     bool needs_rebuild(uint32_t stream0, uint32_t n_stream) const;
