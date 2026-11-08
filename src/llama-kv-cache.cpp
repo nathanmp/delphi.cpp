@@ -1556,7 +1556,8 @@ ggml_tensor * llama_kv_cache::stage_k(ggml_context * ctx, ggml_tensor * k, int32
         return k;
     }
 
-    if (n_tokens < llama_kv_window_stage_min_tokens()) {
+    // the tokens of one stream: a ubatch of several sequences holds a few tokens of each
+    if (n_tokens / std::max<int64_t>(1, k->ne[3]) < llama_kv_window_stage_min_tokens()) {
         return k;
     }
 

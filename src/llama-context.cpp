@@ -57,6 +57,19 @@ static uint32_t dsv4_multi_seq_tokens(const llama_cparams & cparams, const llama
     return kv ? kv->get_n_keep_dec() * cparams.n_seq_max : 0;
 }
 
+// The largest multi-sequence ubatch when the memory gives a long prompt its own ubatches (DeepSeek V4.1, GLM with
+// separate KV streams), or 0 when that split does not apply.
+static uint32_t multi_seq_split_tokens(const llama_cparams & cparams, const llama_memory_i * memory) {
+    if (const uint32_t n = dsv4_multi_seq_tokens(cparams, memory); n > 0) {
+        return n;
+    }
+    if (cparams.kv_unified || cparams.n_seq_max <= 1) {
+        return 0;
+    }
+    const auto * hybrid = dynamic_cast<const llama_memory_hybrid *>(memory);
+    return hybrid ? hybrid->get_n_seq_split_tokens() * cparams.n_seq_max : 0;
+}
+
 static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     switch (ctx_type) {
         case LLAMA_CONTEXT_TYPE_DEFAULT: return LLM_GRAPH_TYPE_DEFAULT;
@@ -1066,7 +1079,12 @@ void llama_context::sched_reserve() {
             case LLM_ARCH_GLM5NEXT: {
                 // Cover the simultaneous two-slot graph after the largest dense
                 // single-slot allocation has already established buffer capacity.
-                gf = graph_reserve_extra(n_tokens, n_seqs, n_outputs_pp, mctx.get());
+                // With separate KV streams, a prompt takes its own ubatches and the
+                // multi-sequence ubatches hold a few tokens of each sequence.
+                const uint32_t n_multi = std::min(n_tokens, multi_seq_split_tokens(cparams, memory.get()));
+                const uint32_t n_tokens_multi   = n_multi > 0 ? n_multi : n_tokens;
+                const uint32_t n_outputs_multi  = n_multi > 0 ? std::min(n_multi, cparams.n_outputs_max) : n_outputs_pp;
+                gf = graph_reserve_extra(n_tokens_multi, n_seqs, n_outputs_multi, mctx.get());
                 if (!gf) {
                     break;
                 }
@@ -1076,7 +1094,7 @@ void llama_context::sched_reserve() {
                 if (!mctx_multi_inc) {
                     throw std::runtime_error("failed to initialize incremental multi-sequence memory module");
                 }
-                gf = graph_reserve_extra(n_tokens, n_seqs, n_outputs_pp, mctx_multi_inc.get());
+                gf = graph_reserve_extra(n_tokens_multi, n_seqs, n_outputs_multi, mctx_multi_inc.get());
                 if (!gf) {
                     break;
                 }
@@ -1464,7 +1482,7 @@ bool llama_context::memory_update(bool optimize) {
                 n_tokens : std::min(n_tokens, cparams.n_outputs_max);
 
         ggml_cgraph * gf = nullptr;
-        if (const uint32_t n_multi = std::min(n_tokens, dsv4_multi_seq_tokens(cparams, memory.get())); n_multi > 0 && !mtp_device_draft) {
+        if (const uint32_t n_multi = std::min(n_tokens, multi_seq_split_tokens(cparams, memory.get())); n_multi > 0 && !mtp_device_draft) {
             // the shapes of sched_reserve: a full ubatch over several streams is larger and never occurs
             gf = graph_reserve(n_multi, n_seqs, std::min(n_multi, cparams.n_outputs_max), mctx.get());
             if (gf) {

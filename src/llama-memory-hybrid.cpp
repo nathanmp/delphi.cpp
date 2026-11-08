@@ -96,12 +96,54 @@ llama_memory_hybrid::llama_memory_hybrid(
             model, offload, unified, kv_size, n_seq_max,
             model.hparams.indexer_kpool, model.hparams.indexer_head_size, filter_idx)) {}
 
+uint32_t llama_memory_hybrid::get_n_seq_split_tokens() const {
+    if (mem_kpool == nullptr || mem_attn->get_n_stream() <= 1) {
+        return 0;
+    }
+    static const uint32_t n = [] {
+        const char * env = getenv("LLAMA_HYBRID_SEQ_SPLIT_TOKENS");
+        return env != nullptr ? (uint32_t) atoi(env) : 16u;
+    }();
+    return n;
+}
+
 llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     do {
         balloc.split_reset();
 
         // follow the recurrent pattern for creating the ubatch splits
         std::vector<llama_ubatch> ubatches;
+
+        // delphi: a prompt of one sequence takes its own ubatches, ahead of the other sequences. An equal split cut it
+        // into pieces as short as the other sequences' parts, and a prompt ubatch over several KV streams stages the
+        // KV window of every stream (GLM at 3 x 512K: 1.5 GiB per layer) and needs its own reservation.
+        if (const uint32_t n_split = get_n_seq_split_tokens(); n_split > 0 && !embd_all) {
+            const llama_batch & batch = balloc.get_batch();
+            std::vector<uint32_t> n_seq_tokens(LLAMA_MAX_SEQ, 0);
+            bool single = true;
+            for (int32_t i = 0; i < batch.n_tokens; ++i) {
+                single = single && batch.n_seq_id[i] == 1;
+                n_seq_tokens[batch.seq_id[i][0]]++;
+            }
+            const uint32_t n_rs_seq = mem_recr->n_rs_seq;
+            const uint32_t n_tail = n_rs_seq > 0 ? n_rs_seq + 1 : 0;
+            for (llama_seq_id seq = 0; single && seq < LLAMA_MAX_SEQ; ++seq) {
+                if (n_seq_tokens[seq] <= n_split) {
+                    continue;
+                }
+                for (uint32_t left = n_seq_tokens[seq]; left > 0;) {
+                    uint32_t n = std::min(n_ubatch, left);
+                    // the trailing (1 + n_rs_seq) tokens of the seq stay in one ubatch
+                    if (n < left && left - n < n_tail && n_tail < n_ubatch) {
+                        n = left - n_tail;
+                    }
+                    auto ubatch = balloc.split_seq_id(n, seq);
+                    GGML_ASSERT(ubatch.n_tokens == n);
+                    left -= n;
+                    ubatches.push_back(std::move(ubatch)); // NOLINT
+                }
+            }
+        }
 
         while (true) {
             llama_ubatch ubatch;

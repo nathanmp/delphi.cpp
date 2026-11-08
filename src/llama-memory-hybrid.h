@@ -65,6 +65,11 @@ public:
 
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
+    // delphi: with parallel sequences in separate KV streams (GLM pooled indexer), a sequence with more than this many
+    // tokens in a batch takes its own ubatches, and the ubatches of several sequences hold at most this many tokens of
+    // each. 0 when the split does not apply.
+    uint32_t get_n_seq_split_tokens() const;
+
     bool get_can_shift() const override;
 
     void set_mtp_index_reuse(bool reuse) override;
