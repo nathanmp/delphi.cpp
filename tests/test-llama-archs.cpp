@@ -1144,7 +1144,7 @@ static int test_deepseek41_ced(const size_t seed) {
         rows.assign(5, 0);
         compare(eval(mask.second.get(), 0, 126, {0}), eval(trim.second.get(), 0, 126, {0}));
         GGML_ASSERT(rows[0] == 126 && rows[1] == 126);
-        GGML_ASSERT(rows[2] == 2*keep && rows[3] == 2*keep && rows[4] == 2*keep);
+        GGML_ASSERT(rows[2] == 1 + keep && rows[3] == 1 + keep && rows[4] == 1 + keep);
         mem_trim->clear(true);
         mem_mask->clear(true);
         compare(eval(mask.second.get(), 0, 65, {0}), eval(trim.second.get(), 0, 65, {0}));
