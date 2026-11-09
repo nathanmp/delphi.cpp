@@ -46,7 +46,8 @@ RAM eviction drops the snapshots that never had a hit first, then the ones that 
 
 ## Limits
 
-- Chat requests only (`/v1/chat/completions`, `/v1/messages`, `/v1/responses`) with a jinja template, as the bound needs the message list. Not for `/completion`, prompts with images or audio, LoRA adapters, `--cache-reuse` or aLoRA.
+- Chat requests only (`/v1/chat/completions`, `/v1/messages`, `/v1/responses`) with a jinja template, as the bound needs the message list. Not for `/completion`, LoRA adapters, `--cache-reuse` or aLoRA.
+- Prompts with images or audio are fine, with the server's media encoder loaded or not: the snapshot ends before the first media chunk. A shared prefix that itself holds an image (the same screenshot at the start of several conversations) is not stored; that would need the media ids in the key.
 - The snapshot is the full state at that point, so its size grows with the prefix: for example 39 MiB for 3K tokens of Ling-3.0-tiny, 260 MiB for 3K tokens of Gemma 4 26B with its MTP draft, 1.5 GiB for 3K tokens of llama-2-7b (f16 KV, no GQA).
 - With `--cache-ram 0`, the server learns a shared prefix only while the first conversation is still in a slot.
 - A harness that changes text inside the shared part for each conversation (a date, a directory listing) moves the shared prefix to before that text.
@@ -55,4 +56,5 @@ RAM eviction drops the snapshots that never had a hit first, then the ones that 
 
 - Restoring a snapshot gives the same logprobs, bit for bit, as reusing the same prefix in the slot: llama-2-7b (plain KV), Ling-3.0-tiny (hybrid), GPT-OSS-20B (SWA), Granite-4.0-H-Small (hybrid recurrent), Gemma 4 26B with an MTP draft (SWA, same draft acceptance with a fixed draft depth). The same holds for a restore from a file after a restart.
 - Cost on the R9700: restore about 22 GB/s (1.5 GiB in 68 ms), snapshot 1.5-2 GB/s (it includes the drain of the prompt pipeline).
+- With `-mm` loaded and an image in the user message (Gemma 4 26B), the next conversation restores the 3020-token text prefix and processes the image and the rest.
 - `tests/test-server-prefix-cache.cpp` covers the selection rules, the RAM eviction, the files across restarts, damaged files and the disk budget.
