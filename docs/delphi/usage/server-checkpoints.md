@@ -66,7 +66,7 @@ Why this default: N is half of upstream's spacing, so any message end of a long 
 
 There is no default directory, and nothing is written unless DIR is set: the server does not pick a place on a disk that may be slow, small or shared. The option does nothing for a model that makes no checkpoints.
 
-What is written: only a checkpoint that `--ctx-checkpoints-eviction` drops to make room. A checkpoint that upstream's spacing rule drops, or one that a new checkpoint at the same position replaces, is not written. A checkpoint of a prompt with images or audio is not written either, as the tokens of those are placeholders and cannot tell two prompts apart.
+What is written: only a checkpoint that `--ctx-checkpoints-eviction` drops to make room. A checkpoint that upstream's spacing rule drops, or one that a new checkpoint at the same position replaces, is not written. A checkpoint after the first image or audio chunk of a prompt is not written either, as the tokens of a media chunk are placeholders and cannot tell two prompts apart. The checkpoints before it are written, also when the server has a media encoder (`-mm`).
 
 When it is read: when a new prompt shares a prefix with the cached prompt of the slot, the server looks for the newest usable checkpoint (the rule that it always used, see the start of this page). With a spill directory it also looks at the files of that slot. If a file reaches further into the prompt than the best checkpoint in memory, and reading it is worth it, the server reads the file and restores from it, and the prompt starts there. If not, nothing changes.
 
@@ -74,7 +74,7 @@ A file is valid only for the prompt it was made for, and only while the slot hol
 
 - The key of a file is the model and the context setup (model path, size and time, parameters, context size per sequence, KV types, SWA setting), the slot, the position (`n_tokens`) and a 64-bit hash of the tokens before the position. The header repeats the key and the positions. The reader checks the header, the sizes and a checksum of the data, and removes a file that fails.
 - Before it reads, the server hashes the first `n_tokens` tokens of the slot's cached prompt and compares. A file for another prompt is removed and never used.
-- Files of a slot go when the slot's prompt is cleared or replaced by a prompt from the host cache, and files that lie beyond the point where a new prompt differs go at the start of that request (the same rule that erases the checkpoints in memory).
+- Files of a slot go when the slot's prompt is cleared or replaced by a prompt from the host cache (not when the host cache has no better prompt and the slot keeps its own), and files that lie beyond the point where a new prompt differs go at the start of that request (the same rule that erases the checkpoints in memory).
 - The server removes all its files when it stops. At start it removes the files of servers that died (Linux and macOS: the name has the pid, and a pid that no longer exists counts as dead). Give each group of servers its own directory when they run in different pid namespaces (containers), or one server may remove the files of another.
 - The file name is `dckpt-<pid>-<model key>-s<slot>-<n_tokens>-<token hash>.bin`, written as `.tmp` and renamed when complete. The format is versioned (version 1: an 80 byte header, then the data of the target context, of the draft context and of the speculative state, in the byte order of the machine). A file of another version is not read.
 
@@ -94,6 +94,8 @@ Prior art: ik_llama.cpp PR 2446 (`--ctx-checkpoints-spill-dir`). It is in-proces
 The files are not part of the host prompt cache (`--cache-ram`): see below.
 
 ## Interaction with the host prompt cache (`--cache-ram`)
+
+For the prefixes that several conversations share, see [Server prefix cache](server-prefix-cache.md).
 
 The prompt cache stores whole prompts of slots that other requests displaced: the prompt tokens, the full state of the sequence, and a copy of the slot's list of checkpoints. The copies count against `--cache-ram`, so a larger `--ctx-checkpoints` means that fewer prompts fit in the cache. A prompt that returns from the cache brings back its list with it, including the pinned checkpoint. The cache picks the stored prompt by the length of the shared token prefix only; it does not check that a checkpoint exists at or before that prefix. For SWA and recurrent models, a cached prompt without such a checkpoint is processed again from the start, so the choice of the checkpoints matters for how much of a cache hit is really used.
 

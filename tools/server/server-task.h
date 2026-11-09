@@ -102,6 +102,7 @@ struct task_params {
 
     // chat message ends for checkpointing, in token order (server-turn.h)
     std::vector<server_turn_boundary> turn_boundaries;
+    int32_t prefix_limit = 0; // delphi: prefix snapshots up to this token position, -1 = no limit, 0 = none (server-prefix-cache.h)
 
     // Embeddings
     int32_t embd_normalize = 2; // (-1=none, 0=max absolute int16, 1=taxicab, 2=Euclidean/L2, >2=p-norm)

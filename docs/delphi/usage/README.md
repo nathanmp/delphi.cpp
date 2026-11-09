@@ -19,4 +19,5 @@ Reference pages for the settings:
 - [Vision memory](vision-memory.md) describes the vision memory modes in detail.
 - [Tune endpoints](tune-endpoints.md) describes the server routes that the auto-tuner uses.
 - [Server context checkpoints](server-checkpoints.md) describes how the server reuses prompt state for models with sliding-window or recurrent layers.
+- [Server prefix cache](server-prefix-cache.md) describes the snapshots of prompt prefixes that several conversations share, in RAM and on disk.
 - [Bottleneck profiler recipes](bottleneck-profiler.md) and [Recording an execution trace](exec-trace-record.md) describe the profiling tools.

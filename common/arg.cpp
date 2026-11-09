@@ -1890,6 +1890,45 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CTX_CHECKPOINTS_SPILL_MAX_MIB").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--cache-prefix-mib"}, "N",
+        "keep snapshots of prompt prefixes that several conversations share (for example a system prompt with tools) in "
+        "N MiB of RAM, apart from --cache-ram (default: min(4096, RAM / 16), -1 - no limit, 0 - disable)",
+        [](common_params & params, int value) {
+            if (value < -1) {
+                throw std::invalid_argument("cache-prefix-mib must be -1 or more");
+            }
+            params.prefix_cache_mib = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_PREFIX_MIB").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-prefix-min-tokens"}, "N",
+        string_format("the shortest shared prompt prefix in tokens that gets a snapshot (default: %d)", params.prefix_cache_min_tokens),
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("cache-prefix-min-tokens must be positive");
+            }
+            params.prefix_cache_min_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_PREFIX_MIN_TOKENS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-prefix-dir"}, "DIR",
+        "also write the prefix snapshots to files in DIR, and use them after a restart (default: off). Servers of different "
+        "models can share DIR. Reads are skipped when they would be slower than processing the tokens again",
+        [](common_params & params, const std::string & value) {
+            params.prefix_cache_dir = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_PREFIX_DIR").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-prefix-disk-mib"}, "N",
+        string_format("the most disk space in MiB that the prefix snapshots of this model use in --cache-prefix-dir (default: %d)", params.prefix_cache_disk_mib),
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("cache-prefix-disk-mib must be positive");
+            }
+            params.prefix_cache_disk_mib = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_PREFIX_DISK_MIB").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-cram", "--cache-ram"}, "N",
         string_format("set the maximum cache size in MiB (default: %d, -1 - no limit, 0 - disable)"
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)", params.cache_ram_mib),

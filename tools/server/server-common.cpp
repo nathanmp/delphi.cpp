@@ -8,6 +8,7 @@
 #include "base64.hpp"
 
 #include "server-common.h"
+#include "server-prefix-cache.h"
 #include "server-turn.h"
 
 #include <random>
@@ -1389,6 +1390,11 @@ json oaicompat_chat_params_parse(
     // delphi: where the messages end in the prompt, for checkpoints (media tokens are not in the text)
     if (for_task && opt.use_jinja && opt.turn_ckpt_step > 0 && out_files.empty()) {
         server_turn_params(llama_params, opt.tmpls.get(), inputs, chat_params.prompt, opt.turn_ckpt_step);
+    }
+
+    // delphi: where the first assistant message starts, the bound for prefix snapshots (a short prompt has no prefix to share)
+    if (for_task && opt.use_jinja && opt.prefix_min_tokens > 0 && chat_params.prompt.size() > (size_t) opt.prefix_min_tokens) {
+        server_prefix_limit_params(llama_params, opt.tmpls.get(), inputs, chat_params.prompt);
     }
 
     // Reasoning budget: pass parameters through to sampling layer

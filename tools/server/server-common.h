@@ -320,6 +320,7 @@ struct server_chat_params {
     std::string media_path;
     bool force_pure_content = false;
     int32_t turn_ckpt_step = 0; // delphi: checkpoints at message ends, min spacing in tokens, 0 = off (server-turn.h)
+    int32_t prefix_min_tokens = 0; // delphi: prefix snapshots of at least this many tokens, 0 = off (server-prefix-cache.h)
 };
 
 // used by /completions endpoint
