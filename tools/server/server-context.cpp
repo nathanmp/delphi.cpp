@@ -395,11 +395,15 @@ struct server_slot {
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
         common_speculative_wait_ctx(ctx_dft);
 
+        const size_t n_before = prompt.tokens.size();
+
         bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
-        } else if (ckpt_spill) {
-            // the prompt of the slot is another one now
+        } else if (ckpt_spill && prompt.tokens.size() != n_before) {
+            // The prompt of the slot is another one now. load() also returns true when it finds nothing better and the slot
+            // keeps its prompt, and then the files stay. (A new prompt of the same size keeps them too, and each file is
+            // checked against the hash of the prompt before it is read.)
             ckpt_spill->drop_slot(id);
         }
 
@@ -2589,21 +2593,16 @@ private:
     // A full slot drops this checkpoint. With --ctx-checkpoints-spill-dir the data goes to the writer thread first, which takes it
     // out of the checkpoint. The caller has synced the async copy of the checkpoint.
     void ckpt_spill_put(server_slot & slot, common_prompt_checkpoint & ckpt) {
-        // a prompt with media has no plain token list to key the file with
-        if (!ckpt_spill.enabled() || ckpt.empty() || slot.prompt.tokens.has_mtmd) {
+        if (!ckpt_spill.enabled() || ckpt.empty()) {
             return;
         }
 
-        const auto & tokens = slot.prompt.tokens.get_tokens();
-        if (ckpt.n_tokens <= 0 || ckpt.n_tokens > (int64_t) tokens.size()) {
+        // A media chunk is only a placeholder in the tokens, so the hash would not tell two prompts apart: only the
+        // checkpoints before the first media chunk go to disk. The text tokens have the indices of the prompt up to there.
+        if (ckpt.n_tokens <= 0 || ckpt.n_tokens > first_media_index(slot.prompt.tokens)) {
             return;
         }
-
-        // a media chunk is only a placeholder in the tokens, so the hash would not tell two prompts apart
-        const auto end = tokens.begin() + ckpt.n_tokens;
-        if (std::find(tokens.begin(), end, LLAMA_TOKEN_NULL) != end) {
-            return;
-        }
+        const llama_tokens tokens = slot.prompt.tokens.get_text_tokens();
 
         const int64_t n_tokens = ckpt.n_tokens;
         if (ckpt_spill.put(slot.id, server_ckpt_prefix_hash(tokens, n_tokens), std::move(ckpt))) {
@@ -2617,7 +2616,7 @@ private:
     // and reads it into out. A file is usable under the rule of the search in memory, and if the prompt of the slot still starts with
     // the tokens that it was made for.
     bool ckpt_spill_load(server_slot & slot, llama_pos pos_next, llama_pos pos_min_thold, int64_t n_ram, common_prompt_checkpoint & out) {
-        if (!ckpt_spill.enabled() || slot.prompt.tokens.has_mtmd) {
+        if (!ckpt_spill.enabled()) {
             return false;
         }
 
@@ -2626,11 +2625,13 @@ private:
             return a.n_tokens > b.n_tokens;
         });
 
-        const auto & tokens = slot.prompt.tokens.get_tokens();
+        // the text tokens have the indices of the prompt only up to the first media chunk
+        const llama_tokens tokens  = slot.prompt.tokens.get_text_tokens();
+        const int64_t      n_text  = first_media_index(slot.prompt.tokens);
 
         for (const auto & e : entries) {
             // the prompt of the slot may be another one than when the file was written
-            if (e.n_tokens > (int64_t) tokens.size() || server_ckpt_prefix_hash(tokens, e.n_tokens) != e.prefix_hash) {
+            if (e.n_tokens > n_text || server_ckpt_prefix_hash(tokens, e.n_tokens) != e.prefix_hash) {
                 ckpt_spill.erase(e);
                 continue;
             }
