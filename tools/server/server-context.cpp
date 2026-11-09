@@ -4319,8 +4319,18 @@ private:
                             // ref: https://github.com/ggml-org/llama.cpp/pull/24110
                             const bool has_new_tokens = (n_past < slot.task->n_tokens());
 
+                            // delphi: a memory that reports pos_min == pos_max cannot go back inside its window (DeepSeek
+                            // V4 compressed KV, hybrid SWA + recurrent). Its checkpoints hold the whole state at pos_max,
+                            // like those of a recurrent memory, so the window does not apply to them. With n_swa, a
+                            // checkpoint less than n_swa tokens before pos_next was never used: a new conversation
+                            // with the same system prompt processed the whole prompt again.
+                            auto *       mem_tgt   = llama_get_memory(ctx_tgt);
+                            const auto   mem_min   = mem_tgt ? llama_memory_seq_pos_min(mem_tgt, slot.id) : -1;
+                            const bool   mem_bound = mem_min > 0 && mem_min == llama_memory_seq_pos_max(mem_tgt, slot.id);
+                            const auto   n_swa_ck  = mem_bound ? 0 : n_swa;
+
                             // the largest pos_min required for a checkpoint to be useful
-                            const auto pos_min_thold = std::max(0, pos_next - n_swa - (has_new_tokens ? 0 : 1));
+                            const auto pos_min_thold = std::max(0, pos_next - n_swa_ck - (has_new_tokens ? 0 : 1));
 
                             if (n_past > 0 && n_past <= slot.prompt.n_tokens()) {
                                 const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);

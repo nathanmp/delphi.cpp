@@ -2,6 +2,8 @@
 
 A model with sliding-window attention (SWA), recurrent layers, or a hybrid of both cannot drop the tail of its memory the way a plain KV cache can. When a new prompt shares a prefix with the slot's cached prompt but then differs, the server needs a saved copy of that state at (or before) the point where the prompts differ. These copies are the context checkpoints. Each slot keeps up to `--ctx-checkpoints N` of them (default 32), and the server restores the newest one that is usable for the new prompt. Without a usable checkpoint, the server processes the whole prompt again.
 
+Which checkpoint is usable: one that ends before the point where the prompts differ. For a model with SWA only, upstream also asks the checkpoint to start more than the window before that point, which a copy of the window does. A memory that cannot go back inside its window reports a checkpoint as a single position (DeepSeek V4: the compressed KV; hybrid models with SWA and recurrent layers), and that check rejected every checkpoint less than a window (128 tokens for DeepSeek V4) before the point. Such a checkpoint holds the whole state at its position, as a recurrent one does, so delphi.cpp drops the window check for these memories. Before this, a new conversation with the same system prompt on DeepSeek V4 processed the whole prompt again, since the message-end checkpoint at the end of the system prompt is less than a window before the point.
+
 This page describes the delphi.cpp options that decide which checkpoints a slot takes, keeps, and writes to disk when it drops them. The upstream options `--ctx-checkpoints` and `--checkpoint-min-step` are unchanged.
 
 ## Eviction
