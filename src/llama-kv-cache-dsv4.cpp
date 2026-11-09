@@ -2152,7 +2152,7 @@ llama_kv_cache_dsv4_raw_context::llama_kv_cache_dsv4_raw_context(
     n_kv_dec(kv_swa_dec ? kv_swa_dec->get_size() : 0),
     status(llama_memory_status_combine(
                 llama_memory_status_combine(ctx_base_mem->get_status(), ctx_swa_mem->get_status()),
-                ctx_dec_mem ? ctx_dec_mem->get_status() : LLAMA_MEMORY_STATUS_SUCCESS)) {
+                ctx_dec_mem ? ctx_dec_mem->get_status() : LLAMA_MEMORY_STATUS_NO_UPDATE)) {
     if (kv_swa_dec) {
         sinfos_read_dec.push_back(dsv4_build_full_sinfo(kv_swa_dec));
         sinfos_write_dec = sinfos_read_dec;
