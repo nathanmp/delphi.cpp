@@ -95,6 +95,8 @@ The files are not part of the host prompt cache (`--cache-ram`): see below.
 
 ## Interaction with the host prompt cache (`--cache-ram`)
 
+For the prefixes that several conversations share, see [Server prefix cache](server-prefix-cache.md).
+
 The prompt cache stores whole prompts of slots that other requests displaced: the prompt tokens, the full state of the sequence, and a copy of the slot's list of checkpoints. The copies count against `--cache-ram`, so a larger `--ctx-checkpoints` means that fewer prompts fit in the cache. A prompt that returns from the cache brings back its list with it, including the pinned checkpoint. The cache picks the stored prompt by the length of the shared token prefix only; it does not check that a checkpoint exists at or before that prefix. For SWA and recurrent models, a cached prompt without such a checkpoint is processed again from the start, so the choice of the checkpoints matters for how much of a cache hit is really used.
 
 The files of the spill directory are not part of this cache. A slot that clears its prompt, or loads a prompt from the cache, drops its files, as the prompt in the slot is another one then. A file for a prompt that the slot no longer holds also fails the token hash check, and is removed when a request looks at it. A checkpoint that is only in the cache entry stays in memory with the entry, and the cache's own eviction drops it without a write. So the cache keeps whole prompts with their checkpoints in memory, and the spill directory keeps the dropped checkpoints of the prompt that is in the slot now.
