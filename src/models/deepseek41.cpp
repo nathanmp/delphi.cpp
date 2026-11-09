@@ -1411,6 +1411,20 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
             comp_k->type == raw_k->type && (comp_k->type == GGML_TYPE_F16 || comp_k->type == GGML_TYPE_Q8_0) &&
             dsv41_prefill_indexed_enabled(hparams, cparams.n_ctx_seq >= 131072, cparams.flash_attn, n_comp, top_k->ne[0], nt, n_stream);
 
+    // A small ubatch reads only the raw cells that its queries see (llm_graph_input_dsv4_raw::self_win_idxs).
+    ggml_tensor * win_idxs = inp_attn->get_win_idxs(il);
+    if (win_idxs && (use_compact || use_verify_gather || use_verify_compact)) {
+        GGML_ASSERT(raw_k->ne[1] == 1 && raw_k->ne[3] == 1);
+        ggml_tensor * rows = ggml_view_2d(ctx0, raw_k, raw_k->ne[0], raw_k->ne[2], raw_k->nb[2], 0);
+        ggml_tensor * win_k = ggml_get_rows(ctx0, rows, win_idxs);
+        if (win_k->type != raw_k->type) {
+            win_k = ggml_cast(ctx0, win_k, raw_k->type);
+        }
+        raw_k = ggml_reshape_4d(ctx0, win_k, raw_k->ne[0], 1, win_idxs->ne[0], 1);
+        cb(raw_k, "raw_k_win", il);
+        raw_mask = inp_attn->get_win_mask(il);
+    }
+
     if (use_verify_gather) {
         // Each query becomes a sequence of its own (dimension 3 of K and of the mask), so that
         // build_attn_mha splits the queries the same way and returns them in token order.

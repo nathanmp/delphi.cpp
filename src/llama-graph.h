@@ -594,6 +594,8 @@ public:
 
     ggml_tensor * get_k_idxs(int32_t il = 0) const;
     ggml_tensor * get_kq_mask(int32_t il = 0) const;
+    ggml_tensor * get_win_idxs(int32_t il = 0) const;
+    ggml_tensor * get_win_mask(int32_t il = 0) const;
 
     ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
 
@@ -604,9 +606,19 @@ public:
     ggml_tensor * self_kq_mask_dec     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_dec_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
 
+    // A small ubatch reads only the raw cells that its queries see. The raw cache keeps n_swa + n_ubatch cells,
+    // and cells that leave the window stay in use until a write replaces them. Thus after a long prompt n_kv stays
+    // at the full cache size, and attention reads ~n_ubatch masked rows for each query.
+    ggml_tensor * self_win_idxs     = nullptr; // I32 [n_win]
+    ggml_tensor * self_win_mask     = nullptr; // F16 [n_win, n_batch]
+    ggml_tensor * self_win_idxs_dec = nullptr; // I32 [n_win]
+    ggml_tensor * self_win_mask_dec = nullptr; // F16 [n_win, n_batch]
+
     ggml_tensor * self_k_rot = nullptr;
 
     const llama_cparams cparams;
+
+    uint32_t n_swa = 0;
 
     const llama_kv_cache_dsv4_raw_context * mctx;
 };

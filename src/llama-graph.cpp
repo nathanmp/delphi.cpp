@@ -1,4 +1,5 @@
 #include "llama-graph.h"
+#include "ggml-alloc.h"
 #include <typeinfo>
 #include "llama-expert-cache.h"
 
@@ -1099,6 +1100,80 @@ static void dsv4_build_comp_inputs(
     }
 }
 
+// The rows of the raw window input of a ubatch, or 0 if the ubatch reads all n_kv cells (see self_win_idxs).
+// LLAMA_DSV41_RAW_WINDOW=0 disables the window.
+static int64_t dsv4_raw_window_rows(const llama_cparams & cparams, uint32_t n_swa, const llama_ubatch & ubatch,
+        int64_t n_kv, int64_t n_stream) {
+    static const bool enabled = [] {
+        const char * env = getenv("LLAMA_DSV41_RAW_WINDOW");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    if (!enabled || !cparams.flash_attn || n_swa == 0 || n_stream != 1 || ubatch.n_tokens == 0 ||
+            ubatch.n_tokens > 16 || ubatch.n_seqs_unq != 1) {
+        return 0;
+    }
+    // the union of the windows of n_tokens consecutive queries; FA wants a multiple of 256 rows
+    const int64_t n_win = GGML_PAD((int64_t) n_swa + ubatch.n_tokens, 256);
+    // The gather and its inputs cost ~0.7 ms per verify on each R9700. On 2026-11-09 they saved 6.5 ms at
+    // n_kv = 4352 and lost at n_kv <= 768 (DeepSeek V4.1, 4-token verify).
+    return 4*n_win <= n_kv ? n_win : 0;
+}
+
+static void dsv4_build_raw_window(ggml_context * ctx, ggml_tensor * kq_mask, int64_t n_win, bool dec,
+        ggml_tensor ** idxs, ggml_tensor ** mask) {
+    *idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_win);
+    ggml_set_input(*idxs);
+    ggml_set_name(*idxs, dec ? "attn_inp_win_idxs_dec" : "attn_inp_win_idxs");
+    *mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_win, kq_mask->ne[1], 1, 1);
+    ggml_set_input(*mask);
+    ggml_set_name(*mask, dec ? "attn_inp_win_mask_dec" : "attn_inp_win_mask");
+}
+
+// Copy the columns of kq_mask that some query sees, in cell order. The remaining rows mask an arbitrary cell.
+static void dsv4_set_raw_window(ggml_tensor * idxs, ggml_tensor * mask, const ggml_tensor * kq_mask) {
+    GGML_ASSERT(ggml_backend_buffer_is_host(kq_mask->buffer) && kq_mask->type == GGML_TYPE_F16);
+    GGML_ASSERT(kq_mask->ne[2] == 1 && kq_mask->ne[3] == 1 && mask->ne[1] == kq_mask->ne[1]);
+
+    const int64_t n_kv  = kq_mask->ne[0];
+    const int64_t n_q   = kq_mask->ne[1];
+    const int64_t n_win = idxs->ne[0];
+    auto src = [&](int64_t q, int64_t k) {
+        return *(const ggml_fp16_t *) ((const char *) kq_mask->data + q*kq_mask->nb[1] + k*sizeof(ggml_fp16_t));
+    };
+
+    std::vector<int32_t> cells;
+    cells.reserve(n_win);
+    for (int64_t k = 0; k < n_kv; ++k) {
+        for (int64_t q = 0; q < n_q; ++q) {
+            if (!std::isinf(ggml_fp16_to_fp32(src(q, k)))) {
+                cells.push_back((int32_t) k);
+                break;
+            }
+        }
+    }
+    GGML_ASSERT((int64_t) cells.size() <= n_win && "DSV4 raw window: more visible cells than window rows");
+
+    const ggml_fp16_t ninf = ggml_fp32_to_fp16(-INFINITY);
+    std::vector<int32_t>     idx(n_win, 0);
+    std::vector<ggml_fp16_t> m(n_win*n_q, ninf);
+    for (size_t i = 0; i < cells.size(); ++i) {
+        idx[i] = cells[i];
+        for (int64_t q = 0; q < n_q; ++q) {
+            m[q*n_win + i] = src(q, cells[i]);
+        }
+    }
+    ggml_backend_tensor_set(idxs, idx.data(), 0, ggml_nbytes(idxs));
+    ggml_backend_tensor_set(mask, m.data(),   0, ggml_nbytes(mask));
+}
+
+ggml_tensor * llm_graph_input_dsv4_raw::get_win_idxs(int32_t il) const {
+    return mctx->is_dec(il) ? self_win_idxs_dec : self_win_idxs;
+}
+
+ggml_tensor * llm_graph_input_dsv4_raw::get_win_mask(int32_t il) const {
+    return mctx->is_dec(il) ? self_win_mask_dec : self_win_mask;
+}
+
 ggml_tensor * llm_graph_input_dsv4_raw::get_k_idxs(int32_t il) const {
     return mctx->is_dec(il) ? self_k_idxs_dec : self_k_idxs;
 }
@@ -1124,6 +1199,32 @@ void llm_graph_input_dsv4_raw::set_input(const llama_ubatch * ubatch) {
         mctx->set_input_kq_mask_dec(self_kq_mask_dec, ubatch, cparams.causal_attn);
     }
 
+    // When all the layers of a group read the window, the full mask has no buffer: fill a host copy for the window
+    auto set_window = [&](ggml_tensor * idxs, ggml_tensor * mask, ggml_tensor * kq_mask, bool dec) {
+        if (!idxs || !idxs->buffer || !mask->buffer) {
+            return;
+        }
+        if (kq_mask->buffer) {
+            dsv4_set_raw_window(idxs, mask, kq_mask);
+            return;
+        }
+        ggml_init_params params = { ggml_tensor_overhead(), nullptr, true };
+        ggml_context * ctx = ggml_init(params);
+        ggml_tensor * tmp = ggml_dup_tensor(ctx, kq_mask);
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_cpu_buffer_type());
+        GGML_ASSERT(buf);
+        if (dec) {
+            mctx->set_input_kq_mask_dec(tmp, ubatch, cparams.causal_attn);
+        } else {
+            mctx->set_input_kq_mask(tmp, ubatch, cparams.causal_attn);
+        }
+        dsv4_set_raw_window(idxs, mask, tmp);
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+    };
+    set_window(self_win_idxs,     self_win_mask,     self_kq_mask,     false);
+    set_window(self_win_idxs_dec, self_win_mask_dec, self_kq_mask_dec, true);
+
     if (self_k_rot) {
         mctx->set_input_k_rot(self_k_rot);
     }
@@ -1131,7 +1232,8 @@ void llm_graph_input_dsv4_raw::set_input(const llama_ubatch * ubatch) {
 
 std::vector<ggml_tensor *> llm_graph_input_dsv4::tensors() const {
     std::vector<ggml_tensor *> res = { inp_raw->self_k_idxs, inp_raw->self_k_idxs_dec, inp_raw->self_kq_mask,
-            inp_raw->self_kq_mask_dec, inp_raw->self_k_rot };
+            inp_raw->self_kq_mask_dec, inp_raw->self_k_rot, inp_raw->self_win_idxs, inp_raw->self_win_mask,
+            inp_raw->self_win_idxs_dec, inp_raw->self_win_mask_dec };
     for (const comp_input * c : { &inp_csa, &inp_hca, &inp_lid }) {
         res.insert(res.end(), { c->state_pos, c->state_persist_src_idxs, c->state_persist_dst_idxs, c->state_restore_src_idxs,
                 c->state_restore_dst_idxs, c->state_snapshot_src_idxs, c->state_snapshot_dst_idxs, c->state_read_idxs,
@@ -1223,6 +1325,14 @@ bool llm_graph_input_dsv4::can_reuse(const llm_graph_params & params) {
     }
     if (inp_raw->self_kq_mask_dec && inp_raw->self_kq_mask_dec->buffer) {
         res &= dsv4_can_reuse_raw_kq_mask(inp_raw->self_kq_mask_dec, raw_ctx, ubatch_dec, n_stream, true);
+    }
+    {
+        const int64_t n_win = dsv4_raw_window_rows(inp_raw->cparams, inp_raw->n_swa, params.ubatch, raw_ctx->get_n_kv(), n_stream);
+        res &= n_win == (inp_raw->self_win_idxs ? inp_raw->self_win_idxs->ne[0] : 0);
+    }
+    if (raw_ctx->has_dec()) {
+        const int64_t n_win = dsv4_raw_window_rows(inp_raw->cparams, inp_raw->n_swa, ubatch_dec, raw_ctx->get_n_kv_dec(), n_stream);
+        res &= n_win == (inp_raw->self_win_idxs_dec ? inp_raw->self_win_idxs_dec->ne[0] : 0);
     }
 
     res &= dsv4_can_reuse_comp_input(inp_csa, plan_csa, params.ubatch.n_tokens, n_stream);
@@ -4087,15 +4197,22 @@ llm_graph_input_dsv4 * llm_graph_context::build_inp_dsv4() const {
 
     GGML_ASSERT(hparams.swa_type != LLAMA_SWA_TYPE_NONE && "DSV4 expects SWA raw cache");
 
+    inp_raw->n_swa = hparams.n_swa;
     inp_raw->self_k_idxs = raw_ctx->build_input_k_idxs(ctx0, ubatch);
     inp_raw->self_kq_mask = dsv4_build_raw_kq_mask(ctx0, raw_ctx, ubatch, cparams, n_stream);
     inp_raw->self_kq_mask_cnv = inp_raw->self_kq_mask;
+    if (const int64_t n_win = dsv4_raw_window_rows(cparams, hparams.n_swa, ubatch, raw_ctx->get_n_kv(), n_stream)) {
+        dsv4_build_raw_window(ctx0, inp_raw->self_kq_mask, n_win, false, &inp_raw->self_win_idxs, &inp_raw->self_win_mask);
+    }
 
     if (raw_ctx->has_dec()) {
         const auto ubatch_dec = raw_ctx->decoder_ubatch(ubatch);
         inp_raw->self_kq_mask_dec = dsv4_build_raw_kq_mask(ctx0, raw_ctx, ubatch_dec, cparams, n_stream, true);
         inp_raw->self_kq_mask_dec_cnv = inp_raw->self_kq_mask_dec;
         inp_raw->self_k_idxs_dec = raw_ctx->build_input_k_idxs_dec(ctx0, ubatch);
+        if (const int64_t n_win = dsv4_raw_window_rows(cparams, hparams.n_swa, ubatch_dec, raw_ctx->get_n_kv_dec(), n_stream)) {
+            dsv4_build_raw_window(ctx0, inp_raw->self_kq_mask_dec, n_win, true, &inp_raw->self_win_idxs_dec, &inp_raw->self_win_mask_dec);
+        }
     }
 
     inp_raw->self_k_rot = raw_ctx->build_input_k_rot(ctx0);
