@@ -134,7 +134,7 @@ static void spill_model_info(std::string & s, const llama_model * model) {
     s += ";";
 }
 
-uint64_t server_ckpt_model_key(const common_params & params, const llama_model * model_tgt, const llama_model * model_dft, uint32_t n_ctx_seq) {
+uint64_t server_ckpt_model_key(const common_params & params, const llama_model * model_tgt, const llama_model * model_dft, uint32_t n_ctx_seq, uint32_t n_seq_max) {
     std::string s = params.model.path + ";";
 
     // the model file may have been replaced under the same name
@@ -152,6 +152,7 @@ uint64_t server_ckpt_model_key(const common_params & params, const llama_model *
     spill_model_info(s, model_dft);
 
     s += std::to_string(n_ctx_seq) + ";";
+    s += std::to_string(n_seq_max) + ";";
     s += std::to_string((int) params.cache_type_k) + ";";
     s += std::to_string((int) params.cache_type_v) + ";";
     s += std::to_string((int) params.swa_full) + ";";

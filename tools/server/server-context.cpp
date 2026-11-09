@@ -1581,7 +1581,7 @@ private:
         if (!params_base.ckpt_spill_dir.empty()) {
             if (ckpt_used()) {
                 ckpt_spill.init(params_base.ckpt_spill_dir, (uint64_t) params_base.ckpt_spill_max_mib << 20,
-                        server_ckpt_model_key(params_base, model_tgt, model_dft, llama_n_ctx_seq(ctx_tgt)));
+                        server_ckpt_model_key(params_base, model_tgt, model_dft, llama_n_ctx_seq(ctx_tgt), llama_n_seq_max(ctx_tgt)));
             } else {
                 SRV_WRN("%s", "--ctx-checkpoints-spill-dir has no effect: the slots make no context checkpoints\n");
             }
@@ -1596,7 +1596,7 @@ private:
             if (ram > 0 && params_base.lora_adapters.empty()) {
                 pfx_cache.init(ram, params_base.prefix_cache_min_tokens, params_base.prefix_cache_dir,
                         (uint64_t) params_base.prefix_cache_disk_mib << 20,
-                        server_ckpt_model_key(params_base, model_tgt, model_dft, llama_n_ctx_seq(ctx_tgt)));
+                        server_ckpt_model_key(params_base, model_tgt, model_dft, llama_n_ctx_seq(ctx_tgt), llama_n_seq_max(ctx_tgt)));
             } else if (ram > 0) {
                 SRV_INF("%s", "prefix cache off: LoRA adapters change the state of a prompt\n");
             }

@@ -37,8 +37,9 @@ uint64_t server_ckpt_hash(uint64_t h, const void * data, size_t n);
 // the hash of the first n tokens of a prompt (n is capped at the number of tokens)
 uint64_t server_ckpt_prefix_hash(const llama_tokens & tokens, size_t n);
 
-// identifies the model files and the context setup that the checkpoints depend on. model_dft can be null.
-uint64_t server_ckpt_model_key(const common_params & params, const llama_model * model_tgt, const llama_model * model_dft, uint32_t n_ctx_seq);
+// identifies the model files and the context setup that the checkpoints depend on. model_dft can be null. The number of
+// sequences is part of it, as the state of a sequence records the number of KV streams.
+uint64_t server_ckpt_model_key(const common_params & params, const llama_model * model_tgt, const llama_model * model_dft, uint32_t n_ctx_seq, uint32_t n_seq_max);
 
 struct server_ckpt_spill {
     server_ckpt_spill();

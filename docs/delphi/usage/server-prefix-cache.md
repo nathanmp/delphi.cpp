@@ -37,7 +37,7 @@ RAM eviction drops the snapshots that never had a hit first, then the ones that 
 
 ## Files
 
-- Name: `dpfx-<model key>-<n_tokens>-<token hash>.bin`. The model key covers the model and draft files (path, size, time), the context size per sequence, the KV types, flash attention and the SWA setting. A change of any of them gives other files.
+- Name: `dpfx-<model key>-<n_tokens>-<token hash>.bin`. The model key covers the model and draft files (path, size, time), the context size per sequence, the number of sequences (`--parallel`), the KV types, flash attention and the SWA setting. A change of any of them gives other files.
 - Format version 1: a 72-byte header, the tokens of the prefix, then the data of the target context, the draft context and the speculative state, in the byte order of the machine. A checksum covers the tokens and the data.
 - The server writes the files from a thread of its own, with at most two in the queue. When the queue is full, the snapshot stays in RAM only.
 - At start, the server reads the headers and tokens of the files with its model key. A file that does not pass the checks is removed. When a read fails its checksum, or the state does not restore, the file is removed and the prompt is processed as usual.
