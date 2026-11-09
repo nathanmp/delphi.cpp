@@ -4531,6 +4531,13 @@ private:
                             break;
                         }
 
+                        // delphi: the prefix snapshot that ends where this media chunk starts, before the chunk is decoded
+                        // (the text before it was decoded with the last batch)
+                        if (slot.pfx_point > 0 && (int64_t) cur_token_idx == slot.pfx_point) {
+                            pfx_snapshot(slot, slot.pfx_point);
+                            slot.pfx_point = 0;
+                        }
+
                         // process the mtmd chunk
                         // note: it submits its own decode, potentially be async
                         //       so the timing is queued and flushed on the next sync
