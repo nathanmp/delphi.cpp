@@ -3,6 +3,7 @@
 #include "server-chat.h"
 #include "server-ckpt.h"
 #include "server-ckpt-spill.h"
+#include "server-prefix-cache.h"
 #include "server-turn.h"
 #include "server-tune.h"
 #include "kld.h"
@@ -359,6 +360,9 @@ struct server_slot {
 
     // delphi: where the checkpoints of this slot go when they are dropped (--ctx-checkpoints-spill-dir)
     server_ckpt_spill * ckpt_spill = nullptr;
+
+    // delphi: where this prompt takes a snapshot of a shared prefix (server-prefix-cache.h), 0 = nowhere
+    int64_t pfx_point = 0;
 
     bool prompt_save(server_prompt_cache & prompt_cache) const {
         if (prompt.tokens.size() == 0) {
@@ -1026,6 +1030,8 @@ private:
 
     server_ckpt_spill ckpt_spill; // delphi: context checkpoints on disk, declared before the slots that point to it
 
+    server_prefix_cache pfx_cache; // delphi: snapshots of shared prompt prefixes, kept when the context is made again
+
     // slots / clients
     std::vector<server_slot> slots;
 
@@ -1110,6 +1116,7 @@ private:
         vram.free();
 
         ckpt_spill.shutdown();
+        pfx_cache.shutdown();
 
         spec.reset();
         spec_init.reset();
@@ -1579,6 +1586,18 @@ private:
             slot.ckpt_spill = &ckpt_spill;
         }
 
+        // delphi: snapshots of the prompt prefixes that conversations share
+        {
+            const uint64_t ram = server_prefix_ram_budget(params_base.prefix_cache_mib);
+            if (ram > 0 && params_base.lora_adapters.empty()) {
+                pfx_cache.init(ram, params_base.prefix_cache_min_tokens, params_base.prefix_cache_dir,
+                        (uint64_t) params_base.prefix_cache_disk_mib << 20,
+                        server_ckpt_model_key(params_base, model_tgt, model_dft, llama_n_ctx_seq(ctx_tgt)));
+            } else if (ram > 0) {
+                SRV_INF("%s", "prefix cache off: LoRA adapters change the state of a prompt\n");
+            }
+        }
+
         if (!params_base.model_alias.empty()) {
             // backward compat: use first alias as model name
             model_name = *params_base.model_alias.begin();
@@ -1738,7 +1757,8 @@ private:
                 /* reasoning_budget_msg  */ params_base.sampling.reasoning_budget_message,
                 /* media_path            */ params_base.media_path,
                 /* force_pure_content    */ params_base.force_pure_content_parser,
-                /* turn_ckpt_step        */ ckpt_turn_step()
+                /* turn_ckpt_step        */ ckpt_turn_step(),
+                /* prefix_min_tokens     */ pfx_cache.enabled() ? pfx_cache.min_tokens() : 0
             };
 
             {
@@ -2645,6 +2665,166 @@ private:
     }
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
+    // delphi: prefix snapshots (server-prefix-cache.h) for this prompt
+    bool pfx_usable(const server_slot & slot) const {
+        return pfx_cache.enabled() &&
+            slot.task->type == SERVER_TASK_TYPE_COMPLETION &&
+            slot.task->params.cache_prompt &&
+            slot.task->params.n_cache_reuse == 0 &&
+            slot.alora_invocation_start <= 0 &&
+            slot.can_split() &&
+            !slot.task->tokens.has_mtmd;
+    }
+
+    // The longest common prefix of the new prompt with a prompt that the server holds (the slots, the host prompt cache, the
+    // stored prefixes), where the two prompts differ after it, before the first assistant message. 0 = none.
+    int64_t pfx_pick_point(const server_slot & slot) const {
+        const int32_t limit = slot.task->params.prefix_limit;
+        if (limit == 0) {
+            return 0;
+        }
+
+        const auto &  input    = slot.task->tokens;
+        const int64_t n_prompt = (int64_t) input.size();
+        if (n_prompt <= pfx_cache.min_tokens()) {
+            return 0;
+        }
+
+        std::vector<int64_t> lcps;
+        std::vector<int64_t> sizes;
+        const auto add = [&](const server_tokens & other) {
+            if (!other.has_mtmd && other.size() > 0) {
+                lcps.push_back((int64_t) other.get_common_prefix(input));
+                sizes.push_back((int64_t) other.size());
+            }
+        };
+
+        for (const auto & other : slots) {
+            add(other.prompt.tokens);
+        }
+        if (prompt_cache) {
+            for (const auto & state : prompt_cache->states) {
+                add(state.prompt.tokens);
+            }
+        }
+
+        const llama_tokens tokens = input.get_text_tokens();
+
+        const int64_t n_stored = pfx_cache.lcp_differs(tokens, n_prompt);
+        lcps.push_back(n_stored);
+        sizes.push_back(n_stored + 1);
+
+        const int64_t point = server_prefix_pick_point(lcps, sizes, n_prompt, limit, pfx_cache.min_tokens());
+        if (point > 0 && pfx_cache.has(tokens, point)) {
+            return 0;
+        }
+        if (point > 0) {
+            SLT_INF(slot, "prompt shares %" PRId64 " tokens with another prompt, a prefix snapshot goes there\n", point);
+        }
+
+        return point;
+    }
+
+    // Restore the longest stored prefix that the prompt starts with, if it reaches further than n_past. The slot loses only
+    // what is after n_past, which the prompt does not use.
+    void pfx_restore(server_slot & slot, int & n_past, llama_pos & pos_next) {
+        const auto &  input    = slot.task->tokens;
+        const int64_t n_prompt = (int64_t) input.size();
+
+        const llama_tokens tokens = input.get_text_tokens();
+
+        server_prefix_match m;
+        if (!pfx_cache.find(tokens, n_past, n_prompt - 1, m)) {
+            return;
+        }
+
+        // The read and the restore block the slot loop, as the processing of the tokens would: they have to take less time
+        // than that. The disk read counts twice, as its speed is less certain. Before any prompt is timed, a gain of at
+        // least the minimum snapshot size counts as worth it.
+        {
+            const int64_t gain    = m.n_tokens - n_past;
+            const double  ms_cost = 2.0 * pfx_cache.fetch_ms(m) + pfx_cache.restore_ms(m.bytes);
+            const double  ms_tok  = metrics.prompt.count > 0 ? 1e-3 * (double) metrics.prompt.time / (double) metrics.prompt.count : 0.0;
+            const double  ms_save = (double) gain * ms_tok;
+            if (ms_tok > 0.0 ? ms_cost > ms_save : gain < pfx_cache.min_tokens()) {
+                SLT_DBG(slot, "not restoring the prefix snapshot of %" PRId64 " tokens (n_past = %d): about %.0f ms, saves about %.0f ms\n",
+                        m.n_tokens, n_past, ms_cost, ms_save);
+                return;
+            }
+        }
+
+        double ms_read = 0.0;
+        const auto snap = pfx_cache.fetch(m, ms_read);
+        if (!snap) {
+            return;
+        }
+
+        const int64_t t_start = ggml_time_us();
+
+        ckpt_async_sync();
+
+        // what the slot holds after n_past belongs to another prompt
+        for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end();) {
+            it = it->pos_max > pos_next ? slot.prompt.checkpoints.erase(it) : std::next(it);
+        }
+        ckpt_spill.erase_beyond(slot.id, pos_next);
+
+        common_speculative_wait_ctx(ctx_dft);
+
+        bool ok = llama_state_seq_set_data_ext(ctx_tgt, snap->data_tgt.data(), snap->data_tgt.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) == snap->data_tgt.size();
+        if (ok && ctx_dft && !snap->data_dft.empty()) {
+            ok = llama_state_seq_set_data_ext(ctx_dft, snap->data_dft.data(), snap->data_dft.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) == snap->data_dft.size();
+        }
+
+        if (!ok) {
+            SLT_WRN(slot, "failed to restore the prefix snapshot of %" PRId64 " tokens, it is removed\n", m.n_tokens);
+            pfx_cache.drop(m);
+            slot.prompt_clear();
+            n_past   = 0;
+            pos_next = 0;
+            return;
+        }
+
+        common_speculative_set_state(spec.get(), slot.id, snap->data_spec);
+
+        pfx_cache.note_restore(snap->size(), (ggml_time_us() - t_start) / 1000.0);
+
+        slot.prompt.tokens.keep_first(n_past);
+        for (int64_t i = n_past; i < m.n_tokens; i++) {
+            slot.prompt.tokens.push_back(tokens[i]);
+        }
+
+        SLT_INF(slot, "restored the prefix snapshot of %" PRId64 " tokens (n_past was %d, %.1f MiB, %s%.0f ms)\n",
+                m.n_tokens, n_past, (float) snap->size() / 1024 / 1024, m.in_ram ? "" : "from disk, ",
+                ms_read + (ggml_time_us() - t_start) / 1000.0);
+
+        n_past   = (int) m.n_tokens;
+        pos_next = slot.prompt.tokens.pos_next(n_past);
+    }
+
+    // Store the state of the slot, which holds exactly the first n tokens of its prompt.
+    void pfx_snapshot(server_slot & slot, int64_t n) {
+        const int64_t t_start = ggml_time_us();
+
+        ckpt_async_sync();
+
+        common_prompt_checkpoint snap;
+        snap.update_pos(n,
+                llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id),
+                llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id));
+        snap.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        snap.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        common_speculative_get_state(spec.get(), slot.id, snap.data_spec);
+
+        const size_t size = snap.size();
+        const bool   ok   = pfx_cache.put(slot.prompt.tokens.get_text_tokens(), std::move(snap));
+
+        const auto st = pfx_cache.stats();
+        SLT_INF(slot, "%s the prefix snapshot of %" PRId64 " tokens (%.1f MiB, %.0f ms), %zu in RAM (%.1f MiB), %zu on disk\n",
+                ok ? "took" : "did not keep", n, (float) size / 1024 / 1024, (ggml_time_us() - t_start) / 1000.0,
+                st.n_ram, st.bytes_ram / (1024.0 * 1024.0), st.n_disk);
+    }
+
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
         const int64_t n_tokens_new = slot.prompt.n_tokens() - n_tokens_cur;
@@ -4227,6 +4407,15 @@ private:
                                 }
                             }
 
+                            // delphi: a snapshot of a shared prefix can reach further than what the slot has
+                            if (pfx_usable(slot)) {
+                                slot.pfx_point = pfx_pick_point(slot);
+                                pfx_restore(slot, n_past, pos_next);
+                                if (slot.pfx_point < n_past) {
+                                    slot.pfx_point = 0; // the slot is past it already
+                                }
+                            }
+
                             {
                                 // erase any checkpoints with pos_max > pos_next
                                 for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end();) {
@@ -4422,6 +4611,11 @@ private:
                             break;
                         }
 
+                        // delphi: break where the prefix snapshot goes, so that the next batch starts there and takes it
+                        if (slot.pfx_point > 0 && slot.prompt.n_tokens() == slot.pfx_point) {
+                            break;
+                        }
+
                         // process the last few tokens of the prompt separately in order to allow for a checkpoint to be created.
                         // create checkpoints that many tokens before the end of the prompt:
                         //  - 4 + n_ubatch
@@ -4504,6 +4698,14 @@ private:
                             is_last_user_message || is_turn_end || near_prompt_end ||
                             n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
+
+                    // delphi: the snapshot of a shared prefix, before the decode of the batch that starts at it
+                    if (slot.pfx_point > 0 && n_tokens_start >= slot.pfx_point) {
+                        if (n_tokens_start == slot.pfx_point && !has_mtmd) {
+                            pfx_snapshot(slot, n_tokens_start);
+                        }
+                        slot.pfx_point = 0;
+                    }
 
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
                     //       yet processed and therefore it is not part of the checkpoint.
@@ -5229,6 +5431,12 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         auto delimiters = common_chat_msg_delimiters_parse(delims);
         delimiters.tokenize(ctx_server.vocab);
 
+        // delphi: the bound for prefix snapshots (server-prefix-cache.h)
+        int32_t prefix_limit = 0;
+        if (inputs.size() == 1 && prompt.is_string() && files.empty()) {
+            prefix_limit = server_prefix_limit_tokens(data, ctx_server.vocab, prompt.get<std::string>());
+        }
+
         // chat message ends for checkpointing (the tokens of a prompt with media are not the tokens of its text)
         std::vector<server_turn_boundary> turn_bounds;
         if (inputs.size() == 1 && prompt.is_string() && files.empty() && params.ckpt_turn_step > 0) {
@@ -5251,6 +5459,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
 
             task.params.message_spans = task.tokens.find_message_spans(delimiters);
             task.params.turn_boundaries = turn_bounds;
+            task.params.prefix_limit    = prefix_limit;
 
             task.id_slot = json_value(data, "id_slot", -1);
             sse_ping_interval = task.params.sse_ping_interval;

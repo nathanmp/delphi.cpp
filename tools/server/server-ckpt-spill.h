@@ -31,6 +31,9 @@ struct server_ckpt_spill_entry {
     uint64_t  bytes       = 0; // size of the file
 };
 
+// FNV-1a style hash that continues h over n bytes of data (finds damaged files, no protection against an attack)
+uint64_t server_ckpt_hash(uint64_t h, const void * data, size_t n);
+
 // the hash of the first n tokens of a prompt (n is capped at the number of tokens)
 uint64_t server_ckpt_prefix_hash(const llama_tokens & tokens, size_t n);
 

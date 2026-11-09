@@ -11,6 +11,8 @@ add_library(${TARGET} STATIC
     server-ckpt.h
     server-ckpt-spill.cpp
     server-ckpt-spill.h
+    server-prefix-cache.cpp
+    server-prefix-cache.h
     server-task.cpp
     server-task.h
     server-queue.cpp

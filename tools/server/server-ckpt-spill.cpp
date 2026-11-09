@@ -104,6 +104,10 @@ static int64_t spill_pid() {
 #endif
 }
 
+uint64_t server_ckpt_hash(uint64_t h, const void * data, size_t n) {
+    return spill_hash(h, data, n);
+}
+
 uint64_t server_ckpt_prefix_hash(const llama_tokens & tokens, size_t n) {
     n = std::min(n, tokens.size());
 
