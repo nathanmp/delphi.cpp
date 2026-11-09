@@ -1458,8 +1458,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
         ggml_tensor * features = use_dev_features ? llama_get_embeddings_layer_inp_tensor(params.ctx_tgt) : nullptr;
         if (features) {
-            // Complete all target writes before the draft copies a row view. The synchronous backend copy below
-            // consumes the source before the next target decode, so no cross-context reader event is needed.
+            // The draft graph reads the target buffer directly.
             llama_synchronize(params.ctx_tgt);
         }
 
@@ -1487,8 +1486,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     view.nb[2] = view.nb[1] * n_chunk;
                     view.nb[3] = view.nb[2];
                     view.data = (char *) features->data + row * features->nb[1];
-                    view.view_src = nullptr;
-                    view.view_offs = 0;
+                    view.view_src = features;
+                    view.view_offs = row * features->nb[1];
                     llama_batch inject = batch_inject;
                     inject.n_tokens = n_chunk;
                     inject.embd = nullptr;
@@ -1507,6 +1506,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     }
                     const int32_t rc = llama_decode(ctx_dft, inject);
                     if (rc != 0) {
+                        llama_synchronize(ctx_dft);
                         LOG_ERR("%s: device feature injection failed rc=%d (n_tokens=%d, offset=%d)\n",
                                 __func__, rc, (int) n_chunk, (int) offset);
                         return false;
@@ -1556,6 +1556,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
         }
 
+        // Finish all reads before another target batch can overwrite the feature buffer.
+        if (features) {
+            llama_synchronize(ctx_dft);
+        }
         return true;
     }
 

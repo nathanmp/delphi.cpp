@@ -557,6 +557,65 @@ static void build_dflash2_selector(llm_graph_context & g, const llama_model & mo
     ggml_build_forward_expand(g.gf, packed);
 }
 
+class llm_graph_input_dflash_features : public llm_graph_input_i {
+public:
+    explicit llm_graph_input_dflash_features(const ggml_tensor * tensor) :
+        src(*(tensor->view_src ? tensor->view_src : tensor)) {}
+
+    void set_input(const llama_ubatch * ubatch) override {
+        const auto * tensor = ubatch->embd_tensor;
+        GGML_ASSERT(tensor && rows && src.ne[0] == tensor->ne[0]);
+        const size_t offset = tensor->view_src ? tensor->view_offs : 0;
+        GGML_ASSERT(offset % src.nb[1] == 0);
+        const int64_t first = offset / src.nb[1];
+        GGML_ASSERT(first + ubatch->n_tokens <= src.ne[1]);
+        std::vector<int32_t> indices(ubatch->n_tokens);
+        for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+            indices[i] = first + i;
+        }
+        ggml_backend_tensor_set(rows, indices.data(), 0, indices.size()*sizeof(int32_t));
+    }
+
+    bool can_reuse(const llm_graph_params & params) override {
+        const auto * tensor = params.ubatch.embd_tensor;
+        const auto * source = tensor && tensor->view_src ? tensor->view_src : tensor;
+        return source && src.buffer == source->buffer && src.data == source->data &&
+            src.type == source->type && ggml_are_same_shape(&src, source) && ggml_are_same_stride(&src, source);
+    }
+
+    ggml_tensor src;
+    ggml_tensor * rows = nullptr;
+};
+
+class llm_graph_input_dflash_host_features : public llm_graph_input_embd {
+public:
+    using llm_graph_input_embd::llm_graph_input_embd;
+
+    bool can_reuse(const llm_graph_params & params) override {
+        return !params.ubatch.embd_tensor && llm_graph_input_embd::can_reuse(params);
+    }
+};
+
+static ggml_tensor * build_inp_target_features(llm_graph_context & g, int64_t n_embd_inp) {
+    if (g.ubatch.embd_tensor) {
+        GGML_ASSERT(g.ubatch.embd_tensor->ne[0] == n_embd_inp);
+        auto inp = std::make_unique<llm_graph_input_dflash_features>(g.ubatch.embd_tensor);
+        // Keep the source address fixed across graph replays; only the row indices change.
+        inp->rows = ggml_new_tensor_1d(g.ctx0, GGML_TYPE_I32, g.n_tokens);
+        ggml_set_input(inp->rows);
+        ggml_tensor * result = ggml_get_rows(g.ctx0, &inp->src, inp->rows);
+        g.res->add_input(std::move(inp));
+        return result;
+    }
+
+    auto inp = std::make_unique<llm_graph_input_dflash_host_features>(n_embd_inp);
+    inp->embd = ggml_new_tensor_2d(g.ctx0, GGML_TYPE_F32, n_embd_inp, g.n_tokens);
+    ggml_set_input(inp->embd);
+    ggml_tensor * result = inp->embd;
+    g.res->add_input(std::move(inp));
+    return result;
+}
+
 // DFlash decoder, dual-mode by batch type:
 //   * embd batch  -> fused target features: project + inject K/V into the cache.
 //   * token batch -> noise-block diffusion: attend over [committed, MASK...] to generate draft tokens
@@ -598,15 +657,8 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 
     // KV cache injection
     if (ubatch.embd || ubatch.embd_tensor) {
-        auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
-
-        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, n_tokens);
-        ggml_set_input(inp->embd);
-
-        ggml_tensor * inp_target = inp->embd;
+        ggml_tensor * inp_target = build_inp_target_features(*this, n_embd_inp);
         cb(inp_target, "inp_target_features", -1);
-
-        res->add_input(std::move(inp));
 
         // fuse the target features through the encoder
         ggml_tensor * inp_g = build_lora_mm(model.fc, inp_target, model.fc_s);
@@ -835,15 +887,8 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
 
     // KV cache injection: fused target features from the encoder
     if (ubatch.embd || ubatch.embd_tensor) {
-        auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
-
-        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, n_tokens);
-        ggml_set_input(inp->embd);
-
-        ggml_tensor * inp_target = inp->embd;
+        ggml_tensor * inp_target = build_inp_target_features(*this, n_embd_inp);
         cb(inp_target, "inp_target_features", -1);
-
-        res->add_input(std::move(inp));
 
         // fuse the target features through the encoder
         ggml_tensor * inp_g = build_lora_mm(model.fc, inp_target, model.fc_s);

@@ -865,6 +865,11 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
             GGML_ASSERT(idxs[i] == idxs[0] + (int32_t) i && "backend embedding batch must remain contiguous");
         }
         llama_tensor_view_rows(udata->embd_tensor, batch.embd_tensor, idxs[0], n_tokens);
+        if (batch.embd_tensor->view_src) {
+            // Keep the stable source and row offset for DFlash device feature gathers.
+            udata->embd_tensor.view_src = batch.embd_tensor->view_src;
+            udata->embd_tensor.view_offs = batch.embd_tensor->view_offs + idxs[0] * batch.embd_tensor->nb[1];
+        }
         udata->has_embd_tensor = true;
     }
 
