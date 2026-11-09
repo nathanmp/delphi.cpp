@@ -13089,6 +13089,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1024, 1)); // 4h PP-1024
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
 
+    // lightning_indexer: speculative-verify widths over long compressed contexts (DeepSeek V4.1 at 25K-250K tokens)
+    for (int kv : { 6400, 25600, 64000 }) {
+        for (int bs : { 1, 4, 6, 8, 512 }) {
+            for (int nh : { 32, 64 }) {
+                test_cases.emplace_back(new test_lightning_indexer(128, nh, kv, bs, 1, 1, GGML_TYPE_F16, true));
+            }
+        }
+    }
+
     // lightning_indexer
     for (int kv : { 256, 4096, 65536 }) {
         for (int bs : { 1, 512, 2048 }) {
