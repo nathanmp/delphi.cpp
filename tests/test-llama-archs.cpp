@@ -71,7 +71,7 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 }
 
 static void usage(char ** argv) {
-    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v N] [--ced-trim] [--numa tensors] [-h/--help]\n", argv[0]);
+    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v N] [--ced-trim] [--comp-padding] [--numa tensors] [-h/--help]\n", argv[0]);
 }
 
 static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32_t n_vocab, const size_t seed){
@@ -1162,6 +1162,159 @@ static int test_deepseek41_ced(const size_t seed) {
     return 0;
 }
 
+static int test_dsv4_comp_padding(const size_t seed, llm_arch arch) {
+    std::vector<std::vector<ggml_backend_dev_t>> configs = {{}};
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        auto dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            configs.push_back({dev});
+            break;
+        }
+    }
+
+    for (const llm_arch test_arch : {LLM_ARCH_DEEPSEEK4, LLM_ARCH_DEEPSEEK41}) {
+        if (arch != LLM_ARCH_UNKNOWN && arch != test_arch) {
+            continue;
+        }
+        auto gguf_ctx = get_gguf_ctx(test_arch, true);
+        const uint32_t capacity = test_arch == LLM_ARCH_DEEPSEEK41 ? 512 : 1024;
+        llama_model_saver ms(test_arch, gguf_ctx.get());
+        ms.add_kv(LLM_KV_CONTEXT_LENGTH, capacity);
+
+        for (const auto & devs : configs) {
+            for (const uint32_t n_seq : {1u, 2u}) {
+                auto batched = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, devs,
+                        LLAMA_SPLIT_MODE_LAYER, false, LLAMA_CONTEXT_TYPE_DEFAULT, nullptr, nullptr, n_seq, 8);
+                auto reference = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, devs,
+                        LLAMA_SPLIT_MODE_LAYER, false, LLAMA_CONTEXT_TYPE_DEFAULT, nullptr, nullptr, n_seq, 8);
+                common_params params;
+                params.cpuparams.n_threads = params.cpuparams_batch.n_threads = 4;
+                common_threadpools pools_batch, pools_ref;
+                pools_batch.init(batched.second.get(), params);
+                pools_ref.init(reference.second.get(), params);
+
+                const auto token = [](llama_seq_id seq, llama_pos pos) {
+                    return (llama_token) ((7*pos + 31*seq + 1) % 128);
+                };
+                const auto eval = [&](llama_context * ctx, const std::vector<llama_pos> & pos, uint32_t count) {
+                    llama_batch batch = llama_batch_init(count*pos.size(), 0, 1);
+                    for (llama_seq_id s = 0; s < (llama_seq_id) pos.size(); ++s) {
+                        for (uint32_t i = 0; i < count; ++i) {
+                            common_batch_add(batch, token(s, pos[s] + i), pos[s] + i, {s}, true);
+                        }
+                    }
+                    const int rc = llama_decode(ctx, batch);
+                    llama_batch_free(batch);
+                    if (rc != 0) {
+                        throw std::runtime_error("compressor padding decode failed");
+                    }
+                    const float * logits = llama_get_logits(ctx);
+                    std::vector<float> result(logits, logits + 128*count*pos.size());
+                    GGML_ASSERT(std::all_of(result.begin(), result.end(), [](float v) { return std::isfinite(v); }));
+                    return result;
+                };
+                const auto compare = [](const std::vector<float> & a, const std::vector<float> & b) {
+                    const double error = nmse(a, b);
+                    if (!(error < 1e-5)) {
+                        throw std::runtime_error("compressor padding logits mismatch: NMSE = " + std::to_string(error));
+                    }
+                };
+                const auto check = [&](const std::vector<llama_pos> & pos, uint32_t count) {
+                    const auto actual = eval(batched.second.get(), pos, count);
+                    std::vector<float> expected;
+                    for (llama_seq_id s = 0; s < (llama_seq_id) pos.size(); ++s) {
+                        for (uint32_t i = 0; i < count; ++i) {
+                            llama_batch batch = llama_batch_init(1, 0, 1);
+                            common_batch_add(batch, token(s, pos[s] + i), pos[s] + i, {s}, true);
+                            GGML_ASSERT(llama_decode(reference.second.get(), batch) == 0);
+                            llama_batch_free(batch);
+                            const float * logits = llama_get_logits(reference.second.get());
+                            expected.insert(expected.end(), logits, logits + 128);
+                        }
+                    }
+                    compare(expected, actual);
+                };
+                const auto prefill = [&](std::vector<llama_pos> & pos, llama_pos end) {
+                    while (pos[0] < end) {
+                        const uint32_t count = std::min<llama_pos>(32, end - pos[0]);
+                        compare(eval(reference.second.get(), pos, count), eval(batched.second.get(), pos, count));
+                        for (auto & p : pos) {
+                            p += count;
+                        }
+                    }
+                };
+
+                for (const uint32_t count : {1u, 3u, 5u, 6u, 7u}) {
+                    llama_memory_clear(llama_get_memory(batched.second.get()), true);
+                    llama_memory_clear(llama_get_memory(reference.second.get()), true);
+                    std::vector<llama_pos> pos(n_seq, 0);
+                    prefill(pos, 32);
+                    if (n_seq == 2) {
+                        // Different compressor phases in the two independent streams.
+                        eval(batched.second.get(), {pos[0], pos[1]}, 1);
+                        eval(reference.second.get(), {pos[0], pos[1]}, 1);
+                        pos[0]++;
+                        pos[1]++;
+                        GGML_ASSERT(llama_memory_seq_rm(llama_get_memory(batched.second.get()), 0, 32, -1));
+                        GGML_ASSERT(llama_memory_seq_rm(llama_get_memory(reference.second.get()), 0, 32, -1));
+                        pos[0]--;
+                    }
+                    for (int step = 0; step < 3; ++step) {
+                        const int32_t reused = llama_perf_context(batched.second.get()).n_reused;
+                        check(pos, count);
+                        if (step > 0 && llama_perf_context(batched.second.get()).n_reused != reused + 1) {
+                            throw std::runtime_error(std::string(llm_arch_name(test_arch)) +
+                                    " rebuilt the compressor graph for width " + std::to_string(count) +
+                                    " and " + std::to_string(n_seq) + " sequences");
+                        }
+                        for (auto & p : pos) {
+                            p += count;
+                        }
+                    }
+                    // Reject part of the last verification and replay through a different width.
+                    for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
+                        pos[s]--;
+                        GGML_ASSERT(llama_memory_seq_rm(llama_get_memory(batched.second.get()), s, pos[s], -1));
+                        GGML_ASSERT(llama_memory_seq_rm(llama_get_memory(reference.second.get()), s, pos[s], -1));
+                    }
+                    check(pos, 5);
+                }
+
+                if (n_seq == 1) {
+                    // The final padded slot becomes live here. A dummy write must not overwrite it.
+                    llama_memory_clear(llama_get_memory(batched.second.get()), true);
+                    llama_memory_clear(llama_get_memory(reference.second.get()), true);
+                    std::vector<llama_pos> pos(1, 0);
+                    prefill(pos, capacity - 8);
+                    std::vector<uint8_t> state_batch(llama_state_get_size(batched.second.get()));
+                    std::vector<uint8_t> state_ref(llama_state_get_size(reference.second.get()));
+                    GGML_ASSERT(llama_state_get_data(batched.second.get(), state_batch.data(), state_batch.size()) == state_batch.size());
+                    GGML_ASSERT(llama_state_get_data(reference.second.get(), state_ref.data(), state_ref.size()) == state_ref.size());
+                    check(pos, 3);
+                    pos[0] += 3;
+                    check(pos, 5);
+                    pos[0] += 5;
+                    GGML_ASSERT(llama_memory_seq_rm(llama_get_memory(batched.second.get()), 0, pos[0] - 1, -1));
+                    GGML_ASSERT(llama_memory_seq_rm(llama_get_memory(reference.second.get()), 0, pos[0] - 1, -1));
+                    pos[0]--;
+                    check(pos, 1);
+                    llama_memory_clear(llama_get_memory(batched.second.get()), true);
+                    llama_memory_clear(llama_get_memory(reference.second.get()), true);
+                    GGML_ASSERT(llama_state_set_data(batched.second.get(), state_batch.data(), state_batch.size()) == state_batch.size());
+                    GGML_ASSERT(llama_state_set_data(reference.second.get(), state_ref.data(), state_ref.size()) == state_ref.size());
+                    pos[0] = capacity - 8;
+                    check(pos, 3);
+                    pos[0] += 3;
+                    check(pos, 5);
+                }
+                printf("%s compressor padding: %s, %u sequences OK\n", llm_arch_name(test_arch),
+                        devs.empty() ? "CPU" : ggml_backend_dev_name(devs[0]), n_seq);
+            }
+        }
+    }
+    return 0;
+}
+
 static bool moe_mandatory(const llm_arch arch) {
     switch (arch) {
         case LLM_ARCH_LLAMA4:
@@ -1625,12 +1778,16 @@ int main(int argc, char ** argv) {
     size_t seed = rd();
     std::string out;
     bool ced_trim = false;
+    bool comp_padding = false;
 
     int verbosity = LOG_LEVEL_ERROR;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--ced-trim") == 0) {
             ced_trim = true;
+        }
+        if (strcmp(argv[i], "--comp-padding") == 0) {
+            comp_padding = true;
         }
         if (strcmp(argv[i], "--numa") == 0) {
             if (++i >= argc || strcmp(argv[i], "tensors") != 0) {
@@ -1684,6 +1841,10 @@ int main(int argc, char ** argv) {
     printf("%s: using seed %zu\n", __func__, seed);
 
     try {
+        if (comp_padding) {
+            common_log_set_verbosity_thold(verbosity);
+            return test_dsv4_comp_padding(seed, arch);
+        }
         if (ced_trim) {
             return test_deepseek41_ced(seed);
         }

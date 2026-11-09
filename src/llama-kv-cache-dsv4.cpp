@@ -436,6 +436,7 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
         const llama_ubatch & ubatch,
         uint32_t ratio,
         bool overlap,
+        bool pad_blocks,
         uint32_t state_size,
         uint32_t kv_size,
         uint32_t n_stream,
@@ -552,10 +553,8 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
         }
     }
 
-    // The overlap compressor reads a fixed window per block, so every sequence has to write the
-    // same number of blocks or the graph shape moves between ubatches. For DeepSeek-V4 this is
-    // exactly the CSA and indexer streams.
-    if (overlap && !plan.state_pos.empty()) {
+    // Keep per-sequence block counts fixed for V4's overlap streams and V4.1's non-overlap streams.
+    if (pad_blocks && !plan.state_pos.empty()) {
         assert(kv_size > 0);
 
         // Pad each stream to the reserve plan's block count.
@@ -563,6 +562,10 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
             const int64_t cache_off = dsv4_stream_offset(n_stream, seq_id, kv_size);
             const int32_t source_idx = state_source_idx(seq_id, ubatch.pos[i]);
 
+            // The padding slot must still be masked for this sequence.
+            for (uint32_t j = i; j < ubatch.n_tokens; ++j) {
+                assert(!dsv4_token_has_seq(ubatch, j, seq_id) || plan.n_visible[j] < (int64_t) kv_size);
+            }
             plan.state_write_idxs.push_back(cache_off + kv_size - 1);
             plan.state_write_pos .push_back(0);
 
@@ -597,7 +600,7 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
                     continue;
                 }
                 if (n_writes + 1 != n_blocks) {
-                    throw std::runtime_error("DSV4 CSA sequence positions are not contiguous");
+                    throw std::runtime_error("DSV4 compressor sequence positions are not contiguous");
                 }
 
                 uint32_t i = 0;
@@ -610,10 +613,8 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
         }
     }
 
-    // A non-overlap stream completes a block only every `ratio` tokens, so a decode step often
-    // completes none. For DeepSeek-V4 this is the HCA stream; V4.1 pools without overlap on both
-    // of its streams and reaches this at ratio 2 on every other token.
-    if (!overlap && !plan.state_pos.empty() && plan.state_write_idxs.empty()) {
+    // V4's HCA stream retains one masked write when no block completes.
+    if (!pad_blocks && !plan.state_pos.empty() && plan.state_write_idxs.empty()) {
         assert(kv_size > 0);
         // the last slot must not be live, or the dummy write would corrupt it;
         // a full stream implies a completed block, which implies real writes
@@ -754,6 +755,7 @@ static std::vector<llama_kv_cache_dsv4_context::comp_plan> dsv4_build_comp_plans
         const std::vector<llama_ubatch> & ubatches,
         uint32_t ratio,
         bool overlap,
+        bool pad_blocks,
         uint32_t state_size,
         uint32_t kv_size,
         uint32_t n_stream,
@@ -765,7 +767,7 @@ static std::vector<llama_kv_cache_dsv4_context::comp_plan> dsv4_build_comp_plans
     // the first ubatch touching a seq consumes its rollback restore
     std::vector<uint32_t> rs(rs_idx);
     for (const llama_ubatch & ubatch : ubatches) {
-        plans.push_back(dsv4_build_comp_plan(ubatch, ratio, overlap, state_size, kv_size, n_stream, n_rs_seq, rs));
+        plans.push_back(dsv4_build_comp_plan(ubatch, ratio, overlap, pad_blocks, state_size, kv_size, n_stream, n_rs_seq, rs));
 
         for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
             const llama_seq_id seq_id = ubatch.seq_id_unq[s];
@@ -918,6 +920,7 @@ llama_dsv4_comp_state::llama_dsv4_comp_state(
         const llama_memory_i::layer_filter_cb & filter) :
     ratio(ratio),
     overlap(overlap),
+    pad_blocks(overlap || model.arch == LLM_ARCH_DEEPSEEK41),
     state_size(state_size),
     n_embd_state(n_embd_state),
     n_stream(unified ? 1 : n_seq_max),
@@ -1070,6 +1073,10 @@ uint32_t llama_dsv4_comp_state::get_ratio() const {
 
 bool llama_dsv4_comp_state::get_overlap() const {
     return overlap;
+}
+
+bool llama_dsv4_comp_state::get_pad_blocks() const {
+    return pad_blocks;
 }
 
 uint32_t llama_dsv4_comp_state::get_state_size() const {
@@ -1549,35 +1556,8 @@ llama_memory_context_ptr llama_kv_cache_dsv4::init_batch(
                 std::move(ubatches_raw));
     };
 
-    // Match llama_kv_cache_iswa splitting when DSV4 compressed state does not
-    // require per-sequence graph layout.
-    do {
-        if (raw_per_seq || comp_per_seq) {
-            break;
-        }
-
-        balloc.split_reset();
-
-        std::vector<llama_ubatch> ubatches;
-        while (true) {
-            auto ubatch = balloc.split_simple(n_ubatch);
-            if (ubatch.n_tokens == 0) {
-                break;
-            }
-            ubatches.push_back(std::move(ubatch)); // NOLINT
-        }
-
-        if (balloc.get_n_used() < balloc.get_n_tokens()) {
-            break;
-        }
-
-        if (auto ctx = make_context(std::move(ubatches))) {
-            return ctx;
-        }
-    } while (false);
-
-    // When raw or compressed state is per-sequence, independent sequences can
-    // share an equal-length ubatch. Coupled sequence sets still serialize until
+    // Independent sequences can share an equal-length ubatch. The compressor needs the actual per-sequence token count.
+    // Coupled sequence sets still serialize until
     // DSV4 has explicit shared-state handling for compressed streams.
     do {
         balloc.split_reset();
@@ -2559,13 +2539,13 @@ llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
         std::vector<llama_ubatch> ubatches,
         std::vector<llama_ubatch> ubatches_raw) :
     ubatches(std::move(ubatches)),
-    plans_csa(dsv4_build_comp_plans(this->ubatches, kv->get_csa_state()->get_ratio(), kv->get_csa_state()->get_overlap(),
+    plans_csa(dsv4_build_comp_plans(this->ubatches, kv->get_csa_state()->get_ratio(), kv->get_csa_state()->get_overlap(), kv->get_csa_state()->get_pad_blocks(),
                 kv->get_csa_state()->get_state_size(), kv->get_csa()->get_size(), kv->get_csa_state()->get_n_stream(),
                 kv->get_n_rs_seq(), kv->get_rs_idx())),
-    plans_hca(dsv4_build_comp_plans(this->ubatches, kv->get_hca_state()->get_ratio(), kv->get_hca_state()->get_overlap(),
+    plans_hca(dsv4_build_comp_plans(this->ubatches, kv->get_hca_state()->get_ratio(), kv->get_hca_state()->get_overlap(), kv->get_hca_state()->get_pad_blocks(),
                 kv->get_hca_state()->get_state_size(), kv->get_hca()->get_size(), kv->get_hca_state()->get_n_stream(),
                 kv->get_n_rs_seq(), kv->get_rs_idx())),
-    plans_lid(dsv4_build_comp_plans(this->ubatches, kv->get_lid_state()->get_ratio(), kv->get_lid_state()->get_overlap(),
+    plans_lid(dsv4_build_comp_plans(this->ubatches, kv->get_lid_state()->get_ratio(), kv->get_lid_state()->get_overlap(), kv->get_lid_state()->get_pad_blocks(),
                 kv->get_lid_state()->get_state_size(), kv->get_lid()->get_size(), kv->get_lid_state()->get_n_stream(),
                 kv->get_n_rs_seq(), kv->get_rs_idx())),
     ctx_raw(std::make_unique<llama_kv_cache_dsv4_raw_context>(
