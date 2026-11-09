@@ -244,6 +244,19 @@ static __global__ void lightning_indexer_kernel_wmma(
 #endif // defined(TURING_MMA_AVAILABLE)
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
+#if defined(GGML_USE_HIP)
+#include "lightning-indexer-rdna4.cuh"
+
+// GGML_HIP_LID_WMMA=0 selects the vector kernel on RDNA4, for A/B tests.
+static bool lid_rdna4_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("GGML_HIP_LID_WMMA");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+#endif // defined(GGML_USE_HIP)
+
 // TODO there is one ugly assumption used in this kernel - that WARP_SIZE is equal to 32
 // thanks to that one warp operating on float4 processes whole indexer K/Q vectors
 // 32 * 4 = 128 (N_EMBD)
@@ -585,6 +598,26 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
         return;
     }
 #endif
+
+#if defined(GGML_USE_HIP)
+    // the fragment loads read 16 bytes at a time
+    if (GGML_CUDA_CC_IS_RDNA4(cc) && lid_rdna4_enabled() && n_embd == 128 && (n_head == 32 || n_head == 64) && k->type == GGML_TYPE_F16 &&
+            nbk2 % 16 == 0 && nbk3 % 16 == 0 && (uintptr_t) k_d % 16 == 0 && nbq1 % 16 == 0 && nbq2 % 16 == 0 && nbq3 % 16 == 0 &&
+            (uintptr_t) q_d % 16 == 0) {
+        constexpr int n_warps = 4;
+        constexpr int kv_tiles = 2;
+        constexpr int batch_tile = 8;
+        const dim3 block(WARP_SIZE, n_warps);
+        const dim3 grid((n_kv + n_warps*kv_tiles*16 - 1)/(n_warps*kv_tiles*16), (n_batch + batch_tile - 1)/batch_tile, n_stream);
+        auto * kernel = n_head == 64 ? lightning_indexer_kernel_rdna4<64, n_warps, kv_tiles, batch_tile> :
+                                       lightning_indexer_kernel_rdna4<32, n_warps, kv_tiles, batch_tile>;
+        kernel<<<grid, block, 0, ctx.stream()>>>(
+                q_d, k_d, w_d, m_d, dst_d, n_batch, n_kv, nb1, nb3, nbq1, nbq2, nbq3, nbk2, nbk3, nbw1, nbw3, nbm1, nbm3,
+                (int) nem3, m_counts);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+#endif // defined(GGML_USE_HIP)
 
     if (n_embd == 128 && n_head == 64) {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
