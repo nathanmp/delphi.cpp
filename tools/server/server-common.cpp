@@ -1393,7 +1393,7 @@ json oaicompat_chat_params_parse(
     }
 
     // delphi: where the first assistant message starts, the bound for prefix snapshots (a short prompt has no prefix to share)
-    if (for_task && opt.use_jinja && opt.prefix_min_tokens > 0 && out_files.empty() && chat_params.prompt.size() > (size_t) opt.prefix_min_tokens) {
+    if (for_task && opt.use_jinja && opt.prefix_min_tokens > 0 && chat_params.prompt.size() > (size_t) opt.prefix_min_tokens) {
         server_prefix_limit_params(llama_params, opt.tmpls.get(), inputs, chat_params.prompt);
     }
 

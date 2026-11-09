@@ -2665,6 +2665,16 @@ private:
     }
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
+    // delphi: the index of the first media chunk of a prompt, or its size. has_mtmd only says that the server has a media
+    // encoder. The prefix snapshots and the spilled checkpoints are keyed by text tokens, so they end before it.
+    static int64_t first_media_index(const server_tokens & t) {
+        if (t.size() > 0 && t[0] == LLAMA_TOKEN_NULL) {
+            return 0;
+        }
+        const auto next = t.find_next_media_chunk(0);
+        return next.first != nullptr ? (int64_t) next.second : (int64_t) t.size();
+    }
+
     // delphi: prefix snapshots (server-prefix-cache.h) for this prompt
     bool pfx_usable(const server_slot & slot) const {
         return pfx_cache.enabled() &&
@@ -2672,28 +2682,29 @@ private:
             slot.task->params.cache_prompt &&
             slot.task->params.n_cache_reuse == 0 &&
             slot.alora_invocation_start <= 0 &&
-            slot.can_split() &&
-            !slot.task->tokens.has_mtmd;
+            slot.can_split();
     }
 
     // The longest common prefix of the new prompt with a prompt that the server holds (the slots, the host prompt cache, the
-    // stored prefixes), where the two prompts differ after it, before the first assistant message. 0 = none.
+    // stored prefixes), where the two prompts differ after it, before the first assistant message and the first media
+    // chunk. 0 = none.
     int64_t pfx_pick_point(const server_slot & slot) const {
-        const int32_t limit = slot.task->params.prefix_limit;
-        if (limit == 0) {
-            return 0;
-        }
-
         const auto &  input    = slot.task->tokens;
         const int64_t n_prompt = (int64_t) input.size();
-        if (n_prompt <= pfx_cache.min_tokens()) {
+        const int64_t n_text   = first_media_index(input);
+
+        int64_t limit = slot.task->params.prefix_limit;
+        if (limit == 0 || n_prompt <= pfx_cache.min_tokens() || n_text < pfx_cache.min_tokens()) {
             return 0;
+        }
+        if (n_text < n_prompt) {
+            limit = limit < 0 ? n_text : std::min(limit, n_text);
         }
 
         std::vector<int64_t> lcps;
         std::vector<int64_t> sizes;
         const auto add = [&](const server_tokens & other) {
-            if (!other.has_mtmd && other.size() > 0) {
+            if (other.size() > 0) {
                 lcps.push_back((int64_t) other.get_common_prefix(input));
                 sizes.push_back((int64_t) other.size());
             }
@@ -2708,9 +2719,10 @@ private:
             }
         }
 
+        // get_text_tokens() leaves out the media chunks: its indices are the prompt's only before the first one
         const llama_tokens tokens = input.get_text_tokens();
 
-        const int64_t n_stored = pfx_cache.lcp_differs(tokens, n_prompt);
+        const int64_t n_stored = pfx_cache.lcp_differs(tokens, n_text);
         lcps.push_back(n_stored);
         sizes.push_back(n_stored + 1);
 
@@ -2734,7 +2746,7 @@ private:
         const llama_tokens tokens = input.get_text_tokens();
 
         server_prefix_match m;
-        if (!pfx_cache.find(tokens, n_past, n_prompt - 1, m)) {
+        if (!pfx_cache.find(tokens, n_past, std::min(n_prompt - 1, first_media_index(input)), m)) {
             return;
         }
 
@@ -5433,7 +5445,9 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
 
         // delphi: the bound for prefix snapshots (server-prefix-cache.h)
         int32_t prefix_limit = 0;
-        if (inputs.size() == 1 && prompt.is_string() && files.empty()) {
+        // With media, the text has a marker where the tokens have the media chunk, so the bound comes out lower than the
+        // real position. The snapshot ends before the first media chunk anyway, and the text before it is exact.
+        if (inputs.size() == 1 && prompt.is_string()) {
             prefix_limit = server_prefix_limit_tokens(data, ctx_server.vocab, prompt.get<std::string>());
         }
 
