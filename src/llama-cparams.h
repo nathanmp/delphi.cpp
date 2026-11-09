@@ -91,6 +91,7 @@ struct llama_cparams {
     const llama_attn_split_weights * attn_split_w = nullptr; // null: the split device reads slices of the model's weights
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
+    bool embeddings_layer_inp_dev = false; // collect enabled layer inputs in a backend buffer
 
     enum llama_context_type ctx_type;
     enum llama_rope_scaling_type rope_scaling_type;

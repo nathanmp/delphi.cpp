@@ -165,6 +165,14 @@ public:
     const int64_t n_embd = 0;
 };
 
+// Original batch indices are the destination rows for device feature extraction.
+class llm_graph_input_idx : public llm_graph_input_i {
+public:
+    void set_input(const llama_ubatch * ubatch) override;
+    bool can_reuse(const llm_graph_params & params) override;
+    ggml_tensor * idxs = nullptr;
+};
+
 class llm_graph_input_pos : public llm_graph_input_i {
 public:
     llm_graph_input_pos(uint32_t n_pos_per_embd) : n_pos_per_embd(n_pos_per_embd) {}
@@ -830,6 +838,7 @@ struct llm_graph_params {
     const llama_mtp_device_draft_cache * mtp_device_draft_cache;
     llama_expert_cache * expert_cache = nullptr;
     class llama_engram_reader * engram_reader = nullptr;
+    ggml_tensor * layer_inp_dev = nullptr;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -949,6 +958,7 @@ struct llm_graph_params {
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
             cparams.causal_attn             == other.cparams.causal_attn             &&
+            layer_inp_dev == other.layer_inp_dev &&
             arch  == other.arch  &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&
@@ -1112,6 +1122,7 @@ struct llm_graph_context {
     const llama_mtp_device_draft_cache * mtp_device_draft_cache;
     llama_expert_cache * expert_cache = nullptr;
     class llama_engram_reader * engram_reader = nullptr;
+    ggml_tensor * layer_inp_dev = nullptr;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -1519,6 +1530,7 @@ struct llm_graph_context {
     //
 
     void build_sampling() const;
+    void build_layer_inp_dev() const;
     void build_mtp_device_draft() const;
 
     // expert-cache routing records, added after the outputs so their CPU split does not stall the GPU layers

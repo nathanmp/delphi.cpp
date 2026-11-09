@@ -210,6 +210,12 @@ LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);
 
+// Collect enabled layer inputs as F32 [n_layer_inp*n_embd, n_batch], in ascending layer order.
+// Allocation failure keeps host extraction enabled. The tensor is valid until extraction settings change.
+LLAMA_API void llama_set_embeddings_layer_inp_dev(struct llama_context * ctx, bool value);
+// Synchronize ctx before reading. Consume the rows before the next target decode overwrites them.
+LLAMA_API struct ggml_tensor * llama_get_embeddings_layer_inp_tensor(struct llama_context * ctx);
+
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 
 //

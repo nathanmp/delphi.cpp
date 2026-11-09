@@ -1180,6 +1180,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
     uint32_t        target_layer_ids_n = 0;
 
+    bool use_dev_features = false;
+
     common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq,
             common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)
         : common_speculative_impl(type, n_seq, params.draft.n_max)
@@ -1301,6 +1303,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
         }
 
+        // The device buffer stores layers in ascending order, as required by the draft projection.
+        const char * dev_env = getenv("LLAMA_DFLASH_DEV");
+        const bool ascending = std::adjacent_find(target_layer_ids, target_layer_ids + target_layer_ids_n,
+                [](int32_t a, int32_t b) { return a >= b; }) == target_layer_ids + target_layer_ids_n;
+        if (ascending && (dev_env == nullptr || atoi(dev_env) != 0)) {
+            llama_set_embeddings_layer_inp_dev(ctx_tgt, true);
+            use_dev_features = llama_get_embeddings_layer_inp_tensor(ctx_tgt) != nullptr;
+        }
+        LOG_INF("%s: DFlash target features via %s\n", __func__, use_dev_features ? "device buffer" : "host copies");
+
         // DFlash2 reads its selector lattice from h_nextn and never consumes raw logits.
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ !is_dflash2);
         llama_set_causal_attn(ctx_dft, causal_attn); // DFlash needs non-causal attention unless the model says otherwise
@@ -1311,6 +1323,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             llama_context_sched_reserve(ctx_dft);
         } catch (...) {
             // The server can continue without speculative decoding.
+            llama_set_embeddings_layer_inp_dev(ctx_tgt, false);
             for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
                 llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], false);
             }
@@ -1443,6 +1456,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         auto * ctx_dft = this->params.ctx_dft;
 
         const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
+        ggml_tensor * features = use_dev_features ? llama_get_embeddings_layer_inp_tensor(params.ctx_tgt) : nullptr;
+        if (features) {
+            // Complete all target writes before the draft copies a row view. The synchronous backend copy below
+            // consumes the source before the next target decode, so no cross-context reader event is needed.
+            llama_synchronize(params.ctx_tgt);
+        }
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_batch_beg[seq_id] < 0) {
@@ -1459,6 +1478,41 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
                 const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
+
+                if (features) {
+                    const int32_t row = i_batch_beg[seq_id] + offset;
+                    GGML_ASSERT(row >= 0 && row + n_chunk <= features->ne[1]);
+                    ggml_tensor view = *features;
+                    view.ne[1] = n_chunk;
+                    view.nb[2] = view.nb[1] * n_chunk;
+                    view.nb[3] = view.nb[2];
+                    view.data = (char *) features->data + row * features->nb[1];
+                    view.view_src = nullptr;
+                    view.view_offs = 0;
+                    llama_batch inject = batch_inject;
+                    inject.n_tokens = n_chunk;
+                    inject.embd = nullptr;
+                    inject.embd_tensor = &view;
+                    for (int32_t i = 0; i < n_chunk; ++i) {
+                        const llama_pos p = batch_in.pos[row + i];
+                        inject.pos[i] = p;
+                        if (is_mrope) {
+                            inject.pos[n_chunk + i] = p;
+                            inject.pos[2 * n_chunk + i] = p;
+                            inject.pos[3 * n_chunk + i] = 0;
+                        }
+                        inject.n_seq_id[i] = 1;
+                        inject.seq_id[i][0] = seq_id;
+                        inject.logits[i] = false;
+                    }
+                    const int32_t rc = llama_decode(ctx_dft, inject);
+                    if (rc != 0) {
+                        LOG_ERR("%s: device feature injection failed rc=%d (n_tokens=%d, offset=%d)\n",
+                                __func__, rc, (int) n_chunk, (int) offset);
+                        return false;
+                    }
+                    continue;
+                }
 
                 // gather target features per extract layer; the fused decode encodes and
                 // injects them into the K/V cache at the target positions
@@ -3555,7 +3609,9 @@ common_speculative * common_speculative_init(common_params_speculative & params,
     if (params.draft.ctx_tgt != nullptr && params.draft.ctx_dft != nullptr) {
         const char * env = getenv("LLAMA_SPEC_ASYNC_INGEST");
         const double cpu_frac = llama_model_cpu_expert_fraction(llama_get_model(params.draft.ctx_tgt));
-        const bool enable = env != nullptr ? atoi(env) != 0 : cpu_frac < 0.25;
+        // A device feature buffer belongs to one target batch; host handoff tickets cannot retain its rows.
+        const bool device_features = llama_get_embeddings_layer_inp_tensor(result->ctx_tgt) != nullptr;
+        const bool enable = !device_features && (env != nullptr ? atoi(env) != 0 : cpu_frac < 0.25);
         SPC_INF("asynchronous prompt ingest: %s (target routed experts on CPU: %.0f%%)\n", enable ? "on" : "off", 100.0*cpu_frac);
         if (enable) {
             result->async_ingest = true;
