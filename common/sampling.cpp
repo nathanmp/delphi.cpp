@@ -801,7 +801,13 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
         // leaves the target distribution in the candidate array
         const llama_token id_tgt = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
 
-        const auto * cur_p = common_sampler_get_candidates(gsmpl, true);
+        // The residual draw is exact in any order; it only needs an order that is stable for a seed.
+        // A full-vocabulary array is in token-id or backend-argsort order, so do not sort its 150K+ entries on the host.
+        // Truncated sets can come from unordered top-k kernels, so sort them.
+        const auto * cur_p = common_sampler_get_candidates(gsmpl, false);
+        if (cur_p->size != (size_t) llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)))) {
+            cur_p = common_sampler_get_candidates(gsmpl, true);
+        }
 
         const bool masked = !grammar_first && grammar_should_apply(gsmpl);
         if (masked) {
