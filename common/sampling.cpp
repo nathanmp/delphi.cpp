@@ -770,6 +770,8 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
     GGML_ASSERT(idxs.size()    == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
     GGML_ASSERT(draft_q.size() == draft.size() && "draft_q must have one entry per draft token");
 
+    llama_synchronize(ctx);
+
     std::vector<llama_token> result;
     result.reserve(idxs.size());
 
@@ -780,13 +782,26 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
 
     std::vector<llama_token_data> cand; // candidate array masked by the grammar, if there is one
 
+    bool backend_verified = false;
     size_t i = 0;
     for (; i < draft.size(); i++) {
+        const auto & q = draft_q[i];
+        const float q_x = prob_of(q.data(), q.size(), draft[i]);
+        float backend_p = 0.0f;
+        const bool tested_backend = !gsmpl->grmr && !gsmpl->rbudget &&
+                llama_get_sampled_token_ith(ctx, idxs[i]) != LLAMA_TOKEN_NULL &&
+                llama_get_sampled_prob_ith(ctx, idxs[i], draft[i], &backend_p);
+        backend_verified |= tested_backend;
+        if (tested_backend && q_x > 0.0f && (backend_p >= q_x || uni(gsmpl->rng) < backend_p / q_x)) {
+            common_sampler_accept(gsmpl, draft[i], true);
+            result.push_back(draft[i]);
+            continue;
+        }
+
         // leaves the target distribution in the candidate array
         const llama_token id_tgt = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
 
         const auto * cur_p = common_sampler_get_candidates(gsmpl, true);
-        const auto & q     = draft_q[i];
 
         const bool masked = !grammar_first && grammar_should_apply(gsmpl);
         if (masked) {
@@ -815,8 +830,6 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
         };
 
         // q_x is never 0 for a token the draft produced, but guard the divide
-        const float q_x = prob_of(q.data(), q.size(), draft[i]);
-
         float p_x = 0.0f;
         for (size_t k = 0; k < cur_p->size; ++k) {
             if (cur_p->data[k].id == draft[i]) {
@@ -825,7 +838,8 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
             }
         }
 
-        if (q_x > 0.0f && (p_x >= q_x || uni(gsmpl->rng) < p_x / q_x)) {
+        // A rejected backend test has already consumed its draw.
+        if (!tested_backend && q_x > 0.0f && (p_x >= q_x || uni(gsmpl->rng) < p_x / q_x)) {
             common_sampler_accept(gsmpl, draft[i], true);
             result.push_back(draft[i]);
             continue;
@@ -862,7 +876,13 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
     }
 
     if (i == draft.size()) {
-        const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        llama_token id = LLAMA_TOKEN_NULL;
+        if (backend_verified && gsmpl->params.n_probs == 0) {
+            id = llama_get_sampled_token_ith(ctx, idxs[i]);
+        }
+        if (id == LLAMA_TOKEN_NULL) {
+            id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        }
 
         common_sampler_accept(gsmpl, id, true);
 

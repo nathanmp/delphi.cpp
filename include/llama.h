@@ -1112,6 +1112,12 @@ extern "C" {
     // Returns LLAMA_TOKEN_NULL if no token was sampled.
     LLAMA_API llama_token llama_get_sampled_token_ith(struct llama_context * ctx, int32_t i);
 
+    // Defer backend sampling arrays until their getters are called. Batches with outputs in more than one ubatch retain eager copies. Disabled by default.
+    LLAMA_API void llama_set_sampler_lazy(struct llama_context * ctx, bool enable);
+
+    // Read one token probability without downloading the candidate arrays. Returns false when the lazy backend probability row is unavailable. Does not advance the sampler state.
+    LLAMA_API bool llama_get_sampled_prob_ith(struct llama_context * ctx, int32_t i, llama_token token, float * prob);
+
     // Get the backend sampled probabilities for the ith token
     // The index matches llama_get_sampled_token_ith().
     // Returns NULL if no probabilities were generated.

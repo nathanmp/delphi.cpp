@@ -128,6 +128,9 @@ struct llama_context {
     float * get_sampled_logits_ith(int32_t idx);
     size_t  get_sampled_logits_count(int32_t idx);
 
+    void set_sampler_lazy(bool enable);
+    bool get_sampled_prob_ith(int32_t idx, llama_token token, float * prob);
+
     float * get_sampled_probs_ith(int32_t idx);
     size_t  get_sampled_probs_count(int32_t idx);
 
@@ -385,6 +388,20 @@ private:
         std::vector<uint32_t> logits_count;
         std::vector<uint32_t> probs_count;
         std::vector<uint32_t> candidates_count;
+
+        // Backend snapshots keep lazy getters valid across graph reuse and scheduler resets.
+        struct lazy_row {
+            ggml_tensor * logits = nullptr;
+            ggml_tensor * probs = nullptr;
+            ggml_tensor * candidates = nullptr;
+            ggml_tensor * probs_by_token = nullptr;
+        };
+        std::vector<lazy_row> lazy_rows;
+        struct lazy_tensor {
+            ggml_backend_buffer_ptr buffer;
+            ggml_tensor tensor;
+        };
+        std::vector<std::unique_ptr<std::array<lazy_tensor, 4>>> lazy_storage;
 
         // optimization
         std::vector<llama_token> token_ids_full_vocab;

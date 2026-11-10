@@ -4786,6 +4786,11 @@ private:
             has_prompt |= batch.tokens[i].is_prompt;
         }
 
+        // Keep full candidate downloads out of accepted probabilistic verify rows.
+        const char * rejection_host = getenv("LLAMA_SPEC_REJECTION_HOST");
+        llama_set_sampler_lazy(ctx_tgt, params_base.speculative.draft.probabilistic &&
+                !(rejection_host && atoi(rejection_host) != 0));
+
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;

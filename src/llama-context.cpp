@@ -1664,6 +1664,41 @@ llama_token llama_context::get_sampled_token_ith(int32_t idx) {
     }
 }
 
+void llama_context::set_sampler_lazy(bool enable) {
+    if (cparams.sampler_lazy != enable) {
+        synchronize();
+        cparams.sampler_lazy = enable;
+        sampler_changed();
+        sched_need_reserve = true;
+    }
+}
+
+bool llama_context::get_sampled_prob_ith(int32_t idx, llama_token token, float * prob) {
+    if (!cparams.sampler_lazy || !prob || token < 0 || (uint32_t) token >= model.vocab.n_tokens()) {
+        return false;
+    }
+    synchronize();
+    output_reorder();
+    try {
+        const int64_t row = output_resolve_row(idx);
+        if ((size_t) row >= sampling.lazy_rows.size() || !sampling.lazy_rows[row].probs_by_token) {
+            return false;
+        }
+        ggml_backend_tensor_get(sampling.lazy_rows[row].probs_by_token, prob, (size_t) token*sizeof(float), sizeof(float));
+        return true;
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: invalid output id %d, reason: %s\n", __func__, idx, err.what());
+        return false;
+    }
+}
+
+static void sampling_read_lazy(ggml_tensor * & tensor, void * dst) {
+    if (tensor) {
+        ggml_backend_tensor_get(tensor, dst, 0, ggml_nbytes(tensor));
+        tensor = nullptr;
+    }
+}
+
 float * llama_context::get_sampled_probs_ith(int32_t idx) {
     output_reorder();
 
@@ -1676,6 +1711,7 @@ float * llama_context::get_sampled_probs_ith(int32_t idx) {
         if ((size_t) row >= sampling.probs_count.size() || sampling.probs_count[row] == 0) {
             return nullptr;
         }
+        sampling_read_lazy(sampling.lazy_rows[row].probs, sampling.probs.data + row*model.vocab.n_tokens());
         return sampling.probs.data + row*model.vocab.n_tokens();
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: invalid backend sampled probs id %d, reason: %s\n", __func__, idx, err.what());
@@ -1695,6 +1731,7 @@ float * llama_context::get_sampled_logits_ith(int32_t idx) {
         if ((size_t) row >= sampling.logits_count.size() || sampling.logits_count[row] == 0) {
             return nullptr;
         }
+        sampling_read_lazy(sampling.lazy_rows[row].logits, sampling.logits.data + row*model.vocab.n_tokens());
         return sampling.logits.data + row*model.vocab.n_tokens();
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: invalid backend sampled logits id %d, reason: %s\n", __func__, idx, err.what());
@@ -1710,6 +1747,7 @@ const llama_token * llama_context::get_sampled_candidates_ith(int32_t idx) {
         if (sampling.candidates.has_data() &&
             (size_t) row < sampling.candidates_count.size() &&
             sampling.candidates_count[row] > 0) {
+            sampling_read_lazy(sampling.lazy_rows[row].candidates, sampling.candidates.data + row*model.vocab.n_tokens());
             return sampling.candidates.data + row*model.vocab.n_tokens();
         }
     } catch (const std::exception & err) {
@@ -3202,9 +3240,57 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
             // async copy the sampling data from the backend to the host
             copy_tensor_async_rows(res->t_sampled,        sampling.sampled,    1,      n_outputs_prev, sched.get());
-            copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     stride, n_outputs_prev, sched.get(), &sampling.logits_count);
-            copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, sched.get(), &sampling.probs_count);
-            copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched.get(), &sampling.candidates_count);
+            const bool lazy = cparams.sampler_lazy && n_outputs_prev == 0 && n_outputs == n_outputs_all &&
+                    n_tokens_prev + ubatch.n_tokens == balloc->get_n_tokens() &&
+                    std::any_of(res->t_sampled_probs_by_token.begin(), res->t_sampled_probs_by_token.end(),
+                            [](ggml_tensor * tensor) { return tensor != nullptr; });
+            if (lazy) {
+                for (size_t i = 0; i < res->t_sampled.size(); ++i) {
+                    auto & row = sampling.lazy_rows[i];
+                    if (i >= sampling.lazy_storage.size()) {
+                        sampling.lazy_storage.emplace_back(new std::array<sampling_info::lazy_tensor, 4>);
+                    }
+                    bool allocation_failed = false;
+                    auto store = [&](ggml_tensor * src, size_t index) -> ggml_tensor * {
+                        if (!src) {
+                            return nullptr;
+                        }
+                        auto & dst = (*sampling.lazy_storage[i])[index];
+                        auto backend = ggml_backend_sched_get_tensor_backend(sched.get(), src);
+                        auto buft = ggml_backend_get_default_buffer_type(backend);
+                        const size_t size = ggml_backend_buft_get_alloc_size(buft, src);
+                        if (!dst.buffer || ggml_backend_buffer_get_type(dst.buffer.get()) != buft ||
+                                ggml_backend_buffer_get_size(dst.buffer.get()) < size) {
+                            dst.buffer.reset(ggml_backend_buft_alloc_buffer(buft, size));
+                            if (!dst.buffer) {
+                                allocation_failed = true;
+                                return nullptr;
+                            }
+                        }
+                        dst.tensor = *src;
+                        dst.tensor.buffer = dst.buffer.get();
+                        dst.tensor.data = ggml_backend_buffer_get_base(dst.buffer.get());
+                        dst.tensor.view_src = nullptr;
+                        dst.tensor.view_offs = 0;
+                        dst.tensor.extra = nullptr;
+                        ggml_backend_tensor_copy_async(backend, backend, src, &dst.tensor);
+                        return &dst.tensor;
+                    };
+                    row = { store(res->t_sampled_logits[i], 0), store(res->t_sampled_probs[i], 1),
+                            store(res->t_candidates[i], 2), store(res->t_sampled_probs_by_token[i], 3) };
+                    if (allocation_failed) {
+                        LLAMA_LOG_ERROR("%s: failed to allocate lazy sampling output\n", __func__);
+                        return -2;
+                    }
+                    sampling.logits_count[i]     = row.logits     ? ggml_nelements(row.logits)     : 0;
+                    sampling.probs_count[i]      = row.probs      ? ggml_nelements(row.probs)      : 0;
+                    sampling.candidates_count[i] = row.candidates ? ggml_nelements(row.candidates) : 0;
+                }
+            } else {
+                copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     stride, n_outputs_prev, sched.get(), &sampling.logits_count);
+                copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, sched.get(), &sampling.probs_count);
+                copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched.get(), &sampling.candidates_count);
+            }
         }
 
         n_outputs_prev += n_outputs;
@@ -3338,6 +3424,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     const auto & vocab   = model.vocab;
 
     const int64_t n_outputs_max = std::max<int64_t>(n_outputs, n_seq_max());
+    sampling.lazy_rows.assign(n_outputs_max, {});
 
     const auto n_batch    = cparams.n_batch;
     const auto n_vocab    = vocab.n_tokens();
@@ -3613,6 +3700,7 @@ void llama_context::output_reorder() {
                 std::swap(sampling.candidates.data[i0*n_vocab + k], sampling.candidates.data[i1*n_vocab + k]);
             }
 
+            std::swap(sampling.lazy_rows[i0],        sampling.lazy_rows[i1]);
             std::swap(sampling.sampled.data[i0],     sampling.sampled.data[i1]);
             std::swap(sampling.logits_count[i0],     sampling.logits_count[i1]);
             std::swap(sampling.probs_count[i0],      sampling.probs_count[i1]);
@@ -3669,7 +3757,7 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     uint32_t n_sampling_nodes = 0;
     uint32_t n_sampling_nodes_max = 0;
     for (const auto & [seq_id, sampler] : sampling.samplers) {
-        const uint32_t n_nodes = llama_sampler_backend_n_nodes(sampler);
+        const uint32_t n_nodes = llama_sampler_backend_n_nodes(sampler) + (cparams.sampler_lazy ? 8 : 0);
         n_sampling_nodes += n_nodes;
         if (cparams.n_outputs_max_per_seq > 1) {
             n_sampling_nodes_max = std::max(n_sampling_nodes_max, n_nodes);
@@ -6344,6 +6432,14 @@ void llama_context::graph_alt_slots_reserve(uint32_t n_slots, uint32_t n_max_tok
 
 void llama_feature_handoff_release(llama_context * ctx, int32_t ticket) {
     ctx->feature_handoff_release(ticket);
+}
+
+void llama_set_sampler_lazy(llama_context * ctx, bool enable) {
+    ctx->set_sampler_lazy(enable);
+}
+
+bool llama_get_sampled_prob_ith(llama_context * ctx, int32_t i, llama_token token, float * prob) {
+    return ctx->get_sampled_prob_ith(i, token, prob);
 }
 
 bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler * smpl) {

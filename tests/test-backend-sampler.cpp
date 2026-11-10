@@ -2,6 +2,7 @@
 #include "llama.h"
 #include "llama-cpp.h"
 #include "common.h"
+#include "sampling.h"
 
 #ifdef NDEBUG
 #undef NDEBUG
@@ -24,6 +25,7 @@ struct test_args {
     std::string model;
     std::string test;
     std::string device = "auto";
+    bool numa_tensors = false;
 };
 
 struct test_params {
@@ -1993,6 +1995,124 @@ static void test_backend_multi_output_cpu_suffix(const test_params & params) {
     printf("backend multi-output CPU suffix test PASSED\n");
 }
 
+
+static void test_backend_lazy_sampling(const test_params & params) {
+    // Interleaved sequences force output reordering. A small top-k also checks zero probability outside the candidate support; k=0 checks the direct vocab path.
+    for (int k : { 0, 16 }) {
+        for (uint32_t ubatch : { 2, 8 }) {
+            llama_sampler_ptr chains[2];
+            std::vector<llama_sampler_seq_config> configs;
+            for (int seq = 0; seq < 2; ++seq) {
+                chains[seq].reset(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+                llama_sampler_chain_add(chains[seq].get(), llama_sampler_init_top_k(k));
+                llama_sampler_chain_add(chains[seq].get(), llama_sampler_init_top_p(0.95f, 1));
+                llama_sampler_chain_add(chains[seq].get(), llama_sampler_init_dist(42 + seq));
+                configs.push_back({ seq, chains[seq].get() });
+            }
+            test_context test_ctx(params, configs, 2, 4, ubatch, 2);
+            llama_set_sampler_lazy(test_ctx.ctx.get(), true);
+            llama_batch batch = llama_batch_init(4, 0, 1);
+            for (int pos = 0; pos < 2; ++pos) {
+                for (int seq : { 1, 0 }) {
+                    common_batch_add(batch, llama_vocab_bos(test_ctx.vocab), pos, { seq }, true);
+                }
+            }
+            for (int repeat = 0; repeat < 2; ++repeat) {
+                GGML_ASSERT(llama_decode(test_ctx.ctx.get(), batch) == 0);
+                llama_synchronize(test_ctx.ctx.get());
+                for (int i = 0; i < 4; ++i) {
+                    const llama_token sampled = llama_get_sampled_token_ith(test_ctx.ctx.get(), i);
+                    float scalar = -1.0f;
+                    const bool lazy = llama_get_sampled_prob_ith(test_ctx.ctx.get(), i, sampled, &scalar);
+                    GGML_ASSERT(lazy == (ubatch == 8));
+                    const float * probs = llama_get_sampled_probs_ith(test_ctx.ctx.get(), i);
+                    const float * logits = llama_get_sampled_logits_ith(test_ctx.ctx.get(), i);
+                    const llama_token * ids = llama_get_sampled_candidates_ith(test_ctx.ctx.get(), i);
+                    const uint32_t count = llama_get_sampled_probs_count_ith(test_ctx.ctx.get(), i);
+                    GGML_ASSERT(probs && logits && ids && count > 0);
+                    std::vector<float> dense(test_ctx.n_vocab, 0.0f);
+                    for (uint32_t j = 0; j < count; ++j) {
+                        dense[ids[j]] = probs[j];
+                    }
+                    if (lazy) {
+                        GGML_ASSERT(scalar == dense[sampled]);
+                        for (llama_token token : { 0, 1, sampled, test_ctx.n_vocab - 1 }) {
+                            GGML_ASSERT(llama_get_sampled_prob_ith(test_ctx.ctx.get(), i, token, &scalar));
+                            GGML_ASSERT(scalar == dense[token]);
+                        }
+                        // Negative row indices must resolve to the same reordered output.
+                        GGML_ASSERT(llama_get_sampled_prob_ith(test_ctx.ctx.get(), i - 4, sampled, &scalar));
+                        GGML_ASSERT(scalar == dense[sampled]);
+                    }
+                }
+                for (int i = 0; i < 4; ++i) {
+                    batch.pos[i] += 2;
+                }
+            }
+            llama_batch_free(batch);
+        }
+    }
+    printf("backend lazy sampling test PASSED\n");
+}
+
+static void test_backend_lazy_rejection(const test_params & params) {
+    common_params_sampling sampling_params;
+    sampling_params.seed = 1234;
+    sampling_params.temp = 1.0f;
+    sampling_params.top_k = 0;
+    sampling_params.top_p = 0.95f;
+    sampling_params.min_p = 0.0f;
+    sampling_params.backend_sampling = true;
+    common_sampler_ptr sampler(common_sampler_init(params.model.get(), sampling_params));
+    std::vector<llama_sampler_seq_config> configs = {{ 0, common_sampler_get(sampler.get()) }};
+    test_context test_ctx(params, configs, 1, 4, 4, 4);
+    llama_set_sampler_lazy(test_ctx.ctx.get(), true);
+    llama_batch batch = llama_batch_init(4, 0, 1);
+    for (int i = 0; i < 4; ++i) {
+        common_batch_add(batch, llama_vocab_bos(test_ctx.vocab), i, { 0 }, true);
+    }
+    GGML_ASSERT(llama_decode(test_ctx.ctx.get(), batch) == 0);
+    llama_synchronize(test_ctx.ctx.get());
+
+    std::vector<std::vector<llama_token_data>> distributions;
+    llama_tokens draft;
+    for (int i = 0; i < 3; ++i) {
+        const auto token = llama_get_sampled_token_ith(test_ctx.ctx.get(), i);
+        float p = 0.0f;
+        GGML_ASSERT(llama_get_sampled_prob_ith(test_ctx.ctx.get(), i, token, &p));
+        GGML_ASSERT(p > 0.0f);
+        draft.push_back(token);
+        // p >= q guarantees acceptance without consuming a rejection draw.
+        distributions.push_back({ { token, 0.0f, p*0.5f },
+                                  { (token + 1) % test_ctx.n_vocab, 0.0f, 1.0f - p*0.5f } });
+    }
+    const auto all = common_sampler_sample_and_accept_n_rejection(sampler.get(), test_ctx.ctx.get(), { 0, 1, 2, 3 }, draft, distributions);
+    GGML_ASSERT(all.size() == 4);
+    GGML_ASSERT(std::equal(draft.begin(), draft.end(), all.begin()));
+
+    // Compare the fast and host paths on identical backend probabilities. q=1 forces rejection often; intermediate q exercises both random branches.
+    for (int repeat = 0; repeat < 32; ++repeat) {
+        common_sampler_ptr fast(common_sampler_clone(sampler.get()));
+        common_sampler_ptr host(common_sampler_clone(sampler.get()));
+        for (int i = 0; i < 3; ++i) {
+            distributions[i][0].p = repeat % 2 ? 1.0f : 0.1f;
+            distributions[i][1].p = 1.0f - distributions[i][0].p;
+        }
+        const auto actual = common_sampler_sample_and_accept_n_rejection(fast.get(), test_ctx.ctx.get(), { 0, 1, 2, 3 }, draft, distributions);
+        llama_set_sampler_lazy(test_ctx.ctx.get(), false);
+        const auto expected = common_sampler_sample_and_accept_n_rejection(host.get(), test_ctx.ctx.get(), { 0, 1, 2, 3 }, draft, distributions);
+        GGML_ASSERT(actual == expected);
+        // Subsequent calls detect an extra/missing rejection RNG draw.
+        const auto actual_next = common_sampler_sample_and_accept_n_rejection(fast.get(), test_ctx.ctx.get(), { 0, 1, 2, 3 }, draft, distributions);
+        const auto expected_next = common_sampler_sample_and_accept_n_rejection(host.get(), test_ctx.ctx.get(), { 0, 1, 2, 3 }, draft, distributions);
+        GGML_ASSERT(actual_next == expected_next);
+        llama_set_sampler_lazy(test_ctx.ctx.get(), true);
+        common_sampler_sample_and_accept_n_rejection(sampler.get(), test_ctx.ctx.get(), { 0, 1, 2, 3 }, draft, distributions);
+    }
+    llama_batch_free(batch);
+    printf("backend lazy rejection test PASSED\n");
+}
+
 struct backend_test_case {
     std::string name;
     void (*fn)(const test_params &);
@@ -2000,6 +2120,8 @@ struct backend_test_case {
 };
 
 static const backend_test_case BACKEND_TESTS[] = {
+    { "lazy", test_backend_lazy_sampling, true },
+    { "lazy_rejection", test_backend_lazy_rejection, true },
     { "greedy",          test_backend_greedy_sampling,         true  },
     { "logit_bias",      test_backend_logit_bias_sampling,     true  },
     { "penalties",       test_backend_penalties_sampling,      true  },
@@ -2027,6 +2149,11 @@ static test_args parse_cli(int argc, char ** argv) {
     for (int i = 1; i < argc; ++i) {
         const char * arg = argv[i];
 
+        if (std::strcmp(arg, "--numa") == 0 && i + 1 < argc && std::strcmp(argv[i + 1], "tensors") == 0) {
+            out.numa_tensors = true;
+            ++i;
+            continue;
+        }
         if (std::strcmp(arg, "--test") == 0) {
             if (i + 1 >= argc) {
                 fprintf(stderr, "--test expects a value\n");
@@ -2153,6 +2280,9 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "using '%s'\n", args.model.c_str());
 
     llama_backend_init();
+    if (args.numa_tensors) {
+        llama_numa_init(GGML_NUMA_STRATEGY_TENSORS);
+    }
 
     test_params params = {
         /*.model =*/ load_model(args),

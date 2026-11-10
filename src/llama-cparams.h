@@ -47,6 +47,8 @@ struct llama_cparams {
 
     int32_t  nextn_layer_offset = 0;
 
+    bool sampler_lazy = false;
+
     uint8_t mtp_device_draft_mode = LLAMA_MTP_DEVICE_DRAFT_DISABLED;
 
     float rope_freq_base;

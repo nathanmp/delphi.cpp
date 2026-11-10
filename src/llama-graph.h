@@ -940,6 +940,10 @@ struct llm_graph_params {
             return false;
         }
 
+        if (cparams.sampler_lazy != other.cparams.sampler_lazy) {
+            return false;
+        }
+
         if (cparams.mtp_device_draft_mode != other.cparams.mtp_device_draft_mode) {
             return false;
         }
@@ -1034,6 +1038,7 @@ public:
 
     std::vector<ggml_tensor *> t_sampled;
     std::vector<ggml_tensor *> t_sampled_probs;
+    std::vector<ggml_tensor *> t_sampled_probs_by_token;
     std::vector<ggml_tensor *> t_sampled_logits;
     std::vector<ggml_tensor *> t_candidates;
 

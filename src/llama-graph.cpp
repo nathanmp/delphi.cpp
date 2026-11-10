@@ -1658,6 +1658,7 @@ void llm_graph_result::reset() {
 
     t_sampled.clear();
     t_sampled_probs.clear();
+    t_sampled_probs_by_token.clear();
     t_sampled_logits.clear();
     t_candidates.clear();
 
@@ -1716,6 +1717,11 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
         }
     }
     for (auto * tensor : t_sampled_probs) {
+        if (tensor != nullptr) {
+            ggml_set_output(tensor);
+        }
+    }
+    for (auto * tensor : t_sampled_probs_by_token) {
         if (tensor != nullptr) {
             ggml_set_output(tensor);
         }
@@ -5033,6 +5039,7 @@ void llm_graph_context::build_sampling() const {
 
     res->t_sampled.resize(n_rows, nullptr);
     res->t_sampled_probs.resize(n_rows, nullptr);
+    res->t_sampled_probs_by_token.resize(n_rows, nullptr);
     res->t_sampled_logits.resize(n_rows, nullptr);
     res->t_candidates.resize(n_rows, nullptr);
 
@@ -5086,6 +5093,22 @@ void llm_graph_context::build_sampling() const {
                     res->t_sampled_probs[rows[i]] = data.probs;
                 }
                 outs[1] = data.probs;
+                ggml_build_forward_select(gf, outs.data(), outs.size(), i_out);
+            }
+
+            if (cparams.sampler_lazy && data.probs != nullptr) {
+                // Invert the candidate permutation once on the backend. Tokens outside a truncated candidate set have zero probability. Do not change normalization.
+                ggml_tensor * probs = data.probs;
+                if (data.candidates) {
+                    auto * zeros = ggml_reshape_2d(ctx0, ggml_fill(ctx0, logits_seq, 0.0f), 1, logits_seq->ne[0]);
+                    probs = ggml_set_rows(ctx0, zeros,
+                            ggml_reshape_2d(ctx0, probs, 1, ggml_nelements(probs)),
+                            ggml_reshape_1d(ctx0, data.candidates, ggml_nelements(data.candidates)));
+                }
+                if (active) {
+                    res->t_sampled_probs_by_token[rows[i]] = probs;
+                }
+                outs[1] = probs;
                 ggml_build_forward_select(gf, outs.data(), outs.size(), i_out);
             }
 
