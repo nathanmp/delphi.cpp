@@ -1605,16 +1605,24 @@ void llm_graph_input_sampling::set_input(const llama_ubatch * ubatch) {
             continue;
         }
 
-        auto & sampler = samplers[seq_id];
+        input_fns.at(seq_id)();
+    }
+}
 
-        if (sampler->iface->backend_set_input) {
-            sampler->iface->backend_set_input(sampler);
+void llm_graph_input_sampling::capture_inputs() {
+    for (const auto & [seq_id, sampler] : samplers) {
+        auto input = llama_sampler_backend_input_fn(sampler);
+        if (!input) {
+            // Rebuild custom callbacks because their private graph pointers cannot be captured.
+            inputs_reusable = false;
+            input = [sampler] { sampler->iface->backend_set_input(sampler); };
         }
+        input_fns.emplace(seq_id, std::move(input));
     }
 }
 
 bool llm_graph_input_sampling::can_reuse(const llm_graph_params & params) {
-    if (samplers.size() != params.samplers.size()) {
+    if (!inputs_reusable || samplers.size() != params.samplers.size()) {
         return false;
     }
 
@@ -5027,7 +5035,6 @@ void llm_graph_context::build_sampling() const {
     outs[0] = res->t_logits;
 
     auto inp_sampling = std::make_unique<llm_graph_input_sampling>(samplers);
-    res->add_input(std::move(inp_sampling));
 
     std::map<llama_seq_id, std::vector<uint32_t>> sampling_rows;
     uint32_t n_rows = 0;
@@ -5129,6 +5136,10 @@ void llm_graph_context::build_sampling() const {
             }
         }
     }
+
+    // The same sampler can build several cached graphs. Capture each graph's inputs after backend_apply has registered all rows.
+    inp_sampling->capture_inputs();
+    res->add_input(std::move(inp_sampling));
 
     // TODO: Call backend_accept after all samplers have been applied.
     /*

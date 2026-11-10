@@ -799,8 +799,11 @@ public:
 
     void set_input(const llama_ubatch * ubatch) override;
     bool can_reuse(const llm_graph_params & params) override;
+    void capture_inputs();
 
     std::map<llama_seq_id, llama_sampler *> samplers;
+    std::map<llama_seq_id, std::function<void()>> input_fns;
+    bool inputs_reusable = true;
 };
 
 //

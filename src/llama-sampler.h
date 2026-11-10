@@ -2,6 +2,7 @@
 
 #include "llama.h"
 
+#include <functional>
 #include <vector>
 
 struct llama_vocab;
@@ -37,6 +38,10 @@ struct llama_sampler_chain {
 
 uint32_t llama_sampler_backend_n_nodes(const llama_sampler * sampler);
 void llama_sampler_backend_begin(llama_sampler * sampler);
+
+// Capture this graph's input tensors while reading RNG and history from the live sampler.
+// An empty function means that the custom sampler's bindings cannot be captured safely.
+std::function<void()> llama_sampler_backend_input_fn(llama_sampler * sampler);
 
 struct llama_sampler * llama_sampler_init_dry_testing(
         float   dry_multiplier,

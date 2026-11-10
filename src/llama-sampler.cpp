@@ -1335,10 +1335,10 @@ static void llama_sampler_dist_backend_apply(
     data->probs = probs;
 }
 
-static void llama_sampler_dist_backend_set_input(struct llama_sampler * smpl) {
+static void llama_sampler_dist_set_input(struct llama_sampler * smpl, const std::vector<ggml_tensor *> & inp_uniforms) {
     auto * sctx = (llama_sampler_dist *) smpl->ctx;
 
-    GGML_ASSERT(!sctx->inp_uniforms.empty());
+    GGML_ASSERT(!inp_uniforms.empty());
 
     // We sample in double precision and cast to float to match rnd numbers of
     // llama_sampler_dist which uses double precision (sampling from
@@ -1349,7 +1349,7 @@ static void llama_sampler_dist_backend_set_input(struct llama_sampler * smpl) {
 
     auto & rng = sctx->backend_transactional ? sctx->rng_backend : sctx->rng;
 
-    for (auto * inp_uniform : sctx->inp_uniforms) {
+    for (auto * inp_uniform : inp_uniforms) {
         GGML_ASSERT(inp_uniform != nullptr);
 
         const float rnd = dist(rng);
@@ -1359,6 +1359,10 @@ static void llama_sampler_dist_backend_set_input(struct llama_sampler * smpl) {
             ++sctx->n_backend_draws_generated;
         }
     }
+}
+
+static void llama_sampler_dist_backend_set_input(struct llama_sampler * smpl) {
+    llama_sampler_dist_set_input(smpl, ((llama_sampler_dist *) smpl->ctx)->inp_uniforms);
 }
 
 static void llama_sampler_dist_backend_reset(struct llama_sampler * smpl) {
@@ -3120,10 +3124,10 @@ static void llama_sampler_penalties_backend_apply(
     }
 }
 
-static void llama_sampler_penalties_backend_set_input(struct llama_sampler * smpl) {
+static void llama_sampler_penalties_set_input(struct llama_sampler * smpl, ggml_tensor * inp_token_ids, ggml_tensor * inp_counts) {
     auto * sctx = (llama_sampler_penalties *) smpl->ctx;
 
-    if (!sctx->inp_token_ids || !sctx->inp_counts || sctx->n_max <= 0 || sctx->n_vocab <= 0) {
+    if (!inp_token_ids || !inp_counts || sctx->n_max <= 0 || sctx->n_vocab <= 0) {
         return;
     }
 
@@ -3175,8 +3179,13 @@ static void llama_sampler_penalties_backend_set_input(struct llama_sampler * smp
         sctx->host_counts   [i] = 0;
     }
 
-    ggml_backend_tensor_set(sctx->inp_token_ids, sctx->host_token_ids.data(), 0, sctx->n_max * sizeof(int32_t));
-    ggml_backend_tensor_set(sctx->inp_counts,    sctx->host_counts.data(),    0, sctx->n_max * sizeof(int32_t));
+    ggml_backend_tensor_set(inp_token_ids, sctx->host_token_ids.data(), 0, sctx->n_max * sizeof(int32_t));
+    ggml_backend_tensor_set(inp_counts,    sctx->host_counts.data(),    0, sctx->n_max * sizeof(int32_t));
+}
+
+static void llama_sampler_penalties_backend_set_input(struct llama_sampler * smpl) {
+    auto * sctx = (llama_sampler_penalties *) smpl->ctx;
+    llama_sampler_penalties_set_input(smpl, sctx->inp_token_ids, sctx->inp_counts);
 }
 
 static void llama_sampler_penalties_backend_reset(struct llama_sampler * smpl) {
@@ -3977,14 +3986,14 @@ static void llama_sampler_logit_bias_backend_apply(
     data->logits = ggml_add(ctx, data->logits, cur);
 }
 
-static void llama_sampler_logit_bias_backend_set_input(struct llama_sampler * smpl) {
+static void llama_sampler_logit_bias_set_input(struct llama_sampler * smpl, ggml_tensor * inp_logit_bias, ggml_tensor * inp_logit_idxs) {
     auto * sctx = (llama_sampler_logit_bias *) smpl->ctx;
     if (sctx->logit_bias.empty()) {
         return;
     }
 
-    GGML_ASSERT(sctx->inp_logit_bias != nullptr);
-    GGML_ASSERT(sctx->inp_logit_idxs != nullptr);
+    GGML_ASSERT(inp_logit_bias != nullptr);
+    GGML_ASSERT(inp_logit_idxs != nullptr);
 
     const size_t n = sctx->logit_bias.size();
 
@@ -3997,8 +4006,13 @@ static void llama_sampler_logit_bias_backend_set_input(struct llama_sampler * sm
         data_logit_idxs[i] = lb.token;
     }
 
-    ggml_backend_tensor_set(sctx->inp_logit_bias, data_logit_bias.data(), 0, ggml_nbytes(sctx->inp_logit_bias));
-    ggml_backend_tensor_set(sctx->inp_logit_idxs, data_logit_idxs.data(), 0, ggml_nbytes(sctx->inp_logit_idxs));
+    ggml_backend_tensor_set(inp_logit_bias, data_logit_bias.data(), 0, ggml_nbytes(inp_logit_bias));
+    ggml_backend_tensor_set(inp_logit_idxs, data_logit_idxs.data(), 0, ggml_nbytes(inp_logit_idxs));
+}
+
+static void llama_sampler_logit_bias_backend_set_input(struct llama_sampler * smpl) {
+    auto * sctx = (llama_sampler_logit_bias *) smpl->ctx;
+    llama_sampler_logit_bias_set_input(smpl, sctx->inp_logit_bias, sctx->inp_logit_idxs);
 }
 
 static void llama_sampler_logit_bias_backend_reset(struct llama_sampler * smpl) {
@@ -4348,6 +4362,48 @@ uint32_t llama_sampler_get_seed(const struct llama_sampler * smpl) {
     }
 
     return LLAMA_DEFAULT_SEED;
+}
+
+std::function<void()> llama_sampler_backend_input_fn(llama_sampler * sampler) {
+    if (!sampler->iface->backend_set_input || sampler->iface == &llama_sampler_empty_i) {
+        return [] {};
+    }
+    if (sampler->iface == &llama_sampler_chain_i) {
+        std::vector<std::function<void()>> inputs;
+        for (const auto & entry : ((llama_sampler_chain *) sampler->ctx)->samplers) {
+            if (!entry.is_backend) {
+                break;
+            }
+            auto input = llama_sampler_backend_input_fn(entry.ptr);
+            if (!input) {
+                return {};
+            }
+            inputs.push_back(std::move(input));
+        }
+        return [inputs = std::move(inputs)] {
+            for (const auto & input : inputs) {
+                input();
+            }
+        };
+    }
+    if (sampler->iface == &llama_sampler_dist_i) {
+        return [sampler, uniforms = ((llama_sampler_dist *) sampler->ctx)->inp_uniforms] {
+            llama_sampler_dist_set_input(sampler, uniforms);
+        };
+    }
+    if (sampler->iface == &llama_sampler_penalties_i) {
+        auto * sctx = (llama_sampler_penalties *) sampler->ctx;
+        return [sampler, ids = sctx->inp_token_ids, counts = sctx->inp_counts] {
+            llama_sampler_penalties_set_input(sampler, ids, counts);
+        };
+    }
+    if (sampler->iface == &llama_sampler_logit_bias_i) {
+        auto * sctx = (llama_sampler_logit_bias *) sampler->ctx;
+        return [sampler, bias = sctx->inp_logit_bias, ids = sctx->inp_logit_idxs] {
+            llama_sampler_logit_bias_set_input(sampler, bias, ids);
+        };
+    }
+    return {};
 }
 
 // perf

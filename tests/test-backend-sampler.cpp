@@ -3,6 +3,7 @@
 #include "llama-cpp.h"
 #include "common.h"
 #include "sampling.h"
+#include "../src/llama-ext.h"
 
 #ifdef NDEBUG
 #undef NDEBUG
@@ -1761,6 +1762,7 @@ static void test_backend_multi_output_dist_transaction(const test_params & param
     };
 
     llama_batch batch = decode();
+    const uint64_t n_built = llama_graph_n_built(test_ctx.ctx.get());
     verify_random(0, randoms[0], false);
     llama_batch_free(batch);
 
@@ -1780,6 +1782,8 @@ static void test_backend_multi_output_dist_transaction(const test_params & param
     verify_random(0, randoms[2]);
     llama_batch_free(batch);
 
+    // The RNG checks must pass while both ubatch graphs remain cached.
+    GGML_ASSERT(llama_graph_n_built(test_ctx.ctx.get()) == n_built);
     printf("backend multi-output dist transaction test PASSED\n");
 }
 
@@ -1996,6 +2000,110 @@ static void test_backend_multi_output_cpu_suffix(const test_params & params) {
 }
 
 
+static void test_backend_custom_graph_input(const test_params & params) {
+    struct input_state {
+        ggml_tensor * input = nullptr;
+        float value = 0.0f;
+    };
+    static llama_sampler_i iface = {
+        /* .name              = */ [](const llama_sampler *) { return "test-graph-input"; },
+        /* .accept            = */ nullptr,
+        /* .apply             = */ [](llama_sampler *, llama_token_data_array *) {},
+        /* .reset             = */ nullptr,
+        /* .clone             = */ nullptr,
+        /* .free              = */ [](llama_sampler * smpl) { delete (input_state *) smpl->ctx; },
+        /* .backend_init      = */ [](llama_sampler *, ggml_backend_buffer_type_t, uint32_t max_outputs) { return max_outputs == 1; },
+        /* .backend_accept    = */ nullptr,
+        /* .backend_apply     = */ [](llama_sampler * smpl, ggml_context * ctx, ggml_cgraph *, llama_sampler_data * data) {
+            auto * state = (input_state *) smpl->ctx;
+            state->input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+            ggml_set_input(state->input);
+            data->logits = ggml_add(ctx, data->logits, state->input);
+        },
+        /* .backend_set_input = */ [](llama_sampler * smpl) {
+            auto * state = (input_state *) smpl->ctx;
+            ggml_backend_tensor_set(state->input, &state->value, 0, sizeof(float));
+        },
+        /* .backend_reset     = */ [](llama_sampler * smpl) { ((input_state *) smpl->ctx)->input = nullptr; },
+        /* .copy_state        = */ nullptr,
+    };
+    auto * state = new input_state;
+    llama_sampler_ptr chain(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+    llama_sampler_chain_add(chain.get(), llama_sampler_init(&iface, state));
+    llama_sampler_chain_add(chain.get(), llama_sampler_init_greedy());
+    std::vector<llama_sampler_seq_config> configs = {{ 0, chain.get() }};
+    std::vector<llama_sampler_seq_config> reference_configs;
+    test_context actual(params, configs, 1, 1, 16);
+    test_context reference(params, reference_configs, 1, 1, 16);
+    int pos = 0;
+    for (int round = 0; round < 4; ++round) {
+        state->value = 0.25f * (round + 1);
+        const int width = round % 2 ? 1 : 2;
+        llama_batch batch = llama_batch_init(width, 0, 1);
+        for (int i = 0; i < width; ++i) {
+            common_batch_add(batch, llama_vocab_bos(actual.vocab), pos++, { 0 }, i + 1 == width);
+        }
+        GGML_ASSERT(llama_decode(actual.ctx.get(), batch) == 0);
+        GGML_ASSERT(llama_decode(reference.ctx.get(), batch) == 0);
+        const float * raw = llama_get_logits_ith(reference.ctx.get(), width - 1);
+        const float * logits = llama_get_sampled_logits_ith(actual.ctx.get(), width - 1);
+        for (int i = 0; i < actual.n_vocab; ++i) {
+            GGML_ASSERT(std::fabs(logits[i] - (raw[i] + state->value)) <= 1e-3f);
+        }
+        llama_batch_free(batch);
+    }
+    printf("backend custom graph input test PASSED\n");
+}
+
+static void test_backend_cached_history_inputs(const test_params & params) {
+    const auto * vocab = llama_model_get_vocab(params.model.get());
+    const int n_vocab = llama_vocab_n_tokens(vocab);
+    const llama_logit_bias bias = { llama_vocab_bos(vocab), 0.5f };
+    auto make_chain = [&] {
+        llama_sampler_ptr chain(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+        llama_sampler_chain_add(chain.get(), llama_sampler_init_logit_bias(n_vocab, 1, &bias));
+        llama_sampler_chain_add(chain.get(), llama_sampler_init_penalties(n_vocab, 8, 1.1f, 0.5f, 0.25f));
+        llama_sampler_chain_add(chain.get(), llama_sampler_init_greedy());
+        return chain;
+    };
+    auto chain = make_chain();
+    auto reference_chain = make_chain();
+    std::vector<llama_sampler_seq_config> configs = {{ 0, chain.get() }};
+    std::vector<llama_sampler_seq_config> reference_configs;
+    test_context actual(params, configs, 1, 1, 16);
+    test_context reference(params, reference_configs, 1, 1, 16);
+    llama_graph_alt_slots_reserve(actual.ctx.get(), 2, 2);
+    uint64_t n_built = 0;
+    int pos = 0;
+    for (int round = 0; round < 6; ++round) {
+        // Alternate graph shapes while changing the shared penalty history.
+        const llama_token history = round % 2 ? llama_vocab_eos(vocab) : llama_vocab_bos(vocab);
+        llama_sampler_accept(chain.get(), history);
+        llama_sampler_accept(reference_chain.get(), history);
+        const int width = round % 2 ? 1 : 2;
+        llama_batch batch = llama_batch_init(width, 0, 1);
+        for (int i = 0; i < width; ++i) {
+            common_batch_add(batch, llama_vocab_bos(vocab), pos++, { 0 }, i + 1 == width);
+        }
+        GGML_ASSERT(llama_decode(actual.ctx.get(), batch) == 0);
+        GGML_ASSERT(llama_decode(reference.ctx.get(), batch) == 0);
+        const float * raw = llama_get_logits_ith(reference.ctx.get(), width - 1);
+        const auto expected = apply_cpu_sampler(std::vector<float>(raw, raw + n_vocab), reference_chain.get());
+        const float * logits = llama_get_sampled_logits_ith(actual.ctx.get(), width - 1);
+        GGML_ASSERT(llama_get_sampled_logits_count_ith(actual.ctx.get(), width - 1) == (uint32_t) n_vocab);
+        for (int i = 0; i < n_vocab; ++i) {
+            GGML_ASSERT(std::fabs(logits[i] - expected[i].logit) <= 1e-3f);
+        }
+        if (round == 1) {
+            n_built = llama_graph_n_built(actual.ctx.get());
+        } else if (round > 1) {
+            GGML_ASSERT(llama_graph_n_built(actual.ctx.get()) == n_built);
+        }
+        llama_batch_free(batch);
+    }
+    printf("backend cached history input test PASSED\n");
+}
+
 static void test_backend_lazy_sampling(const test_params & params) {
     // Interleaved sequences force output reordering. A small top-k also checks zero probability outside the candidate support; k=0 checks the direct vocab path.
     for (int k : { 0, 16 }) {
@@ -2120,6 +2228,8 @@ struct backend_test_case {
 };
 
 static const backend_test_case BACKEND_TESTS[] = {
+    { "custom_graph_input", test_backend_custom_graph_input, true },
+    { "cached_history_inputs", test_backend_cached_history_inputs, true },
     { "lazy", test_backend_lazy_sampling, true },
     { "lazy_rejection", test_backend_lazy_rejection, true },
     { "greedy",          test_backend_greedy_sampling,         true  },
