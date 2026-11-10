@@ -10284,6 +10284,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_get_rows(type,     256,   5,         4, 700, 100, false));
     }
 
+    // Narrow gathers: row packing, partial blocks, strided views and the wide-row dispatch boundary.
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_I32}) {
+        for (int n : {1, 2, 3, 4, 7, 8, 16, 31, 32, 33}) {
+            test_cases.emplace_back(new test_get_rows(type, n, 37, 259, 2, 3));
+        }
+        for (int n : {1, 3, 32}) {
+            for (bool v : {false, true}) {
+                for (bool vs0 : {false, true}) {
+                    test_cases.emplace_back(new test_get_rows(type, n, 37, 259, 2, 3, v, vs0));
+                }
+            }
+        }
+    }
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_I32}) {
+        test_cases.emplace_back(new test_get_rows(type, 1, 154880, 154880));
+    }
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 3, 33, 700, 100));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 37, 65536));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 32, 37, 2048));
+
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 8, 2, 1, 1, false));
     // delphi: shapes whose launch step is a multiple of 64 Ki threads (ggml_cuda_grid_pad must leave them alone), small and large
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 5120, 8, 256, 1, 1, false));
