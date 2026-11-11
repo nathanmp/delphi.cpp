@@ -167,7 +167,23 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
                 has_short = has_short || (n_seq_tokens[seq] > 0 && n_seq_tokens[seq] <= n_split);
             }
             const uint32_t n_ubatch_seq = staggered && has_short && n_ubatch_mixed > 0 ? std::min(n_ubatch, n_ubatch_mixed) : n_ubatch;
-            for (llama_seq_id seq = 0; single && seq < LLAMA_MAX_SEQ; ++seq) {
+            // LLAMA_VERIFY_STREAMS=1: the short sequences (verify rows) go first, so that their graphs are queued on their own
+            // streams before the host builds and queues the prompt ubatches
+            static const bool short_first = [] {
+                const char * env = getenv("LLAMA_VERIFY_STREAMS");
+                return env != nullptr && atoi(env) != 0;
+            }();
+            std::vector<llama_seq_id> seq_order;
+            for (int pass = 0; pass < (staggered && short_first ? 2 : 1); ++pass) {
+                for (llama_seq_id seq = 0; seq < LLAMA_MAX_SEQ; ++seq) {
+                    const bool is_short = n_seq_tokens[seq] <= n_split;
+                    if (n_seq_tokens[seq] > 0 && (!staggered || !short_first || is_short == (pass == 0))) {
+                        seq_order.push_back(seq);
+                    }
+                }
+            }
+            for (size_t i_seq = 0; single && i_seq < seq_order.size(); ++i_seq) {
+                const llama_seq_id seq = seq_order[i_seq];
                 if (n_seq_tokens[seq] == 0 || (!staggered && n_seq_tokens[seq] <= n_split)) {
                     continue;
                 }

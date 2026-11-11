@@ -15,6 +15,7 @@
 
 #include <array>
 #include <condition_variable>
+#include <deque>
 #include <mutex>
 #include <map>
 #include <vector>
@@ -70,6 +71,16 @@ struct llama_context {
             uint32_t n_tokens_all, uint32_t n_tokens_prev);
 
     void synchronize();
+
+    // delphi: LLAMA_VERIFY_STREAMS (llama-verify-streams.cpp). Like synchronize(), but background prompt work of the main
+    // scheduler (set_prompt_background) may still run; the outputs of the last decode are complete
+    void synchronize_outputs();
+    bool    verify_streams_enabled() const { return verify_streams; }
+    void    set_prompt_background(bool value) { prompt_bg = value; }
+    int64_t prompt_background_ticket(int32_t * row_base) const;
+    int32_t prompt_background_pending();
+    bool    prompt_background_done(int64_t ticket);
+    void    prompt_background_wait();
 
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
@@ -551,6 +562,44 @@ private:
 
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
+
+    // delphi: LLAMA_VERIFY_STREAMS=1 (llama-verify-streams.cpp). The schedulers of the alternate graph slots (small
+    // ubatches: verify rows) use a second set of GPU backends, with their own high-priority streams, so their graphs do not
+    // wait behind the prompt ubatches that the main scheduler queued on the first set
+    struct bg_ticket {
+        int64_t                           id       = 0;
+        int32_t                           row_base = 0;
+        std::vector<ggml_backend_event_t> events; // per entry of `backends`, null for non-GPU backends
+    };
+    bool                          verify_streams = false;
+    std::vector<ggml_backend_ptr> backends_v;     // GPU backends of the second set
+    std::vector<ggml_backend_t>   backend_ptrs_v; // backend_ptrs, with the GPU backends of the second set
+    std::vector<int8_t>           seq_set;        // per sequence: set of its last ubatch (0 main, 1 alternate), -1 none
+    bool    prompt_bg       = false; // main-scheduler ubatches of the next decodes are background work
+    bool    decode_bg       = false; // the current decode is a background decode
+    bool    decode_bg_main  = false; // ... and it queued work on the main scheduler
+    bool    main_fg_queued  = false; // the main scheduler has foreground work that synchronize_outputs waits for
+    int64_t layer_inp_row_base = 0;  // added to the device feature rows of main-scheduler ubatches
+    int64_t bg_next = 0;
+    int64_t bg_last = -1;            // ticket of the last decode, -1 if it queued no background work
+    int32_t bg_last_row_base = 0;
+    bool    sync_outputs_only = false;
+    std::deque<bg_ticket>             bg_tickets;
+    std::vector<std::vector<ggml_backend_event_t>> bg_event_pool; // per entry of `backends`
+    bool (*bg_event_query)(ggml_backend_event_t) = nullptr;
+
+    void    verify_streams_init();
+    void    verify_streams_free();
+    ggml_backend_t * sched_backend_ptrs(int slot_id);
+    // the backend of scheduler s on the device of b (the alternate schedulers have their own GPU backends)
+    ggml_backend_t   sched_backend_of(ggml_backend_sched_t s, ggml_backend_t b) const;
+    void    verify_streams_decode_begin(uint32_t n_tokens_all);
+    void    verify_streams_decode_end(bool ok);
+    void    verify_streams_ubatch(const llama_ubatch & ubatch, int32_t n_outputs_ubatch);
+    void    verify_streams_sync_main();
+    void    bg_recycle(bg_ticket & t);
+    void    verify_streams_sync_alt();
+    int32_t bg_region_rows() const;
 
 public:
     // LLAMA_STATE_SEQ_FLAGS_ASYNC: device tensors are copied into pinned staging buffers on their backends' streams,

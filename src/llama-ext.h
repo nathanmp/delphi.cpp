@@ -163,6 +163,18 @@ LLAMA_API const float * llama_feature_handoff_nextn(struct llama_context * ctx, 
 LLAMA_API const float * llama_feature_handoff_layer_inp(struct llama_context * ctx, int32_t ticket, uint32_t lid);
 LLAMA_API void          llama_feature_handoff_release(struct llama_context * ctx, int32_t ticket);
 
+// LLAMA_VERIFY_STREAMS=1: the small ubatches (verify rows) run on their own high-priority device streams. With
+// llama_set_prompt_background(ctx, true), the large ubatches (main scheduler, no outputs) of the next decodes are
+// background work: llama_synchronize() and the output accessors do not wait for it. Each decode that queued such work has
+// a ticket (else -1); its device feature rows (llama_get_embeddings_layer_inp_tensor) are at row_base + batch index, and
+// stay there for the next 3 background decodes. llama_prompt_background_done() and _pending() do not wait; _wait() does.
+LLAMA_API bool          llama_verify_streams(const struct llama_context * ctx);
+LLAMA_API void          llama_set_prompt_background(struct llama_context * ctx, bool background);
+LLAMA_API int64_t       llama_prompt_background_ticket(struct llama_context * ctx, int32_t * row_base);
+LLAMA_API int32_t       llama_prompt_background_pending(struct llama_context * ctx);
+LLAMA_API bool          llama_prompt_background_done(struct llama_context * ctx, int64_t ticket);
+LLAMA_API void          llama_prompt_background_wait(struct llama_context * ctx);
+
 // number of compute graphs the context has built instead of reusing one (a build costs its construction, allocation
 // and device graph capture; the cost-aware draft depth drops rounds with builds from its round times)
 LLAMA_API uint64_t      llama_graph_n_built(const struct llama_context * ctx);

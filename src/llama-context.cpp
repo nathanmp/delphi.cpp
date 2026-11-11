@@ -724,6 +724,7 @@ llama_context::llama_context(
                 LLAMA_LOG_INFO("%s: expert cache off: %s\n", __func__, e.what());
             }
         }
+        verify_streams_init();
         sched_reserve();
 
         // LLAMA_MOE_CACHE_TIERS=<dev>:<MiB>[,...]: run-time tiers added at once, for tests without a VRAM sharing daemon
@@ -799,6 +800,7 @@ llama_context::~llama_context() {
 
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+    verify_streams_free();
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
@@ -1357,7 +1359,15 @@ void llama_context::synchronize() {
         return;
     }
 
-    ggml_backend_sched_synchronize(sched.get());
+    if (verify_streams) {
+        // synchronize_outputs() leaves the background prompt work of the main scheduler running
+        verify_streams_sync_alt();
+        if (!sync_outputs_only || main_fg_queued) {
+            verify_streams_sync_main();
+        }
+    } else {
+        ggml_backend_sched_synchronize(sched.get());
+    }
 
     if (!state_async_pending.empty()) {
         state_async_finish();
@@ -1687,7 +1697,7 @@ bool llama_context::get_sampled_prob_ith(int32_t idx, llama_token token, float *
     if (!cparams.sampler_lazy || !prob || token < 0 || (uint32_t) token >= model.vocab.n_tokens()) {
         return false;
     }
-    synchronize();
+    synchronize_outputs();
     output_reorder();
     try {
         const int64_t row = output_resolve_row(idx);
@@ -2519,6 +2529,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         reuse   = can_reuse();
     }
     graph_slots[graph_slot_live].last_use = ++graph_slot_clock;
+    verify_streams_ubatch(ubatch, n_outputs);
     auto * gf = res->get_gf();
 
     if (reuse) {
@@ -2937,6 +2948,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
     const uint32_t n_outputs_all = balloc->get_n_outputs();
     embd_nextn_backend_rows = 0;
+    verify_streams_decode_begin(n_tokens_all);
 
     if (output_all) {
         // require that all tokens are output
@@ -3366,6 +3378,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
+
+    verify_streams_decode_end(true);
 
     return 0;
 }
@@ -3875,8 +3889,8 @@ void llama_context::sched_set_workers(ggml_backend_sched_t s) {
         }
         const bool prefill = expert_cache && expert_cache->prefill_overlap() && b.get() == expert_cache->backend();
         const bool worker = remote || (enabled && prefill);
-        ggml_backend_sched_set_worker(s, b.get(), worker, worker ? share_worker_cpu(dev) : -1);
-        ggml_backend_sched_set_worker_ready(s, b.get(), prefill ? llama_expert_cache::prefill_worker_ready : nullptr,
+        ggml_backend_sched_set_worker(s, sched_backend_of(s, b.get()), worker, worker ? share_worker_cpu(dev) : -1);
+        ggml_backend_sched_set_worker_ready(s, sched_backend_of(s, b.get()), prefill ? llama_expert_cache::prefill_worker_ready : nullptr,
                 prefill ? expert_cache.get() : nullptr);
     }
 }
@@ -3997,7 +4011,7 @@ void llama_context::sched_set_stage_lender() {
         auto * dev = ggml_backend_get_device(b.get());
         if (dev && (!expert_device_policy.stage_allowed(ggml_backend_dev_name(dev)) ||
                 std::find(stage_blocked.begin(), stage_blocked.end(), dev) != stage_blocked.end())) {
-            ggml_backend_sched_stage_allow(sched.get(), b.get(), false);
+            ggml_backend_sched_stage_allow(sched.get(), sched_backend_of(sched.get(), b.get()), false);
         }
     }
     if (stage_min_tokens >= 0) {
@@ -4019,7 +4033,7 @@ void llama_context::graph_slot_activate(int id) {
     exchange(graph_slots[id]);
     graph_slot_live = id;
     if (!sched) {
-        sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
+        sched.reset(ggml_backend_sched_new(sched_backend_ptrs(id), backend_buft.data(), backend_ptrs.size(),
                 gf_res_reserve->get_max_nodes(), cparams.pipeline_parallel, cparams.op_offload));
         sched_set_stage_lender();
         gf_res_prev_active = nullptr;
@@ -4133,7 +4147,7 @@ size_t llama_context::share_release_compute() {
         freed += ggml_backend_sched_stage_release(s);
         for (auto & b : backends) {
             if (ggml_backend_dev_type(ggml_backend_get_device(b.get())) == GGML_BACKEND_DEVICE_TYPE_GPU) {
-                freed += ggml_backend_sched_get_buffer_size(s, b.get());
+                freed += ggml_backend_sched_get_buffer_size(s, sched_backend_of(s, b.get()));
             }
         }
     };
@@ -4205,10 +4219,10 @@ void llama_context::share_stage_allow(ggml_backend_dev_t dev, bool allow) {
             continue;
         }
         const bool permitted = allow && expert_device_policy.stage_allowed(ggml_backend_dev_name(dev));
-        ggml_backend_sched_stage_allow(sched.get(), b.get(), permitted);
+        ggml_backend_sched_stage_allow(sched.get(), sched_backend_of(sched.get(), b.get()), permitted);
         for (auto & slot : graph_slots) {
             if (slot.sched) {
-                ggml_backend_sched_stage_allow(slot.sched.get(), b.get(), permitted);
+                ggml_backend_sched_stage_allow(slot.sched.get(), sched_backend_of(slot.sched.get(), b.get()), permitted);
             }
         }
     }
@@ -4519,6 +4533,7 @@ llm_graph_params llama_context::graph_params(
     };
     params.share_gen = share_gen;
     params.samplers_gen = samplers_gen;
+    params.layer_inp_dev_row_base = &layer_inp_row_base;
     params.dsv41_prefill = dsv41_prefill_graph;
     if (dsv41_prefill_graph && dsv41_prefill_graph->last <= (int) cparams.n_layer_prefill) {
         std::fill(params.cparams.embeddings_layer_inp.begin(), params.cparams.embeddings_layer_inp.end(), false);
@@ -4688,7 +4703,7 @@ llm_graph_cb llama_context::graph_get_cb() const {
                 for (const auto & backend : backends) {
                     if (ggml_backend_get_device(backend.get()) == dev_layer) {
                         if (ggml_backend_supports_op(backend.get(), cur)) {
-                            ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend.get());
+                            ggml_backend_sched_set_tensor_backend(sched.get(), cur, sched_backend_of(sched.get(), backend.get()));
                         }
                     }
                 }
@@ -5804,17 +5819,17 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
     if (model.hparams.no_alloc) {
         for (size_t i = 0; i < backends.size(); ++i) {
             ggml_backend_t             backend = backends[i].get();
-            ggml_backend_buffer_type_t buft    = ggml_backend_sched_get_buffer_type(sched.get(), backend);
+            ggml_backend_buffer_type_t buft    = ggml_backend_sched_get_buffer_type(sched.get(), sched_backend_of(sched.get(), backend));
             ret[buft].compute += backend_buf_exp_size[i];
         }
     } else {
         for (const auto & backend_ptr : backends) {
             ggml_backend_t             backend = backend_ptr.get();
-            ggml_backend_buffer_type_t buft    = ggml_backend_sched_get_buffer_type(sched.get(), backend);
-            ret[buft].compute += ggml_backend_sched_get_buffer_size(sched.get(), backend);
+            ggml_backend_buffer_type_t buft    = ggml_backend_sched_get_buffer_type(sched.get(), sched_backend_of(sched.get(), backend));
+            ret[buft].compute += ggml_backend_sched_get_buffer_size(sched.get(), sched_backend_of(sched.get(), backend));
             for (const auto & slot : graph_slots) {
                 if (slot.sched) {
-                    ret[buft].compute += ggml_backend_sched_get_buffer_size(slot.sched.get(), backend);
+                    ret[buft].compute += ggml_backend_sched_get_buffer_size(slot.sched.get(), sched_backend_of(slot.sched.get(), backend));
                 }
             }
         }
@@ -6291,17 +6306,17 @@ void llama_set_warmup(llama_context * ctx, bool warmup) {
 }
 
 void llama_synchronize(llama_context * ctx) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 }
 
 float * llama_get_logits(llama_context * ctx) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return ctx->get_logits();
 }
 
 float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     float * res = nullptr;
 
@@ -6315,19 +6330,19 @@ float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
 }
 
 float * llama_get_embeddings(llama_context * ctx) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return ctx->get_embeddings();
 }
 
 float * llama_get_embeddings_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return ctx->get_embeddings_ith(i);
 }
 
 float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return ctx->get_embeddings_seq(seq_id);
 }
@@ -6382,13 +6397,13 @@ llama_memory_t llama_get_memory(const struct llama_context * ctx) {
 }
 
 float * llama_get_embeddings_nextn(llama_context * ctx) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return ctx->get_embeddings_nextn();
 }
 
 float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return ctx->get_embeddings_nextn_ith(i);
 }
@@ -6398,7 +6413,7 @@ ggml_tensor * llama_get_embeddings_nextn_tensor(llama_context * ctx) {
 }
 
 float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return ctx->get_embeddings_layer_inp(lid);
 }
@@ -6464,43 +6479,43 @@ bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler *
 }
 
 llama_token llama_get_sampled_token_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return ctx->get_sampled_token_ith(i);
 }
 
 float * llama_get_sampled_probs_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return ctx->get_sampled_probs_ith(i);
 }
 
 float * llama_get_sampled_logits_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return ctx->get_sampled_logits_ith(i);
 }
 
 llama_token * llama_get_sampled_candidates_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return const_cast<llama_token *>(ctx->get_sampled_candidates_ith(i));
 }
 
 uint32_t llama_get_sampled_candidates_count_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return static_cast<uint32_t>(ctx->get_sampled_candidates_count(i));
 }
 
 uint32_t llama_get_sampled_logits_count_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return static_cast<uint32_t>(ctx->get_sampled_logits_count(i));
 }
 
 uint32_t llama_get_sampled_probs_count_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return static_cast<uint32_t>(ctx->get_sampled_probs_count(i));
 }

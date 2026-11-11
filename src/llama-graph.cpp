@@ -180,8 +180,9 @@ void llm_graph_input_idx::set_input(const llama_ubatch * ubatch) {
     GGML_ASSERT(ggml_backend_buffer_is_host(idxs->buffer));
 
     int64_t * data = (int64_t *) idxs->data;
+    const int64_t base = row_base ? *row_base : 0;
     for (int64_t i = 0; i < n_tokens; ++i) {
-        data[i] = ubatch->data->idx[i];
+        data[i] = base + ubatch->data->idx[i];
     }
 }
 
@@ -1878,6 +1879,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     expert_cache     (params.expert_cache),
     engram_reader    (params.engram_reader),
     layer_inp_dev    (params.layer_inp_dev),
+    layer_inp_dev_row_base(params.layer_inp_dev_row_base),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -5008,6 +5010,7 @@ void llm_graph_context::build_layer_inp_dev() const {
 
     inp->idxs = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, n_tokens);
     ggml_set_input(inp->idxs);
+    inp->row_base = layer_inp_dev_row_base;
 
     // row layout: [layer_0 | layer_1 | ...] in ascending layer id order
     int64_t col = 0;

@@ -171,6 +171,7 @@ public:
     void set_input(const llama_ubatch * ubatch) override;
     bool can_reuse(const llm_graph_params & params) override;
     ggml_tensor * idxs = nullptr;
+    const int64_t * row_base = nullptr; // delphi: added to the rows at set_input (background prompt regions)
 };
 
 class llm_graph_input_pos : public llm_graph_input_i {
@@ -873,6 +874,7 @@ struct llm_graph_params {
     uint64_t samplers_gen = 0;
 
     struct llama_dsv41_prefill_graph * dsv41_prefill = nullptr;
+    const int64_t * layer_inp_dev_row_base = nullptr; // delphi: read at set_input; see llm_graph_input_idx
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
@@ -1131,6 +1133,7 @@ struct llm_graph_context {
     llama_expert_cache * expert_cache = nullptr;
     class llama_engram_reader * engram_reader = nullptr;
     ggml_tensor * layer_inp_dev = nullptr;
+    const int64_t * layer_inp_dev_row_base = nullptr; // delphi: read at set_input; see llm_graph_input_idx
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
