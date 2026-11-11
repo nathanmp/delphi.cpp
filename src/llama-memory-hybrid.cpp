@@ -156,14 +156,25 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
                 const char * env = getenv("LLAMA_STAGGERED_VERIFY");
                 return env != nullptr && atoi(env) != 0;
             }();
+            // LLAMA_STAGGERED_MIXED_UBATCH=N: when a batch has prompt and verify sequences, cut the prompts into ubatches of
+            // at most N tokens, so that they pipeline over the devices and the verify of the batch completes earlier
+            static const uint32_t n_ubatch_mixed = [] {
+                const char * env = getenv("LLAMA_STAGGERED_MIXED_UBATCH");
+                return env != nullptr ? (uint32_t) std::max(0, atoi(env)) : 0u;
+            }();
+            bool has_short = false;
+            for (llama_seq_id seq = 0; seq < LLAMA_MAX_SEQ; ++seq) {
+                has_short = has_short || (n_seq_tokens[seq] > 0 && n_seq_tokens[seq] <= n_split);
+            }
+            const uint32_t n_ubatch_seq = staggered && has_short && n_ubatch_mixed > 0 ? std::min(n_ubatch, n_ubatch_mixed) : n_ubatch;
             for (llama_seq_id seq = 0; single && seq < LLAMA_MAX_SEQ; ++seq) {
                 if (n_seq_tokens[seq] == 0 || (!staggered && n_seq_tokens[seq] <= n_split)) {
                     continue;
                 }
                 for (uint32_t left = n_seq_tokens[seq]; left > 0;) {
-                    uint32_t n = std::min(n_ubatch, left);
+                    uint32_t n = std::min(n_ubatch_seq, left);
                     // the trailing (1 + n_rs_seq) tokens of the seq stay in one ubatch
-                    if (n < left && left - n < n_tail && n_tail < n_ubatch) {
+                    if (n < left && left - n < n_tail && n_tail < n_ubatch_seq) {
                         n = left - n_tail;
                     }
                     auto ubatch = balloc.split_seq_id(n, seq);

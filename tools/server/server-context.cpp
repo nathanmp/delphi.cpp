@@ -4133,12 +4133,20 @@ private:
         auto & alora_scale       = batch.alora_scale;
         auto & alora_disabled_id = batch.alora_disabled_id;
 
+        // delphi: LLAMA_SERVER_PREFILL_CAP=N admits at most N prompt tokens to a batch that also has tokens of generating
+        // slots. A full n_batch of prompt makes the generating slots wait for all of its ubatches (seconds per token).
+        static const int32_t prefill_cap = [] {
+            const char * env = getenv("LLAMA_SERVER_PREFILL_CAP");
+            return env != nullptr ? std::max(0, atoi(env)) : 0;
+        }();
+        const int32_t n_batch_prompt = prefill_cap > 0 && batch.size() > 0 ? std::min(n_batch, batch.size() + prefill_cap) : n_batch;
+
         // next, batch any pending prompts without exceeding n_batch
         if (params_base.cont_batching || batch.size() == 0) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
             iterate(slots, [&](server_slot & slot) {
-                if (!add_ok || batch.size() >= n_batch) {
+                if (!add_ok || batch.size() >= n_batch_prompt) {
                     return; // batch is full, skip remaining slots
                 }
 
@@ -4601,7 +4609,7 @@ private:
                     };
 
                     // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch_prompt) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
