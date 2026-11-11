@@ -5297,6 +5297,25 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
     return ggml_backend_sched_compute_splits(sched);
 }
 
+void ggml_backend_sched_wait_graph(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    if (sched->n_copies <= 1) {
+        ggml_backend_sched_synchronize(sched);
+        return;
+    }
+    for (int i = 0; i < sched->n_backends; i++) {
+        ggml_backend_sched_worker_join(sched->workers[i]);
+    }
+    // the slot event of cur_copy is recorded after the last split of the last graph on each backend
+    for (int i = 0; i < sched->n_backends; i++) {
+        if (sched->slot_events[i][sched->cur_copy] != NULL) {
+            ggml_backend_event_synchronize(sched->slot_events[i][sched->cur_copy]);
+        } else {
+            ggml_backend_synchronize(sched->backends[i]);
+        }
+    }
+}
+
 void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     for (int i = 0; i < sched->n_backends; i++) {

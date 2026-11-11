@@ -379,6 +379,10 @@ extern "C" {
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);
+    // delphi: wait on the host until the last graph of this scheduler is complete on every backend. Unlike
+    // ggml_backend_sched_synchronize, do not wait for work that other schedulers queued later on the same backends.
+    // Falls back to ggml_backend_sched_synchronize without pipeline parallelism (no slot events).
+    GGML_API void                 ggml_backend_sched_wait_graph(ggml_backend_sched_t sched);
 
     // Reset all assignments and allocators - must be called before changing the node backends or allocating a new graph.
     // This in effect deallocates all tensors that were previously allocated and leaves them with dangling pointers.

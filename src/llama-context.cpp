@@ -70,6 +70,16 @@ static uint32_t multi_seq_split_tokens(const llama_cparams & cparams, const llam
     return hybrid ? hybrid->get_n_seq_split_tokens() * cparams.n_seq_max : 0;
 }
 
+// LLAMA_STAGGERED_VERIFY=1: the memory gives each sequence of a batch its own ubatches (llama_memory_hybrid), so that
+// pipeline parallelism overlaps the verify of one sequence on one device with the next sequence on another device
+static bool staggered_verify_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("LLAMA_STAGGERED_VERIFY");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     switch (ctx_type) {
         case LLAMA_CONTEXT_TYPE_DEFAULT: return LLM_GRAPH_TYPE_DEFAULT;
@@ -2517,7 +2527,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // with pipeline parallelism, the previous graph_compute_async may still be running
         // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
         // that the previous compute is still reading.
-        if (cparams.pipeline_parallel) {
+        // with staggered verify, the graphs of the other sequences are in other graph slots (own schedulers and
+        // inputs), so wait only for this scheduler's last graph and let their work continue on the devices
+        if (cparams.pipeline_parallel && staggered_verify_enabled()) {
+            ggml_backend_sched_wait_graph(sched.get());
+        } else if (cparams.pipeline_parallel) {
             ggml_backend_sched_synchronize(sched.get());
         }
 
@@ -3240,14 +3254,17 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
             // async copy the sampling data from the backend to the host
             copy_tensor_async_rows(res->t_sampled,        sampling.sampled,    1,      n_outputs_prev, sched.get());
-            const bool lazy = cparams.sampler_lazy && n_outputs_prev == 0 && n_outputs == n_outputs_all &&
-                    n_tokens_prev + ubatch.n_tokens == balloc->get_n_tokens() &&
+            // with staggered verify each sequence has its own ubatch, so the lazy rows of a ubatch start at n_outputs_prev
+            const bool lazy = cparams.sampler_lazy &&
+                    (staggered_verify_enabled() || (n_outputs_prev == 0 && n_outputs == n_outputs_all &&
+                                         n_tokens_prev + ubatch.n_tokens == balloc->get_n_tokens())) &&
                     std::any_of(res->t_sampled_probs_by_token.begin(), res->t_sampled_probs_by_token.end(),
                             [](ggml_tensor * tensor) { return tensor != nullptr; });
             if (lazy) {
-                for (size_t i = 0; i < res->t_sampled.size(); ++i) {
+                for (size_t i0 = 0; i0 < res->t_sampled.size(); ++i0) {
+                    const size_t i = n_outputs_prev + i0;
                     auto & row = sampling.lazy_rows[i];
-                    if (i >= sampling.lazy_storage.size()) {
+                    while (i >= sampling.lazy_storage.size()) {
                         sampling.lazy_storage.emplace_back(new std::array<sampling_info::lazy_tensor, 4>);
                     }
                     bool allocation_failed = false;
@@ -3276,8 +3293,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
                         ggml_backend_tensor_copy_async(backend, backend, src, &dst.tensor);
                         return &dst.tensor;
                     };
-                    row = { store(res->t_sampled_logits[i], 0), store(res->t_sampled_probs[i], 1),
-                            store(res->t_candidates[i], 2), store(res->t_sampled_probs_by_token[i], 3) };
+                    row = { store(res->t_sampled_logits[i0], 0), store(res->t_sampled_probs[i0], 1),
+                            store(res->t_candidates[i0], 2), store(res->t_sampled_probs_by_token[i0], 3) };
                     if (allocation_failed) {
                         LLAMA_LOG_ERROR("%s: failed to allocate lazy sampling output\n", __func__);
                         return -2;
