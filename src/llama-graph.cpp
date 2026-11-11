@@ -1336,10 +1336,13 @@ bool llm_graph_input_dsv4::can_reuse(const llm_graph_params & params) {
     if (inp_raw->self_k_idxs_dec && inp_raw->self_k_idxs_dec->buffer) {
         res &= inp_raw->self_k_idxs_dec->ne[0] == raw_ctx->get_n_write_dec();
     }
-    if (inp_raw->self_kq_mask && inp_raw->self_kq_mask->buffer) {
+    // Check the raw masks also when they have no buffer. Then all the layers read the raw window, and set_input
+    // fills the window from a host mask of the build-time shape: with a stale n_kv it misses the newest cells.
+    // The raw K views of the graph also have the build-time n_kv.
+    if (inp_raw->self_kq_mask) {
         res &= dsv4_can_reuse_raw_kq_mask(inp_raw->self_kq_mask, raw_ctx, params.ubatch, n_stream);
     }
-    if (inp_raw->self_kq_mask_dec && inp_raw->self_kq_mask_dec->buffer) {
+    if (inp_raw->self_kq_mask_dec) {
         res &= dsv4_can_reuse_raw_kq_mask(inp_raw->self_kq_mask_dec, raw_ctx, ubatch_dec, n_stream, true);
     }
     {
