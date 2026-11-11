@@ -7880,6 +7880,45 @@ static void ggml_backend_cuda_trim(ggml_backend_t backend) {
     }
 }
 
+// delphi: create the compute stream of a new backend with the highest (high = true) or lowest stream priority of its device.
+// The device then starts the blocks of the kernels on this stream before those of lower-priority streams. False if the
+// stream exists already or priorities are not available.
+static bool ggml_backend_cuda_set_stream_priority(ggml_backend_t backend, bool high) {
+#if defined(GGML_USE_MUSA)
+    GGML_UNUSED_VARS(backend, high);
+    return false;
+#else
+    if (!ggml_backend_is_cuda(backend)) {
+        return false;
+    }
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    if (ctx->streams[ctx->device][0] != nullptr) {
+        return false;
+    }
+    ggml_cuda_set_device(ctx->device);
+    int lo = 0;
+    int hi = 0;
+#if defined(GGML_USE_HIP)
+    CUDA_CHECK(hipDeviceGetStreamPriorityRange(&lo, &hi));
+    CUDA_CHECK(hipStreamCreateWithPriority(&ctx->streams[ctx->device][0], hipStreamNonBlocking, high ? hi : lo));
+#else
+    CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&lo, &hi));
+    CUDA_CHECK(cudaStreamCreateWithPriority(&ctx->streams[ctx->device][0], cudaStreamNonBlocking, high ? hi : lo));
+#endif
+    return true;
+#endif
+}
+
+// delphi: true if the work before the last record of the event is complete; does not wait
+static bool ggml_backend_cuda_event_query(ggml_backend_event_t event) {
+    const cudaError_t err = cudaEventQuery((cudaEvent_t) event->context);
+    if (err == cudaErrorNotReady) {
+        return false;
+    }
+    CUDA_CHECK(err);
+    return true;
+}
+
 // delphi: queue a copy between two device tensors, on any devices, on the stream of `backend` (the scheduler's backend
 // workers pull their inputs and push their outputs on their own stream; the caller orders it with events). False if the
 // buffers are not CUDA buffers or the devices cannot copy directly.
@@ -7916,6 +7955,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_trim") == 0) {
         return (void *) ggml_backend_cuda_trim;
+    }
+    if (strcmp(name, "ggml_backend_set_stream_priority") == 0) {
+        return (void *) ggml_backend_cuda_set_stream_priority;
+    }
+    if (strcmp(name, "ggml_backend_event_query") == 0) {
+        return (void *) ggml_backend_cuda_event_query;
     }
     if (strcmp(name, "ggml_backend_host_numa_buffer_type") == 0) {
         return (void *) ggml_backend_cuda_host_numa_buffer_type;

@@ -1135,6 +1135,16 @@ static bool ggml_gallocr_reserve_n_impl(
                 }
             }
 #endif
+            // delphi: GGML_GALLOC_GROW_PCT=N gives a buffer that grows N % more room than this graph needs. Each growth frees
+            // the old buffer, and on CUDA that waits for all work of the device (LLAMA_VERIFY_STREAMS: background prompt work)
+            if (galloc->buffers[i] != NULL && !no_alloc) {
+                const char * env = getenv("GGML_GALLOC_GROW_PCT");
+                const int grow_pct = env != NULL ? atoi(env) : 0;
+                for (int c = 0; grow_pct > 0 && c < galloc->buf_tallocs[i]->n_chunks; c++) {
+                    struct tallocr_chunk * chunk = galloc->buf_tallocs[i]->chunks[c];
+                    chunk->max_size += chunk->max_size / 100 * (size_t) grow_pct;
+                }
+            }
             ggml_vbuffer_free(galloc->buffers[i]);
             if (no_alloc) {
                 galloc->buffers[i] = NULL;
