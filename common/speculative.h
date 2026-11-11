@@ -132,6 +132,10 @@ bool common_speculative_process(common_speculative * spec, const llama_batch & b
 // prompt batch): the draft ingests it on a worker thread while the caller continues with the next target decode
 bool common_speculative_process_async(common_speculative * spec, const llama_batch & batch);
 
+// delphi: like common_speculative_process, for a batch whose device feature rows start at row_base (background prompt
+// work of a target with LLAMA_VERIFY_STREAMS, see llama_prompt_background_ticket); the rows must be complete
+bool common_speculative_process_rows(common_speculative * spec, const llama_batch & batch, int32_t row_base);
+
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);
 

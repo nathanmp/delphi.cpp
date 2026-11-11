@@ -28,6 +28,7 @@
 #include "mtmd-helper.h"
 #include "../../src/llama-ext.h" // llama_expert_cache_auto, llama_share_stage_calibrate
 
+#include <deque>
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
@@ -1023,6 +1024,47 @@ private:
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
 
     common_speculative_ptr spec;
+
+    // delphi: LLAMA_VERIFY_STREAMS - prompt batches of a round with generating slots run as background work of the target
+    // (llama_set_prompt_background); the draft ingests their feature rows once they are done (vs_ingest)
+    struct vs_deferred {
+        int64_t     ticket   = -1;
+        int32_t     row_base = 0;
+        llama_batch batch    = {};
+    };
+    std::deque<vs_deferred> vs_queue;
+    bool    vs_round      = false; // this round may queue background prompt work
+    bool    vs_round_bg   = false; // the batch of this round is background prompt work + generating tokens
+    bool    vs_tail_round = false; // the batch of this round ends the prompt of a slot
+    int32_t vs_n_gen      = 0;     // tokens of generating slots at the start of the batch
+
+    bool vs_enabled() const {
+        return ctx_tgt && llama_verify_streams(ctx_tgt) && (!spec || llama_get_embeddings_layer_inp_tensor(ctx_tgt) != nullptr);
+    }
+
+    // ingest the deferred prompt rows whose background work is done (all of them with wait)
+    void vs_ingest(bool wait) {
+        bool done = false;
+        while (!vs_queue.empty()) {
+            auto & d = vs_queue.front();
+            if (!llama_prompt_background_done(ctx_tgt, d.ticket)) {
+                if (!wait) {
+                    break;
+                }
+                llama_prompt_background_wait(ctx_tgt);
+            }
+            if (spec && !common_speculative_process_rows(spec.get(), d.batch, d.row_base)) {
+                SRV_ERR("%s", "failed to process deferred speculative batch\n");
+            }
+            llama_batch_free(d.batch);
+            vs_queue.pop_front();
+            done = true;
+        }
+        // a later background decode writes these rows again: the draft must have read them by then
+        if (done && ctx_dft) {
+            llama_synchronize(ctx_dft);
+        }
+    }
 
     bool add_bos_token = true;
 
@@ -3818,6 +3860,10 @@ private:
             }
         }
 
+        if (!vs_queue.empty()) {
+            vs_ingest(false);
+        }
+
         try {
             scoped_timer t(t_pre_decode, n_pre_decode);
             pre_decode();
@@ -3831,6 +3877,11 @@ private:
         }
 
         GGML_ASSERT(batch.slot_batched || batch.size() == 0);
+
+        vs_round_bg = vs_round && batch.size() > vs_n_gen && batch.size() <= llama_n_batch(ctx_tgt) && !batch.has_embd;
+        for (int32_t i = 0; vs_round_bg && i < batch.size(); ++i) {
+            vs_round_bg = i < vs_n_gen ? !batch.tokens[i].is_prompt : batch.tokens[i].is_prompt && !batch.tokens[i].output;
+        }
 
         if (batch.slot_batched) {
             auto & slot_batched      = batch.slot_batched;
@@ -4139,7 +4190,25 @@ private:
             const char * env = getenv("LLAMA_SERVER_PREFILL_CAP");
             return env != nullptr ? std::max(0, atoi(env)) : 0;
         }();
-        const int32_t n_batch_prompt = prefill_cap > 0 && batch.size() > 0 ? std::min(n_batch, batch.size() + prefill_cap) : n_batch;
+        int32_t n_batch_prompt = prefill_cap > 0 && batch.size() > 0 ? std::min(n_batch, batch.size() + prefill_cap) : n_batch;
+
+        // delphi: LLAMA_VERIFY_STREAMS - with generating slots, a round adds at most one chunk of prompt (default 1024 tokens),
+        // as background work, while fewer than LLAMA_VERIFY_STREAMS_DEPTH (default 3) such chunks are in flight
+        static const int32_t vs_depth = [] {
+            const char * env = getenv("LLAMA_VERIFY_STREAMS_DEPTH");
+            return env != nullptr ? std::min(3, std::max(1, atoi(env))) : 3;
+        }();
+        static const int32_t vs_tail = [] {
+            const char * env = getenv("LLAMA_VERIFY_STREAMS_TAIL");
+            return env != nullptr ? std::min(32, std::max(1, atoi(env))) : 16;
+        }();
+        vs_round      = batch.size() > 0 && vs_enabled();
+        vs_tail_round = false;
+        vs_n_gen      = batch.size();
+        const int32_t vs_cap = prefill_cap > 0 ? prefill_cap : 1024;
+        if (vs_round) {
+            n_batch_prompt = llama_prompt_background_pending(ctx_tgt) >= vs_depth ? batch.size() : std::min(n_batch, batch.size() + vs_cap);
+        }
 
         // next, batch any pending prompts without exceeding n_batch
         if (params_base.cont_batching || batch.size() == 0) {
@@ -4557,6 +4626,11 @@ private:
                         }
 
                         // process the mtmd chunk
+                        // delphi: LLAMA_VERIFY_STREAMS - the media decode is not background work (see decode())
+                        if (!vs_queue.empty()) {
+                            vs_ingest(true);
+                        }
+
                         // note: it submits its own decode, potentially be async
                         //       so the timing is queued and flushed on the next sync
                         metrics_pre_decode();
@@ -4609,7 +4683,30 @@ private:
                     };
 
                     // add prompt tokens for processing in the current batch
+                    bool vs_tail_ok = false;
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch_prompt) {
+                        // delphi: LLAMA_VERIFY_STREAMS - the last tokens of a prompt (with its output) go alone in a batch, after
+                        // the background work: the generating slots then wait for one small ubatch only
+                        if (vs_round && !vs_tail_ok) {
+                            if (vs_tail_round) {
+                                break;
+                            }
+                            const int32_t n_left = slot.task->n_tokens() - slot.prompt.n_tokens();
+                            // a short last chunk has a new graph shape, and its synchronous input uploads then wait behind the
+                            // copies of the chunks in flight (about 1 s on the CMPs): it waits for them on the device instead
+                            if (batch.size() == vs_n_gen && n_left > vs_tail && n_left - vs_tail < vs_cap &&
+                                    llama_prompt_background_pending(ctx_tgt) > 0) {
+                                break;
+                            }
+                            if (n_left <= vs_tail) {
+                                if (batch.size() != vs_n_gen || !vs_queue.empty() || llama_prompt_background_pending(ctx_tgt) > 0) {
+                                    break;
+                                }
+                                vs_tail_ok    = true;
+                                vs_tail_round = true;
+                            }
+                        }
+
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
@@ -4801,6 +4898,14 @@ private:
 
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
+        // delphi: LLAMA_VERIFY_STREAMS - a prompt batch that is not background work comes after the background work and
+        // its deferred rows (it reuses their feature rows and its draft ingest needs them)
+        const bool vs_bg = vs_round_bg && off == 0 && batch_view.n_tokens == batch.size();
+        if (!vs_bg && (has_prompt || batch.has_embd) && !vs_queue.empty()) {
+            vs_ingest(true);
+        }
+        llama_set_prompt_background(ctx_tgt, vs_bg);
+
         int ret = 0;
         queue_tasks.yield_to_queue([&]() {
             const auto phase = has_prompt ? GGML_EXEC_TRACE_PHASE_PROMPT : GGML_EXEC_TRACE_PHASE_GENERATION_TARGET;
@@ -4810,6 +4915,7 @@ private:
             if (!has_prompt) {
                 common_spec_ledger_span(COMMON_SPEC_LEDGER_TGT_DECODE, t_decode, batch_view.n_tokens);
             }
+            llama_set_prompt_background(ctx_tgt, false);
             if (ret == 0 && has_output) {
                 const uint64_t t_sync = common_spec_ledger_now();
                 llama_synchronize(ctx_tgt);
@@ -4875,6 +4981,30 @@ private:
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
+        // the background prompt rows of the batch: the draft ingests them when the target has done them
+        int32_t vs_row_base = 0;
+        const int64_t vs_ticket = vs_bg ? llama_prompt_background_ticket(ctx_tgt, &vs_row_base) : -1;
+        llama_batch spec_view = batch_view;
+        if (vs_ticket >= 0) {
+            const int32_t n = batch_view.n_tokens - vs_n_gen;
+            vs_deferred d;
+            d.ticket   = vs_ticket;
+            d.row_base = vs_row_base + vs_n_gen;
+            d.batch    = llama_batch_init(n, 0, 1);
+            d.batch.n_tokens = n;
+            for (int32_t i = 0; i < n; ++i) {
+                const int32_t j = vs_n_gen + i;
+                GGML_ASSERT(batch_view.n_seq_id[j] == 1);
+                d.batch.token[i]     = batch_view.token[j];
+                d.batch.pos[i]       = batch_view.pos[j];
+                d.batch.n_seq_id[i]  = 1;
+                d.batch.seq_id[i][0] = batch_view.seq_id[j][0];
+                d.batch.logits[i]    = 0;
+            }
+            vs_queue.push_back(d);
+            spec_view.n_tokens = vs_n_gen;
+        }
+
         if (spec) {
             bool ok = true;
             queue_tasks.yield_to_queue([&]() {
@@ -4882,8 +5012,8 @@ private:
                 server_exec_trace_phase_scope trace_phase(phase);
                 // an intermediate prompt batch: the draft ingests it while the next target batch runs
                 ok = has_prompt && !has_output ?
-                    common_speculative_process_async(spec.get(), batch_view) :
-                    common_speculative_process(spec.get(), batch_view);
+                    common_speculative_process_async(spec.get(), spec_view) :
+                    common_speculative_process(spec.get(), spec_view);
             });
 
             if (!ok) {

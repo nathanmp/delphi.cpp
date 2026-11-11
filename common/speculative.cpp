@@ -301,6 +301,8 @@ using common_speculative_draft_params_vec = std::vector<common_speculative_draft
 struct common_speculative_tgt_features {
     llama_context * ctx    = nullptr;
     int32_t         ticket = -1;
+    // delphi: first row of the batch in the target's device feature buffer (background prompt work, LLAMA_VERIFY_STREAMS)
+    int32_t         row_base = 0;
 
     const float * nextn() const {
         return ticket < 0 ? llama_get_embeddings_nextn(ctx) : llama_feature_handoff_nextn(ctx, ticket);
@@ -1480,14 +1482,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                 if (features) {
                     const int32_t row = i_batch_beg[seq_id] + offset;
-                    GGML_ASSERT(row >= 0 && row + n_chunk <= features->ne[1]);
+                    const int32_t row_dev = row + tgt.row_base; // the row in the target's feature buffer
+                    GGML_ASSERT(row_dev >= 0 && row_dev + n_chunk <= features->ne[1]);
                     ggml_tensor view = *features;
                     view.ne[1] = n_chunk;
                     view.nb[2] = view.nb[1] * n_chunk;
                     view.nb[3] = view.nb[2];
-                    view.data = (char *) features->data + row * features->nb[1];
+                    view.data = (char *) features->data + row_dev * features->nb[1];
                     view.view_src = features;
-                    view.view_offs = row * features->nb[1];
+                    view.view_offs = row_dev * features->nb[1];
                     llama_batch inject = batch_inject;
                     inject.n_tokens = n_chunk;
                     inject.embd = nullptr;
@@ -3723,6 +3726,15 @@ bool common_speculative_process(common_speculative * spec, const llama_batch & b
                 llama_memory_seq_pos_max(llama_get_memory(spec->ctx_dft), 0), 2);
     }
     return result;
+}
+
+bool common_speculative_process_rows(common_speculative * spec, const llama_batch & batch, int32_t row_base) {
+    if (spec == nullptr) {
+        return true;
+    }
+    const bool ok = common_speculative_wait(spec);
+    const common_speculative_tgt_features tgt = { spec->ctx_tgt, -1, row_base };
+    return common_speculative_process_impl(spec, batch, tgt) && ok;
 }
 
 bool common_speculative_process_async(common_speculative * spec, const llama_batch & batch) {
