@@ -999,6 +999,7 @@ private:
         return env == nullptr || atoi(env) != 0;
     }();
     bool ckpt_async_pending = false;
+    std::deque<common_prompt_checkpoint> ckpt_retired;
 
     void ckpt_async_sync() {
         if (ckpt_async_pending) {
@@ -1010,6 +1011,18 @@ private:
                 llama_synchronize(ctx_dft);
             }
             ckpt_async_pending = false;
+        }
+        ckpt_retired.clear();
+    }
+
+    void ckpt_async_retire(common_prompt_checkpoint & ckpt) {
+        // Eviction must retain download destinations, but an old checkpoint need not drain newer prompt work.
+        // Bound the extra host storage and keep the synchronous path when the checkpoint must be spilled.
+        if (ckpt_async_pending && vs_enabled() && !ckpt_spill.enabled() && ckpt_retired.size() < 4) {
+            common_speculative_wait_ctx(ctx_dft);
+            ckpt_retired.push_back(std::move(ckpt));
+        } else {
+            ckpt_async_sync();
         }
     }
 
@@ -2892,7 +2905,7 @@ private:
             if (it->n_tokens == n_tokens_new) {
                 SLT_TRC(slot, "superseding context checkpoint at n_tokens = %" PRId64 "\n", it->n_tokens);
                 if (it->id_task == id_task) {
-                    ckpt_async_sync();
+                    ckpt_async_retire(*it);
                 }
                 it = slot.prompt.checkpoints.erase(it);
             } else {
@@ -2923,12 +2936,12 @@ private:
             // make room for the new checkpoint, if needed
             const auto victim = server_ckpt_pick_victim(slot.prompt.checkpoints, n_tokens_new, params_base.ckpt_evict, params_base.ckpt_pin_first);
 
-            if (victim->id_task == id_task) {
-                ckpt_async_sync();
-            }
-
             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                     victim->pos_min, victim->pos_max, victim->n_tokens, (float) victim->size() / 1024 / 1024);
+
+            if (victim->id_task == id_task) {
+                ckpt_async_retire(*victim);
+            }
 
             ckpt_spill_put(slot, *victim);
 
