@@ -875,11 +875,12 @@ struct llm_graph_params {
 
     struct llama_dsv41_prefill_graph * dsv41_prefill = nullptr;
     const int64_t * layer_inp_dev_row_base = nullptr; // delphi: read at set_input; see llm_graph_input_idx
+    uint32_t n_tokens_layout = 0; // prompt partitioning uses the main scheduler's reserved width
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
-        if (dsv41_prefill || other.dsv41_prefill) {
+        if (dsv41_prefill || other.dsv41_prefill || n_tokens_layout != other.n_tokens_layout) {
             return false;
         }
         // first check the ubatch
@@ -1115,6 +1116,7 @@ struct llm_graph_context {
     const float norm_rms_eps;
 
     const int64_t n_tokens;
+    const int64_t n_tokens_layout;
     const int64_t n_outputs;
     const int32_t n_ctx_orig; // yarn
 

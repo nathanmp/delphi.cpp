@@ -578,8 +578,17 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
     // F16 [n_pools, rows]: both grow with the context times the rows (-c 1048576, -ub 4096: 4 GiB + 2 GiB per device).
     // With more than one chunk, each chunk makes its own interval mask, so that the full mask is not kept for all the
     // layers of the device. The single-row paths (temporal top-k, MTP selection sharing) never chunk.
-    const int64_t n_chunk = n_tps == 1 ? 1 : chunk_size(n_tps, n_tps, n_pools_max);
-    const bool chunked = n_chunk < n_tps;
+    static const bool stable_prefill_chunks = [] {
+        const char * env = std::getenv("LLAMA_GLM5_STABLE_PREFILL_CHUNKS");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+    // Keep the partition count of the full prompt ubatch. At -c 1572864 -np 3 -ub 1024, 1024 queries need two
+    // pieces but 1020 fit in one. Changing that count replaces the allocation plan and drains the pipeline.
+    const int64_t n_tps_layout = stable_prefill_chunks && n_tokens_layout > 0 ?
+            std::max<int64_t>(n_tps, n_tokens_layout/n_stream) : n_tps;
+    const int64_t n_chunk = n_tps == 1 ? 1 : chunk_size(n_tps_layout, n_tps_layout, n_pools_max);
+    const int64_t n_chunks = n_tps == 1 ? 1 : std::min<int64_t>(n_tps, (n_tps_layout + n_chunk - 1)/n_chunk);
+    const bool chunked = n_chunks > 1;
 
     ggml_backend_dev_t dev = layer.wo->buffer ?
             ggml_backend_buft_get_device(ggml_backend_buffer_get_type(layer.wo->buffer)) : nullptr;
@@ -726,8 +735,9 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
 
     ggml_tensor * top_k = nullptr;
     ggml_tensor * selected_valid = nullptr;
-    for (int64_t q0 = 0; q0 < n_tps; q0 += n_chunk) {
-        const int64_t nq = std::min<int64_t>(n_chunk, n_tps - q0);
+    for (int64_t part = 0, q0 = 0; q0 < n_tps; ++part) {
+        const int64_t nq = stable_prefill_chunks && n_tokens_layout > 0 ?
+                n_tps/n_chunks + (part < n_tps%n_chunks) : std::min<int64_t>(n_chunk, n_tps - q0);
 
         ggml_tensor * iq_c = rows_of(iq, 2, q0, nq);
         ggml_tensor * w_c  = rows_of(w,  1, q0, nq);
@@ -841,6 +851,7 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
                 ggml_build_forward_expand(gf, selected_valid);
             }
         }
+        q0 += nq;
     }
 
     if (expand) {

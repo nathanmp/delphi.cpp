@@ -1865,6 +1865,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     norm_eps         (hparams.f_norm_eps),
     norm_rms_eps     (hparams.f_norm_rms_eps),
     n_tokens         (ubatch.n_tokens),
+    n_tokens_layout  (params.n_tokens_layout),
     n_outputs        (params.n_outputs),
     n_ctx_orig       (cparams.n_ctx_orig_yarn),
     pooling_type     (cparams.pooling_type),

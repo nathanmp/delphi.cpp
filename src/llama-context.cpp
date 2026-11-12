@@ -4581,6 +4581,10 @@ llm_graph_params llama_context::graph_params(
     params.samplers_gen = samplers_gen;
     params.layer_inp_dev_row_base = &layer_inp_row_base;
     params.dsv41_prefill = dsv41_prefill_graph;
+    if (graph_slot_live == 0 && ubatch.n_tokens > graph_alt_max_tokens &&
+            ubatch.n_seqs_unq == 1 && ubatch.n_seq_tokens == ubatch.n_tokens) {
+        params.n_tokens_layout = cparams.n_ubatch;
+    }
     if (dsv41_prefill_graph && dsv41_prefill_graph->last <= (int) cparams.n_layer_prefill) {
         std::fill(params.cparams.embeddings_layer_inp.begin(), params.cparams.embeddings_layer_inp.end(), false);
         params.cparams.embeddings_layer_inp_dev = false;
