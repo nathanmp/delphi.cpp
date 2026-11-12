@@ -1175,6 +1175,7 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
 struct ggml_cuda_retired_buffers {
     std::mutex mutex;
     std::vector<void *> ptrs;
+    std::vector<std::pair<void *, size_t>> numa_ptrs;
     size_t bytes = 0;
 };
 
@@ -1198,9 +1199,11 @@ static void ggml_cuda_retired_flush(int device) {
         g_cuda_retired[device].bytes = 0;
     }
     std::vector<void *> ptrs_host;
+    std::vector<std::pair<void *, size_t>> ptrs_numa;
     {
         std::lock_guard<std::mutex> lock(g_cuda_retired_host.mutex);
         ptrs_host.swap(g_cuda_retired_host.ptrs);
+        ptrs_numa.swap(g_cuda_retired_host.numa_ptrs);
         g_cuda_retired_host.bytes = 0;
     }
     if (!ptrs.empty()) {
@@ -1212,9 +1215,12 @@ static void ggml_cuda_retired_flush(int device) {
     for (void * ptr : ptrs_host) {
         CUDA_CHECK(cudaFreeHost(ptr));
     }
+    for (const auto & ptr : ptrs_numa) {
+        ggml_cuda_host_numa_free(ptr.first, ptr.second);
+    }
 }
 
-static bool ggml_cuda_retire_host(void * ptr, size_t size) {
+static bool ggml_cuda_retire_host(void * ptr, size_t size, bool numa = false) {
     if (g_cuda_n_high_priority.load(std::memory_order_relaxed) == 0 || ptr == nullptr) {
         return false;
     }
@@ -1222,7 +1228,11 @@ static bool ggml_cuda_retire_host(void * ptr, size_t size) {
     if (g_cuda_retired_host.bytes + size > ggml_cuda_retire_max_bytes()) {
         return false;
     }
-    g_cuda_retired_host.ptrs.push_back(ptr);
+    if (numa) {
+        g_cuda_retired_host.numa_ptrs.emplace_back(ptr, size);
+    } else {
+        g_cuda_retired_host.ptrs.push_back(ptr);
+    }
     g_cuda_retired_host.bytes += size;
     return true;
 }
@@ -1947,7 +1957,9 @@ ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
 // all nodes use. Without a second node, or if this allocation fails, the buffer is ordinary pinned host memory.
 
 static void ggml_backend_cuda_host_numa_buffer_free_buffer(ggml_backend_buffer_t buffer) {
-    ggml_cuda_host_numa_free(buffer->context, buffer->size);
+    if (!ggml_cuda_retire_host(buffer->context, buffer->size, true)) {
+        ggml_cuda_host_numa_free(buffer->context, buffer->size);
+    }
 }
 
 static ggml_backend_buffer_t ggml_backend_cuda_host_numa_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
