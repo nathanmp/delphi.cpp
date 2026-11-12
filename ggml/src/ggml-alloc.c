@@ -464,6 +464,7 @@ struct hash_node {
     struct buffer_address addr;
     bool allocated;
     int topo; // position in the reserved graph: node i -> i + 1, leaf i -> -(i + 1), 0 = not in the graph
+    size_t size_min; // delphi: allocate at least this many bytes (GGML_GALLOC_GROW_NODE_PCT)
 };
 
 struct tensor_alloc {
@@ -507,6 +508,13 @@ struct ggml_gallocr {
     int n_leafs;
 
     struct ggml_gallocr_peak * peaks; // [n_buffers], only with GGML_GALLOCR_PEAK_LOG
+
+    // delphi: the sizes to allocate for the nodes and leafs that grew since the last layout (0: their own size), set
+    // by ggml_gallocr_reserve_n_impl for one allocation pass
+    size_t * grow_node_size; // [n_grow_nodes]
+    size_t * grow_leaf_size; // [n_grow_leafs]
+    int n_grow_nodes;
+    int n_grow_leafs;
 };
 
 // GGML_GALLOCR_PEAK_LOG=1: after each reserve, log the largest tensors that are live when the sum of live tensors
@@ -684,6 +692,8 @@ void ggml_gallocr_free(ggml_gallocr_t galloc) {
     free(galloc->buf_tallocs);
     free(galloc->node_allocs);
     free(galloc->leaf_allocs);
+    free(galloc->grow_node_size);
+    free(galloc->grow_leaf_size);
     if (galloc->peaks != NULL) {
         for (int i = 0; i < galloc->n_buffers; i++) {
             free(galloc->peaks[i].live);
@@ -748,13 +758,20 @@ static bool ggml_gallocr_is_allocated(ggml_gallocr_t galloc, struct ggml_tensor 
         || ggml_gallocr_is_own(galloc, t); // tensor will be allocated by galloc
 }
 
+// the bytes that the layout gives a tensor: its own size, or more when it grew (GGML_GALLOC_GROW_NODE_PCT)
+static size_t ggml_gallocr_tensor_size(ggml_gallocr_t galloc, int buffer_id, struct ggml_tensor * t) {
+    const size_t size = ggml_backend_buft_get_alloc_size(galloc->bufts[buffer_id], t);
+    const struct hash_node * hn = ggml_gallocr_hash_get(galloc, t);
+    return hn->size_min > size ? hn->size_min : size;
+}
+
 // free the extra space at the end if the new tensor is smaller
 static void ggml_gallocr_free_extra_space(ggml_gallocr_t galloc, struct ggml_tensor * node, struct ggml_tensor * parent) {
     struct hash_node * hn = ggml_gallocr_hash_get(galloc, node);
     struct hash_node * p_hn = ggml_gallocr_hash_get(galloc, parent);
 
-    size_t parent_size = ggml_backend_buft_get_alloc_size(galloc->bufts[p_hn->buffer_id], parent);
-    size_t node_size = ggml_backend_buft_get_alloc_size(galloc->bufts[hn->buffer_id], node);
+    size_t parent_size = ggml_gallocr_tensor_size(galloc, p_hn->buffer_id, parent);
+    size_t node_size = ggml_gallocr_tensor_size(galloc, hn->buffer_id, node);
 
     GGML_ASSERT(parent_size >= node_size);
 
@@ -806,6 +823,11 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
                 }
 
                 struct hash_node * p_hn = ggml_gallocr_hash_get(galloc, parent);
+                // the room of the node (GGML_GALLOC_GROW_NODE_PCT) must fit in the parent's
+                const struct ggml_tensor * p_src = ggml_impl_is_view(parent) ? parent->view_src : parent;
+                if (ggml_gallocr_hash_get(galloc, (struct ggml_tensor *) p_src)->size_min < ggml_gallocr_hash_get(galloc, node)->size_min) {
+                    continue;
+                }
                 if (p_hn->n_children == 1 && p_hn->n_views == 0) {
                     if (ggml_impl_is_view(parent)) {
                         struct ggml_tensor * view_src = parent->view_src;
@@ -835,8 +857,7 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
         }
         // allocate tensor from the buffer
         struct ggml_dyn_tallocr * alloc = galloc->buf_tallocs[buffer_id];
-        ggml_backend_buffer_type_t buft = galloc->bufts[buffer_id];
-        size_t size = ggml_backend_buft_get_alloc_size(buft, node);
+        size_t size = ggml_gallocr_tensor_size(galloc, buffer_id, node);
         hn->buffer_id = buffer_id;
         hn->addr = ggml_dyn_tallocr_alloc(alloc, size, node);
         if (galloc->peaks != NULL) {
@@ -855,8 +876,7 @@ static void ggml_gallocr_free_node(ggml_gallocr_t galloc, struct ggml_tensor * n
     struct hash_node * hn = ggml_gallocr_hash_get(galloc, node);
     int buffer_id = hn->buffer_id;
     struct ggml_dyn_tallocr * alloc = galloc->buf_tallocs[buffer_id];
-    ggml_backend_buffer_type_t buft = galloc->bufts[buffer_id];
-    size_t size = ggml_backend_buft_get_alloc_size(buft, node);
+    size_t size = ggml_gallocr_tensor_size(galloc, buffer_id, node);
 
     AT_PRINTF("%s: freeing %s at {chunk=%d, offset=%zu} (%zu bytes) - n_free_blocks = %d\n",
         __func__, node->name, hn->addr.chunk, hn->addr.offset, size, alloc->chunks[hn->addr.chunk]->n_free_blocks);
@@ -879,6 +899,17 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
     // clear hash tables
     ggml_hash_set_reset(&galloc->hash_set);
     memset(galloc->hash_values, 0, sizeof(struct hash_node) * galloc->hash_set.size);
+
+    for (int i = 0; i < galloc->n_grow_nodes; i++) {
+        if (galloc->grow_node_size[i] > 0) {
+            ggml_gallocr_hash_get(galloc, graph->nodes[i])->size_min = galloc->grow_node_size[i];
+        }
+    }
+    for (int i = 0; i < galloc->n_grow_leafs; i++) {
+        if (galloc->grow_leaf_size[i] > 0) {
+            ggml_gallocr_hash_get(galloc, graph->leafs[i])->size_min = galloc->grow_leaf_size[i];
+        }
+    }
 
     // allocate leafs
     // these may be tensors that the application is not using in the graph, but may still want to allocate for other purposes
@@ -1015,8 +1046,62 @@ static bool ggml_gallocr_reserve_n_impl(
         }
     }
 
+    // delphi: GGML_GALLOC_GROW_NODE_PCT=N: when the graph has the layout's shape but tensors grew (e.g. the KV view of
+    // the next prompt ubatch), give them N % more room (at least GGML_GALLOC_GROW_NODE_MIN_KIB, default 64, at most GGML_GALLOC_GROW_NODE_MAX_MIB, default 32, each), so
+    // that the next ubatches fit the layout: each new layout makes the scheduler wait for all work on its backends
+    galloc->n_grow_nodes = 0;
+    galloc->n_grow_leafs = 0;
+    {
+        const char * env = getenv("GGML_GALLOC_GROW_NODE_PCT");
+        const int pct = env != NULL ? atoi(env) : 0;
+        const char * env_max = getenv("GGML_GALLOC_GROW_NODE_MAX_MIB");
+        const size_t grow_max = (size_t) (env_max != NULL ? atoll(env_max) : 32) * 1024 * 1024;
+        // small tensors (e.g. per-pool indices of the KV view) grow by a few bytes per ubatch: give them at least this much
+        const char * env_min = getenv("GGML_GALLOC_GROW_NODE_MIN_KIB");
+        const size_t grow_min = (size_t) (env_min != NULL ? atoll(env_min) : 64) * 1024;
+        if (pct > 0 && !no_alloc && galloc->n_nodes == graph->n_nodes && galloc->n_leafs == graph->n_leafs) {
+            free(galloc->grow_node_size);
+            free(galloc->grow_leaf_size);
+            galloc->grow_node_size = calloc(graph->n_nodes + 1, sizeof(size_t));
+            galloc->grow_leaf_size = calloc(graph->n_leafs + 1, sizeof(size_t));
+            GGML_ASSERT(galloc->grow_node_size != NULL && galloc->grow_leaf_size != NULL);
+            for (int i = 0; i < graph->n_nodes; i++) {
+                struct ggml_tensor * t = graph->nodes[i];
+                const struct tensor_alloc * ta = &galloc->node_allocs[i].dst;
+                if (!t->view_src && !t->data && ta->buffer_id >= 0 && ta->size_max > 0) {
+                    const size_t size = ggml_backend_buft_get_alloc_size(galloc->bufts[ta->buffer_id], t);
+                    if (size > ta->size_max) {
+                        size_t grow = size / 100 * (size_t) pct;
+                        grow = grow < grow_min ? grow_min : grow;
+                        galloc->grow_node_size[i] = size + (grow < grow_max ? grow : grow_max);
+                    } else {
+                        galloc->grow_node_size[i] = ta->size_max; // keep the room for the next growth
+                    }
+                }
+            }
+            for (int i = 0; i < graph->n_leafs; i++) {
+                struct ggml_tensor * t = graph->leafs[i];
+                const struct tensor_alloc * ta = &galloc->leaf_allocs[i].leaf;
+                if (!t->view_src && !t->data && ta->buffer_id >= 0 && ta->size_max > 0) {
+                    const size_t size = ggml_backend_buft_get_alloc_size(galloc->bufts[ta->buffer_id], t);
+                    if (size > ta->size_max) {
+                        size_t grow = size / 100 * (size_t) pct;
+                        grow = grow < grow_min ? grow_min : grow;
+                        galloc->grow_leaf_size[i] = size + (grow < grow_max ? grow : grow_max);
+                    } else {
+                        galloc->grow_leaf_size[i] = ta->size_max; // keep the room for the next growth
+                    }
+                }
+            }
+            galloc->n_grow_nodes = graph->n_nodes;
+            galloc->n_grow_leafs = graph->n_leafs;
+        }
+    }
+
     // allocate in hash table
     ggml_gallocr_alloc_graph_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids);
+    galloc->n_grow_nodes = 0;
+    galloc->n_grow_leafs = 0;
 
     if (galloc->peaks != NULL) {
         ggml_gallocr_peak_print(galloc);
@@ -1051,7 +1136,7 @@ static bool ggml_gallocr_reserve_n_impl(
             struct hash_node * hn = ggml_gallocr_hash_get(galloc, node);
             node_alloc->dst.buffer_id = hn->buffer_id;
             node_alloc->dst.addr = hn->addr;
-            node_alloc->dst.size_max  = ggml_backend_buft_get_alloc_size(galloc->bufts[hn->buffer_id], node);
+            node_alloc->dst.size_max  = ggml_gallocr_tensor_size(galloc, hn->buffer_id, node);
         }
         for (int j = 0; j < GGML_MAX_SRC; j++) {
             struct ggml_tensor * src = node->src[j];
@@ -1063,7 +1148,7 @@ static bool ggml_gallocr_reserve_n_impl(
                 struct hash_node * hn = ggml_gallocr_hash_get(galloc, src);
                 node_alloc->src[j].buffer_id = hn->buffer_id;
                 node_alloc->src[j].addr = hn->addr;
-                node_alloc->src[j].size_max = ggml_backend_buft_get_alloc_size(galloc->bufts[hn->buffer_id], src);
+                node_alloc->src[j].size_max = ggml_gallocr_tensor_size(galloc, hn->buffer_id, src);
             }
         }
     }
@@ -1084,7 +1169,7 @@ static bool ggml_gallocr_reserve_n_impl(
         } else {
             galloc->leaf_allocs[i].leaf.buffer_id = hn->buffer_id;
             galloc->leaf_allocs[i].leaf.addr = hn->addr;
-            galloc->leaf_allocs[i].leaf.size_max = ggml_backend_buft_get_alloc_size(galloc->bufts[hn->buffer_id], leaf);
+            galloc->leaf_allocs[i].leaf.size_max = ggml_gallocr_tensor_size(galloc, hn->buffer_id, leaf);
         }
     }
 
@@ -1135,14 +1220,17 @@ static bool ggml_gallocr_reserve_n_impl(
                 }
             }
 #endif
-            // delphi: GGML_GALLOC_GROW_PCT=N gives a buffer that grows N % more room than this graph needs. Each growth frees
+            // delphi: GGML_GALLOC_GROW_PCT=N gives a buffer that grows N % (at most GGML_GALLOC_GROW_MAX_MIB, default 16) more room than this graph needs. Each growth frees
             // the old buffer, and on CUDA that waits for all work of the device (LLAMA_VERIFY_STREAMS: background prompt work)
             if (galloc->buffers[i] != NULL && !no_alloc) {
                 const char * env = getenv("GGML_GALLOC_GROW_PCT");
                 const int grow_pct = env != NULL ? atoi(env) : 0;
+                const char * env_max = getenv("GGML_GALLOC_GROW_MAX_MIB");
+                const size_t grow_max = (size_t) (env_max != NULL ? atoll(env_max) : 16) * 1024 * 1024;
                 for (int c = 0; grow_pct > 0 && c < galloc->buf_tallocs[i]->n_chunks; c++) {
                     struct tallocr_chunk * chunk = galloc->buf_tallocs[i]->chunks[c];
-                    chunk->max_size += chunk->max_size / 100 * (size_t) grow_pct;
+                    const size_t grow = chunk->max_size / 100 * (size_t) grow_pct;
+                    chunk->max_size += grow < grow_max ? grow : grow_max;
                 }
             }
             ggml_vbuffer_free(galloc->buffers[i]);
