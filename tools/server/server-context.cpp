@@ -1037,6 +1037,7 @@ private:
     bool    vs_round_bg   = false; // the batch of this round is background prompt work + generating tokens
     bool    vs_tail_round = false; // the batch of this round ends the prompt of a slot
     int32_t vs_n_gen      = 0;     // tokens of generating slots at the start of the batch
+    int32_t vs_pos_end    = 0;     // end of the longest prompt with tokens in the batch of this round
 
     bool vs_enabled() const {
         return ctx_tgt && llama_verify_streams(ctx_tgt) && (!spec || llama_get_embeddings_layer_inp_tensor(ctx_tgt) != nullptr);
@@ -4207,6 +4208,7 @@ private:
         vs_round      = (batch.size() > 0 || vs_split_alone) && vs_enabled();
         vs_tail_round = false;
         vs_n_gen      = batch.size();
+        vs_pos_end    = 0;
         const int32_t vs_cap = prefill_cap > 0 ? prefill_cap : 1024;
         if (vs_round) {
             n_batch_prompt = llama_prompt_background_pending(ctx_tgt) >= vs_depth ? batch.size() : std::min(n_batch, batch.size() + vs_cap);
@@ -4704,6 +4706,16 @@ private:
                                     llama_prompt_background_pending(ctx_tgt) > 0) {
                                 break;
                             }
+                            // a chunk that needs a new compute layout (the first chunks of a prompt, the change to indexed
+                            // attention) makes the target wait for the chunks in flight: hold it until they are done, so that
+                            // the generating slots do not wait with it
+                            if (batch.size() == vs_n_gen && n_left > vs_tail && llama_prompt_background_pending(ctx_tgt) > 0) {
+                                const int32_t n_chunk = std::min(n_left - vs_tail, n_batch_prompt - batch.size());
+                                if (llama_prompt_background_new_layout(ctx_tgt, slot.id, slot.prompt.n_tokens() + n_chunk - 1, n_chunk)) {
+                                    break;
+                                }
+                            }
+                            vs_pos_end = std::max(vs_pos_end, (int32_t) slot.task->n_tokens());
                             if (n_left <= vs_tail) {
                                 if (batch.size() != vs_n_gen || !vs_queue.empty() || llama_prompt_background_pending(ctx_tgt) > 0) {
                                     break;
@@ -4910,6 +4922,7 @@ private:
         if (!vs_bg && (has_prompt || batch.has_embd) && !vs_queue.empty()) {
             vs_ingest(true);
         }
+        llama_set_prompt_background_end(ctx_tgt, vs_bg ? vs_pos_end : 0);
         llama_set_prompt_background(ctx_tgt, vs_bg);
 
         int ret = 0;

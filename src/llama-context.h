@@ -77,6 +77,8 @@ struct llama_context {
     void synchronize_outputs();
     bool    verify_streams_enabled() const { return verify_streams; }
     void    set_prompt_background(bool value) { prompt_bg = value; }
+    void    set_prompt_background_end(llama_pos pos_end) { bg_pos_end = pos_end; }
+    bool    prompt_background_new_layout(llama_seq_id seq_id, llama_pos pos_last, uint32_t n_tokens);
     int64_t prompt_background_ticket(int32_t * row_base) const;
     int32_t prompt_background_pending();
     bool    prompt_background_done(int64_t ticket);
@@ -312,7 +314,8 @@ public:
 
     // reserve a graph with a dummy ubatch of the specified size
     ggml_cgraph * graph_reserve(
-        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
+        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr,
+        bool main_only = false); // main_only: keep the graphs of the alternate schedulers
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
@@ -517,6 +520,8 @@ private:
     uint64_t                            max_prefill_reserves = 0;
     // the attention variant of that reservation for GLM-5 kpool memory (0 dense, 1 indexed), -1 without variants
     int                                 max_prefill_variant  = -1;
+    // the KV length of that reservation (variants only)
+    uint32_t                            max_prefill_n_kv     = UINT32_MAX;
 
     // env: LLAMA_GRAPH_ALT_MAX_TOKENS, largest ubatch that may use an alternate scheduler (0 disables them)
     uint32_t graph_alt_max_tokens = 32;
@@ -577,6 +582,8 @@ private:
     std::vector<int8_t>           seq_set;        // per sequence: set of its last ubatch (0 main, 1 alternate), -1 none
     bool    prompt_bg       = false; // main-scheduler ubatches of the next decodes are background work
     bool    decode_bg       = false; // the current decode is a background decode
+    llama_pos bg_pos_end    = 0;     // end position of the longest background prompt in flight (0: not known)
+    uint32_t  bg_n_kv_step  = 16384; // env: LLAMA_VERIFY_STREAMS_KV_STEP, step of the indexed reservation for background prompts
     bool    decode_bg_main  = false; // ... and it queued work on the main scheduler
     bool    main_fg_queued  = false; // the main scheduler has foreground work that synchronize_outputs waits for
     int64_t layer_inp_row_base = 0;  // added to the device feature rows of main-scheduler ubatches

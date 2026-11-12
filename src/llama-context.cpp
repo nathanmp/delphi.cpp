@@ -1293,7 +1293,14 @@ void llama_context::reserve_max_prefill(
             }
         }
     }
-    if (n_tokens_prev != 0 && variant == max_prefill_variant) {
+    // LLAMA_VERIFY_STREAMS: the final KV length of a background prompt (set_prompt_background_end) bounds the indexed
+    // reservation. The full-context one has masks of n_ctx_seq cells per query, more than the free memory of a long context.
+    const uint32_t n_kv_ubatch = ubatch.n_tokens > 0 ? (uint32_t) GGML_PAD((int64_t) ubatch.pos[ubatch.n_tokens - 1] + 1, 256) : 0;
+    if (variant == 1 && decode_bg && bg_pos_end > 0) {
+        n_kv_max = std::min<uint32_t>(n_kv_max, std::max<uint32_t>(n_kv_ubatch, GGML_PAD((uint32_t) bg_pos_end + cparams.n_ubatch, bg_n_kv_step)));
+    }
+    const bool n_kv_fits = variant < 0 || n_kv_ubatch <= max_prefill_n_kv;
+    if (n_tokens_prev != 0 && variant == max_prefill_variant && n_kv_fits) {
         return;
     }
     // Only plain hybrid memory gives a one-stream full-cache context. For other memories init_full() exposes all
@@ -1336,21 +1343,31 @@ void llama_context::reserve_max_prefill(
     // would synchronize every backend and drain the ubatches still in flight from the previous llama_decode call.
     ggml_backend_sched_t sched_main = graph_sched_main();
     if (sched_main == max_prefill_sched && ggml_backend_sched_get_n_reserves(sched_main) == max_prefill_reserves &&
-            variant == max_prefill_variant) {
+            variant == max_prefill_variant && n_kv_fits) {
         return;
     }
 
     LLAMA_LOG_INFO("%s: pre-recording max prefill reservation for %u ubatch tokens (KV length %u)\n", __func__, n_tokens_max, n_kv_max);
 
-    if (!graph_reserve(n_tokens_max, 1, n_outputs, mctx_max.get())) {
+    static const bool build_log = getenv("LLAMA_GRAPH_BUILD_LOG") != nullptr;
+    const int64_t t_reserve_us = build_log ? ggml_time_us() : 0;
+    // with verify streams, the alternate schedulers have their own backends and buffers: their graphs stay valid, and the
+    // generating slots do not build and capture their verify graphs again
+    if (!graph_reserve(n_tokens_max, 1, n_outputs, mctx_max.get(), false, nullptr, verify_streams)) {
         LLAMA_LOG_WARN("%s: failed to reserve max prefill graph\n", __func__);
         max_prefill_sched   = nullptr;
         max_prefill_variant = variant; // do not retry for every later ubatch
+        max_prefill_n_kv    = UINT32_MAX;
     } else {
         // graph_reserve reserved on the main scheduler, which is `sched` again now
         max_prefill_sched    = sched.get();
         max_prefill_reserves = ggml_backend_sched_get_n_reserves(sched.get());
         max_prefill_variant  = variant;
+        max_prefill_n_kv     = n_kv_max;
+    }
+    if (build_log) {
+        LLAMA_LOG_WARN("max prefill reserve: n_tokens %u n_kv %u variant %d background %d: %.2f ms\n", n_tokens_max, n_kv_max, variant, (int) decode_bg,
+                (ggml_time_us() - t_reserve_us)/1e3);
     }
 }
 
@@ -2576,6 +2593,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         t_alloc_us = ggml_time_us();
+        const uint64_t n_reserves0 = ggml_backend_sched_get_n_reserves(sched.get());
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
@@ -2583,6 +2601,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
         t_alloc_us = ggml_time_us() - t_alloc_us;
+        if (build_log && ggml_backend_sched_get_n_reserves(sched.get()) != n_reserves0) {
+            LLAMA_LOG_WARN("graph build: ctx %p n_tokens %u slot %d new compute layout\n", (void *) this, ubatch.n_tokens, graph_slot_live);
+        }
 
         gf_res_prev_active  = res;
         gf_res_prev_threads = backend_n_threads;
@@ -3056,6 +3077,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
+    int64_t n_tokens_prev_main = 0; // tokens of the earlier ubatches of this call that ran on the main scheduler
 
     auto prefill_window = llama_dsv41_prefill_window::create(*this, mctx.get());
     if (prefill_window) {
@@ -3085,7 +3107,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
         // pre-record the largest prefill reservation ahead of a growing
         // multi-ubatch prefill, so later ubatches fit without reallocating
         if (!prefill_window) {
-            reserve_max_prefill(ubatch, mctx.get(), n_tokens_all, n_tokens_prev);
+            // a background decode starts with the verify ubatches of the generating slots (alternate schedulers): they
+            // do not cover the prompt ubatch that follows
+            reserve_max_prefill(ubatch, mctx.get(), n_tokens_all, decode_bg ? n_tokens_prev_main : n_tokens_prev);
         }
 
         // count the outputs in this ubatch
@@ -3324,6 +3348,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
+        if (graph_slot_live == 0) {
+            n_tokens_prev_main += ubatch.n_tokens;
+        }
     } while (mctx->next());
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
@@ -4448,7 +4475,7 @@ static void ubatch_prepare_reserve(
 }
 
 ggml_cgraph * llama_context::graph_reserve(
-        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes) {
+        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes, bool main_only) {
     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
     if (n_tokens % n_seqs != 0) {
         n_tokens = ((n_tokens + (n_seqs - 1)) / n_seqs) * n_seqs; // round to next multiple of n_seqs
@@ -4456,7 +4483,11 @@ ggml_cgraph * llama_context::graph_reserve(
     }
 
     // reserve on the main scheduler
-    graph_alt_reset();
+    if (main_only) {
+        graph_slot_activate(0);
+    } else {
+        graph_alt_reset();
+    }
 
     ggml_backend_sched_reset(sched.get());
 

@@ -15,8 +15,12 @@
 
 #include "llama-context.h"
 #include "llama-impl.h"
+#include "llama-kv-cache-kpool.h"
+#include "llama-memory-hybrid.h"
+#include "llama-memory-hybrid-idx.h"
 #include "llama-model.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <stdexcept>
 
@@ -91,6 +95,9 @@ void llama_context::verify_streams_init() {
     }
     verify_streams = true;
     seq_set.assign(LLAMA_MAX_SEQ, -1);
+    if (const char * env = getenv("LLAMA_VERIFY_STREAMS_KV_STEP")) {
+        bg_n_kv_step = (uint32_t) GGML_PAD(std::max(256, atoi(env)), 256);
+    }
     LLAMA_LOG_WARN("%s: verify streams: on, %d GPU backends for the alternate graph slots, background regions of %d rows\n",
             __func__, n, bg_region_rows());
 }
@@ -305,6 +312,27 @@ bool llama_context::prompt_background_done(int64_t ticket) {
     return bg_tickets.empty() || bg_tickets.front().id > ticket;
 }
 
+// The same decisions as reserve_max_prefill() and the graph allocation, without their effects.
+bool llama_context::prompt_background_new_layout(llama_seq_id seq_id, llama_pos pos_last, uint32_t n_tokens) {
+    if (!verify_streams || n_tokens == 0 || pos_last < 0) {
+        return false;
+    }
+    const auto * mem = dynamic_cast<const llama_memory_hybrid *>(memory.get());
+    auto * cache = mem ? mem->get_kpool_cache() : nullptr;
+    if (cache == nullptr || dynamic_cast<const llama_memory_hybrid_idx *>(memory.get()) != nullptr) {
+        return false; // no reservation variants: the regular reservation covers the chunk
+    }
+    // a cold pool cache gives the first ubatch of the sequence its own graph shape
+    if (seq_id >= 0 && (uint32_t) seq_id < cache->get_n_stream() && cache->needs_rebuild((uint32_t) seq_id, 1)) {
+        return true;
+    }
+    const uint32_t n_kv    = (uint32_t) GGML_PAD((int64_t) pos_last + 1, 256);
+    const int      variant = llama_kpool_indexed_attn_enabled(n_kv, n_tokens) ? 1 : 0;
+    ggml_backend_sched_t sched_main = graph_sched_main();
+    return !(sched_main == max_prefill_sched && ggml_backend_sched_get_n_reserves(sched_main) == max_prefill_reserves &&
+            variant == max_prefill_variant && n_kv <= max_prefill_n_kv);
+}
+
 void llama_context::prompt_background_wait() {
     if (verify_streams) {
         verify_streams_sync_main();
@@ -321,6 +349,14 @@ bool llama_verify_streams(const llama_context * ctx) {
 
 void llama_set_prompt_background(llama_context * ctx, bool background) {
     ctx->set_prompt_background(background);
+}
+
+void llama_set_prompt_background_end(llama_context * ctx, llama_pos pos_end) {
+    ctx->set_prompt_background_end(pos_end);
+}
+
+bool llama_prompt_background_new_layout(llama_context * ctx, llama_seq_id seq_id, llama_pos pos_last, uint32_t n_tokens) {
+    return ctx->prompt_background_new_layout(seq_id, pos_last, n_tokens);
 }
 
 int64_t llama_prompt_background_ticket(llama_context * ctx, int32_t * row_base) {

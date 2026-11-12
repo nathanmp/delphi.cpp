@@ -170,6 +170,13 @@ LLAMA_API void          llama_feature_handoff_release(struct llama_context * ctx
 // stay there for the next 3 background decodes. llama_prompt_background_done() and _pending() do not wait; _wait() does.
 LLAMA_API bool          llama_verify_streams(const struct llama_context * ctx);
 LLAMA_API void          llama_set_prompt_background(struct llama_context * ctx, bool background);
+// pos_end: the end position of the longest prompt whose chunks run as background work (0: not known). The compute
+// layout for these chunks is then reserved once for that KV length.
+LLAMA_API void          llama_set_prompt_background_end(struct llama_context * ctx, llama_pos pos_end);
+// true if the next background chunk of the sequence (n_tokens tokens that end at pos_last) needs a new compute layout,
+// for which the context waits for all background work in flight. The caller can hold the chunk until
+// llama_prompt_background_pending() is 0, so that the wait is short. Does not wait.
+LLAMA_API bool          llama_prompt_background_new_layout(struct llama_context * ctx, llama_seq_id seq_id, llama_pos pos_last, uint32_t n_tokens);
 LLAMA_API int64_t       llama_prompt_background_ticket(struct llama_context * ctx, int32_t * row_base);
 LLAMA_API int32_t       llama_prompt_background_pending(struct llama_context * ctx);
 LLAMA_API bool          llama_prompt_background_done(struct llama_context * ctx, int64_t ticket);
