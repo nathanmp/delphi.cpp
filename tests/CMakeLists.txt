@@ -340,6 +340,7 @@ endif()
 # TODO: make this test (and others) not link `libllama` as it is not needed [TAG_TESTS_LLAMA_LINK]
 llama_build(test-backend-ops.cpp)
 llama_build(test-stage-keep.cpp)
+llama_build(test-sched-input-staging.cpp)
 llama_build(test-dsv41-layer-bank.cpp)
 llama_build(test-dsv41-fa-prefill.cpp)
 llama_build(test-cuda-hc-fusion-tail.cpp)

@@ -4039,6 +4039,9 @@ void llama_context::expert_cache_auto(llama_context * draft) {
 
 void llama_context::sched_set_stage_lender() {
     ggml_backend_sched_set_input_async(sched.get(), verify_input_async && (graph_slot_live != 0 || model.arch == LLM_ARCH_DFLASH));
+    const char * prompt_input_env = getenv("LLAMA_VERIFY_STREAMS_PROMPT_INPUT_ASYNC");
+    ggml_backend_sched_set_input_staging(sched.get(), verify_streams && verify_input_async && graph_slot_live == 0 &&
+            (prompt_input_env == nullptr || atoi(prompt_input_env) != 0));
     sched_set_workers(sched.get());
     if (expert_cache) {
         ggml_backend_sched_set_stage_lender(sched.get(), llama_expert_cache::lend, expert_cache.get());
