@@ -4864,6 +4864,10 @@ private:
                         do_checkpoint = false;
                     }
 
+                    // A slot waiting for background work has no prompt tokens in this round. Taking its checkpoint
+                    // again would repeatedly supersede the same snapshot and eventually drain the retirement queue.
+                    do_checkpoint = do_checkpoint && (!vs_round || n_tokens_cur > 0);
+
                     // do not checkpoint after mtmd chunks
                     do_checkpoint = do_checkpoint && !has_mtmd;
 
