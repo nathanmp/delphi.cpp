@@ -6189,8 +6189,20 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph, graph_key);
+            const bool prefill_capture = ggml_cuda_graph_prefill_capture_enabled() &&
+                    !GGML_CUDA_CC_IS_AMD(ggml_cuda_info().devices[cuda_ctx->device].cc) &&
+                    ggml_cuda_graph_is_prefill_candidate(cgraph);
 
-            if (!graph->warmup_complete) {
+            if (prefill_capture) {
+                // A new buffer address needs a recapture, not an eager run that can fill the launch queue and block
+                // the server behind prefill. Initialize BLAS outside capture, including the first wide prompt split.
+                if (ggml_cuda_graph_may_create_blas_handle(cuda_ctx, cgraph)) {
+                    cuda_ctx->cublas_handle();
+                }
+                graph->warmup_complete = true;
+                use_cuda_graph = true;
+                cuda_graph_update_required = properties_changed || graph->instance == nullptr;
+            } else if (!graph->warmup_complete) {
                 // Warmup: need at least 2 calls with no property change on the 2nd call
                 if (!properties_changed) {
                     graph->warmup_complete = true;
@@ -6199,17 +6211,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     cuda_graph_update_required = true;
                 } else {
                     fallback_reason = GGML_EXEC_TRACE_GPU_GRAPH_REASON_WARMUP;
-                    // delphi: single-use prefill capture skips the warmup gate. Each ubatch
-                    // shape is a new key that would never warm up within one prompt; capture
-                    // itself never blocks on the launch queue, so first-use capture still wins.
-                    const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
                     // a graph that may create the BLAS handle runs eagerly first: it must not be created during capture
                     const bool first_use_capture = !ggml_cuda_graph_may_create_blas_handle(cuda_ctx, cgraph);
-                    if (first_use_capture && ggml_cuda_graph_prefill_capture_enabled() && !GGML_CUDA_CC_IS_AMD(cc) &&
-                            ggml_cuda_graph_is_prefill_candidate(cgraph)) {
-                        use_cuda_graph = true;
-                        cuda_graph_update_required = true;
-                    } else if (first_use_capture && ggml_cuda_graph_find_sibling(cuda_ctx, cgraph, graph) != nullptr) {
+                    if (first_use_capture && ggml_cuda_graph_find_sibling(cuda_ctx, cgraph, graph) != nullptr) {
                         // capture right away: updating the sibling's executable is cheaper than an eager run
                         graph->warmup_complete = true;
                         use_cuda_graph = true;
@@ -6238,6 +6242,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     if (!use_cuda_graph) {
 #ifdef USE_CUDA_GRAPH
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+        static const bool fallback_log = getenv("GGML_CUDA_GRAPH_FALLBACK_LOG") != nullptr;
+        if (fallback_log) {
+            GGML_LOG_WARN("CUDA graph fallback: device %d nodes %d reason %d first %s last %s\n", cuda_ctx->device,
+                    cgraph->n_nodes, (int) fallback_reason, cgraph->nodes[0]->name, cgraph->nodes[cgraph->n_nodes - 1]->name);
+        }
         ggml_exec_trace_gpu_graph(GGML_EXEC_TRACE_GPU_GRAPH_FALLBACK, graph->trace_id, cgraph->n_nodes, fallback_reason);
 #else
         ggml_exec_trace_gpu_graph(GGML_EXEC_TRACE_GPU_GRAPH_FALLBACK, 0, cgraph->n_nodes,

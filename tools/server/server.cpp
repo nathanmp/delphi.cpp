@@ -114,6 +114,13 @@ static std::pair<std::string, uint32_t> gguf_arch_ctx(const std::string & path) 
 int llama_server(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
+    // Loading a new CUDA kernel can synchronize the device while background prefill is running. Set the default
+    // before argument parsing can enumerate devices; an explicit CUDA loading policy still takes precedence.
+    const char * verify_streams = std::getenv("LLAMA_VERIFY_STREAMS");
+    if (verify_streams && std::atoi(verify_streams) != 0 && std::getenv("CUDA_MODULE_LOADING") == nullptr) {
+        common_set_env("CUDA_MODULE_LOADING", "EAGER");
+    }
+
 #ifndef _WIN32
     // Ignore SIGPIPE so the server does not crash if a child (MCP server, tools runtime) exits while we are writing to its stdin
     signal(SIGPIPE, SIG_IGN);
