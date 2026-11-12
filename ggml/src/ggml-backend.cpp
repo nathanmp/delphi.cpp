@@ -16,6 +16,7 @@
 #include "ggml-impl.h"
 #include "ggml-offload-cost.h"
 #include "ggml-stage-copy.h"
+#include "ggml-sched-input.h"
 
 #include <assert.h>
 #include <limits.h>
@@ -998,6 +999,7 @@ struct ggml_backend_sched {
     // and at the end of the graph
     ggml_backend_event_t host_read_events[GGML_SCHED_MAX_BACKENDS];
     bool host_read_pending[GGML_SCHED_MAX_BACKENDS];
+    bool input_async; // caller holds host graph inputs until this scheduler completes
     struct ggml_tensor ** graph_inputs;
     int n_graph_inputs;
     int graph_inputs_capacity;
@@ -2392,6 +2394,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 const int src_backend_id = sched->hv_tensor_backend_ids[src_id];
                 GGML_ASSERT(src_backend_id != -1); // all inputs should be assigned by now
 
+                if (sched->input_async && (src->flags & GGML_TENSOR_FLAG_INPUT)) {
+                    // A single-copy graph must also keep upload sources out of allocator reuse.
+                    ggml_set_output(src);
+                }
                 if (src->flags & GGML_TENSOR_FLAG_INPUT && sched->n_copies > 1) {
                     if (sched_hv_copy(sched, src, src_backend_id, 0) == NULL) {
                         ggml_backend_t backend = sched->backends[src_backend_id];
@@ -4574,7 +4580,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             uint64_t copy_bytes = observe_copy ? ggml_nbytes(input) : 0;
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
-                copy_path = GGML_EXEC_TRACE_COPY_USER_INPUT_SYNC;
+                const bool input_async = sched->input_async && input->buffer != NULL && input_cpy->buffer != NULL &&
+                        ggml_backend_buffer_is_host(input->buffer) && !ggml_backend_buffer_is_host(input_cpy->buffer) &&
+                        split_backend->iface.set_tensor_async != NULL;
+                copy_path = input_async ? GGML_EXEC_TRACE_COPY_BACKEND_ASYNC : GGML_EXEC_TRACE_COPY_USER_INPUT_SYNC;
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
                 const uint64_t wait_start = ggml_backend_sched_trace_detail_span_begin();
                 if (copy_slot_free[split_backend_id] && !sched->copy_reuse_wait_all) {
@@ -4594,7 +4603,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             GGML_EXEC_TRACE_WAIT_API_BACKEND_SYNCHRONIZE, copy_bytes);
                 }
                 const uint64_t body_start = ggml_backend_sched_trace_detail_span_begin();
-                if (split_is_meta && backends_idle && ggml_backend_buffer_is_host(input->buffer)) {
+                if (input_async) {
+                    // The caller holds the source until this graph completes. Avoid a synchronous buffer copy,
+                    // which can wait for unrelated streams while background prefill runs on the same device.
+                    ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+                } else if (split_is_meta && backends_idle && ggml_backend_buffer_is_host(input->buffer)) {
                     // one synchronous copy per input and simple device costs about 0.1 ms per input on a Meta
                     // backend; queue them all and synchronize once after the last input instead. Only while
                     // nothing else is queued: otherwise that synchronization would also wait for the previous
@@ -5337,6 +5350,11 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
         // which avoids changes in the graph that could cause CUDA or other graphs to be disabled
         sched->next_copy = 0;
     }
+}
+
+void ggml_backend_sched_set_input_async(ggml_backend_sched_t sched, bool enable) {
+    GGML_ASSERT(sched);
+    sched->input_async = enable;
 }
 
 void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data) {

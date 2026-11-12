@@ -4,6 +4,7 @@
 
 #include "ggml-cpuset.h"
 #include "ggml-exec-trace.h"
+#include "ggml-sched-input.h"
 #include "ggml.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
@@ -2547,6 +2548,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
     graph_slots[graph_slot_live].last_use = ++graph_slot_clock;
     verify_streams_ubatch(ubatch, n_outputs);
+    const bool async_inputs = verify_input_async && (graph_slot_live != 0 || model.arch == LLM_ARCH_DFLASH);
     auto * gf = res->get_gf();
 
     if (reuse) {
@@ -2557,7 +2559,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // that the previous compute is still reading.
         // with staggered verify, the graphs of the other sequences are in other graph slots (own schedulers and
         // inputs), so wait only for this scheduler's last graph and let their work continue on the devices
-        if (cparams.pipeline_parallel && staggered_verify_enabled()) {
+        if (async_inputs || (cparams.pipeline_parallel && staggered_verify_enabled())) {
             ggml_backend_sched_wait_graph(sched.get());
         } else if (cparams.pipeline_parallel) {
             ggml_backend_sched_synchronize(sched.get());
@@ -2565,6 +2567,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         n_reused++;
     } else {
+        // The old graph's host inputs remain in use until its asynchronous uploads complete. This also covers
+        // single-device draft contexts, which do not use pipeline parallelism.
+        if (async_inputs) {
+            ggml_backend_sched_wait_graph(sched.get());
+        }
         if (build_log) {
             const bool fresh = gf_res_prev_active != res || res->get_gf() == nullptr;
             LLAMA_LOG_WARN("graph build: ctx %p n_tokens %u slot %d reason %s\n", (void *) this, ubatch.n_tokens, graph_slot_live,
@@ -4030,6 +4037,7 @@ void llama_context::expert_cache_auto(llama_context * draft) {
 }
 
 void llama_context::sched_set_stage_lender() {
+    ggml_backend_sched_set_input_async(sched.get(), verify_input_async && (graph_slot_live != 0 || model.arch == LLM_ARCH_DFLASH));
     sched_set_workers(sched.get());
     if (expert_cache) {
         ggml_backend_sched_set_stage_lender(sched.get(), llama_expert_cache::lend, expert_cache.get());

@@ -49,8 +49,12 @@ void llama_context::verify_streams_init() {
         return;
     }
 
+    const char * input_async_env = getenv("LLAMA_VERIFY_STREAMS_INPUT_ASYNC");
+    const bool input_async = input_async_env == nullptr || atoi(input_async_env) != 0;
+
     // a draft model only runs verify-side work: give its streams the high priority, so its drafts also pass prompt work
     if (model.arch == LLM_ARCH_DFLASH) {
+        verify_input_async = input_async;
         int n = 0;
         for (auto & b : backends) {
             if (is_gpu(b.get())) {
@@ -94,6 +98,7 @@ void llama_context::verify_streams_init() {
         return;
     }
     verify_streams = true;
+    verify_input_async = input_async;
     seq_set.assign(LLAMA_MAX_SEQ, -1);
     if (const char * env = getenv("LLAMA_VERIFY_STREAMS_KV_STEP")) {
         bg_n_kv_step = (uint32_t) GGML_PAD(std::max(256, atoi(env)), 256);

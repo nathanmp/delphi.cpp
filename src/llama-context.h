@@ -577,6 +577,7 @@ private:
         std::vector<ggml_backend_event_t> events; // per entry of `backends`, null for non-GPU backends
     };
     bool                          verify_streams = false;
+    bool                          verify_input_async = false; // env: LLAMA_VERIFY_STREAMS_INPUT_ASYNC=0 disables
     std::vector<ggml_backend_ptr> backends_v;     // GPU backends of the second set
     std::vector<ggml_backend_t>   backend_ptrs_v; // backend_ptrs, with the GPU backends of the second set
     std::vector<int8_t>           seq_set;        // per sequence: set of its last ubatch (0 main, 1 alternate), -1 none
