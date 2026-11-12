@@ -333,9 +333,7 @@ bool llama_context::prompt_background_new_layout(llama_seq_id seq_id, llama_pos 
     }
     const uint32_t n_kv    = (uint32_t) GGML_PAD((int64_t) pos_last + 1, 256);
     const int      variant = llama_kpool_indexed_attn_enabled(n_kv, n_tokens) ? 1 : 0;
-    ggml_backend_sched_t sched_main = graph_sched_main();
-    return !(sched_main == max_prefill_sched && ggml_backend_sched_get_n_reserves(sched_main) == max_prefill_reserves &&
-            variant == max_prefill_variant && n_kv <= max_prefill_n_kv);
+    return !(max_prefill_fits(variant, n_kv) && max_prefill_in_place());
 }
 
 void llama_context::prompt_background_wait() {

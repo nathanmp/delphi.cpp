@@ -1203,6 +1203,17 @@ void llama_context::sched_reserve() {
     }
 }
 
+// true if a prompt ubatch of this attention variant and padded KV length fits the sizes of the last max prefill reservation
+bool llama_context::max_prefill_fits(int variant, uint32_t n_kv) const {
+    return variant == max_prefill_variant && (variant < 0 || n_kv <= max_prefill_n_kv);
+}
+
+// true if the main scheduler still has the layout of the last max prefill reservation
+bool llama_context::max_prefill_in_place() const {
+    ggml_backend_sched_t sched_main = graph_sched_main();
+    return sched_main == max_prefill_sched && ggml_backend_sched_get_n_reserves(sched_main) == max_prefill_reserves;
+}
+
 void llama_context::reserve_max_prefill(
         const llama_ubatch & ubatch, const llama_memory_context_i * mctx,
         uint32_t n_tokens_all, uint32_t n_tokens_prev) {
@@ -1292,8 +1303,8 @@ void llama_context::reserve_max_prefill(
     if (variant == 1 && decode_bg && bg_pos_end > 0) {
         n_kv_max = std::min<uint32_t>(n_kv_max, std::max<uint32_t>(n_kv_ubatch, GGML_PAD((uint32_t) bg_pos_end + cparams.n_ubatch, bg_n_kv_step)));
     }
-    const bool n_kv_fits = variant < 0 || n_kv_ubatch <= max_prefill_n_kv;
-    if (n_tokens_prev != 0 && variant == max_prefill_variant && n_kv_fits) {
+    const bool fits = max_prefill_fits(variant, n_kv_ubatch);
+    if (n_tokens_prev != 0 && fits) {
         return;
     }
     // Only plain hybrid memory gives a one-stream full-cache context. For other memories init_full() exposes all
@@ -1334,9 +1345,7 @@ void llama_context::reserve_max_prefill(
 
     // An earlier logical batch of this prompt (or an earlier prompt) left the reservation in place. Reserving again
     // would synchronize every backend and drain the ubatches still in flight from the previous llama_decode call.
-    ggml_backend_sched_t sched_main = graph_sched_main();
-    if (sched_main == max_prefill_sched && ggml_backend_sched_get_n_reserves(sched_main) == max_prefill_reserves &&
-            variant == max_prefill_variant && n_kv_fits) {
+    if (fits && max_prefill_in_place()) {
         return;
     }
 

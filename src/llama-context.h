@@ -516,6 +516,8 @@ private:
 
     // the main scheduler and its reservation count right after reserve_max_prefill; while both still match, the max
     // prefill reservation is in effect and a later logical batch does not need (or synchronize for) another one
+    bool max_prefill_fits(int variant, uint32_t n_kv) const;
+    bool max_prefill_in_place() const;
     ggml_backend_sched_t                max_prefill_sched    = nullptr;
     uint64_t                            max_prefill_reserves = 0;
     // the attention variant of that reservation for GLM-5 kpool memory (0 dense, 1 indexed), -1 without variants
