@@ -577,6 +577,10 @@ private:
         std::vector<ggml_backend_event_t> events; // per entry of `backends`, null for non-GPU backends
     };
     bool                          verify_streams = false;
+    // staggered verify: the memory gives each sequence of a batch its own ubatches, so that pipeline parallelism overlaps
+    // the verify of one sequence on one device with the next sequence on another device. On where it applies
+    // (staggered_verify_init); env: LLAMA_STAGGERED_VERIFY=0 disables
+    bool                          staggered_verify = false;
     bool                          verify_input_async = false; // env: LLAMA_VERIFY_STREAMS_INPUT_ASYNC=0 disables
     std::vector<ggml_backend_ptr> backends_v;     // GPU backends of the second set
     std::vector<ggml_backend_t>   backend_ptrs_v; // backend_ptrs, with the GPU backends of the second set
@@ -596,6 +600,7 @@ private:
     std::vector<std::vector<ggml_backend_event_t>> bg_event_pool; // per entry of `backends`
     bool (*bg_event_query)(ggml_backend_event_t) = nullptr;
 
+    void    staggered_verify_init();
     void    verify_streams_init();
     void    verify_streams_free();
     ggml_backend_t * sched_backend_ptrs(int slot_id);

@@ -150,12 +150,7 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
             }
             const uint32_t n_rs_seq = mem_recr->n_rs_seq;
             const uint32_t n_tail = n_rs_seq > 0 ? n_rs_seq + 1 : 0;
-            // LLAMA_STAGGERED_VERIFY=1: every sequence takes its own ubatches, also a short verify. The scheduler can then
-            // pipeline the ubatches of different sequences over the devices of a layer split.
-            static const bool staggered = [] {
-                const char * env = getenv("LLAMA_STAGGERED_VERIFY");
-                return env != nullptr && atoi(env) != 0;
-            }();
+            const bool staggered = seq_staggered;
             // LLAMA_STAGGERED_MIXED_UBATCH=N: when a batch has prompt and verify sequences, cut the prompts into ubatches of
             // at most N tokens, so that they pipeline over the devices and the verify of the batch completes earlier
             static const uint32_t n_ubatch_mixed = [] {

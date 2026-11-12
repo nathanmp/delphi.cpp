@@ -71,16 +71,6 @@ static uint32_t multi_seq_split_tokens(const llama_cparams & cparams, const llam
     return hybrid ? hybrid->get_n_seq_split_tokens() * cparams.n_seq_max : 0;
 }
 
-// LLAMA_STAGGERED_VERIFY=1: the memory gives each sequence of a batch its own ubatches (llama_memory_hybrid), so that
-// pipeline parallelism overlaps the verify of one sequence on one device with the next sequence on another device
-static bool staggered_verify_enabled() {
-    static const bool enabled = [] {
-        const char * env = getenv("LLAMA_STAGGERED_VERIFY");
-        return env != nullptr && atoi(env) != 0;
-    }();
-    return enabled;
-}
-
 static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     switch (ctx_type) {
         case LLAMA_CONTEXT_TYPE_DEFAULT: return LLM_GRAPH_TYPE_DEFAULT;
@@ -725,6 +715,7 @@ llama_context::llama_context(
                 LLAMA_LOG_INFO("%s: expert cache off: %s\n", __func__, e.what());
             }
         }
+        staggered_verify_init();
         verify_streams_init();
         sched_reserve();
 
@@ -1019,6 +1010,7 @@ void llama_context::sched_reserve() {
             if (cparams.pipeline_parallel) {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
+                staggered_verify_init();
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
                 sched_set_stage_lender();
                 gf = graph_reserve(n_tokens_pp, n_seqs_pp, n_outputs_pp_first, mctx_pp_ptr);
@@ -2559,7 +2551,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // that the previous compute is still reading.
         // with staggered verify, the graphs of the other sequences are in other graph slots (own schedulers and
         // inputs), so wait only for this scheduler's last graph and let their work continue on the devices
-        if (async_inputs || (cparams.pipeline_parallel && staggered_verify_enabled())) {
+        if (async_inputs || (cparams.pipeline_parallel && staggered_verify)) {
             ggml_backend_sched_wait_graph(sched.get());
         } else if (cparams.pipeline_parallel) {
             ggml_backend_sched_synchronize(sched.get());
@@ -3299,7 +3291,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             copy_tensor_async_rows(res->t_sampled,        sampling.sampled,    1,      n_outputs_prev, sched.get());
             // with staggered verify each sequence has its own ubatch, so the lazy rows of a ubatch start at n_outputs_prev
             const bool lazy = cparams.sampler_lazy &&
-                    (staggered_verify_enabled() || (n_outputs_prev == 0 && n_outputs == n_outputs_all &&
+                    (staggered_verify || (n_outputs_prev == 0 && n_outputs == n_outputs_all &&
                                          n_tokens_prev + ubatch.n_tokens == balloc->get_n_tokens())) &&
                     std::any_of(res->t_sampled_probs_by_token.begin(), res->t_sampled_probs_by_token.end(),
                             [](ggml_tensor * tensor) { return tensor != nullptr; });
@@ -4232,6 +4224,7 @@ bool llama_context::share_restore_memory() {
     }
     const int64_t t0 = ggml_time_us();
     memory.reset(model.create_memory(mem_params, cparams));
+    staggered_verify_init();
     memory_released = false;
     sched_need_reserve = true;
     LLAMA_LOG_WARN("%s: memory module created again in %.1f ms\n", __func__, (ggml_time_us() - t0) / 1000.0);
@@ -6479,6 +6472,24 @@ uint64_t llama_graph_n_built(const llama_context * ctx) {
 
 void llama_graph_alt_slots_reserve(llama_context * ctx, uint32_t n_slots, uint32_t n_max_tokens) {
     ctx->graph_alt_slots_reserve(n_slots, n_max_tokens);
+}
+
+void llama_context::staggered_verify_init() {
+    const char * env = getenv("LLAMA_STAGGERED_VERIFY");
+    auto * hybrid = dynamic_cast<llama_memory_hybrid *>(memory.get());
+    const uint32_t n_split = hybrid ? hybrid->get_n_seq_split_tokens() : 0;
+
+    // The gain is the overlap of sequences over the devices of a layer split. Without pipeline parallelism the ubatches
+    // of the sequences run one after the other, and without an alternate graph slot per sequence they rebuild graphs.
+    staggered_verify = (env == nullptr || atoi(env) != 0) && cparams.pipeline_parallel && !cparams.kv_unified &&
+        cparams.n_seq_max > 1 && n_split > 0 && graph_alt_max_tokens >= n_split && graph_alt_slots >= cparams.n_seq_max;
+
+    if (hybrid) {
+        hybrid->set_seq_staggered(staggered_verify);
+    }
+    if (staggered_verify) {
+        LLAMA_LOG_INFO("%s: staggered verify enabled\n", __func__);
+    }
 }
 
 void llama_context::graph_alt_slots_reserve(uint32_t n_slots, uint32_t n_max_tokens) {

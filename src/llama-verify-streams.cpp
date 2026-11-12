@@ -66,8 +66,8 @@ void llama_context::verify_streams_init() {
         return;
     }
 
-    if (cparams.kv_unified || graph_alt_max_tokens == 0 || expert_cache) {
-        LLAMA_LOG_WARN("%s: verify streams: off (needs a KV stream per sequence, alternate graph slots and no expert cache)\n", __func__);
+    if (!staggered_verify || expert_cache) {
+        LLAMA_LOG_WARN("%s: verify streams: off (needs staggered verify and no expert cache)\n", __func__);
         return;
     }
 

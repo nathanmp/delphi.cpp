@@ -70,6 +70,10 @@ public:
     // each. 0 when the split does not apply.
     uint32_t get_n_seq_split_tokens() const;
 
+    // delphi: staggered verify. Every sequence of a batch takes its own ubatches, also a short verify. The scheduler can
+    // then pipeline the ubatches of different sequences over the devices of a layer split. The context sets this.
+    void set_seq_staggered(bool value) { seq_staggered = value; }
+
     bool get_can_shift() const override;
 
     void set_mtp_index_reuse(bool reuse) override;
@@ -110,6 +114,8 @@ private:
     const std::unique_ptr<llama_memory_recurrent> mem_recr;
     const std::unique_ptr<llama_kv_cache> mem_idx;
     const std::unique_ptr<llama_kpool_cache> mem_kpool;
+
+    bool seq_staggered = false;
 };
 
 class llama_memory_hybrid_context : public llama_memory_context_i {
