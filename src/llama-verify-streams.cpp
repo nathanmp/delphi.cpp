@@ -114,6 +114,10 @@ static void verify_streams_grow_env() {
     if (getenv("GGML_GALLOC_GROW_PCT") == nullptr) {
         setenv("GGML_GALLOC_GROW_PCT", "25", 0);
     }
+    // a buffer that grows all the same (an alternate graph slot at its first larger verify) is freed later (ggml-cuda)
+    if (getenv("GGML_CUDA_RETIRE_MAX_MIB") == nullptr) {
+        setenv("GGML_CUDA_RETIRE_MAX_MIB", "512", 0);
+    }
     // a prompt ubatch has a larger KV view than the last one, and a new layout waits for all background ubatches in
     // flight: tensors that grew get room for the next ubatches (bounded by GGML_GALLOC_GROW_NODE_MAX_MIB)
     if (getenv("GGML_GALLOC_GROW_NODE_PCT") == nullptr) {

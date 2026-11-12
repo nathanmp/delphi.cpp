@@ -1168,6 +1168,87 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
 
 // cuda buffer
 
+// delphi: cudaFree waits for all work of the device. With a high-priority stream (ggml_backend_set_stream_priority) a
+// compute buffer that grew made the work of that stream wait for the lower-priority work of the device. A freed buffer
+// is then retired, and freed when a backend without a high-priority stream synchronizes (its work is complete then),
+// or when an allocation fails. GGML_CUDA_RETIRE_MAX_MIB bounds the retired buffers of a device (default 0: off).
+struct ggml_cuda_retired_buffers {
+    std::mutex mutex;
+    std::vector<void *> ptrs;
+    size_t bytes = 0;
+};
+
+static ggml_cuda_retired_buffers g_cuda_retired[GGML_CUDA_MAX_DEVICES];
+static ggml_cuda_retired_buffers g_cuda_retired_host; // pinned host buffers: cudaFreeHost waits in the same way
+static std::mutex g_cuda_high_priority_mutex;
+static std::vector<const void *> g_cuda_high_priority; // backend contexts
+static std::atomic<int> g_cuda_n_high_priority{0};
+
+static size_t ggml_cuda_retire_max_bytes() {
+    // read at each free (rare): the limit is set when background work starts, so that load-time frees are not retired
+    const char * env = getenv("GGML_CUDA_RETIRE_MAX_MIB");
+    return (size_t) (env != nullptr ? std::max(0, atoi(env)) : 0) * 1024 * 1024;
+}
+
+static void ggml_cuda_retired_flush(int device) {
+    std::vector<void *> ptrs;
+    {
+        std::lock_guard<std::mutex> lock(g_cuda_retired[device].mutex);
+        ptrs.swap(g_cuda_retired[device].ptrs);
+        g_cuda_retired[device].bytes = 0;
+    }
+    std::vector<void *> ptrs_host;
+    {
+        std::lock_guard<std::mutex> lock(g_cuda_retired_host.mutex);
+        ptrs_host.swap(g_cuda_retired_host.ptrs);
+        g_cuda_retired_host.bytes = 0;
+    }
+    if (!ptrs.empty()) {
+        ggml_cuda_set_device(device);
+    }
+    for (void * ptr : ptrs) {
+        CUDA_CHECK(cudaFree(ptr));
+    }
+    for (void * ptr : ptrs_host) {
+        CUDA_CHECK(cudaFreeHost(ptr));
+    }
+}
+
+static bool ggml_cuda_retire_host(void * ptr, size_t size) {
+    if (g_cuda_n_high_priority.load(std::memory_order_relaxed) == 0 || ptr == nullptr) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_cuda_retired_host.mutex);
+    if (g_cuda_retired_host.bytes + size > ggml_cuda_retire_max_bytes()) {
+        return false;
+    }
+    g_cuda_retired_host.ptrs.push_back(ptr);
+    g_cuda_retired_host.bytes += size;
+    return true;
+}
+
+// true if the buffer memory was retired; the caller must not free it
+static bool ggml_cuda_retire(int device, void * ptr, size_t size) {
+    if (g_cuda_n_high_priority.load(std::memory_order_relaxed) == 0 || ptr == nullptr) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_cuda_retired[device].mutex);
+    if (g_cuda_retired[device].bytes + size > ggml_cuda_retire_max_bytes()) {
+        return false;
+    }
+    g_cuda_retired[device].ptrs.push_back(ptr);
+    g_cuda_retired[device].bytes += size;
+    return true;
+}
+
+static bool ggml_cuda_is_high_priority(const void * cuda_ctx) {
+    if (g_cuda_n_high_priority.load(std::memory_order_relaxed) == 0) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_cuda_high_priority_mutex);
+    return std::find(g_cuda_high_priority.begin(), g_cuda_high_priority.end(), cuda_ctx) != g_cuda_high_priority.end();
+}
+
 struct ggml_backend_cuda_buffer_context {
     int device;
     void * dev_ptr = nullptr;
@@ -1195,6 +1276,9 @@ static void ggml_backend_cuda_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     // delphi: the packed MoE weights are keyed by the tensor address, which a later buffer can reuse
     ggml_cuda_moe_packed_forget(ctx->device, ctx->dev_ptr, buffer->size);
     ggml_cuda_moe_int4_forget(ctx->device, ctx->dev_ptr, buffer->size);
+    if (ctx->region == nullptr && ggml_cuda_retire(ctx->device, ctx->dev_ptr, buffer->size)) {
+        ctx->dev_ptr = nullptr;
+    }
     delete ctx;
 }
 
@@ -1356,6 +1440,11 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
 
     void * dev_ptr;
     cudaError_t err = ggml_cuda_device_malloc(&dev_ptr, size, buft_ctx->device);
+    if (err != cudaSuccess && g_cuda_retired[buft_ctx->device].bytes > 0) {
+        (void)cudaGetLastError();
+        ggml_cuda_retired_flush(buft_ctx->device);
+        err = ggml_cuda_device_malloc(&dev_ptr, size, buft_ctx->device);
+    }
     if (err != cudaSuccess) {
         // clear the error
         (void)cudaGetLastError();
@@ -1798,6 +1887,9 @@ static bool ggml_backend_buft_is_cuda_host(ggml_backend_buffer_type_t buft) {
 }
 
 static void ggml_backend_cuda_host_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    if (ggml_cuda_retire_host(buffer->context, buffer->size)) {
+        return;
+    }
     CUDA_CHECK(cudaFreeHost(buffer->context));
 }
 
@@ -3335,6 +3427,9 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     if (cuda_ctx->side_download != nullptr) {
         CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->side_download->stream));
         cuda_ctx->side_download->last = nullptr;
+    }
+    if ((g_cuda_retired[cuda_ctx->device].bytes > 0 || g_cuda_retired_host.bytes > 0) && !ggml_cuda_is_high_priority(cuda_ctx)) {
+        ggml_cuda_retired_flush(cuda_ctx->device);
     }
 
     // Timing events are recorded on stream 0; this existing synchronization completes all of them.
@@ -7905,6 +8000,11 @@ static bool ggml_backend_cuda_set_stream_priority(ggml_backend_t backend, bool h
     CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&lo, &hi));
     CUDA_CHECK(cudaStreamCreateWithPriority(&ctx->streams[ctx->device][0], cudaStreamNonBlocking, high ? hi : lo));
 #endif
+    if (high) {
+        std::lock_guard<std::mutex> lock(g_cuda_high_priority_mutex);
+        g_cuda_high_priority.push_back(ctx);
+        g_cuda_n_high_priority++;
+    }
     return true;
 #endif
 }
