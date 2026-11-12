@@ -1378,6 +1378,8 @@ void llama_context::synchronize() {
         return;
     }
 
+    // Output-only waits can leave checkpoint downloads on the background streams unfinished.
+    const bool state_complete = !verify_streams || !sync_outputs_only || main_fg_queued;
     if (verify_streams) {
         // synchronize_outputs() leaves the background prompt work of the main scheduler running
         verify_streams_sync_alt();
@@ -1388,7 +1390,7 @@ void llama_context::synchronize() {
         ggml_backend_sched_synchronize(sched.get());
     }
 
-    if (!state_async_pending.empty()) {
+    if (!state_async_pending.empty() && (state_complete || state_async_ready())) {
         state_async_finish();
     }
 
@@ -4946,7 +4948,8 @@ private:
 // device data without a staging buffer or a known stream, is read after a synchronization, as llama_io_write_host does.
 class llama_io_write_host_async : public llama_io_write_i {
 public:
-    llama_io_write_host_async(uint8_t * p, size_t len, llama_context & lctx) : ptr(p), buf_size(len), lctx(lctx) {}
+    llama_io_write_host_async(uint8_t * p, size_t len, llama_context & lctx, llama_seq_id seq_id) :
+        ptr(p), buf_size(len), lctx(lctx), seq_id(seq_id) {}
 
     ~llama_io_write_host_async() {
         size_t n_dev = 0;
@@ -4958,11 +4961,15 @@ public:
 
         bool synced = false;
         size_t off = 0;
+        std::vector<ggml_backend_t> copied;
         for (const auto & winfo : winfos) {
             if (winfo.backend && staging) {
                 ggml_backend_tensor_get_async(winfo.backend, winfo.tensor, staging + off, winfo.offset, winfo.size);
                 lctx.state_async_pending.push_back({ staging + off, winfo.ptr, winfo.size });
                 off += winfo.size;
+                if (std::find(copied.begin(), copied.end(), winfo.backend) == copied.end()) {
+                    copied.push_back(winfo.backend);
+                }
                 continue;
             }
             if (!synced && !ggml_backend_buffer_is_host(winfo.tensor->buffer)) {
@@ -4970,6 +4977,15 @@ public:
                 synced = true;
             }
             ggml_backend_tensor_get(winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
+        }
+        for (auto * backend : copied) {
+            ggml_backend_event_t event = ggml_backend_event_new(ggml_backend_get_device(backend));
+            if (event) {
+                ggml_backend_event_record(event, backend);
+            }
+            auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+            const auto query = (bool (*)(ggml_backend_event_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_event_query");
+            lctx.state_async_events.push_back({ ggml_backend_event_ptr(event), query });
         }
     }
 
@@ -4991,7 +5007,7 @@ public:
         ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
         ggml_backend_t backend = nullptr;
         if (buf && !ggml_backend_buffer_is_host(buf)) {
-            backend = lctx.state_async_backend(ggml_backend_buffer_get_type(buf));
+            backend = lctx.state_async_backend(ggml_backend_buffer_get_type(buf), seq_id);
         }
         winfos.push_back({tensor, backend, ptr, size, offset});
 
@@ -5019,6 +5035,7 @@ private:
     std::vector<write_info> winfos;
 
     llama_context & lctx;
+    llama_seq_id seq_id;
 };
 
 uint8_t * llama_context::state_async_staging(size_t size) {
@@ -5054,14 +5071,35 @@ uint8_t * llama_context::state_async_staging(size_t size) {
     return (uint8_t *) ggml_backend_buffer_get_base(buf);
 }
 
-ggml_backend_t llama_context::state_async_backend(ggml_backend_buffer_type_t buft) const {
+ggml_backend_t llama_context::state_async_backend(ggml_backend_buffer_type_t buft, llama_seq_id seq_id) const {
     for (const auto & backend : backends) {
         ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
         if (dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU && ggml_backend_dev_buffer_type(dev) == buft) {
+            // A prompt tail can already be on the alternate streams when its checkpoint is taken.
+            const bool alternate = verify_streams && seq_id >= 0 && seq_id < (llama_seq_id) seq_set.size() && seq_set[seq_id] == 1;
+            if (alternate) {
+                for (auto * b : backend_ptrs_v) {
+                    if (ggml_backend_get_device(b) == dev) {
+                        return b;
+                    }
+                }
+            }
             return backend.get();
         }
     }
     return nullptr;
+}
+
+bool llama_context::state_async_ready() const {
+    if (state_async_events.empty()) {
+        return false;
+    }
+    for (const auto & event : state_async_events) {
+        if (!event.event || !event.query || !event.query(event.event.get())) {
+            return false;
+        }
+    }
+    return true;
 }
 
 void llama_context::state_async_finish() {
@@ -5069,6 +5107,7 @@ void llama_context::state_async_finish() {
         memcpy(cpy.dst, cpy.src, cpy.size);
     }
     state_async_pending.clear();
+    state_async_events.clear();
     std::fill(state_async_busy.begin(), state_async_busy.end(), false);
 }
 
@@ -5424,7 +5463,7 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
         io = std::make_unique<llama_io_write_device>(dst, size, mem_storage[seq_id]);
     } else if (flags & LLAMA_STATE_SEQ_FLAGS_ASYNC) {
-        io = std::make_unique<llama_io_write_host_async>(dst, size, *this);
+        io = std::make_unique<llama_io_write_host_async>(dst, size, *this, seq_id);
     } else {
         io = std::make_unique<llama_io_write_host>(dst, size);
     }

@@ -342,7 +342,9 @@ bool llama_context::prompt_background_new_layout(llama_seq_id seq_id, llama_pos 
 
 void llama_context::prompt_background_wait() {
     if (verify_streams) {
-        verify_streams_sync_main();
+        // Checkpoints can have copies on either stream set. Finish their host copies too when the caller drains
+        // background work before reading or removing its state.
+        synchronize();
     }
 }
 

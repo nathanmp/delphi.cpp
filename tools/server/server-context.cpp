@@ -1002,6 +1002,7 @@ private:
 
     void ckpt_async_sync() {
         if (ckpt_async_pending) {
+            llama_prompt_background_wait(ctx_tgt);
             llama_synchronize(ctx_tgt);
             if (ctx_dft) {
                 // the draft context may be ingesting on the speculative worker
@@ -2957,7 +2958,10 @@ private:
             common_speculative_run_ctx(ctx_dft, [this, pcur, seq_id]() {
                 const size_t n = llama_state_seq_get_size_ext(ctx_dft, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                 pcur->data_dft.resize(n);
-                if (llama_state_seq_get_data_ext(ctx_dft, pcur->data_dft.data(), n, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != n) {
+                // run_ctx can execute here when device features disable the ingest worker. Keep the downloads
+                // asynchronous in that case too; ckpt_async_sync completes them before the checkpoint is used.
+                if (llama_state_seq_get_data_ext(ctx_dft, pcur->data_dft.data(), n, seq_id,
+                        LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ASYNC) != n) {
                     GGML_ABORT("checkpoint size mismatch\n");
                 }
                 common_speculative_get_state_now(spec.get(), seq_id, pcur->data_spec);
@@ -2983,8 +2987,11 @@ private:
             return false;
         }
 
-        // the task may read, copy or drop the slots' checkpoints
-        if (!is_yielding) {
+        // Polling and the next decode round do not read or remove checkpoints. Waiting here would drain background
+        // prefill after each checkpoint even though its copies can finish while the generating slots run.
+        const bool ckpt_poll = vs_enabled() && (task.type == SERVER_TASK_TYPE_NEXT_RESPONSE ||
+                task.type == SERVER_TASK_TYPE_METRICS || task.type == SERVER_TASK_TYPE_SLOT_GET);
+        if (!is_yielding && !ckpt_poll) {
             ckpt_async_sync();
         }
 
@@ -3769,6 +3776,7 @@ private:
     }
 
     void abort_all_slots(const std::string & reason) {
+        ckpt_async_sync();
         for (auto & slot : slots) {
             if (slot.is_processing()) {
                 send_error(slot, reason, ERROR_TYPE_SERVER);
@@ -3972,6 +3980,7 @@ private:
         // TODO: simplify and improve
         iterate(slots, [&](server_slot & slot) {
             if (slot.state == SLOT_STATE_GENERATING && slot.prompt.n_tokens() + 1 >= slot.n_ctx) {
+                ckpt_async_sync();
                 if (!params_base.ctx_shift) {
                     // this check is redundant (for good)
                     // we should never get here, because generation should already stopped in process_token()
@@ -4968,6 +4977,8 @@ private:
                 if (!err.empty()) {
                     SRV_ERR("%s off = %d, n_batch = %d, ret = %d\n", err.c_str(), off, n_batch, ret);
 
+                    ckpt_async_sync();
+
                     for (auto & slot : slots) {
                         if (slot.is_processing()) {
                             send_error(slot, err);
@@ -5055,6 +5066,9 @@ private:
 
                 // all children slots should already launched by launch_slots_with_parent_task()
                 // copy state to the child slots
+                if (!children.empty()) {
+                    ckpt_async_sync();
+                }
                 for (auto & child : children) {
                     SLT_TRC(slot, " - copying state to child %d\n", child->id);
 

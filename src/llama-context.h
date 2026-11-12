@@ -628,10 +628,16 @@ public:
     // a free pinned staging buffer of at least size bytes (nullptr without a pinned host buffer type)
     uint8_t * state_async_staging(size_t size);
     // the backend whose stream writes tensors of this buffer type (nullptr if none)
-    ggml_backend_t state_async_backend(ggml_backend_buffer_type_t buft) const;
+    ggml_backend_t state_async_backend(ggml_backend_buffer_type_t buft, llama_seq_id seq_id) const;
+    bool state_async_ready() const;
     void state_async_finish();
 
     std::vector<state_async_copy> state_async_pending;
+    struct state_async_event {
+        ggml_backend_event_ptr event;
+        bool (*query)(ggml_backend_event_t);
+    };
+    std::vector<state_async_event> state_async_events;
 
     uint64_t n_graph_built = 0; // number of graphs built (not reused); never reset
     // grow the alternate slots (llama_graph_alt_slots_reserve)
