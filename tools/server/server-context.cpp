@@ -3878,7 +3878,7 @@ private:
 
         GGML_ASSERT(batch.slot_batched || batch.size() == 0);
 
-        vs_round_bg = vs_round && batch.size() > vs_n_gen && batch.size() <= llama_n_batch(ctx_tgt) && !batch.has_embd;
+        vs_round_bg = vs_round && batch.size() > vs_n_gen && batch.size() <= (int32_t) llama_n_batch(ctx_tgt) && !batch.has_embd;
         for (int32_t i = 0; vs_round_bg && i < batch.size(); ++i) {
             vs_round_bg = i < vs_n_gen ? !batch.tokens[i].is_prompt : batch.tokens[i].is_prompt && !batch.tokens[i].output;
         }
@@ -4202,7 +4202,9 @@ private:
             const char * env = getenv("LLAMA_VERIFY_STREAMS_TAIL");
             return env != nullptr ? std::min(32, std::max(1, atoi(env))) : 16;
         }();
-        vs_round      = batch.size() > 0 && vs_enabled();
+        // LLAMA_VERIFY_STREAMS_SPLIT_ALONE (test only): a prompt without generating slots takes the same chunks and tail
+        static const bool vs_split_alone = getenv("LLAMA_VERIFY_STREAMS_SPLIT_ALONE") != nullptr;
+        vs_round      = (batch.size() > 0 || vs_split_alone) && vs_enabled();
         vs_tail_round = false;
         vs_n_gen      = batch.size();
         const int32_t vs_cap = prefill_cap > 0 ? prefill_cap : 1024;
@@ -4690,6 +4692,10 @@ private:
                         if (vs_round && !vs_tail_ok) {
                             if (vs_tail_round) {
                                 break;
+                            }
+                            if (vs_n_gen == 0 && batch.size() == 0) {
+                                vs_ingest(true);
+                                llama_prompt_background_wait(ctx_tgt);
                             }
                             const int32_t n_left = slot.task->n_tokens() - slot.prompt.n_tokens();
                             // a short last chunk has a new graph shape, and its synchronous input uploads then wait behind the

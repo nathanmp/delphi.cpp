@@ -45,11 +45,6 @@ void llama_context::verify_streams_init() {
         return;
     }
 
-    // a buffer that grows frees the old one, and cudaFree waits for all work of the device, i.e. for the background prompt
-    if (getenv("GGML_GALLOC_GROW_PCT") == nullptr) {
-        setenv("GGML_GALLOC_GROW_PCT", "25", 0);
-    }
-
     // a draft model only runs verify-side work: give its streams the high priority, so its drafts also pass prompt work
     if (model.arch == LLM_ARCH_DFLASH) {
         int n = 0;
@@ -100,6 +95,20 @@ void llama_context::verify_streams_init() {
             __func__, n, bg_region_rows());
 }
 
+// set at the first background decode, so that the buffers sized at load (and by the fit) do not get the headroom
+static void verify_streams_grow_env() {
+    // a buffer that grows at run time frees the old one, and cudaFree waits for all work of the device, i.e. for the
+    // background prompt: give such buffers headroom (ggml-alloc bounds it, GGML_GALLOC_GROW_MAX_MIB)
+    if (getenv("GGML_GALLOC_GROW_PCT") == nullptr) {
+        setenv("GGML_GALLOC_GROW_PCT", "25", 0);
+    }
+    // a prompt ubatch has a larger KV view than the last one, and a new layout waits for all background ubatches in
+    // flight: tensors that grew get room for the next ubatches (bounded by GGML_GALLOC_GROW_NODE_MAX_MIB)
+    if (getenv("GGML_GALLOC_GROW_NODE_PCT") == nullptr) {
+        setenv("GGML_GALLOC_GROW_NODE_PCT", "400", 0);
+    }
+}
+
 void llama_context::verify_streams_free() {
     if (!verify_streams) {
         return;
@@ -145,6 +154,11 @@ int32_t llama_context::bg_region_rows() const {
 
 void llama_context::verify_streams_decode_begin(uint32_t n_tokens_all) {
     decode_bg      = verify_streams && prompt_bg && (int32_t) n_tokens_all <= bg_region_rows();
+    static bool grow_env = false;
+    if (decode_bg && !grow_env) {
+        verify_streams_grow_env();
+        grow_env = true;
+    }
     decode_bg_main = false;
     layer_inp_row_base = 0;
 }
