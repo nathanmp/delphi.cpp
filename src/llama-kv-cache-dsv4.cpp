@@ -653,7 +653,13 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
     // Keep the mask (and with it the compressed-attention branch) present even
     // before the first block is visible, so the graph topology never changes.
     // Padded slots are masked out; comp cache buffers are zero-initialized.
-    plan.n_kv = std::max<int64_t>(GGML_PAD(plan.n_kv, 256u), 256);
+    // The step follows the raw cache (larger for draft and verify widths): each step makes the graphs of all widths stale.
+    {
+        static const bool comp_pad = [] { const char * e = getenv("LLAMA_DSV4_COMP_N_PAD"); return e == nullptr || atoi(e) != 0; }();
+        const int64_t step = comp_pad ? llama_kv_cache_n_pad_step(ubatch.n_tokens, 256) : 256;
+        plan.n_kv = std::max<int64_t>(GGML_PAD(plan.n_kv, 256u), 256);
+        plan.n_kv = std::max<int64_t>(plan.n_kv, std::min<int64_t>(GGML_PAD(plan.n_kv, step), GGML_PAD((int64_t) kv_size - 255, 256)));
+    }
 
     std::sort(persist_rows.begin(), persist_rows.end(),
             [](const persist_row & a, const persist_row & b) {

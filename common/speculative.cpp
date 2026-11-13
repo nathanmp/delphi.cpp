@@ -3567,9 +3567,9 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         }
         // every KV view step makes the graphs of all widths stale (GLM: ~30 ms per target width); 2048 measured best
         // on GLM (conf-7 +6 % vs the step 256; the masked cells cost ~0.5 ms per verify round)
-        if (!impl->block_ctl) {
-            llama_kv_cache_n_pad_reserve(2048);
-        }
+        // DSpark block mode: DeepSeek V4.1 verify -5 % (short) to -8 % (10K) per round; LLAMA_SPEC_BLOCK_KV_N_PAD sets the step, 0 = no reservation
+        const char * block_pad = impl->block_ctl ? getenv("LLAMA_SPEC_BLOCK_KV_N_PAD") : nullptr;
+        llama_kv_cache_n_pad_reserve(block_pad ? (uint32_t) atoi(block_pad) : 2048);
     }
 
     if (impls.empty()) {

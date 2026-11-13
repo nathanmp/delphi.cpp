@@ -20,6 +20,9 @@ struct llama_context;
 // delphi: KV window: ubatches of at least this many tokens copy a windowed layer to VRAM, narrower ones gather
 uint32_t llama_kv_window_stage_min_tokens();
 
+// the step of the padded KV view for a batch of n_batch_tokens tokens (LLAMA_KV_N_PAD, llama_kv_cache_n_pad_reserve)
+uint32_t llama_kv_cache_n_pad_step(size_t n_batch_tokens, uint32_t n_pad);
+
 class llama_kv_cache : public llama_memory_i {
 public:
     struct stream_copy_info {

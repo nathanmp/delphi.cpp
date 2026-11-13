@@ -1565,9 +1565,7 @@ void llama_kv_cache_n_pad_reserve(uint32_t n_pad) {
     }
 }
 
-uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
-    uint32_t result = 0;
-
+uint32_t llama_kv_cache_n_pad_step(size_t n_batch_tokens, uint32_t n_pad) {
     // pad the n_kv value so that the graph remains constant across batches and can be reused
     // note: this also helps some backends with performance (f.ex https://github.com/ggml-org/llama.cpp/pull/16812#issuecomment-3455112220)
     // LLAMA_KV_N_PAD (multiple of 256) or llama_kv_cache_n_pad_reserve(): a larger step makes the KV view grow less often,
@@ -1584,9 +1582,17 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     }();
     // The reservation is for small batches only (draft and verify widths). Prompt ubatches change the view at every ubatch
     // anyway, and on a pipelined layer split (Qwen on 3 ROCm GPUs) the large step cost 40 % of the prefill speed.
-    const bool small_batch = !sinfo.empty() && !sinfo.idxs[0].empty() && sinfo.idxs[0].size() <= kv_n_pad_reserve_max_tokens;
-    const uint32_t n_pad_rsv = small_batch ? kv_n_pad_reserved.load(std::memory_order_relaxed) : 0u;
-    const uint32_t n_pad_cur = std::max(n_pad, n_pad_env > 0 ? n_pad_env : std::max(256u, n_pad_rsv));
+    const bool small_batch = n_batch_tokens > 0 && n_batch_tokens <= kv_n_pad_reserve_max_tokens;
+    // LLAMA_KV_N_PAD_RESERVE: diagnostic, sets the reservation without a speculative context (e.g. for logits tests)
+    static const uint32_t n_pad_rsv_env = [] { const char * e = getenv("LLAMA_KV_N_PAD_RESERVE"); return e ? (uint32_t) atol(e) : 0u; }();
+    const uint32_t n_pad_rsv = small_batch ? std::max(n_pad_rsv_env, kv_n_pad_reserved.load(std::memory_order_relaxed)) : 0u;
+    return std::max(n_pad, n_pad_env > 0 ? n_pad_env : std::max(256u, n_pad_rsv));
+}
+
+uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
+    uint32_t result = 0;
+
+    const uint32_t n_pad_cur = llama_kv_cache_n_pad_step(sinfo.empty() || sinfo.idxs[0].empty() ? 0 : sinfo.idxs[0].size(), n_pad);
 
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const auto & cells = v_cells[sinfo.strm[s]];
