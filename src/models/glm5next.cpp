@@ -633,7 +633,10 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
         ggml_tensor * ape = ggml_cont(ctx0, ggml_transpose(ctx0, layer.indexer_comp_ape));
         gate_t = ggml_add(ctx0, gate_t, ggml_reshape_4d(ctx0, ape, r, d_idx, 1, 1));
 
-        ggml_tensor * probs = ggml_soft_max(ctx0, gate_t);
+        // Softmax on 2D rows: CUDA puts ne02 (n_group) on the grid y axis, which allows at most 65535 blocks. A full
+        // pool rebuild at more than 262140 cells (r = 4) exceeded it and failed with "invalid argument".
+        ggml_tensor * probs = ggml_soft_max(ctx0, ggml_reshape_2d(ctx0, gate_t, r, d_idx*n_group*n_stream));
+        probs = ggml_reshape_4d(ctx0, probs, r, d_idx, n_group, n_stream);
         cb(probs, "indexer_pool_probs", il);
 
         ggml_tensor * result = ggml_sum_rows(ctx0, ggml_mul(ctx0, keys_t, probs));
