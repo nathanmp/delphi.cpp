@@ -120,7 +120,8 @@ static bool run_multistream_restore(
         }
     }
 
-    constexpr llama_state_seq_flags flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+    // a full read: a partial one (prompt checkpoint) keeps the pools, since it leaves the indexer cache as it is
+    constexpr llama_state_seq_flags flags = 0;
     const size_t state_size = llama_state_seq_get_size_ext(ctx, 0, flags);
     std::vector<uint8_t> state(state_size);
     if (llama_state_seq_get_data_ext(ctx, state.data(), state.size(), 0, flags) != state.size() ||
@@ -129,7 +130,7 @@ static bool run_multistream_restore(
         return false;
     }
 
-    // Restoring sequence 0 invalidates every pool map. Rebuilding it must not
+    // Restoring sequence 0 invalidates its pool map. Rebuilding it must not
     // clear the pending rebuild state of sequence 1's physical KV stream.
     const bool ok = decode_sequence(ctx, tokens, n_prefill, 1, 0) &&
                     decode_sequence(ctx, tokens, n_prefill, 1, 1);

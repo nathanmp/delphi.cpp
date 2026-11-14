@@ -392,16 +392,30 @@ llama_kpool_cache::stream_plan llama_kpool_cache::prepare_stream(
 void llama_kpool_cache::mark_cached(uint32_t stream, const std::vector<int32_t> & slots) {
     GGML_ASSERT(stream < pimpl->n_stream);
     auto & map = pimpl->maps[stream];
-    for (int32_t slot : slots) {
-        bool found = false;
-        for (auto & [_, value] : map) {
-            if (value.slot == slot) {
-                value.cached = true;
-                found = true;
-                break;
+    if (slots.size() <= 8) {
+        for (int32_t slot : slots) {
+            bool found = false;
+            for (auto & [_, value] : map) {
+                if (value.slot == slot) {
+                    value.cached = true;
+                    found = true;
+                    break;
+                }
             }
+            GGML_ASSERT(found);
         }
-        GGML_ASSERT(found);
+        return;
+    }
+    // A scan of the map per slot is quadratic: a full pool rebuild marks every pool, and at 450K cells (112K pools)
+    // that took ~27 s on the server thread before the first token of a cached prompt. Index the slots once.
+    std::vector<impl::entry *> by_slot(pimpl->max_slots, nullptr);
+    for (auto & [_, value] : map) {
+        GGML_ASSERT(value.slot >= 0 && (uint32_t) value.slot < pimpl->max_slots);
+        by_slot[value.slot] = &value;
+    }
+    for (int32_t slot : slots) {
+        GGML_ASSERT(slot >= 0 && (uint32_t) slot < pimpl->max_slots && by_slot[slot] != nullptr);
+        by_slot[slot]->cached = true;
     }
 }
 

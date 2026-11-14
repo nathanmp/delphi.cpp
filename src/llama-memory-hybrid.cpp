@@ -379,7 +379,10 @@ void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
         if (mem_idx) mem_idx->state_read(io, seq_id, flags);
     }
     mem_recr->state_read(io, seq_id, flags);
-    if (mem_kpool) mem_kpool->invalidate(seq_id);
+    // The pools are computed from the indexer cache. A partial read (a prompt checkpoint) leaves that cache as it is,
+    // and the seq_rm that follows a restore drops the blocks past it: invalidating here made the next ubatch rebuild
+    // every pool of the sequence (GLM-5.3, a cached 450K prompt: ~27 s before the first token).
+    if (mem_kpool && (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) mem_kpool->invalidate(seq_id);
 }
 
 llama_kv_cache * llama_memory_hybrid::get_mem_attn() const {
