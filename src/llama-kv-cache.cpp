@@ -227,6 +227,167 @@ static ggml_backend_buffer_t llama_kv_window_alloc(ggml_context * ctx, ggml_back
     return buf;
 }
 
+
+// delphi: see llama_kv_cache::window_lend
+void llama_kv_cache::window_lend_init(ggml_backend_buffer_t buf, ggml_context * ctx, ggml_backend_buffer_type_t buft,
+        uint32_t n_resident, uint32_t kv_size) {
+    const char * env = getenv("LLAMA_KV_WINDOW_LEND");
+    if (env == nullptr || atoi(env) == 0 || n_stream < 2) {
+        return;
+    }
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    if (reg == nullptr) {
+        return;
+    }
+    using gran_fn_t = size_t (*)(ggml_backend_buffer_t);
+    auto gran_fn = (gran_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_kv_region_swap_granularity");
+    auto swap_fn = (decltype(window_lend::swap)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_kv_region_swap");
+    const size_t g = gran_fn && swap_fn ? gran_fn(buf) : 0;
+    if (g == 0) {
+        LLAMA_LOG_WARN("%s: %s: the KV window cannot lend (the region is not mapped per granule)\n", __func__, ggml_backend_buffer_name(buf));
+        return;
+    }
+
+    window_lend L;
+    L.buf  = buf;
+    L.swap = swap_fn;
+    L.g    = g;
+    const char * base = (const char *) ggml_backend_buffer_get_base(buf);
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+        if (t->view_src != nullptr || t->ne[1] != (int64_t) kv_size) {
+            continue;
+        }
+        const size_t off = (const char *) t->data - base;
+        if (L.nb1 == 0) {
+            L.nb1 = t->nb[1];
+            L.nb2 = t->nb[2];
+        }
+        if (t->nb[1] != L.nb1 || t->nb[2] != L.nb2 || off % g != 0 || L.nb2 % g != 0 || t->ne[2] != (int64_t) n_stream) {
+            LLAMA_LOG_WARN("%s: %s: the KV window cannot lend (%s is not laid out in whole granules per stream)\n",
+                    __func__, ggml_backend_buffer_name(buf), t->name);
+            return;
+        }
+        L.offs.push_back(off);
+    }
+    if (L.offs.empty()) {
+        return;
+    }
+    L.n_gran = (uint32_t) (L.nb2/g);
+    L.base   = (uint32_t) (((size_t) n_resident*L.nb1 + g - 1)/g);
+    // a small window (the indexer cache) is not worth the moves
+    if (L.base < 16 || L.base >= L.n_gran) {
+        return;
+    }
+    L.v.assign(n_stream, L.base);
+    LLAMA_LOG_INFO("%s: %s: KV window lending on: %u of %u granules (%.1f MiB) VRAM per stream, %zu tensors\n",
+            __func__, ggml_backend_buffer_name(buf), L.base, L.n_gran, g/1048576.0, L.offs.size());
+    window_lends.push_back(std::move(L));
+}
+
+void llama_kv_cache::window_rebalance() {
+    static const int64_t idle_ms = [] {
+        const char * env = getenv("LLAMA_KV_WINDOW_LEND_IDLE_MS");
+        return env ? (int64_t) atoll(env) : (int64_t) 5000;
+    }();
+    static const uint32_t min_move = [] {
+        const char * env = getenv("LLAMA_KV_WINDOW_LEND_MIN_GRANULES");
+        return env ? (uint32_t) atoi(env) : 8u;
+    }();
+
+    const int64_t now = ggml_time_ms();
+    const uint32_t ns = n_stream;
+
+    for (auto & L : window_lends) {
+        std::vector<size_t>   used(ns);
+        std::vector<uint32_t> need(ns);
+        for (uint32_t s = 0; s < ns; ++s) {
+            used[s] = (size_t) v_cells[s].used_max_p1()*L.nb1;
+            const uint32_t ug = (uint32_t) std::min<size_t>(L.n_gran, (used[s] + L.g - 1)/L.g);
+            const bool active = now - stream_last_use_ms[s] < idle_ms;
+            need[s] = active ? ug : 0;
+        }
+
+        // water-filling of the VRAM granules over the needs of the busy streams
+        const uint32_t total = L.base*ns;
+        std::vector<uint32_t> order(ns);
+        for (uint32_t s = 0; s < ns; ++s) {
+            order[s] = s;
+        }
+        std::sort(order.begin(), order.end(), [&](uint32_t x, uint32_t y) { return need[x] < need[y]; });
+        std::vector<uint32_t> target(ns, 0);
+        uint32_t rem = total;
+        for (uint32_t i = 0; i < ns; ++i) {
+            const uint32_t s = order[i];
+            target[s] = std::min(need[s], rem/(ns - i));
+            rem -= target[s];
+        }
+        // the rest: stay where it is, then back to the base, then anywhere
+        for (uint32_t s = 0; s < ns && rem > 0; ++s) {
+            const uint32_t add = std::min(L.v[s] > target[s] ? L.v[s] - target[s] : 0u, rem);
+            target[s] += add;
+            rem -= add;
+        }
+        for (uint32_t s = 0; s < ns && rem > 0; ++s) {
+            const uint32_t add = std::min(L.base > target[s] ? L.base - target[s] : 0u, rem);
+            target[s] += add;
+            rem -= add;
+        }
+        for (uint32_t s = 0; s < ns && rem > 0; ++s) {
+            const uint32_t add = std::min(L.n_gran - target[s], rem);
+            target[s] += add;
+            rem -= add;
+        }
+        GGML_ASSERT(rem == 0);
+
+        uint32_t max_gain = 0;
+        for (uint32_t s = 0; s < ns; ++s) {
+            if (target[s] > L.v[s] && need[s] > L.v[s]) {
+                max_gain = std::max(max_gain, std::min(target[s], need[s]) - L.v[s]);
+            }
+        }
+        if (max_gain < min_move) {
+            continue;
+        }
+
+        const int64_t t0 = ggml_time_us();
+        size_t moved = 0;
+        for (uint32_t a = 0; a < ns; ++a) {
+            while (L.v[a] < target[a]) {
+                uint32_t b = 0;
+                while (b < ns && L.v[b] <= target[b]) {
+                    ++b;
+                }
+                GGML_ASSERT(b < ns);
+                const uint32_t k = std::min(target[a] - L.v[a], L.v[b] - target[b]);
+                const size_t   len = (size_t) k*L.g;
+                // the top k VRAM granules of b become a's next k granules; each range keeps the data it holds
+                const size_t lend_off = (size_t) (L.v[b] - k)*L.g;
+                const size_t borr_off = (size_t) L.v[a]*L.g;
+                const bool keep_lend = used[b] > lend_off;
+                const bool keep_borr = used[a] > borr_off;
+                for (size_t off : L.offs) {
+                    if (!L.swap(L.buf, off + b*L.nb2 + lend_off, off + a*L.nb2 + borr_off, len, keep_lend, keep_borr)) {
+                        LLAMA_LOG_ERROR("%s: %s: KV window swap failed, lending stops\n", __func__, ggml_backend_buffer_name(L.buf));
+                        window_lends.clear();
+                        return;
+                    }
+                    moved += (keep_lend ? len : 0) + (keep_borr ? len : 0);
+                }
+                L.v[a] += k;
+                L.v[b] -= k;
+            }
+        }
+
+        std::string desc;
+        for (uint32_t s = 0; s < ns; ++s) {
+            desc += (s ? ", " : "") + std::to_string((size_t) L.v[s]*L.g/L.nb1);
+        }
+        LLAMA_LOG_INFO("%s: %s: KV window VRAM cells per stream now %s (%.1f MiB copied, %.1f ms)\n", __func__,
+                ggml_backend_buffer_name(L.buf), desc.c_str(), moved/1048576.0, (ggml_time_us() - t0)/1000.0);
+    }
+}
+
 //
 // llama_kv_cache
 //
@@ -529,6 +690,7 @@ llama_kv_cache::llama_kv_cache(
                     LLAMA_LOG_INFO("%s: %10s KV window: cells [0, %u) in VRAM, [%u, %u) in host memory: %.2f MiB VRAM + %.2f MiB host\n",
                             __func__, ggml_backend_buffer_name(buf), n_resident, n_resident, kv_size,
                             (ggml_backend_buffer_get_size(buf) - n_host)/1024.0/1024.0, n_host/1024.0/1024.0);
+                    window_lend_init(buf, ctx.get(), buft, n_resident, kv_size);
                 } else {
                     LLAMA_LOG_WARN("%s: %10s KV window not available, allocating the cache in VRAM\n", __func__, buft_dev);
                 }
@@ -1447,6 +1609,20 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
         auto & head = v_heads[sinfo.strm[s]];
 
         head = sinfo.idxs[s].back() + 1;
+    }
+
+    // delphi: KV window lending. Decode steps only (a prompt would move memory on every ubatch as it grows), at most
+    // every 250 ms; the work of earlier ubatches is all queued here, so the swap's device synchronization is safe.
+    if (!window_lends.empty()) {
+        const int64_t now = ggml_time_ms();
+        stream_last_use_ms.resize(n_stream, 0);
+        for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+            stream_last_use_ms[sinfo.strm[s]] = now;
+        }
+        if (ubatch.n_tokens <= 16*sinfo.n_stream() && now - window_last_check_ms >= 250) {
+            window_last_check_ms = now;
+            window_rebalance();
+        }
     }
 }
 

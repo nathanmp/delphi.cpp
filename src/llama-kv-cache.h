@@ -337,6 +337,28 @@ private:
     // delphi: bytes of each KV window buffer that are pinned host memory (not counted as device memory)
     std::map<ggml_backend_buffer_t, size_t> window_host_bytes;
 
+    // delphi: KV window lending (LLAMA_KV_WINDOW_LEND=1). Every stream of a window buffer starts with the same VRAM
+    // prefix (base granules of its cell range); a stream that decodes past its prefix takes VRAM granules from the top
+    // of the prefixes of idle streams (or a fair share of the busy ones), so that one long session can hold the VRAM
+    // of the idle slots. The memory moves with ggml_backend_kv_region_swap; the data at every address is kept.
+    struct window_lend {
+        ggml_backend_buffer_t buf = nullptr;
+        bool (*swap)(ggml_backend_buffer_t, size_t, size_t, size_t, bool, bool) = nullptr;
+        size_t   g      = 0;   // granule bytes
+        size_t   nb1    = 0;   // bytes per cell
+        size_t   nb2    = 0;   // bytes per stream
+        uint32_t base   = 0;   // VRAM granules per stream at allocation
+        uint32_t n_gran = 0;   // granules per stream
+        std::vector<size_t>   offs; // the windowed tensors, from the buffer base
+        std::vector<uint32_t> v;    // VRAM granules (a prefix) per stream
+    };
+    std::vector<window_lend> window_lends;
+    std::vector<int64_t>     stream_last_use_ms;
+    int64_t                  window_last_check_ms = 0;
+    void window_rebalance();
+    void window_lend_init(ggml_backend_buffer_t buf, ggml_context * ctx, ggml_backend_buffer_type_t buft,
+            uint32_t n_resident, uint32_t kv_size);
+
     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method
     std::vector<uint32_t> v_heads;

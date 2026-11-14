@@ -1494,6 +1494,22 @@ static ggml_backend_buffer_t ggml_backend_cuda_kv_region_alloc(ggml_backend_buff
     return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
 }
 
+// delphi: KV window lending (LLAMA_KV_WINDOW_LEND): the swap granularity of a region buffer (0: none) and the swap of
+// two of its ranges (offsets from the buffer base), see ggml_cuda_kv_region_swap
+static size_t ggml_backend_cuda_kv_region_swap_granularity(ggml_backend_buffer_t buf) {
+    if (buf == nullptr || buf->iface.free_buffer != ggml_backend_cuda_buffer_interface.free_buffer) {
+        return 0;
+    }
+    return ggml_cuda_kv_region_swap_granularity(((ggml_backend_cuda_buffer_context *) buf->context)->region);
+}
+
+static bool ggml_backend_cuda_kv_region_swap(ggml_backend_buffer_t buf, size_t a, size_t b, size_t len, bool keep_a, bool keep_b) {
+    if (ggml_backend_cuda_kv_region_swap_granularity(buf) == 0) {
+        return false;
+    }
+    return ggml_cuda_kv_region_swap(((ggml_backend_cuda_buffer_context *) buf->context)->region, a, b, len, keep_a, keep_b);
+}
+
 static size_t ggml_backend_cuda_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
     return 128;
 
@@ -8156,6 +8172,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_kv_region_alloc") == 0) {
         return (void *)ggml_backend_cuda_kv_region_alloc;
+    }
+    if (strcmp(name, "ggml_backend_kv_region_swap_granularity") == 0) {
+        return (void *)ggml_backend_cuda_kv_region_swap_granularity;
+    }
+    if (strcmp(name, "ggml_backend_kv_region_swap") == 0) {
+        return (void *)ggml_backend_cuda_kv_region_swap;
     }
     if (strcmp(name, "ggml_backend_cuda_moe_int4_set_mode") == 0) {
         return (void *)ggml_backend_cuda_moe_int4_set_mode;
