@@ -4442,6 +4442,26 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
 
     const uint32_t stream0 = mctx_idx->get_stream_base();
     const uint32_t n_stream_cache = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
+
+    // delphi: the device-table path (llm_graph_input_kpool::fast), decided on shapes only; a stream whose pool run moved
+    // off its ring origin rebases (and so rebuilds) before the rebuild decision below
+    bool fast_eligible = false;
+    if (scoring && pool_cache != nullptr) {
+        const int64_t n_kv     = mctx_attn->get_n_kv();
+        const int64_t n_stream = n_stream_cache;
+        const int64_t n_tps    = ubatch.n_tokens/n_stream;
+        const int64_t n_ps     = (int64_t) ubatch.n_seqs_unq/n_stream;
+        const int64_t n_pools  = llama_kpool_n_pools(n_kv, kpool, n_ps);
+        const int64_t n_pool_select = llama_kpool_select_k((uint32_t) n_pools, hparams.indexer_top_k, kpool);
+        const int64_t n_compact = GGML_PAD(kpool*n_pool_select + kpool - 1, 256);
+        const bool attn_ok = llama_kpool_indexed_attn_enabled(n_kv, n_tps) || (n_tps == 1 && n_kv >= n_compact);
+        fast_eligible = n_ps == 1 &&
+                llama_kpool_fast_eligible(pool_cache, ubatch, n_stream, n_pools, attn_ok, pool_cache->get_mtp_index_reuse());
+        if (fast_eligible) {
+            llama_kpool_fast_rebase(pool_cache, mctx_attn->get_kv(), ubatch, stream0, n_stream, n_pools, kpool);
+        }
+    }
+
     bool rebuild_pool_cache = pool_cache != nullptr && scoring &&
             pool_cache->needs_rebuild(stream0, n_stream_cache);
     if (pool_cache != nullptr && scoring && mctx_cur->get_kpool_rebuild_override() >= 0) {
@@ -4478,15 +4498,36 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
         // the selection terms below exist only for real queries
         GGML_ASSERT(kq_mask->ne[1] == n_tps && "the pooled indexer needs an unpadded KQ mask");
 
-        inp->pool_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool*n_pools, n_stream);
-        ggml_set_input(inp->pool_cells);
-        ggml_set_name(inp->pool_cells, "kpool_pool_cells");
+        constexpr int64_t k_fa_pad = 256;
+        const int64_t n_pool_select = llama_kpool_select_k(
+                (uint32_t) n_pools, hparams.indexer_top_k, hparams.indexer_kpool);
+        const int64_t n_selected = hparams.indexer_kpool*n_pool_select;
+        const int64_t n_compact = GGML_PAD(
+                n_selected + hparams.indexer_kpool - 1, k_fa_pad);
+        const bool compact_decode = n_tps == 1 && n_kv >= n_compact;
+
+        // delphi: device tables (llm_graph_input_kpool::fast) when nothing per cell is needed on the host
+        int64_t n_update_fast = 0;
+        int64_t n_delta_fast  = 0;
+        GGML_ASSERT(!fast_eligible || (indexed_attn || compact_decode));
+        inp->fast = fast_eligible &&
+                llama_kpool_fast_prepare(*inp, mctx_attn->get_kv(), pool_cache, ubatch, stream0, n_kv, n_stream, n_pools,
+                        rebuild_pool_cache, n_update_fast, n_delta_fast);
+        inp->fast_n_delta = n_delta_fast;
+
+        if (!inp->fast) {
+            inp->pool_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool*n_pools, n_stream);
+            ggml_set_input(inp->pool_cells);
+            ggml_set_name(inp->pool_cells, "kpool_pool_cells");
+        }
 
         if (llama_kpool_device_masks_enabled()) {
             // the pool bias is built per device from these (see llm_graph_input_kpool)
-            inp->pool_iv_cells = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_pools, 2, 1, n_stream);
-            ggml_set_input(inp->pool_iv_cells);
-            ggml_set_name(inp->pool_iv_cells, "kpool_pool_iv_cells");
+            if (!inp->fast) {
+                inp->pool_iv_cells = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_pools, 2, 1, n_stream);
+                ggml_set_input(inp->pool_iv_cells);
+                ggml_set_name(inp->pool_iv_cells, "kpool_pool_iv_cells");
+            }
 
             inp->pool_iv_queries = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_tps, 2, 1, n_stream);
             ggml_set_input(inp->pool_iv_queries);
@@ -4497,7 +4538,18 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
             ggml_set_name(inp->pool_bias, "kpool_pool_bias");
         }
 
-        if (pool_cache != nullptr) {
+        if (pool_cache != nullptr && inp->fast) {
+            // the keys are read in place and a rebuild copies into the slots [0, n_pools): only the update rows
+            if (!rebuild_pool_cache) {
+                inp->pool_update_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool*n_update_fast, n_stream);
+                ggml_set_input(inp->pool_update_cells);
+                ggml_set_name(inp->pool_update_cells, "kpool_update_cells");
+
+                inp->pool_update_dst = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_update_fast, n_stream);
+                ggml_set_input(inp->pool_update_dst);
+                ggml_set_name(inp->pool_update_dst, "kpool_update_dst");
+            }
+        } else if (pool_cache != nullptr) {
             inp->pool_cache_slots = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_pools, n_stream);
             ggml_set_input(inp->pool_cache_slots);
             ggml_set_name(inp->pool_cache_slots, "kpool_cache_slots");
@@ -4541,14 +4593,6 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
                     GGML_TYPE_F16);
             ggml_set_name(inp->pool_bias_f16, "kpool_pool_bias_f16");
         }
-
-        constexpr int64_t k_fa_pad = 256;
-        const int64_t n_pool_select = llama_kpool_select_k(
-                (uint32_t) n_pools, hparams.indexer_top_k, hparams.indexer_kpool);
-        const int64_t n_selected = hparams.indexer_kpool*n_pool_select;
-        const int64_t n_compact = GGML_PAD(
-                n_selected + hparams.indexer_kpool - 1, k_fa_pad);
-        const bool compact_decode = n_tps == 1 && n_kv >= n_compact;
 
         if (!indexed_attn && !compact_decode && n_ps == 1 && llama_kpool_device_masks_enabled()) {
             // the dense masks are built per device from these (see llm_graph_input_kpool)

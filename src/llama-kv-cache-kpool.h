@@ -119,6 +119,44 @@ public:
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
+    // delphi: ring slots. Without a unified KV cache a stream holds one sequence, and the slot of its pool block b is
+    // b % max_slots: the live blocks of a sequence span at most max_slots, so no map is needed, and when the packed
+    // run starts at a multiple of max_slots (b_base == 0 in practice) the slot of packed pool p is p itself, which
+    // lets the indexer read the keys in place. ring_blocks()[slot] is the block that slot holds (-1: none), and
+    // ring_cached()[slot] says whether its key is current.
+    bool      is_ring() const;
+    int64_t * ring_blocks(uint32_t stream);
+    uint8_t * ring_cached(uint32_t stream);
+    // slots >= ring_hi(stream) hold no block
+    uint32_t & ring_hi(uint32_t stream);
+    // the slot of a block: (block - origin) mod max_slots; a rebase empties the stream's ring (and rebuilds it) with
+    // a new origin, so that the packed ordinals of the stream's run are its slots again
+    int64_t  ring_origin(uint32_t stream) const;
+    uint32_t ring_slot(uint32_t stream, int64_t block) const;
+    void     ring_rebase(uint32_t stream, int64_t origin);
+
+    // delphi: device-resident pool tables (ring mode only), one per buffer type that holds pool keys, so a decode
+    // step uploads the rows that changed instead of two n_kv-sized tables per device (GLM-5.3 at 250K: ~1.5 MiB per
+    // device per step over PCIe, with the devices idle). The shadows mirror what the device holds.
+    struct dev_table {
+        ggml_tensor * cells = nullptr;       // I32 [kpool*max_slots, n_stream], the members of packed pool p
+        ggml_tensor * iv    = nullptr;       // F32 [max_slots, n_stream, 2]: p if complete else BIG; p
+        std::vector<int32_t> shadow_cells;   // [n_stream][kpool*max_slots]
+        std::vector<uint8_t> shadow_valid;   // [n_stream][max_slots]
+    };
+    size_t      n_tables() const;
+    dev_table & get_table(size_t i);
+    // the table on the device of layer il's pool keys, -1 if none
+    int32_t     table_of_layer(int32_t il) const;
+
+    // the first n_pools slots of layer il's keys [n_embd, n_pools, n_stream], written by a copy of cur
+    ggml_tensor * store_prefix(
+            ggml_context * ctx,
+            ggml_tensor * cur,
+            int32_t il,
+            uint32_t stream0,
+            uint32_t n_stream) const;
+
 private:
     struct impl;
     std::unique_ptr<impl> pimpl;
@@ -182,6 +220,48 @@ void llama_kv_cache_set_input_kpool(
               ggml_tensor    * mask_queries       = nullptr,
               ggml_tensor    * pool_iv_cells      = nullptr,
               ggml_tensor    * pool_iv_queries    = nullptr);
+
+// delphi: device tables, see llm_graph_input_kpool::fast. LLAMA_GLM5_DEVICE_TABLES=0 keeps the host tables.
+bool llama_kpool_device_tables_enabled();
+
+class llm_graph_input_kpool;
+
+// Compute the pool tables of a device-table ubatch and the rows of each device table that differ (into inp.fast_*).
+// Read-only on the caches: graph build and can_reuse call it, set_input commits. n_update and n_delta are the shapes
+// the graph needs (with floors, so that a reservation covers the real ubatches).
+// the static conditions of the device-table path (the same for reservations and real ubatches, so that their graphs have
+// the same topology)
+bool llama_kpool_fast_eligible(
+        const llama_kpool_cache * cache,
+        const llama_ubatch      & ubatch,
+        int64_t                   n_stream,
+        int64_t                   n_pools,
+        bool                      attn_indexed_or_compact,
+        bool                      mtp_reuse);
+
+// rebase the ring of every stream of the ubatch whose packed run no longer starts at its origin (a removed prefix):
+// that stream rebuilds its pools. Call before the rebuild decision of the graph.
+void llama_kpool_fast_rebase(
+        llama_kpool_cache    * cache,
+        const llama_kv_cache * kv,
+        const llama_ubatch   & ubatch,
+        uint32_t               stream0,
+        int64_t                n_stream,
+        int64_t                n_pools,
+        uint32_t               kpool);
+
+bool llama_kpool_fast_prepare(
+        llm_graph_input_kpool & inp,
+        const llama_kv_cache  * kv,
+        llama_kpool_cache     * cache,
+        const llama_ubatch    & ubatch,
+        uint32_t                stream0,
+        int64_t                 n_kv,
+        int64_t                 n_stream,
+        int64_t                 n_pools,
+        bool                    rebuild,
+        int64_t               & n_update,
+        int64_t               & n_delta);
 
 // One pooling map per ubatch; rebuilding it per indexer layer costs O(n_kv * n_tokens)
 // host writes and dominates prefill. sharing is valid only while every indexer layer sees
@@ -251,6 +331,42 @@ public:
     ggml_tensor * pool_store_dst    = nullptr; // I32 [n_pools, n_stream], rebuild only
     ggml_tensor * pool_update_cells = nullptr; // I32 [kpool*n_update, n_stream], incremental
     ggml_tensor * pool_update_dst   = nullptr; // I32 [n_update, n_stream], incremental
+
+    // delphi: device tables (LLAMA_GLM5_DEVICE_TABLES, default on). Ring-mode pool cache, one sequence per stream,
+    // packed run at slot 0, device masks, indexed or compact attention. Then pool_cells, pool_iv_cells and
+    // pool_cache_slots are null: the pool members and the validity rows live on each device (llama_kpool_cache::
+    // dev_table) and get the rows that changed by set_rows, and the pool keys are read in place (slot = ordinal).
+    struct fast_stream {
+        llama_seq_id seq = -1;
+        int64_t b_base = 0;
+        int64_t n_run  = 0;
+        bool    aligned = true;       // b_base is the ring origin of the stream
+        std::vector<int32_t> cells;   // [kpool*n_pools], the pool_cells row of the legacy path
+        std::vector<uint8_t> valid;   // [n_pools]
+        std::vector<int32_t> filled;  // [n_pools], scratch
+    };
+    struct dev_update {
+        int32_t table = -1;
+        ggml_tensor * idx   = nullptr; // I32 [n_delta]: stream*max_slots + p
+        ggml_tensor * cells = nullptr; // F32 [kpool, n_delta]: the I32 bits of the members
+        ggml_tensor * iv    = nullptr; // F32 [1, n_delta]: row 0 of the validity rows
+        ggml_tensor * cells_out = nullptr; // I32 [kpool*n_pools, n_stream], contiguous per stream
+        ggml_tensor * iv_out    = nullptr; // F32 [n_pools, 2, 1, n_stream]
+    };
+    bool    fast         = false;
+    int64_t fast_n_pools = 0;
+    int64_t fast_n_delta = 0; // rows of each delta input
+    int64_t fast_n_need  = 0; // pools whose key this step must compute, max over the streams
+    std::vector<fast_stream> fast_streams;
+    std::vector<std::vector<int32_t>> fast_dirty; // per table: the rows (stream*max_slots + p) that differ from its shadow
+    std::vector<dev_update> dev_updates;
+
+    int64_t get_n_pools() const;
+
+    // the per-device views of the tables, built once per graph and device; the set_rows that apply the deltas are
+    // expanded into gf right away so that set_input can commit the shadows
+    ggml_tensor * get_pool_cells   (ggml_context * ctx, ggml_cgraph * gf, int32_t il);
+    ggml_tensor * get_pool_iv_cells(ggml_context * ctx, ggml_cgraph * gf, int32_t il);
 
     const llama_kv_cache_context * mctx_attn;
     const llama_kv_cache_context * mctx_idx;

@@ -352,6 +352,23 @@ public:
         return (int32_t) it->second;
     }
 
+    // delphi: the cells of sequence seq_id with a position in [p0, p1), in position order (one ordered-set walk,
+    // not a scan of every cell)
+    void seq_cells_in(llama_seq_id seq_id, llama_pos p0, llama_pos p1, std::vector<uint32_t> & out) const {
+        assert(seq_id >= 0);
+        assert(seq_id < LLAMA_MAX_SEQ);
+
+        out.clear();
+        const auto & sp = seq_pos[seq_id];
+        for (auto it = sp.lower_bound({ p0, 0 }); it != sp.end() && it->first < p1; ++it) {
+            out.push_back(it->second);
+        }
+    }
+
+    // delphi: raw per-cell positions (-1 = empty) and sequence sets, for tight read-only loops
+    const llama_pos * pos_data() const { return pos.data(); }
+    const seq_set_t * seq_data() const { return seq.data(); }
+
     // note: call only if the cell is not empty and the seq_id is not in the cell
     void seq_add(uint32_t i, llama_seq_id seq_id) {
         assert(i < pos.size());

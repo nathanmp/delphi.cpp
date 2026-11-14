@@ -656,17 +656,13 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 
         uint32_t new_head = cells.size();
 
-        // Unused cells have no position, so only scan the used range. Large contexts have 100K+ cells per stream and this runs after every speculative verify.
-        const uint32_t i_end = cells.used_max_p1();
-        for (uint32_t i = cells.used_min(); i < i_end; ++i) {
-            if (!cells.pos_in(i, p0, p1)) {
-                continue;
-            }
-
-            if (cells.seq_has(i, seq_id) && cells.seq_rm(i, seq_id)) {
-                if (new_head == cells.size()) {
-                    new_head = i;
-                }
+        // Only the cells of the sequence in [p0, p1), from its position index: this runs after every speculative
+        // verify, where a scan of the used range (100K+ cells per stream at long context) cost more than the removal.
+        static thread_local std::vector<uint32_t> idxs;
+        cells.seq_cells_in(seq_id, p0, p1, idxs);
+        for (uint32_t i : idxs) {
+            if (cells.seq_rm(i, seq_id) && (new_head == cells.size() || i < new_head)) {
+                new_head = i;
             }
         }
 

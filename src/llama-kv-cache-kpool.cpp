@@ -8,6 +8,7 @@
 #include "llama-model.h"
 
 #include <algorithm>
+#include <cinttypes>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -80,6 +81,7 @@ struct llama_kpool_cache::impl {
         ggml_tensor * topk_hint;
         ggml_tensor * mtp_topk;
         ggml_tensor * mtp_mask;
+        int32_t table = -1;
     };
 
     uint32_t max_slots;
@@ -94,6 +96,41 @@ struct llama_kpool_cache::impl {
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
     std::vector<layer> layers;
     std::unordered_map<int32_t, int32_t> map_layer_ids;
+
+    // ring mode (one sequence per stream), see llama_kpool_cache::is_ring
+    bool ring = false;
+    std::vector<int64_t>              ring_org;
+    std::vector<std::vector<int64_t>> ring_block;
+    std::vector<std::vector<uint8_t>> ring_cache;
+    std::vector<uint32_t>             ring_hi;
+
+    std::vector<dev_table> tables;
+
+    void ring_clear(uint32_t s) {
+        std::fill(ring_block[s].begin(), ring_block[s].begin() + ring_hi[s], -1);
+        std::fill(ring_cache[s].begin(), ring_cache[s].begin() + ring_hi[s], 0);
+        ring_hi[s] = 0;
+    }
+
+    // the state of a fresh buffer: no member (cell 0), every slot invalid (BIG), row 1 = ordinal
+    void init_tables() {
+        for (auto & t : tables) {
+            t.shadow_cells.assign((size_t) kpool*max_slots*n_stream, 0);
+            t.shadow_valid.assign((size_t) max_slots*n_stream, 0);
+            if (t.cells->buffer == nullptr || t.cells->data == nullptr || ggml_backend_buffer_get_size(t.cells->buffer) == 0) {
+                continue; // no_alloc (fit)
+            }
+            ggml_backend_tensor_memset(t.cells, 0, 0, ggml_nbytes(t.cells));
+            std::vector<float> iv((size_t) max_slots*n_stream*2);
+            for (uint32_t st = 0; st < n_stream; ++st) {
+                for (uint32_t p = 0; p < max_slots; ++p) {
+                    iv[(size_t) st*max_slots + p] = 1e30f;
+                    iv[(size_t) (n_stream + st)*max_slots + p] = (float) p;
+                }
+            }
+            ggml_backend_tensor_set(t.iv, iv.data(), 0, ggml_nbytes(t.iv));
+        }
+    }
 };
 
 llama_kpool_cache::llama_kpool_cache(
@@ -116,6 +153,16 @@ llama_kpool_cache::llama_kpool_cache(
     pimpl->kpool = kpool;
     pimpl->maps.resize(pimpl->n_stream);
     pimpl->rebuild.resize(pimpl->n_stream, true);
+
+    // n_stream == 1 also when n_seq_max == 1: a single sequence then owns the one stream, which is the ring case
+    pimpl->ring = !unified || n_seq_max == 1;
+    if (pimpl->ring) {
+        pimpl->ring_block.assign(pimpl->n_stream, std::vector<int64_t>(pimpl->max_slots, -1));
+        pimpl->ring_cache.assign(pimpl->n_stream, std::vector<uint8_t>(pimpl->max_slots, 0));
+        pimpl->ring_hi.assign(pimpl->n_stream, 0);
+        pimpl->ring_org.assign(pimpl->n_stream, 0);
+    }
+    std::map<ggml_backend_buffer_type_t, int32_t> table_of_buft;
 
     struct buft_comparator {
         bool operator()(ggml_backend_buffer_type_t lhs, ggml_backend_buffer_type_t rhs) const {
@@ -159,8 +206,29 @@ llama_kpool_cache::llama_kpool_cache(
             throw std::runtime_error("failed to create ggml context for GLM pool-key cache");
         }
 
+        int32_t table = -1;
+        if (pimpl->ring) {
+            auto it = table_of_buft.find(buft);
+            if (it == table_of_buft.end()) {
+                dev_table t;
+                t.cells = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, (int64_t) kpool*pimpl->max_slots, pimpl->n_stream);
+                t.iv    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, pimpl->max_slots, pimpl->n_stream, 2);
+                ggml_format_name(t.cells, "cache_kpool_tbl_cells_%zu", pimpl->tables.size());
+                ggml_format_name(t.iv,    "cache_kpool_tbl_iv_%zu",    pimpl->tables.size());
+                it = table_of_buft.emplace(buft, (int32_t) pimpl->tables.size()).first;
+                pimpl->tables.push_back(std::move(t));
+            }
+            table = it->second;
+        }
+
+        // delphi: LLAMA_GLM5_POOL_KEYS_F16=1 stores the pool keys as F16 (opt-in precision trade): half the memory,
+        // and the indexer reads them with tensor cores (its WMMA kernel) instead of FP32 FMA
+        static const bool keys_f16 = [] {
+            const char * env = std::getenv("LLAMA_GLM5_POOL_KEYS_F16");
+            return env != nullptr && std::atoi(env) != 0;
+        }();
         ggml_tensor * keys = ggml_new_tensor_3d(
-                ctx, GGML_TYPE_F32, n_embd, pimpl->max_slots, pimpl->n_stream);
+                ctx, keys_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32, n_embd, pimpl->max_slots, pimpl->n_stream);
         ggml_format_name(keys, "cache_kpool_l%d", il);
 
         ggml_tensor * topk_hint = ggml_new_tensor_2d(
@@ -179,7 +247,7 @@ llama_kpool_cache::llama_kpool_cache(
         }
 
         pimpl->map_layer_ids[il] = pimpl->layers.size();
-        pimpl->layers.push_back({ il, keys, topk_hint, mtp_topk, mtp_mask });
+        pimpl->layers.push_back({ il, keys, topk_hint, mtp_topk, mtp_mask, table });
     }
 
     for (auto & [buft, ctx] : ctx_map) {
@@ -202,8 +270,10 @@ llama_kpool_cache::llama_kpool_cache(
         pimpl->ctxs_bufs.emplace_back(std::move(ctx), buf);
     }
 
-    LLAMA_LOG_INFO("%s: slots = %u, width = %u, streams = %u, layers = %zu\n",
-            __func__, pimpl->max_slots, n_embd, pimpl->n_stream, pimpl->layers.size());
+    pimpl->init_tables();
+
+    LLAMA_LOG_INFO("%s: slots = %u, width = %u, streams = %u, layers = %zu, ring = %d, device tables = %zu\n",
+            __func__, pimpl->max_slots, n_embd, pimpl->n_stream, pimpl->layers.size(), pimpl->ring, pimpl->tables.size());
 }
 
 llama_kpool_cache::~llama_kpool_cache() = default;
@@ -214,12 +284,16 @@ void llama_kpool_cache::clear(bool data) {
         for (auto & [_, buf] : pimpl->ctxs_bufs) {
             ggml_backend_buffer_clear(buf.get(), 0);
         }
+        pimpl->init_tables();
     }
 }
 
 void llama_kpool_cache::invalidate() {
     for (auto & map : pimpl->maps) {
         map.clear();
+    }
+    for (uint32_t s = 0; pimpl->ring && s < pimpl->n_stream; ++s) {
+        pimpl->ring_clear(s);
     }
     std::fill(pimpl->rebuild.begin(), pimpl->rebuild.end(), true);
     pimpl->mtp_index_reuse = false;
@@ -232,6 +306,9 @@ void llama_kpool_cache::invalidate(llama_seq_id seq_id) {
         return;
     }
     pimpl->maps[seq_id].clear();
+    if (pimpl->ring) {
+        pimpl->ring_clear(seq_id);
+    }
     pimpl->rebuild[seq_id] = true;
     pimpl->mtp_index_reuse = false;
 }
@@ -243,6 +320,24 @@ void llama_kpool_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) 
 
     const int64_t block0 = p0 < 0 ? 0 : p0/pimpl->kpool;
     const int64_t block1 = p1 < 0 ? INT64_MAX : (p1 - 1)/pimpl->kpool;
+
+    if (pimpl->ring) {
+        // a stream holds one sequence: stream s is sequence s, or the only stream holds them all
+        for (uint32_t s = 0; s < pimpl->n_stream; ++s) {
+            if (seq_id >= 0 && pimpl->n_stream > 1 && (uint32_t) seq_id != s) {
+                continue;
+            }
+            int64_t * blocks = pimpl->ring_block[s].data();
+            uint8_t * cached = pimpl->ring_cache[s].data();
+            for (uint32_t slot = 0; slot < pimpl->ring_hi[s]; ++slot) {
+                if (blocks[slot] >= block0 && blocks[slot] <= block1) {
+                    blocks[slot] = -1;
+                    cached[slot] = 0;
+                }
+            }
+        }
+        return;
+    }
 
     for (auto & map : pimpl->maps) {
         for (auto it = map.begin(); it != map.end();) {
@@ -294,6 +389,15 @@ void llama_kpool_cache::mark_dirty(uint32_t stream, llama_seq_id seq_id, llama_p
     GGML_ASSERT(stream < pimpl->n_stream);
     GGML_ASSERT(seq_id >= 0 && pos >= 0);
 
+    if (pimpl->ring) {
+        const int64_t block = pos/pimpl->kpool;
+        const uint32_t slot = ring_slot(stream, block);
+        if (pimpl->ring_block[stream][slot] == block) {
+            pimpl->ring_cache[stream][slot] = 0;
+        }
+        return;
+    }
+
     auto & map = pimpl->maps[stream];
     const auto it = map.find({ seq_id, pos/pimpl->kpool });
     if (it != map.end()) {
@@ -308,6 +412,55 @@ llama_kpool_cache::stream_plan llama_kpool_cache::prepare_stream(
         bool rebuild) {
     GGML_ASSERT(stream < pimpl->n_stream);
     GGML_ASSERT(ids.size() + n_scratch <= pimpl->max_slots);
+
+    if (pimpl->ring) {
+        // the map semantics: a pool keeps its key while it is named on every call; any other slot is dropped
+        int64_t * blocks = pimpl->ring_block[stream].data();
+        uint8_t * cached = pimpl->ring_cache[stream].data();
+        if (rebuild) {
+            pimpl->ring_clear(stream);
+        }
+
+        static thread_local std::vector<uint8_t> named;
+        named.assign(pimpl->max_slots, 0);
+
+        stream_plan result;
+        result.slots.reserve(ids.size());
+        result.cached.reserve(ids.size());
+        uint32_t hi = 0;
+        for (const auto & id : ids) {
+            GGML_ASSERT(id.block >= 0);
+            const uint32_t slot = ring_slot(stream, id.block);
+            GGML_ASSERT(!named[slot] && "the pools of a stream must span at most max_slots blocks");
+            named[slot] = 1;
+            hi = std::max(hi, slot + 1);
+            const bool hit = blocks[slot] == id.block && cached[slot];
+            if (!hit) {
+                blocks[slot] = id.block;
+                cached[slot] = 0;
+            }
+            result.slots.push_back((int32_t) slot);
+            result.cached.push_back(hit ? 1 : 0);
+        }
+        for (uint32_t slot = 0; slot < pimpl->ring_hi[stream]; ++slot) {
+            if (!named[slot]) {
+                blocks[slot] = -1;
+                cached[slot] = 0;
+            }
+        }
+        pimpl->ring_hi[stream] = hi;
+
+        uint32_t next_free = 0;
+        result.scratch.reserve(n_scratch);
+        for (size_t i = 0; i < n_scratch; ++i) {
+            while (next_free < pimpl->max_slots && named[next_free]) {
+                ++next_free;
+            }
+            GGML_ASSERT(next_free < pimpl->max_slots);
+            result.scratch.push_back((int32_t) next_free++);
+        }
+        return result;
+    }
 
     auto & map = pimpl->maps[stream];
     if (rebuild) {
@@ -391,6 +544,13 @@ llama_kpool_cache::stream_plan llama_kpool_cache::prepare_stream(
 
 void llama_kpool_cache::mark_cached(uint32_t stream, const std::vector<int32_t> & slots) {
     GGML_ASSERT(stream < pimpl->n_stream);
+    if (pimpl->ring) {
+        for (int32_t slot : slots) {
+            GGML_ASSERT(slot >= 0 && (uint32_t) slot < pimpl->max_slots && pimpl->ring_block[stream][slot] >= 0);
+            pimpl->ring_cache[stream][slot] = 1;
+        }
+        return;
+    }
     auto & map = pimpl->maps[stream];
     if (slots.size() <= 8) {
         for (int32_t slot : slots) {
@@ -433,12 +593,81 @@ uint32_t llama_kpool_cache::get_max_uncached(uint32_t stream0, uint32_t n_stream
     uint32_t result = 0;
     for (uint32_t s = stream0; s < stream0 + n_stream; ++s) {
         uint32_t current = 0;
-        for (const auto & [_, entry] : pimpl->maps[s]) {
-            current += !entry.cached;
+        if (pimpl->ring) {
+            for (uint32_t slot = 0; slot < pimpl->ring_hi[s]; ++slot) {
+                current += pimpl->ring_block[s][slot] >= 0 && !pimpl->ring_cache[s][slot];
+            }
+        } else {
+            for (const auto & [_, entry] : pimpl->maps[s]) {
+                current += !entry.cached;
+            }
         }
         result = std::max(result, current);
     }
     return result;
+}
+
+bool llama_kpool_cache::is_ring() const {
+    return pimpl->ring;
+}
+
+int64_t * llama_kpool_cache::ring_blocks(uint32_t stream) {
+    GGML_ASSERT(pimpl->ring && stream < pimpl->n_stream);
+    return pimpl->ring_block[stream].data();
+}
+
+uint8_t * llama_kpool_cache::ring_cached(uint32_t stream) {
+    GGML_ASSERT(pimpl->ring && stream < pimpl->n_stream);
+    return pimpl->ring_cache[stream].data();
+}
+
+uint32_t & llama_kpool_cache::ring_hi(uint32_t stream) {
+    GGML_ASSERT(pimpl->ring && stream < pimpl->n_stream);
+    return pimpl->ring_hi[stream];
+}
+
+int64_t llama_kpool_cache::ring_origin(uint32_t stream) const {
+    GGML_ASSERT(pimpl->ring && stream < pimpl->n_stream);
+    return pimpl->ring_org[stream];
+}
+
+uint32_t llama_kpool_cache::ring_slot(uint32_t stream, int64_t block) const {
+    const int64_t m = pimpl->max_slots;
+    return (uint32_t) (((block - ring_origin(stream)) % m + m) % m);
+}
+
+void llama_kpool_cache::ring_rebase(uint32_t stream, int64_t origin) {
+    GGML_ASSERT(pimpl->ring && stream < pimpl->n_stream);
+    pimpl->maps[stream].clear();
+    pimpl->ring_clear(stream);
+    pimpl->ring_org[stream] = origin;
+    pimpl->rebuild[stream] = true;
+    pimpl->mtp_index_reuse = false;
+}
+
+size_t llama_kpool_cache::n_tables() const {
+    return pimpl->tables.size();
+}
+
+llama_kpool_cache::dev_table & llama_kpool_cache::get_table(size_t i) {
+    GGML_ASSERT(i < pimpl->tables.size());
+    return pimpl->tables[i];
+}
+
+int32_t llama_kpool_cache::table_of_layer(int32_t il) const {
+    return pimpl->layers[pimpl->map_layer_ids.at(il)].table;
+}
+
+ggml_tensor * llama_kpool_cache::store_prefix(
+        ggml_context * ctx,
+        ggml_tensor * cur,
+        int32_t il,
+        uint32_t stream0,
+        uint32_t n_stream) const {
+    ggml_tensor * keys = get(ctx, il, stream0, n_stream);
+    GGML_ASSERT(cur->type == GGML_TYPE_F32 && cur->ne[0] == keys->ne[0] && cur->ne[1] <= keys->ne[1] && cur->ne[2] == keys->ne[2]);
+    ggml_tensor * dst = ggml_view_3d(ctx, keys, keys->ne[0], cur->ne[1], n_stream, keys->nb[1], keys->nb[2], 0);
+    return ggml_cpy(ctx, cur, dst);
 }
 
 ggml_tensor * llama_kpool_cache::get(
@@ -1181,6 +1410,427 @@ void llama_kv_cache_set_input_kpool(
     }
 }
 
+bool llama_kpool_device_tables_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("LLAMA_GLM5_DEVICE_TABLES");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+int64_t llm_graph_input_kpool::get_n_pools() const {
+    return fast ? fast_n_pools : pool_cells->ne[0]/kpool;
+}
+
+// the packing of llama_kv_cache_set_input_kpool for one sequence per stream: the first block of the packed run
+static void kpool_fast_run(const llama_kv_cells & cells, llama_seq_id seq, int64_t r, int64_t n_pools,
+        int64_t & b_base, int64_t & n_run) {
+    const llama_pos p_min = cells.seq_pos_min(seq);
+    const llama_pos p_max = cells.seq_pos_max(seq);
+    const int64_t b_min = p_min < 0 ? 0 : p_min/r;
+    const int64_t b_max = p_min < 0 ? 0 : p_max/r;
+    n_run  = p_min < 0 ? 0 : std::min<int64_t>(b_max - b_min + 1, n_pools);
+    b_base = p_min < 0 ? 0 : std::max(b_min, b_max - (n_run - 1));
+}
+
+bool llama_kpool_fast_eligible(
+        const llama_kpool_cache * cache,
+        const llama_ubatch      & ubatch,
+        int64_t                   n_stream,
+        int64_t                   n_pools,
+        bool                      attn_indexed_or_compact,
+        bool                      mtp_reuse) {
+    return llama_kpool_device_tables_enabled() && llama_kpool_device_masks_enabled() && cache != nullptr &&
+        cache->is_ring() && cache->n_tables() > 0 && attn_indexed_or_compact && !mtp_reuse &&
+        n_stream > 0 && (int64_t) ubatch.n_seqs_unq == n_stream && ubatch.n_tokens % n_stream == 0 &&
+        n_pools <= (int64_t) cache->get_max_slots();
+}
+
+void llama_kpool_fast_rebase(
+        llama_kpool_cache    * cache,
+        const llama_kv_cache * kv,
+        const llama_ubatch   & ubatch,
+        uint32_t               stream0,
+        int64_t                n_stream,
+        int64_t                n_pools,
+        uint32_t               kpool) {
+    const int64_t max_slots = cache->get_max_slots();
+    const int64_t n_tps = ubatch.n_tokens/n_stream;
+    for (int64_t s = 0; s < n_stream; ++s) {
+        const llama_seq_id seq = ubatch.seq_id[s*n_tps][0];
+        int64_t b_base = 0;
+        int64_t n_run  = 0;
+        kpool_fast_run(kv->get_cells(seq), seq, kpool, n_pools, b_base, n_run);
+        const uint32_t st = stream0 + (uint32_t) s;
+        if (n_run > 0 && ((b_base - cache->ring_origin(st)) % max_slots + max_slots) % max_slots != 0) {
+            LLAMA_LOG_DEBUG("%s: stream %u: the pool run starts at block %" PRId64 ", rebasing its pool keys\n", __func__, st, b_base);
+            cache->ring_rebase(st, b_base);
+        }
+    }
+}
+
+bool llama_kpool_fast_prepare(
+        llm_graph_input_kpool & inp,
+        const llama_kv_cache  * kv,
+        llama_kpool_cache     * cache,
+        const llama_ubatch    & ubatch,
+        uint32_t                stream0,
+        int64_t                 n_kv,
+        int64_t                 n_stream,
+        int64_t                 n_pools,
+        bool                    rebuild,
+        int64_t               & n_update,
+        int64_t               & n_delta) {
+    const int64_t r         = inp.kpool;
+    const int64_t max_slots = cache->get_max_slots();
+    const int64_t n_tps     = ubatch.n_tokens/n_stream;
+
+    inp.fast_streams.resize(n_stream);
+    int64_t n_need = 0;
+
+    for (int64_t s = 0; s < n_stream; ++s) {
+        auto & fs = inp.fast_streams[s];
+        fs.seq = ubatch.seq_id[s*n_tps][0];
+
+        const auto & cells = kv->get_cells(fs.seq);
+        kpool_fast_run(cells, fs.seq, r, n_pools, fs.b_base, fs.n_run);
+        // the slot of ordinal p is p only when the run starts at the ring origin (llama_kpool_fast_rebase); a
+        // reservation's ubatch may not, and its tables are never used
+        fs.aligned = fs.n_run == 0 ||
+            ((fs.b_base - cache->ring_origin(stream0 + s)) % max_slots + max_slots) % max_slots == 0;
+
+        fs.cells.assign(r*n_pools, 0);
+        fs.valid.assign(n_pools, 0);
+        fs.filled.assign(n_pools, 0);
+
+        const llama_pos * pos  = cells.pos_data();
+        const auto      * seqs = cells.seq_data();
+        const int64_t b_base = fs.b_base;
+        const int64_t n_run  = fs.n_run;
+        const int64_t n_scan = std::min<int64_t>(n_kv, cells.size());
+        for (int64_t j = 0; j < n_scan; ++j) {
+            const llama_pos p = pos[j];
+            if (p < 0 || !seqs[j].test(fs.seq)) {
+                continue;
+            }
+            const int64_t bo = p/r - b_base;
+            if (bo < 0 || bo >= n_run) {
+                continue;
+            }
+            fs.cells[bo*r + p%r] = (int32_t) j;
+            fs.filled[bo]++;
+        }
+        // != rather than <: two cells claiming one position overwrite each other (legacy pool_valid)
+        for (int64_t p = 0; p < n_run; ++p) {
+            fs.valid[p] = fs.filled[p] == (int32_t) r;
+        }
+
+        if (!rebuild) {
+            const int64_t * blocks = cache->ring_blocks(stream0 + s);
+            const uint8_t * cached = cache->ring_cached(stream0 + s);
+            int64_t cur = 0;
+            for (int64_t p = 0; p < n_run; ++p) {
+                cur += fs.valid[p] && !(blocks[p] == b_base + p && cached[p]);
+            }
+            n_need = std::max(n_need, cur);
+        }
+    }
+
+    // the rows of each device table that differ from what the device holds
+    constexpr int64_t chunk = 64;
+    inp.fast_dirty.resize(cache->n_tables());
+    size_t max_dirty = 0;
+    for (size_t t = 0; t < cache->n_tables(); ++t) {
+        const auto & tb = cache->get_table(t);
+        auto & dirty = inp.fast_dirty[t];
+        dirty.clear();
+        for (int64_t s = 0; s < n_stream; ++s) {
+            const auto & fs = inp.fast_streams[s];
+            const int64_t st = stream0 + s;
+            const int32_t * sh_c = tb.shadow_cells.data() + st*r*max_slots;
+            const uint8_t * sh_v = tb.shadow_valid.data() + st*max_slots;
+            for (int64_t p0 = 0; p0 < n_pools; p0 += chunk) {
+                const int64_t np = std::min(chunk, n_pools - p0);
+                if (memcmp(sh_c + p0*r, fs.cells.data() + p0*r, np*r*sizeof(int32_t)) == 0 &&
+                    memcmp(sh_v + p0, fs.valid.data() + p0, np) == 0) {
+                    continue;
+                }
+                for (int64_t p = p0; p < p0 + np; ++p) {
+                    if (sh_v[p] != fs.valid[p] || memcmp(sh_c + p*r, fs.cells.data() + p*r, r*sizeof(int32_t)) != 0) {
+                        dirty.push_back((int32_t) (st*max_slots + p));
+                    }
+                }
+            }
+        }
+        max_dirty = std::max(max_dirty, dirty.size());
+    }
+
+    // the floor: the pools a ubatch completes plus the ones it changes at its ends, so that a prompt's ubatches keep
+    // the shape of their reservation
+    n_delta = 32;
+    while (n_delta < std::max<int64_t>((int64_t) max_dirty, (n_tps + r - 1)/r + 2)) {
+        n_delta *= 2;
+    }
+    n_update = rebuild ? 0 : std::min<int64_t>(n_pools, std::max<int64_t>((n_tps + r - 1)/r + 1, n_need));
+
+    inp.fast_n_pools = n_pools;
+    inp.fast_n_need  = n_need;
+    return true;
+}
+
+// a view with another element type of the same size (no conversion: the bits are kept)
+static ggml_tensor * kpool_bitcast(ggml_context * ctx, ggml_tensor * t, ggml_type type) {
+    GGML_ASSERT(ggml_type_size(type) == ggml_type_size(t->type) && !ggml_is_quantized(type) && !ggml_is_quantized(t->type));
+    ggml_tensor * v = ggml_view_4d(ctx, t, t->ne[0], t->ne[1], t->ne[2], t->ne[3], t->nb[1], t->nb[2], t->nb[3], 0);
+    v->type = type;
+    return v;
+}
+
+static llm_graph_input_kpool::dev_update & kpool_fast_update(
+        llm_graph_input_kpool & inp, ggml_context * ctx, ggml_cgraph * gf, int32_t il) {
+    GGML_ASSERT(inp.fast && inp.pool_cache != nullptr);
+    const int32_t t = inp.pool_cache->table_of_layer(il);
+    GGML_ASSERT(t >= 0 && "a layer with pool keys must have a device table in ring mode");
+    for (auto & u : inp.dev_updates) {
+        if (u.table == t) {
+            return u;
+        }
+    }
+
+    auto & tb = inp.pool_cache->get_table(t);
+    const int64_t r         = inp.kpool;
+    const int64_t max_slots = inp.pool_cache->get_max_slots();
+    const int64_t n_st_all  = inp.pool_cache->get_n_stream();
+    const int64_t n_stream  = (int64_t) inp.fast_streams.size();
+    const int64_t n_pools   = inp.fast_n_pools;
+    const int64_t n_delta   = inp.fast_n_delta;
+
+    llm_graph_input_kpool::dev_update u;
+    u.table = t;
+    u.idx   = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_delta);
+    u.cells = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, r, n_delta);
+    u.iv    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, n_delta);
+    ggml_set_input(u.idx);
+    ggml_set_input(u.cells);
+    ggml_set_input(u.iv);
+    ggml_format_name(u.idx,   "kpool_tbl_idx_%d",   t);
+    ggml_format_name(u.cells, "kpool_tbl_cells_%d", t);
+    ggml_format_name(u.iv,    "kpool_tbl_iv_%d",    t);
+
+    // the members: the I32 table as F32 rows of r (set_rows takes F32 and copies the bits)
+    ggml_tensor * dst_c = ggml_view_2d(ctx, tb.cells, r, max_slots*n_st_all, r*ggml_type_size(GGML_TYPE_I32), 0);
+    dst_c->type = GGML_TYPE_F32;
+    ggml_tensor * c = ggml_set_rows(ctx, dst_c, u.cells, u.idx);
+    ggml_build_forward_expand(gf, c);
+    ggml_tensor * ci = kpool_bitcast(ctx, c, GGML_TYPE_I32);
+    u.cells_out = ggml_view_2d(ctx, ci, r*n_pools, n_stream, tb.cells->nb[1], inp.stream0*tb.cells->nb[1]);
+    if (n_stream > 1) {
+        u.cells_out = ggml_cont(ctx, u.cells_out); // ggml_kpool_expand reads contiguous members
+    }
+
+    // row 0 of the validity rows; row 1 (the ordinals) never changes
+    ggml_tensor * dst_v = ggml_view_2d(ctx, tb.iv, 1, max_slots*n_st_all, tb.iv->nb[0], 0);
+    ggml_tensor * v = ggml_set_rows(ctx, dst_v, u.iv, u.idx);
+    ggml_build_forward_expand(gf, v);
+    u.iv_out = ggml_view_4d(ctx, v, n_pools, 2, 1, n_stream, tb.iv->nb[2], 2*tb.iv->nb[2], tb.iv->nb[1],
+            inp.stream0*tb.iv->nb[1]);
+
+    inp.dev_updates.push_back(u);
+    return inp.dev_updates.back();
+}
+
+ggml_tensor * llm_graph_input_kpool::get_pool_cells(ggml_context * ctx, ggml_cgraph * gf, int32_t il) {
+    return fast ? kpool_fast_update(*this, ctx, gf, il).cells_out : pool_cells;
+}
+
+ggml_tensor * llm_graph_input_kpool::get_pool_iv_cells(ggml_context * ctx, ggml_cgraph * gf, int32_t il) {
+    return fast ? kpool_fast_update(*this, ctx, gf, il).iv_out : pool_iv_cells;
+}
+
+static void kpool_fast_set_input(llm_graph_input_kpool & inp, const llama_ubatch * ubatch) {
+    llama_kpool_cache * cache = inp.pool_cache;
+    GGML_ASSERT(cache != nullptr && cache->is_ring());
+
+    const llama_kv_cache * kv = inp.mctx_attn->get_kv();
+    const int64_t n_kv      = inp.mctx_attn->get_n_kv();
+    const int64_t r         = inp.kpool;
+    const int64_t n_pools   = inp.fast_n_pools;
+    const int64_t n_stream  = (int64_t) inp.fast_streams.size();
+    const int64_t max_slots = cache->get_max_slots();
+    const uint32_t stream0  = inp.stream0;
+    GGML_ASSERT(n_stream > 0 && ubatch->n_tokens % n_stream == 0);
+    const int64_t n_tps = ubatch->n_tokens/n_stream;
+    const bool rebuild = inp.rebuild_pool_cache;
+
+    ggml_tensor * tail_cells = inp.compact_tail_cells && inp.compact_tail_cells->buffer ? inp.compact_tail_cells : nullptr;
+    ggml_tensor * tail_mask  = inp.compact_tail_mask  && inp.compact_tail_mask ->buffer ? inp.compact_tail_mask  : nullptr;
+    ggml_tensor * iv_q       = inp.pool_iv_queries    && inp.pool_iv_queries  ->buffer ? inp.pool_iv_queries    : nullptr;
+    GGML_ASSERT((tail_cells == nullptr) == (tail_mask == nullptr));
+
+    const int64_t n_tail_pad = tail_cells ? tail_cells->ne[0] : 0;
+    int32_t     * dst_tail_cells = tail_cells ? (int32_t     *) tail_cells->data : nullptr;
+    ggml_fp16_t * dst_tail_mask  = tail_mask  ? (ggml_fp16_t *) tail_mask ->data : nullptr;
+    float       * dst_iv_q       = iv_q       ? (float       *) iv_q      ->data : nullptr;
+    if (tail_cells != nullptr) {
+        GGML_ASSERT(tail_mask->type == GGML_TYPE_F16 && tail_cells->ne[1] == n_tps && tail_cells->ne[2] == n_stream);
+        std::fill(dst_tail_cells, dst_tail_cells + ggml_nelements(tail_cells), 0);
+        kpool_mask_fill(dst_tail_mask, ggml_nelements(tail_mask));
+    }
+    GGML_ASSERT(iv_q == nullptr || (iv_q->ne[0] == n_tps && iv_q->ne[1] == 2 && iv_q->ne[3] == n_stream));
+
+    const bool update = !rebuild && inp.pool_update_cells != nullptr;
+    const int64_t n_update = update ? inp.pool_update_dst->ne[0] : 0;
+    if (update) {
+        GGML_ASSERT(inp.pool_update_cells->buffer && inp.pool_update_dst->buffer);
+        GGML_ASSERT(inp.pool_update_cells->ne[0] == r*n_update && inp.pool_update_cells->ne[1] == n_stream);
+    }
+
+    static thread_local std::vector<int32_t> uncached;
+
+    for (int64_t s = 0; s < n_stream; ++s) {
+        const auto & fs = inp.fast_streams[s];
+        const uint32_t st = stream0 + (uint32_t) s;
+        GGML_ASSERT(fs.aligned && "the pool run of a device-table ubatch must start at its ring origin");
+        const auto & cells = kv->get_cells(fs.seq);
+        const llama_pos * pos  = cells.pos_data();
+        const auto      * seqs = cells.seq_data();
+
+        int64_t  * blocks = cache->ring_blocks(st);
+        uint8_t  * cached = cache->ring_cached(st);
+        uint32_t & hi     = cache->ring_hi(st);
+
+        // the ring state: complete pools keep their key while they stay complete, everything else is dropped
+        uncached.clear();
+        int32_t first_valid = -1;
+        for (int64_t p = 0; p < fs.n_run; ++p) {
+            if (!fs.valid[p]) {
+                blocks[p] = -1;
+                cached[p] = 0;
+                continue;
+            }
+            if (first_valid < 0) {
+                first_valid = (int32_t) p;
+            }
+            const int64_t block = fs.b_base + p;
+            if (rebuild) {
+                blocks[p] = block;
+                cached[p] = 1; // this graph computes every pool
+            } else if (!(blocks[p] == block && cached[p])) {
+                blocks[p] = block;
+                cached[p] = 0;
+                uncached.push_back((int32_t) p);
+            }
+        }
+        for (uint32_t p = (uint32_t) fs.n_run; p < hi; ++p) {
+            blocks[p] = -1;
+            cached[p] = 0;
+        }
+        hi = (uint32_t) fs.n_run;
+
+        if (update) {
+            GGML_ASSERT((int64_t) uncached.size() <= n_update && "the graph has too few pool update rows");
+            int32_t * cur_cells = (int32_t *) inp.pool_update_cells->data + s*r*n_update;
+            int32_t * cur_dst   = (int32_t *) inp.pool_update_dst  ->data + s*n_update;
+            for (int64_t u = 0; u < n_update; ++u) {
+                // pad by recomputing a valid pool: the same value to the same slot
+                const int32_t p = u < (int64_t) uncached.size() ? uncached[u] : first_valid;
+                if (p >= 0) {
+                    std::copy(fs.cells.data() + p*r, fs.cells.data() + (p + 1)*r, cur_cells + u*r);
+                    cur_dst[u] = p;
+                } else {
+                    std::fill(cur_cells + u*r, cur_cells + (u + 1)*r, 0);
+                    cur_dst[u] = 0; // no valid pool: slot 0 is not valid either
+                }
+            }
+            for (int32_t p : uncached) {
+                cached[p] = 1;
+            }
+        }
+
+        for (int64_t ii = 0; ii < n_tps; ++ii) {
+            const int64_t i = s*n_tps + ii;
+            GGML_ASSERT(ubatch->seq_id[i][0] == fs.seq);
+            const llama_pos q = ubatch->pos[i];
+            GGML_ASSERT(q >= 0);
+
+            const llama_pos tail_start = (q + 1)/r*r;
+            const int64_t   bo_vis     = std::max<int64_t>(0, tail_start/r - fs.b_base);
+
+            if (dst_iv_q != nullptr) {
+                float * cur = dst_iv_q + s*2*n_tps;
+                cur[ii]         = (float) (std::min<int64_t>(fs.n_run, bo_vis) - 1);
+                cur[n_tps + ii] = 0.0f;
+            }
+
+            if (dst_tail_cells == nullptr) {
+                continue;
+            }
+            int32_t     * cur_tail_cells = dst_tail_cells + i*n_tail_pad;
+            ggml_fp16_t * cur_tail_mask  = dst_tail_mask  + i*n_tail_pad;
+            const ggml_fp16_t v_sel = ggml_fp32_to_fp16(0.0f);
+            const int64_t bo_tail = tail_start/r - fs.b_base;
+            if (bo_tail >= 0 && bo_tail < fs.n_run) {
+                for (llama_pos p = tail_start; p <= q; ++p) {
+                    const int32_t j = fs.cells[bo_tail*r + p%r];
+                    if (pos[j] != p || !seqs[j].test(fs.seq)) {
+                        continue;
+                    }
+                    const int64_t ti = p - tail_start;
+                    GGML_ASSERT(ti >= 0 && ti < n_tail_pad);
+                    cur_tail_cells[ti] = j;
+                    cur_tail_mask [ti] = v_sel;
+                }
+            } else {
+                // the scan of kpool_mask_row: the cells of the sequence in [tail_start, q]
+                for (int64_t j = 0; j < n_kv; ++j) {
+                    const llama_pos p = pos[j];
+                    if (p < tail_start || p > q || !seqs[j].test(fs.seq)) {
+                        continue;
+                    }
+                    const int64_t ti = p - tail_start;
+                    GGML_ASSERT(ti >= 0 && ti < n_tail_pad);
+                    cur_tail_cells[ti] = (int32_t) j;
+                    cur_tail_mask [ti] = v_sel;
+                }
+            }
+        }
+    }
+
+    // the rows that changed, into each device table this graph updates; padding repeats a row with its new value
+    for (auto & u : inp.dev_updates) {
+        auto & tb = cache->get_table(u.table);
+        const auto & dirty = inp.fast_dirty[u.table];
+        const int64_t n_delta = u.idx->ne[0];
+        GGML_ASSERT((int64_t) dirty.size() <= n_delta && "the graph has too few device table rows");
+        GGML_ASSERT(u.idx->buffer && u.cells->buffer && u.iv->buffer);
+
+        int32_t * idx = (int32_t *) u.idx->data;
+        int32_t * cl  = (int32_t *) u.cells->data; // F32 tensor, I32 bits
+        float   * iv0 = (float   *) u.iv->data;
+        for (int64_t k = 0; k < n_delta; ++k) {
+            const int32_t row = k < (int64_t) dirty.size() ? dirty[k] : dirty.empty() ? (int32_t) (stream0*max_slots) : dirty[0];
+            const int64_t s = row/max_slots - stream0;
+            const int64_t p = row%max_slots;
+            GGML_ASSERT(s >= 0 && s < n_stream && p < n_pools);
+            const auto & fs = inp.fast_streams[s];
+            idx[k] = row;
+            std::copy(fs.cells.data() + p*r, fs.cells.data() + (p + 1)*r, cl + k*r);
+            iv0[k] = fs.valid[p] ? (float) p : k_kpool_mask_big;
+        }
+        for (int32_t row : dirty) {
+            const int64_t s = row/max_slots - stream0;
+            const int64_t p = row%max_slots;
+            const auto & fs = inp.fast_streams[s];
+            std::copy(fs.cells.data() + p*r, fs.cells.data() + (p + 1)*r, tb.shadow_cells.data() + (int64_t) row*r);
+            tb.shadow_valid[row] = fs.valid[p];
+        }
+    }
+
+    if (rebuild) {
+        cache->finish_rebuild(stream0, (uint32_t) n_stream);
+    }
+}
+
 void llm_graph_input_kpool::set_input(const llama_ubatch * ubatch) {
     // The K/G store runs on every normal graph, including dense attention.
     // Reused MTP iterations intentionally omit that store, so its sole input
@@ -1189,6 +1839,11 @@ void llm_graph_input_kpool::set_input(const llama_ubatch * ubatch) {
         mctx_idx->set_input_k_idxs(k_idxs, ubatch);
     } else {
         GGML_ASSERT(pool_cache != nullptr && pool_cache->get_mtp_index_reuse());
+    }
+
+    if (fast) {
+        kpool_fast_set_input(*this, ubatch);
+        return;
     }
 
     if (pool_cells == nullptr) {
@@ -1263,7 +1918,7 @@ bool llm_graph_input_kpool::can_reuse(const llm_graph_params & params) {
     res &= k_idxs->ne[0] == params.ubatch.n_tokens;
     res &= params.hparams.indexer_kpool == kpool;
 
-    if (pool_cells == nullptr) {
+    if (pool_cells == nullptr && !fast) {
         return res;
     }
 
@@ -1287,6 +1942,41 @@ bool llm_graph_input_kpool::can_reuse(const llm_graph_params & params) {
     auto shape = [](const ggml_tensor * t, int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3) {
         return t != nullptr && t->ne[0] == ne0 && t->ne[1] == ne1 && t->ne[2] == ne2 && t->ne[3] == ne3;
     };
+
+    {
+        const bool want_fast = res && cache != nullptr && n_ps == 1 &&
+                llama_kpool_fast_eligible(cache, params.ubatch, n_stream, n_pools, indexed_attn || compact_decode,
+                        cache->get_mtp_index_reuse());
+        if (want_fast) {
+            llama_kpool_fast_rebase(cache, attn->get_kv(), params.ubatch, stream0, n_stream, n_pools, kpool);
+        }
+        const bool rebuild   = cache != nullptr && cache->needs_rebuild(stream0, n_stream);
+        const bool mtp_reuse = cache != nullptr && cache->get_mtp_index_reuse();
+        if (!res || rebuild != rebuild_pool_cache || mtp_reuse != mtp_index_reuse || want_fast != fast) {
+            return false;
+        }
+        const int64_t n_pools_built = fast_n_pools;
+        int64_t n_update_fast = 0;
+        int64_t n_delta_fast  = 0;
+        if (want_fast) {
+            llama_kpool_fast_prepare(*this, attn->get_kv(), cache, params.ubatch, stream0, n_kv, n_stream, n_pools,
+                    rebuild, n_update_fast, n_delta_fast);
+        }
+        if (fast) {
+            res &= n_pools_built == n_pools;
+            res &= fast_n_delta == n_delta_fast;
+            res &= shape(pool_iv_queries, n_tps, 2, 1, n_stream);
+            res &= shape(compact_tail_cells, n_compact - n_selected, n_tps, n_stream, 1);
+            res &= shape(compact_tail_mask, n_compact - n_selected, n_tps, n_stream, 1);
+            if (rebuild) {
+                res &= pool_update_cells == nullptr && pool_update_dst == nullptr;
+            } else {
+                res &= shape(pool_update_cells, kpool*n_update_fast, n_stream, 1, 1);
+                res &= shape(pool_update_dst, n_update_fast, n_stream, 1, 1);
+            }
+            return res;
+        }
+    }
 
     res &= shape(pool_cells, kpool*n_pools, n_stream, 1, 1);
     if (llama_kpool_device_masks_enabled()) {

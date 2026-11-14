@@ -548,7 +548,7 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
     const int64_t n_kv     = kbuf->ne[2];
     const int64_t n_stream = kbuf->ne[3];
     const int64_t n_tps    = n_tokens/n_stream;
-    const int64_t n_pools  = inp_kp->pool_cells->ne[0]/r;
+    const int64_t n_pools  = inp_kp->get_n_pools();
 
     GGML_ASSERT(kbuf->ne[0] == d_idx && kbuf->ne[1] == 2 &&
             "the pooled indexer cache needs a key head and a gate head");
@@ -597,10 +597,10 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
     // input is uploaded (and copied once per pipeline copy). The device mask is F16 for the fused indexer.
     ggml_tensor * pool_bias     = inp_kp->pool_bias;     // F32 [n_pools, n_tps, n_stream]
     ggml_tensor * pool_bias_f16 = inp_kp->pool_bias_f16; // F16 [n_pools, n_tps, 1, n_stream]
-    if (inp_kp->pool_iv_cells != nullptr && !chunked) {
+    if ((inp_kp->pool_iv_cells != nullptr || inp_kp->fast) && !chunked) {
         auto it = inp_kp->dev_pool_bias.find(dev);
         if (it == inp_kp->dev_pool_bias.end()) {
-            ggml_tensor * bias = ggml_interval_mask(ctx0, inp_kp->pool_iv_cells, inp_kp->pool_iv_queries,
+            ggml_tensor * bias = ggml_interval_mask(ctx0, inp_kp->get_pool_iv_cells(ctx0, gf, il), inp_kp->pool_iv_queries,
                     cparams.fused_lid ? GGML_TYPE_F16 : GGML_TYPE_F32);
             cb(bias, "kpool_dev_pool_bias", il);
             glm5next_pin(sched, bias, dev);
@@ -673,6 +673,17 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
 
     if (inp_kp->pool_cache == nullptr) {
         pool_k = compress_all(inp_kp->pool_cells);
+    } else if (inp_kp->rebuild_pool_cache && inp_kp->fast) {
+        // device tables: slot p is packed pool p, so the rebuilt keys are copied to the slots [0, n_pools) and read
+        // in place (the incomplete pools get keys too, which their -INFINITY bias makes inert)
+        ggml_tensor * rebuilt = compress_all(inp_kp->get_pool_cells(ctx0, gf, il));
+        ggml_tensor * cache_write = inp_kp->pool_cache->store_prefix(ctx0, rebuilt, il, mctx_idx->get_stream_base(), n_stream);
+        if (state_only) {
+            ggml_build_forward_expand(gf, cache_write);
+            *top_k_mask = nullptr;
+            return nullptr;
+        }
+        pool_k = cache_write;
     } else if (inp_kp->rebuild_pool_cache) {
         // Prefill and invalidation rebuild every resident completed pool once.
         ggml_tensor * rebuilt = compress_all(inp_kp->pool_cells);
@@ -700,10 +711,21 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
             *top_k_mask = nullptr;
             return nullptr;
         }
-        pool_k = ggml_get_rows(ctx0, cache_write, inp_kp->pool_cache_slots);
+        // device tables: the keys in place, the first n_pools slots (no copy of the whole cache per layer)
+        pool_k = inp_kp->fast ? cache_write : ggml_get_rows(ctx0, cache_write, inp_kp->pool_cache_slots);
     }
 
-    pool_k = ggml_reshape_4d(ctx0, pool_k, d_idx, n_pools, 1, n_stream);
+    // in place, pool_k is a view with the cache's stream stride: views, not reshapes
+    const bool pool_k_view = inp_kp->pool_cache != nullptr && inp_kp->fast;
+    if (pool_k_view) {
+        pool_k = ggml_view_4d(ctx0, pool_k, d_idx, n_pools, 1, n_stream,
+                pool_k->nb[1], pool_k->nb[1]*n_pools, pool_k->nb[2], 0);
+        if (n_stream > 1 && !cparams.fused_lid) {
+            pool_k = ggml_cont(ctx0, pool_k);
+        }
+    } else {
+        pool_k = ggml_reshape_4d(ctx0, pool_k, d_idx, n_pools, 1, n_stream);
+    }
     cb(pool_k, "indexer_pool_k", il);
 
     // no rope: n_rot() is 0 for the whole text tower
@@ -747,8 +769,8 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
 
         ggml_tensor * bias_c     = rows_of(pool_bias,     1, q0, nq);
         ggml_tensor * bias_f16_c = rows_of(pool_bias_f16, 1, q0, nq);
-        if (chunked && inp_kp->pool_iv_cells != nullptr) {
-            ggml_tensor * bias = ggml_interval_mask(ctx0, inp_kp->pool_iv_cells,
+        if (chunked && (inp_kp->pool_iv_cells != nullptr || inp_kp->fast)) {
+            ggml_tensor * bias = ggml_interval_mask(ctx0, inp_kp->get_pool_iv_cells(ctx0, gf, il),
                     rows_of(inp_kp->pool_iv_queries, 0, q0, nq), cparams.fused_lid ? GGML_TYPE_F16 : GGML_TYPE_F32);
             cb(bias, "kpool_dev_pool_bias", il);
             glm5next_pin(sched, bias, dev);
@@ -766,8 +788,10 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
         ggml_tensor * pool_score = nullptr;
 
         if (cparams.fused_lid) {
-            // pool_k stays f32 so the kernel takes its f32 path; f16 wmma would undo the prec
-            ggml_tensor * pool_kf = ggml_reshape_4d(ctx0, pool_k, d_idx, 1, n_pools, n_stream);
+            // F32 pool keys take the FP32 kernel; F16 ones (LLAMA_GLM5_POOL_KEYS_F16, opt-in) the WMMA kernel, which also
+            // rounds q to F16
+            ggml_tensor * pool_kf = ggml_is_contiguous(pool_k) ? ggml_reshape_4d(ctx0, pool_k, d_idx, 1, n_pools, n_stream) :
+                    ggml_view_4d(ctx0, pool_k, d_idx, 1, n_pools, n_stream, pool_k->nb[1], pool_k->nb[1], pool_k->nb[3], 0);
 
             pool_score = ggml_lightning_indexer(ctx0, iq_c, pool_kf, w_c, bias_f16_c);
             cb(pool_score, "indexer_pool_score", il);
@@ -811,7 +835,7 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
         ggml_tensor * top_k_c;
         ggml_tensor * valid_c = nullptr;
         if (expand) {
-            top_k_c = ggml_kpool_expand(ctx0, sel, inp_kp->pool_cells, bias_any_c,
+            top_k_c = ggml_kpool_expand(ctx0, sel, inp_kp->get_pool_cells(ctx0, gf, il), bias_any_c,
                     rows_of(inp_kp->compact_tail_cells, 1, q0, nq), rows_of(inp_kp->compact_tail_mask, 1, q0, nq),
                     (int32_t) r);
             cb(top_k_c, "indexer_top_k_compact", il);
@@ -835,7 +859,7 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
             // The query axis folds into the gather's row axis, which is what lets ONE
             // ggml_get_rows serve every query, while the stream axis stays where get_rows wants
             // it (src0 dim 2 is indexed by the index tensor's dim 1)
-            ggml_tensor * pc3      = ggml_reshape_3d(ctx0, inp_kp->pool_cells, r, n_pools, n_stream);
+            ggml_tensor * pc3      = ggml_reshape_3d(ctx0, inp_kp->get_pool_cells(ctx0, gf, il), r, n_pools, n_stream);
             ggml_tensor * sel_flat = ggml_reshape_2d(ctx0, sel, select_k*nq, n_stream);
 
             top_k_c = ggml_get_rows(ctx0, pc3, sel_flat);
