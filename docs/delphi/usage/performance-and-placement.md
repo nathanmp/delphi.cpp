@@ -28,7 +28,7 @@ Each streaming GPU uses two slots by default, and each slot holds one layer's ex
 
 Streaming needs a fast link. On a PCIe 4.0 x2 link, the cost model keeps the experts on the CPU.
 
-Use a large `-ub` if you have the VRAM for it. Each prompt batch copies the experts of every layer once, so a larger batch spreads that copy over more tokens. With a fast GPU, prompt speed is then set by the batch size, the link speed and the size of the expert weights. DeepSeek V4.1 Flash uses `-b 4096 -ub 4096`.
+Use a large `-ub` if you have the VRAM for it. Each prompt batch copies the experts of every layer once, so a larger batch spreads that copy over more tokens. With a fast GPU, prompt speed is then set by the batch size, the link speed and the size of the expert weights. DeepSeek V4.1 Flash uses `-b 16384 -ub 4096`. Keep `-b` several times larger than `-ub` on DeepSeek V4.1 Flash: its layer-bank prefill keeps a layer's experts on the GPU for all the ubatches of one call, and with `-b` equal to `-ub` prompts were about 40 % slower (650 vs 1100 tokens per second at 16K).
 
 The full list of streaming settings is in [Runtime environment variables](environment-variables.md).
 

@@ -37,7 +37,7 @@ DSpark also takes a separate draft file, which needs a GPU with room for it. DSp
 
 ```sh
 llama-server -m deepseek-00001-of-00002.gguf --numa tensors -ngl 999 --device ROCm0,ROCm1 -ts 48,52 -cmoe -ot engram_embd=CPU \
-  -lm mlock -lzm on -t 48 -fa on -c 65536 -b 4096 -ub 4096 \
+  -lm mlock -lzm on -t 48 -fa on -c 65536 -b 16384 -ub 4096 \
   --spec-type draft-dspark --spec-draft-model DSPARK.gguf --spec-draft-device ROCm1 --spec-draft-ngl all \
   --chat-template-file models/templates/deepseek-ai-DeepSeek-V4.1.jinja \
   --moe-stage-min-tokens 1024 --graph-alt-slots 7 --moe-cache-refresh-max 512 -bs --parallel 1
