@@ -1,19 +1,24 @@
 # delphi.cpp: a fork of llama.cpp
 
-## Key Features
+## Major Features
 
 * Tensor splitting across NUMA nodes with `--numa tensors`.
-* GPU hot-expert cache. (Spare VRAM on any `--device` used is automatically allocated for the cache.)
-* Streaming routed experts into GPUs for long-context prefill. (Tuned automatically on warmup.)
+* GPU hot-expert cache. Spare VRAM on any `--device` used is automatically allocated for the cache.
+* Streaming routed experts into GPUs for long-context prefill. (Threshold tuned automatically on warmup.)
 * Bottleneck profiler.
 * Support for DeepSeek V4.1 Flash's Causal Encoder-Decoder architecture.
 * Support for ik_llama.cpp's IQn_K/IQn_KS tensors.
 * Automatic model quantizer.
 * Automatic parameter tuner.
-* Lazily-loaded vision encoder. (Turn it off with `--mmproj-memory resident`)
-* A ton of optimizations, focused on AVX2 CPUs and RDNA4/SM_80 GPUs, and DeepSeek V4.1 Flash/GLM-5.3 Flash/Qwen 3.8 Flash Next.
+* Lazily-loaded vision encoder to save VRAM at the cost of slightly longer time to load images. Turn it off with `--mmproj-memory resident`.
+* Various improvements to parallelism.
+* A ton of optimizations, focused on AVX2 CPUs, RDNA4 GPUs (e.g. R9700s), and SM_80 GPUs (CMP 170HXs), and DeepSeek V4.1 Flash/GLM-5.3 Flash/Qwen 3.8 Flash Next.
 
-Refer to [docs/delphi/usage](docs/delphi/usage) for information about how to use the project, and [docs/delphi/usage/environment-variables.md](docs/delphi/usage/environment-variables.md) for information about environment variables.
+Refer to:
+
+* [docs/delphi/usage](docs/delphi/usage) for information about how to use the project
+* [docs/delphi/usage/environment-variables.md](docs/delphi/usage/environment-variables.md) for information about environment variables.
+* [docs/delphi/changelog.md](docs/delphi/changelog.md) for a changelog of all the work done in this project.
 
 ## Credits
 
@@ -25,13 +30,13 @@ Refer to [docs/delphi/usage](docs/delphi/usage) for information about how to use
 * [Strata](https://github.com/Niko1221/Strata) for design improvements for the expert cache.
 * [llama-cpp-rdna-boosts](https://github.com/stew675/llama-cpp-rdna-boosts) for the ring buffer used to speed up long-context prefill, adaptive speculative decoding (WIP), and some other RDNA4 improvements.
 * [ubergarm](https://gist.github.com/ubergarm/edfeb3ff9c6ec8b49e88cdf627b0711a/) for default calibration data for the automatic quantizer.
-* DeepSeek, Z.ai, and Alibaba for making local models.
+* Any AI company committed to making local models.
 
 ## License
 
 MIT license. Go nuts with this.
 
-PRs are welcome. Support is on a best-effort basis. Untested on Windows. (If you're using Windows for local AI... why?)
+PRs are welcome. Support is on a best-effort basis. Untested on Windows.
 
 (The original README.md follows.)
 
