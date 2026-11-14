@@ -1,4 +1,4 @@
-// delphi: verify streams (LLAMA_VERIFY_STREAMS=1).
+// delphi: verify streams (on where they apply; LLAMA_VERIFY_STREAMS=0 opts out).
 //
 // With one context, all schedulers share one backend (one stream) per device. A verify graph that is queued behind prompt
 // ubatches then waits until they have passed every device of a layer split, and llama_synchronize() waits for them too.
@@ -28,7 +28,7 @@ static constexpr int32_t bg_regions = 4; // regions of the feature buffer for ba
 
 static bool verify_streams_env() {
     const char * env = getenv("LLAMA_VERIFY_STREAMS");
-    return env != nullptr && atoi(env) != 0;
+    return env == nullptr || atoi(env) != 0;
 }
 
 using set_stream_priority_t = bool (*)(ggml_backend_t, bool);

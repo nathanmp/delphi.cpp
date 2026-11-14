@@ -163,7 +163,7 @@ LLAMA_API const float * llama_feature_handoff_nextn(struct llama_context * ctx, 
 LLAMA_API const float * llama_feature_handoff_layer_inp(struct llama_context * ctx, int32_t ticket, uint32_t lid);
 LLAMA_API void          llama_feature_handoff_release(struct llama_context * ctx, int32_t ticket);
 
-// LLAMA_VERIFY_STREAMS=1: the small ubatches (verify rows) run on their own high-priority device streams. With
+// Verify streams (default on where they apply, LLAMA_VERIFY_STREAMS=0 opts out): the small ubatches (verify rows) run on their own high-priority device streams. With
 // llama_set_prompt_background(ctx, true), the large ubatches (main scheduler, no outputs) of the next decodes are
 // background work: llama_synchronize() and the output accessors do not wait for it. Each decode that queued such work has
 // a ticket (else -1); its device feature rows (llama_get_embeddings_layer_inp_tensor) are at row_base + batch index, and

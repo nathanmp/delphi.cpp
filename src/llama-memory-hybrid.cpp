@@ -162,11 +162,11 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
                 has_short = has_short || (n_seq_tokens[seq] > 0 && n_seq_tokens[seq] <= n_split);
             }
             const uint32_t n_ubatch_seq = staggered && has_short && n_ubatch_mixed > 0 ? std::min(n_ubatch, n_ubatch_mixed) : n_ubatch;
-            // LLAMA_VERIFY_STREAMS=1: the short sequences (verify rows) go first, so that their graphs are queued on their own
+            // verify streams (default on, LLAMA_VERIFY_STREAMS=0 opts out): the short sequences (verify rows) go first, so that their graphs are queued on their own
             // streams before the host builds and queues the prompt ubatches
             static const bool short_first = [] {
                 const char * env = getenv("LLAMA_VERIFY_STREAMS");
-                return env != nullptr && atoi(env) != 0;
+                return env == nullptr || atoi(env) != 0;
             }();
             std::vector<llama_seq_id> seq_order;
             for (int pass = 0; pass < (staggered && short_first ? 2 : 1); ++pass) {

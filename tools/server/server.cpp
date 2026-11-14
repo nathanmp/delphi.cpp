@@ -117,7 +117,7 @@ int llama_server(int argc, char ** argv) {
     // Loading a new CUDA kernel can synchronize the device while background prefill is running. Set the default
     // before argument parsing can enumerate devices; an explicit CUDA loading policy still takes precedence.
     const char * verify_streams = std::getenv("LLAMA_VERIFY_STREAMS");
-    if (verify_streams && std::atoi(verify_streams) != 0 && std::getenv("CUDA_MODULE_LOADING") == nullptr) {
+    if ((verify_streams == nullptr || std::atoi(verify_streams) != 0) && std::getenv("CUDA_MODULE_LOADING") == nullptr) {
         common_set_env("CUDA_MODULE_LOADING", "EAGER");
     }
 

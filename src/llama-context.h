@@ -570,7 +570,7 @@ private:
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
 
-    // delphi: LLAMA_VERIFY_STREAMS=1 (llama-verify-streams.cpp). The schedulers of the alternate graph slots (small
+    // delphi: verify streams, default on where they apply, LLAMA_VERIFY_STREAMS=0 opts out (llama-verify-streams.cpp). The schedulers of the alternate graph slots (small
     // ubatches: verify rows) use a second set of GPU backends, with their own high-priority streams, so their graphs do not
     // wait behind the prompt ubatches that the main scheduler queued on the first set
     struct bg_ticket {
