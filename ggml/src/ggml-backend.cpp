@@ -4440,6 +4440,15 @@ static bool ggml_backend_sched_input_can_stage(ggml_backend_t backend, const ggm
             backend->iface.set_tensor_async && backend->iface.event_record;
 }
 
+// GGML_SCHED_INPUT_STAGING_MIN_KIB: initial capacity of each staging slot (default 4096)
+static size_t ggml_backend_sched_input_staging_min_bytes() {
+    static const size_t bytes = [] {
+        const char * env = getenv("GGML_SCHED_INPUT_STAGING_MIN_KIB");
+        return (size_t) (env ? std::max(0, atoi(env)) : 4096) * 1024;
+    }();
+    return bytes;
+}
+
 static int ggml_backend_sched_input_stage_begin(ggml_backend_sched_t sched) {
     auto * stage = sched->input_staging;
     if (!stage) {
@@ -4477,7 +4486,10 @@ static int ggml_backend_sched_input_stage_begin(ggml_backend_sched_t sched) {
             s.pending = false;
         }
         if (!s.buffer || ggml_backend_buffer_get_size(s.buffer) < sizes[b]) {
-            const size_t capacity = std::max(sizes[b], s.buffer ? 2*ggml_backend_buffer_get_size(s.buffer) : sizes[b]);
+            // Freeing pinned memory waits for all work of the device and breaks the prompt pipeline. Prompt inputs grow
+            // with the KV view (about 0.4 MiB at 60K for GLM-5.3), so start with room for long prompts.
+            const size_t capacity = std::max({ sizes[b], ggml_backend_sched_input_staging_min_bytes(),
+                    s.buffer ? 2*ggml_backend_buffer_get_size(s.buffer) : 0 });
             ggml_backend_buffer_free(s.buffer);
             s.buffer = ggml_backend_buft_alloc_buffer(buft, capacity);
         }

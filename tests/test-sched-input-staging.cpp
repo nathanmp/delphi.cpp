@@ -6,6 +6,7 @@
 #undef NDEBUG
 #include <cassert>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -27,6 +28,8 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "usage: test-sched-input-staging --numa tensors DEVICE\n");
         return 1;
     }
+    // exercise growth of the staging slots: no initial capacity
+    setenv("GGML_SCHED_INPUT_STAGING_MIN_KIB", "0", 1);
     ggml_backend_load_all();
     auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     auto * gpu_dev = ggml_backend_dev_by_name(argv[3]);
