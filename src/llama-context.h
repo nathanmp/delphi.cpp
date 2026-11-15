@@ -409,6 +409,8 @@ private:
             ggml_tensor * probs = nullptr;
             ggml_tensor * candidates = nullptr;
             ggml_tensor * probs_by_token = nullptr;
+            bool          sorted = false;  // probs descend to a tail of exact zeros (llm_graph_result::t_sampled_sorted)
+            uint32_t      prefix = 0;      // entries read of a sorted row (the nonzero probs), 0: all
         };
         std::vector<lazy_row> lazy_rows;
         struct lazy_tensor {

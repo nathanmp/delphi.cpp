@@ -1673,6 +1673,7 @@ void llm_graph_result::reset() {
     t_sampled_probs_by_token.clear();
     t_sampled_logits.clear();
     t_candidates.clear();
+    t_sampled_sorted.clear();
 
     params = {};
 
@@ -5100,6 +5101,7 @@ void llm_graph_context::build_sampling() const {
     res->t_sampled_probs_by_token.resize(n_rows, nullptr);
     res->t_sampled_logits.resize(n_rows, nullptr);
     res->t_candidates.resize(n_rows, nullptr);
+    res->t_sampled_sorted.resize(n_rows, 0);
 
     // res->t_logits will contain logits for all tokens that want the logits calculated (logits=1 or output=1)
     GGML_ASSERT(res->t_logits != nullptr && "missing t_logits tensor");
@@ -5181,6 +5183,9 @@ void llm_graph_context::build_sampling() const {
             if (data.candidates != nullptr) {
                 if (active) {
                     res->t_candidates[rows[i]] = data.candidates;
+                    // top-p sorts the candidates by logit and masks its tail to -INF, and the samplers after it in a chain
+                    // (min-p, temperature, dist) keep the order: the probs then descend to a tail of exact zeros
+                    res->t_sampled_sorted[rows[i]] = strcmp(ggml_get_name(data.candidates), "top_p_candidates") == 0;
                 }
                 outs[1] = data.candidates;
                 ggml_build_forward_select(gf, outs.data(), outs.size(), i_out);

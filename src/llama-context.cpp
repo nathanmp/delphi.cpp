@@ -1733,11 +1733,30 @@ bool llama_context::get_sampled_prob_ith(int32_t idx, llama_token token, float *
     }
 }
 
-static void sampling_read_lazy(ggml_tensor * & tensor, void * dst) {
+static void sampling_read_lazy(ggml_tensor * & tensor, void * dst, uint32_t prefix = 0) {
     if (tensor) {
-        ggml_backend_tensor_get(tensor, dst, 0, ggml_nbytes(tensor));
+        const size_t n = prefix ? std::min<size_t>(ggml_nbytes(tensor), (size_t) prefix*ggml_element_size(tensor)) : ggml_nbytes(tensor);
+        ggml_backend_tensor_get(tensor, dst, 0, n);
         tensor = nullptr;
     }
+}
+
+// delphi: the probs of a sorted row (top-p) are nonzero only in a prefix, often a few hundred of 150K+ entries. Read them
+// in a first chunk and stop at the first zero, so that the logits and candidates need only the same prefix (a rejected draft
+// token reads one row over PCIe for its residual draw). Returns the number of entries read.
+static uint32_t sampling_read_lazy_sorted_probs(ggml_tensor * & tensor, float * dst) {
+    const uint32_t n     = (uint32_t) ggml_nelements(tensor);
+    const uint32_t first = std::min<uint32_t>(n, 2048);
+    ggml_backend_tensor_get(tensor, dst, 0, (size_t) first*sizeof(float));
+    uint32_t k = first;
+    if (dst[first - 1] == 0.0f) {
+        k = (uint32_t) (std::lower_bound(dst, dst + first, 0.0f, [](float a, float b) { return a > b; }) - dst);
+    } else if (first < n) {
+        ggml_backend_tensor_get(tensor, dst + first, (size_t) first*sizeof(float), (size_t) (n - first)*sizeof(float));
+        k = n;
+    }
+    tensor = nullptr;
+    return std::max<uint32_t>(k, 1);
 }
 
 float * llama_context::get_sampled_probs_ith(int32_t idx) {
@@ -1752,7 +1771,21 @@ float * llama_context::get_sampled_probs_ith(int32_t idx) {
         if ((size_t) row >= sampling.probs_count.size() || sampling.probs_count[row] == 0) {
             return nullptr;
         }
-        sampling_read_lazy(sampling.lazy_rows[row].probs, sampling.probs.data + row*model.vocab.n_tokens());
+        auto & lazy = sampling.lazy_rows[row];
+        if (lazy.probs && lazy.sorted && lazy.prefix == 0) {
+            const uint32_t k = sampling_read_lazy_sorted_probs(lazy.probs, sampling.probs.data + row*model.vocab.n_tokens());
+            if (k < sampling.probs_count[row]) {
+                lazy.prefix = k;
+                sampling.probs_count[row] = k;
+                if ((size_t) row < sampling.logits_count.size() && sampling.logits_count[row] > k && lazy.logits) {
+                    sampling.logits_count[row] = k;
+                }
+                if ((size_t) row < sampling.candidates_count.size() && sampling.candidates_count[row] > k && lazy.candidates) {
+                    sampling.candidates_count[row] = k;
+                }
+            }
+        }
+        sampling_read_lazy(lazy.probs, sampling.probs.data + row*model.vocab.n_tokens());
         return sampling.probs.data + row*model.vocab.n_tokens();
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: invalid backend sampled probs id %d, reason: %s\n", __func__, idx, err.what());
@@ -1772,7 +1805,7 @@ float * llama_context::get_sampled_logits_ith(int32_t idx) {
         if ((size_t) row >= sampling.logits_count.size() || sampling.logits_count[row] == 0) {
             return nullptr;
         }
-        sampling_read_lazy(sampling.lazy_rows[row].logits, sampling.logits.data + row*model.vocab.n_tokens());
+        sampling_read_lazy(sampling.lazy_rows[row].logits, sampling.logits.data + row*model.vocab.n_tokens(), sampling.lazy_rows[row].prefix);
         return sampling.logits.data + row*model.vocab.n_tokens();
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: invalid backend sampled logits id %d, reason: %s\n", __func__, idx, err.what());
@@ -1788,7 +1821,8 @@ const llama_token * llama_context::get_sampled_candidates_ith(int32_t idx) {
         if (sampling.candidates.has_data() &&
             (size_t) row < sampling.candidates_count.size() &&
             sampling.candidates_count[row] > 0) {
-            sampling_read_lazy(sampling.lazy_rows[row].candidates, sampling.candidates.data + row*model.vocab.n_tokens());
+            sampling_read_lazy(sampling.lazy_rows[row].candidates, sampling.candidates.data + row*model.vocab.n_tokens(),
+                    sampling.lazy_rows[row].prefix);
             return sampling.candidates.data + row*model.vocab.n_tokens();
         }
     } catch (const std::exception & err) {
@@ -3341,6 +3375,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     };
                     row = { store(res->t_sampled_logits[i0], 0), store(res->t_sampled_probs[i0], 1),
                             store(res->t_candidates[i0], 2), store(res->t_sampled_probs_by_token[i0], 3) };
+                    row.sorted = i0 < res->t_sampled_sorted.size() && res->t_sampled_sorted[i0] && row.probs && row.logits &&
+                            row.candidates && ggml_nelements(row.probs) == ggml_nelements(row.logits) &&
+                            ggml_nelements(row.probs) == ggml_nelements(row.candidates);
+                    row.prefix = 0;
                     if (allocation_failed) {
                         LLAMA_LOG_ERROR("%s: failed to allocate lazy sampling output\n", __func__);
                         return -2;
