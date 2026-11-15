@@ -6,6 +6,7 @@
 #include "log.h"
 
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <cstdint>
 #include <string>
@@ -266,6 +267,14 @@ struct llama_sampler * common_reasoning_budget_init(
         int32_t                           budget,
         common_reasoning_budget_state     initial_state) {
     return common_reasoning_budget_init_state(vocab, start_seqs, end_seqs, forced_tokens, budget, initial_state);
+}
+
+bool common_reasoning_budget_is_passive(const struct llama_sampler * smpl) {
+    if (!smpl) {
+        return true;
+    }
+    const auto * ctx = (const common_reasoning_budget_ctx *) smpl->ctx;
+    return ctx->budget == INT_MAX && ctx->state != REASONING_BUDGET_FORCING && ctx->state != REASONING_BUDGET_WAITING_UTF8;
 }
 
 common_reasoning_budget_state common_reasoning_budget_get_state(const struct llama_sampler * smpl) {

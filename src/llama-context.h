@@ -18,6 +18,7 @@
 #include <deque>
 #include <mutex>
 #include <map>
+#include <set>
 #include <vector>
 
 struct llama_model;
@@ -318,6 +319,7 @@ public:
         bool main_only = false); // main_only: keep the graphs of the alternate schedulers
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
+    void set_sampler_raw_logits(llama_seq_id seq_id, bool raw);
 
 private:
     llm_graph_result * get_gf_res_prev();
@@ -413,6 +415,7 @@ private:
             uint32_t      prefix = 0;      // entries read of a sorted row (the nonzero probs), 0: all
         };
         std::vector<lazy_row> lazy_rows;
+        std::set<llama_seq_id> raw_logits_seqs; // seqs whose raw logits are copied despite a backend sampler
         struct lazy_tensor {
             ggml_backend_buffer_ptr buffer;
             ggml_tensor tensor;

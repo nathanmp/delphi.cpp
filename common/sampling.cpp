@@ -134,10 +134,11 @@ struct common_sampler {
         rng.seed(llama_sampler_get_seed(chain) ^ 0x9e3779b9u);
     }
 
-    void set_logits(struct llama_context * ctx, int idx) {
-        const float *       sampled_probs  = llama_get_sampled_probs_ith     (ctx, idx);
-        const float *       sampled_logits = llama_get_sampled_logits_ith    (ctx, idx);
-        const llama_token * sampled_ids    = llama_get_sampled_candidates_ith(ctx, idx);
+    // raw: the full-vocabulary logits row, also when the backend sampled the row (llama_set_sampler_raw_logits)
+    void set_logits(struct llama_context * ctx, int idx, bool raw = false) {
+        const float *       sampled_probs  = raw ? nullptr : llama_get_sampled_probs_ith     (ctx, idx);
+        const float *       sampled_logits = raw ? nullptr : llama_get_sampled_logits_ith    (ctx, idx);
+        const llama_token * sampled_ids    = raw ? nullptr : llama_get_sampled_candidates_ith(ctx, idx);
 
         const llama_model * model = llama_get_model(ctx);
         const llama_vocab * vocab = llama_model_get_vocab(model);
@@ -419,18 +420,6 @@ struct common_sampler * common_sampler_init(
         llama_sampler_chain_add(chain, smpl);
     }
 
-    if (grmr && params.backend_sampling) {
-        LOG_WRN("%s: backend sampling is not compatible with grammar, disabling\n", __func__);
-
-        params.backend_sampling = false;
-    }
-
-    if (rbudget && params.backend_sampling) {
-        LOG_WRN("%s: backend sampling is not compatible with reasoning budget, disabling\n", __func__);
-
-        params.backend_sampling = false;
-    }
-
     auto * result = new common_sampler {
         /* .params  = */ params,
         /* .grmr    = */ grmr,
@@ -442,6 +431,22 @@ struct common_sampler * common_sampler_init(
         // mix it, the chain and the draft are seeded from this one too
         /* .rng     = */ std::mt19937(llama_sampler_get_seed(chain) ^ 0x9e3779b9u),
     };
+
+    // delphi: a lazy grammar (the tool calls of a chat template) masks nothing until its trigger, nor inside a reasoning
+    // block, and the reasoning-budget sampler that comes with it does nothing while the budget is unlimited, so the backend
+    // can sample until the grammar triggers; after that, common_sampler_sample() samples again on the CPU from the raw logits
+    // (llama_set_sampler_raw_logits) whatever the grammar rejects.
+    // LLAMA_GRAMMAR_BACKEND_SAMPLING=0: no backend sampling with a grammar or a reasoning budget (as before).
+    static const bool grammar_backend = [] {
+        const char * e = getenv("LLAMA_GRAMMAR_BACKEND_SAMPLING");
+        return !e || atoi(e) != 0;
+    }();
+    if (params.backend_sampling && (grmr || rbudget) && (!grammar_backend || !common_sampler_backend_ok(result))) {
+        LOG_WRN("%s: backend sampling is not compatible with %s, disabling\n", __func__, grmr ? "grammar" : "reasoning budget");
+
+        params.backend_sampling = false;
+        result->params.backend_sampling = false;
+    }
 
     return result;
 }
@@ -458,7 +463,7 @@ void common_sampler_free(struct common_sampler * gsmpl) {
     delete gsmpl;
 }
 
-static bool grammar_should_apply(struct common_sampler * gsmpl) {
+static bool grammar_should_apply(const struct common_sampler * gsmpl) {
     if (!gsmpl->grmr) {
         return false;
     }
@@ -471,6 +476,16 @@ static bool grammar_should_apply(struct common_sampler * gsmpl) {
         return state == REASONING_BUDGET_IDLE || state == REASONING_BUDGET_DONE;
     }
     return true;
+}
+
+bool common_sampler_backend_ok(const struct common_sampler * gsmpl) {
+    if (!gsmpl) {
+        return false;
+    }
+    if (gsmpl->rbudget && (gsmpl->params.reasoning_control || !common_reasoning_budget_is_passive(gsmpl->rbudget))) {
+        return false;
+    }
+    return !gsmpl->grmr || !grammar_should_apply(gsmpl) || llama_sampler_grammar_awaiting_trigger(gsmpl->grmr);
 }
 
 void common_sampler_accept(struct common_sampler * gsmpl, llama_token token, bool is_generated) {
@@ -655,6 +670,9 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 
     gsmpl->set_logits(ctx, idx);
 
+    // full-vocabulary CPU sampling of a row the backend sampled too: all of the chain runs on the CPU
+    bool raw = false;
+
     // Check if a backend sampler has already sampled a token in which case we
     // return that token id directly.
     {
@@ -663,9 +681,6 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
         if (id != LLAMA_TOKEN_NULL) {
             LOG_DBG("%s: Backend sampler selected token: '%d'. Will not run any CPU samplers\n", __func__, id);
 
-            GGML_ASSERT(!gsmpl->grmr    && "using grammar in combination with backend sampling is not supported");
-            GGML_ASSERT(!gsmpl->rbudget && "using reasoning budget in combination with backend sampling is not supported");
-
             for (size_t i = 0; i < cur_p.size; ++i) {
                 if (cur_p.data[i].id == id) {
                     cur_p.selected = i;
@@ -673,9 +688,36 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
                 }
             }
 
-            return id;
+            if (common_sampler_backend_ok(gsmpl)) {
+                return id;
+            }
+
+            // delphi: the lazy grammar has triggered, and the server asked for the raw logits of this row
+            // (llama_set_sampler_raw_logits). The backend draw is the first draw of the CPU path below; keep it if the
+            // grammar accepts it, else sample the raw logits on the CPU as without a backend sampler.
+            if (grmr && !grammar_first && (!rbudget || common_reasoning_budget_is_passive(rbudget))) {
+                llama_token_data       single_token_data       = { id, 1.0f, 0.0f };
+                llama_token_data_array single_token_data_array = { &single_token_data, 1, -1, false };
+
+                llama_sampler_apply(grmr, &single_token_data_array);
+
+                if (single_token_data_array.data[0].logit != -INFINITY) {
+                    return id;
+                }
+            }
+
+            raw = true;
+            gsmpl->set_logits(ctx, idx, raw);
         }
     }
+
+    auto apply_chain = [&]() {
+        if (raw) {
+            llama_sampler_chain_apply_all(chain, &cur_p);
+        } else {
+            llama_sampler_apply(chain, &cur_p);
+        }
+    };
 
     // apply reasoning budget first
     llama_sampler_apply(rbudget, &cur_p);
@@ -684,7 +726,9 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
         llama_sampler_apply(grmr, &cur_p);
     }
 
-    llama_sampler_apply(chain, &cur_p);
+    apply_chain();
+
+    GGML_ASSERT(cur_p.selected != -1 && "no selected token during sampling - check your sampling configuration");
 
     id = cur_p.data[cur_p.selected].id;
 
@@ -707,7 +751,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 
     // resampling:
     // if the token is not valid, sample again, but first apply the grammar sampler and then the sampling chain
-    gsmpl->set_logits(ctx, idx);
+    gsmpl->set_logits(ctx, idx, raw);
 
     llama_sampler_apply(rbudget,  &cur_p);
 
@@ -715,7 +759,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
         llama_sampler_apply(grmr,  &cur_p);
     }
 
-    llama_sampler_apply(chain, &cur_p);
+    apply_chain();
 
     GGML_ASSERT(cur_p.selected != -1 && "no selected token during sampling - check your sampling configuration");
 
@@ -724,14 +768,31 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     return id;
 }
 
+// delphi: a lazy grammar that triggered on an accepted token of this batch would have to mask the rows after it, but those
+// were sampled by the backend from the unmasked distribution. End the result at the token that triggered the grammar instead:
+// it is then the "new" token of the cycle (an accepted draft token is distributed as a sampled one), and the next batch
+// is sampled on the CPU.
+// Only the batch in which the grammar triggers lacks the raw logits: the server asks for them from the next batch on.
+static bool grammar_stop(const struct common_sampler * gsmpl, struct llama_context * ctx, int idx, const std::vector<llama_token> & result,
+        bool backend_ok_at_entry) {
+    return backend_ok_at_entry && !result.empty() && !common_sampler_backend_ok(gsmpl) &&
+           llama_get_sampled_token_ith(ctx, idx) != LLAMA_TOKEN_NULL;
+}
+
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first) {
     GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
 
     std::vector<llama_token> result;
     result.reserve(idxs.size());
 
+    const bool backend_ok_at_entry = common_sampler_backend_ok(gsmpl);
+
     size_t i = 0;
     for (; i < draft.size(); i++) {
+        if (grammar_stop(gsmpl, ctx, idxs[i], result, backend_ok_at_entry)) {
+            return result;
+        }
+
         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
 
         common_sampler_accept(gsmpl, id, true);
@@ -744,6 +805,10 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     }
 
     if (i == draft.size()) {
+        if (grammar_stop(gsmpl, ctx, idxs[i], result, backend_ok_at_entry)) {
+            return result;
+        }
+
         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
 
         common_sampler_accept(gsmpl, id, true);
@@ -775,6 +840,8 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
     std::vector<llama_token> result;
     result.reserve(idxs.size());
 
+    const bool backend_ok_at_entry = common_sampler_backend_ok(gsmpl);
+
     // draws come from the sampler's own stream, so they stay independent of what was drafted
     std::uniform_real_distribution<float> uni(0.0f, 1.0f);
 
@@ -787,10 +854,14 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
     bool backend_verified = false;
     size_t i = 0;
     for (; i < draft.size(); i++) {
+        if (grammar_stop(gsmpl, ctx, idxs[i], result, backend_ok_at_entry)) {
+            return result;
+        }
+
         const auto & q = draft_q[i];
         const float q_x = prob_of(q.data(), q.size(), draft[i]);
         float backend_p = 0.0f;
-        const bool tested_backend = !gsmpl->grmr && !gsmpl->rbudget &&
+        const bool tested_backend = common_sampler_backend_ok(gsmpl) &&
                 llama_get_sampled_token_ith(ctx, idxs[i]) != LLAMA_TOKEN_NULL &&
                 llama_get_sampled_prob_ith(ctx, idxs[i], draft[i], &backend_p);
         backend_verified |= tested_backend;
@@ -903,6 +974,10 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
     }
 
     if (i == draft.size()) {
+        if (grammar_stop(gsmpl, ctx, idxs[i], result, backend_ok_at_entry)) {
+            return result;
+        }
+
         llama_token id = LLAMA_TOKEN_NULL;
         if (backend_verified && gsmpl->params.n_probs == 0) {
             id = llama_get_sampled_token_ith(ctx, idxs[i]);

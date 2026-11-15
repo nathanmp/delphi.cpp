@@ -51,6 +51,9 @@ void                    common_sampler_reset (struct common_sampler * gsmpl);
 // per-request state outside the sampler chain (grammar, reasoning budget). Keeping the object lets llama reuse the
 // graphs that contain its backend sampling nodes.
 bool common_sampler_params_reusable(const common_params_sampling & a, const common_params_sampling & b);
+
+// delphi: the backend may sample for this sampler: neither its grammar nor its reasoning budget can mask the next token
+bool common_sampler_backend_ok(const struct common_sampler * gsmpl);
 struct common_sampler * common_sampler_clone (struct common_sampler * gsmpl);
 void                    common_sampler_copy  (const struct common_sampler * src, struct common_sampler * dst);
 

@@ -2172,6 +2172,8 @@ private:
             // TODO: getting pre sampling logits is not yet supported with backend sampling
             use_backend_sampling &= !need_pre_sample_logits;
 
+            llama_set_sampler_raw_logits(ctx_tgt, slot.id, false);
+
             // TODO: tmp until backend sampling is fully implemented
             if (use_backend_sampling) {
                 llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl.get()));
@@ -2207,6 +2209,14 @@ private:
 
         SLT_INF(slot, "processing task, is_child = %d\n", slot.task->is_child());
         return true;
+    }
+
+    // delphi: once a lazy grammar has triggered, the CPU may have to sample a row again under the grammar, so the raw logits
+    // of the slot are copied to the host from the next batch on (no graph change, unlike detaching the backend sampler)
+    void sampler_raw_logits_update(server_slot & slot) {
+        if (slot.smpl) {
+            llama_set_sampler_raw_logits(slot.ctx_tgt, slot.id, !common_sampler_backend_ok(slot.smpl.get()));
+        }
     }
 
     bool process_token(completion_token_output & result, server_slot & slot) {
@@ -5334,6 +5344,8 @@ private:
 
             common_sampler_accept(slot.smpl.get(), id, true);
 
+            sampler_raw_logits_update(slot);
+
             // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
             const int64_t t_now = ggml_time_us();
 
@@ -5410,6 +5422,10 @@ private:
                     accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
                 }
                 slot.spec_i_batch.clear();
+
+                // before a checkpoint restore below can take the grammar back to before its trigger (the replay then
+                // needs the raw logits)
+                sampler_raw_logits_update(slot);
 
                 GGML_ASSERT(accepted.size() >= 1);
 

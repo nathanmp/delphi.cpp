@@ -1374,6 +1374,14 @@ extern "C" {
     // note: prefer initializing the context with llama_context_params.samplers when possible
     LLAMA_API bool llama_set_sampler(struct llama_context * ctx, llama_seq_id seq_id, struct llama_sampler * smpl);
 
+    // delphi: also copy the raw logits of seq_id's outputs to the host while a backend sampler is attached, so that the CPU
+    // can sample a row again (a lazy grammar that has triggered); no graph change, one extra n_vocab copy per output
+    LLAMA_API void llama_set_sampler_raw_logits(struct llama_context * ctx, llama_seq_id seq_id, bool raw);
+
+    // delphi: apply every sampler of a chain to cur_p on the CPU, also those that a backend-initialized chain leaves to the
+    // graph (llama_sampler_apply skips them, as cur_p normally holds the backend's output then)
+    LLAMA_API void llama_sampler_chain_apply_all(struct llama_sampler * chain, llama_token_data_array * cur_p);
+
     // mirror of llama_sampler_i:
     LLAMA_API struct llama_sampler * llama_sampler_init  (      struct llama_sampler_i * iface, llama_sampler_context_t ctx);
     LLAMA_API const char *           llama_sampler_name  (const struct llama_sampler * smpl);
@@ -1492,6 +1500,9 @@ extern "C" {
                             size_t num_trigger_patterns,
                const llama_token * trigger_tokens,
                             size_t num_trigger_tokens);
+
+    /// delphi: true when smpl is a lazy grammar sampler that has not been triggered yet (it then masks nothing)
+    LLAMA_API bool llama_sampler_grammar_awaiting_trigger(const struct llama_sampler * smpl);
 
 
     /// NOTE: Avoid using on the full vocabulary as searching for repeated tokens can become slow. For example, apply top-k or top-p sampling first.

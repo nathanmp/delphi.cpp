@@ -37,6 +37,10 @@ struct llama_sampler_chain {
 };
 
 uint32_t llama_sampler_backend_n_nodes(const llama_sampler * sampler);
+
+// delphi: a chain detached from its context (llama_set_sampler(ctx, seq, other or nullptr)) applies all its samplers on the
+// CPU again; while initialized for the backend, llama_sampler_chain_apply skips the prefix that ran in the graph
+void llama_sampler_chain_backend_release(llama_sampler * sampler);
 void llama_sampler_backend_begin(llama_sampler * sampler);
 
 // Capture this graph's input tensors while reading RNG and history from the live sampler.
