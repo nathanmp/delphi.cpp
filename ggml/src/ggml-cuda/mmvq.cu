@@ -1,4 +1,5 @@
 #include "mmvq.cuh"
+#include "mmvq-dedup.cuh"
 #include "moe-packed.cuh"
 #ifdef GGML_CUDA_MOE_PACKED_AVAILABLE
 #include "moe-packed-q.cuh"
@@ -2165,6 +2166,10 @@ static void mul_mat_vec_q_packed_launch(
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, nchannels_y_fd, stride_channel_x, stride_channel_y, stride_channel_dst);
         }
     } else {
+        if (ggml_cuda_mmvq_dedup_launch(fmt, vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_col_y, stride_col_dst,
+                nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst, ids_stride, stream)) {
+            return;
+        }
         if (has_fusion) {
             mul_mat_vec_q_packed_moe<fmt, true><<<block_nums, block_dims, 0, stream>>>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, nchannels_y_fd, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y,
