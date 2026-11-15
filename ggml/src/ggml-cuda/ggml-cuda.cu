@@ -38,6 +38,7 @@
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/mmid-partial.cuh"
 #include "ggml-cuda/mmvq-q8-tc.cuh"
+#include "ggml-cuda/mmvq-q8-frag.cuh"
 #include "ggml-cuda/mm-dense-chunked.cuh"
 #include "ggml-cuda/moe-devsort.cuh"
 #include "ggml-cuda/moe-schedule.cuh"
@@ -1286,6 +1287,7 @@ static void ggml_backend_cuda_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     // delphi: the packed MoE weights are keyed by the tensor address, which a later buffer can reuse
     ggml_cuda_moe_packed_forget(ctx->device, ctx->dev_ptr, buffer->size);
     ggml_cuda_moe_int4_forget(ctx->device, ctx->dev_ptr, buffer->size);
+    ggml_cuda_q8f_forget(ctx->device, ctx->dev_ptr, buffer->size);
     if (ctx->region == nullptr && ggml_cuda_retire(ctx->device, ctx->dev_ptr, buffer->size)) {
         ctx->dev_ptr = nullptr;
     }
@@ -1332,6 +1334,7 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_moe_int4_before_write(ctx->device, (char *) tensor->data + offset, size); // delphi: new data is row-major again
+    ggml_cuda_q8f_check_not_packed(ctx->device, (char *) tensor->data + offset, size, "memset_tensor");
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemsetAsync((char *) tensor->data + offset, value, size, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
@@ -1341,6 +1344,7 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_moe_int4_before_write(ctx->device, (char *) tensor->data + offset, size); // delphi: new data is row-major again
+    ggml_cuda_q8f_check_not_packed(ctx->device, (char *) tensor->data + offset, size, "set_tensor");
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
@@ -1350,6 +1354,7 @@ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, co
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_moe_int4_check_not_packed(ctx->device, (const char *) tensor->data + offset, size, "get_tensor");
+    ggml_cuda_q8f_check_not_packed(ctx->device, (const char *) tensor->data + offset, size, "get_tensor");
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
@@ -2492,6 +2497,9 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 
     bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear && src1->type == GGML_TYPE_F32 &&
                              dst->type == GGML_TYPE_F32 && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
+    if (tensor->op == GGML_OP_MUL_MAT && ggml_cuda_q8f_packed(src0)) {
+        return false; // delphi: read only by ggml_cuda_q8f_mul_mat
+    }
 
     // fusion is not universally faster on Pascal
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -2517,6 +2525,14 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     if (hint == GGML_HINT_SRC0_IS_HADAMARD && ggml_cuda_op_fwht(ctx, src1, dst)) {
         ggml_exec_trace_dispatch(dst->op, GGML_EXEC_TRACE_DISPATCH_GPU_FWHT,
                 GGML_EXEC_TRACE_DISPATCH_VARIANT_DEFAULT, 0, 0);
+        return;
+    }
+
+    // delphi: Q8_0 weights packed in the mma fragment layout have one reader (mmvq-q8-frag.cuh)
+    if (ggml_cuda_q8f_packed(src0)) {
+        ggml_exec_trace_dispatch(dst->op, ggml_cuda_q8f_uses_cublas(ne11*ne12*ne13) ? GGML_CUDA_TRACE_BLAS : GGML_EXEC_TRACE_DISPATCH_GPU_MMVQ,
+                GGML_EXEC_TRACE_DISPATCH_VARIANT_DEFAULT, 0, 0);
+        ggml_cuda_q8f_mul_mat(ctx, src0, src1, dst);
         return;
     }
 
@@ -2610,6 +2626,9 @@ static bool ggml_cuda_mul_mat_may_use_cublas(const ggml_tensor * dst, const int 
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
     const int64_t ne11 = src1->ne[1];
+    if (ggml_cuda_q8f_packed(src0)) {
+        return ggml_cuda_q8f_uses_cublas(ne11*src1->ne[2]*src1->ne[3]);
+    }
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
         && ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
     if (bad_padding_clear || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
@@ -4870,7 +4889,8 @@ static bool ggml_cuda_mul_mat_takes_mmvq(const ggml_tensor * mm, const int cc) {
         ggml_get_op_params_i32(mm, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
         return false;
     }
-    if (ggml_cuda_mmvq_q8_smallk_supported(src0, src1, mm, cc) || ggml_cuda_mmvq_q8_tc_supported(src0, src1, mm, cc)) {
+    if (ggml_cuda_mmvq_q8_smallk_supported(src0, src1, mm, cc) || ggml_cuda_mmvq_q8_tc_supported(src0, src1, mm, cc) ||
+            ggml_cuda_q8f_packed(src0)) {
         return false;
     }
     return ggml_cuda_should_use_mmvq(src0->type, cc, src1->ne[1], src0->ne[1]);
@@ -6144,6 +6164,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_hip_moe_int4_prepare_graph(*cuda_ctx, cgraph);
 #endif
     ggml_cuda_moe_packed_prepare(*cuda_ctx, cgraph);
+    ggml_cuda_q8f_prepare(*cuda_ctx, cgraph); // delphi: dense Q8_0 weights in the fragment layout (mmvq-q8-frag.cuh)
 
     // delphi: INT4 copies of the expert weights of the routed FFN regions of this graph (moe-int4-decode.cuh), likewise before capture
     if (ggml_cuda_moe_int4_enabled()) {
