@@ -779,6 +779,8 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
     std::uniform_real_distribution<float> uni(0.0f, 1.0f);
 
     std::vector<llama_token_data> residual;
+    static thread_local std::vector<float>   q_map; // q by token id, zero outside q
+    static thread_local std::vector<uint8_t> q_set;
 
     std::vector<llama_token_data> cand; // candidate array masked by the grammar, if there is one
 
@@ -851,14 +853,33 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
             continue;
         }
 
-        // rejected: tokens outside q's support keep all of p
+        // rejected: tokens outside q's support keep all of p. q is a few candidates and p can be the whole vocabulary, so q is
+        // read through a dense map by token id (the first entry of a duplicate id wins, as in prob_of).
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+        if ((int) q_map.size() < n_vocab) {
+            q_map.assign(n_vocab, 0.0f);
+            q_set.assign(n_vocab, 0);
+        }
+        for (const auto & e : q) {
+            if (e.id >= 0 && e.id < n_vocab && !q_set[e.id]) {
+                q_set[e.id] = 1;
+                q_map[e.id] = e.p;
+            }
+        }
         residual.clear();
         float sum = 0.0f;
         for (size_t k = 0; k < cur_p->size; ++k) {
-            const float r = p_of(k) - prob_of(q.data(), q.size(), cur_p->data[k].id);
+            const llama_token id = cur_p->data[k].id;
+            const float r = p_of(k) - (id >= 0 && id < n_vocab ? q_map[id] : 0.0f);
             if (r > 0.0f) {
-                residual.push_back({ cur_p->data[k].id, 0.0f, r });
+                residual.push_back({ id, 0.0f, r });
                 sum += r;
+            }
+        }
+        for (const auto & e : q) {
+            if (e.id >= 0 && e.id < n_vocab) {
+                q_set[e.id] = 0;
+                q_map[e.id] = 0.0f;
             }
         }
 

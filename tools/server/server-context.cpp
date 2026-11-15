@@ -5383,7 +5383,11 @@ private:
             // verify and try to accept the draft
             const uint64_t t_accept = common_spec_ledger_now();
             {
-                common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
+                // the sampler state is restored only when a partial acceptance restores the checkpoint (below); a clone copies the
+                // vocabulary-sized candidate array, so skip it when no rollback of this draft can need the checkpoint
+                const bool may_restore = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_draft > llama_n_rs_seq(ctx_tgt));
+                common_sampler_ptr smpl_save(may_restore ? common_sampler_clone(slot.smpl.get()) : nullptr);
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 GGML_ASSERT(slot.spec_draft_q.empty() || (slot.spec_draft_q.size() == slot.spec_draft.size()));
@@ -5440,6 +5444,7 @@ private:
                         slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
 
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
+                        GGML_ASSERT(smpl_save && "a checkpoint restore needs the saved sampler");
                         common_sampler_copy(smpl_save.get(), slot.smpl.get());
 
                         return;
