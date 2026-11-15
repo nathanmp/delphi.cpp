@@ -2,10 +2,13 @@
 #include "convert.cuh"
 
 #include <algorithm>
+#include <cinttypes>
 #include <atomic>
 #include <cstdlib>
 #include <mutex>
 #include <set>
+#include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -235,12 +238,14 @@ struct q8f_range {
     int          device;
     const char * lo;
     const char * hi;
+    int64_t      row_bytes = 0;   // the packed layout is local to 16-row tiles of rows of this size
+    std::string  name;            // the weight that was packed (diagnostics; graph tensor names do not outlive the graph)
 };
 
 std::mutex                              q8f_mutex;
 std::vector<q8f_range>                  q8f_ranges;  // packed weights, no two overlap
 std::vector<q8f_range>                  q8f_blocked; // weights that other ops read: never packed
-std::set<std::pair<int, const void *>>  q8f_seen;    // (device, data) of MUL_MAT weights already decided
+std::set<std::tuple<int, const void *, size_t>> q8f_seen; // (device, data, size) of MUL_MAT weights already decided
 std::atomic<bool>                       q8f_any{false};
 
 static bool overlaps(const q8f_range & r, int device, const char * lo, const char * hi) {
@@ -304,8 +309,8 @@ void ggml_cuda_q8f_forget(int device, const void * base, size_t size) {
     q8f_ranges.erase(std::remove_if(q8f_ranges.begin(), q8f_ranges.end(), gone), q8f_ranges.end());
     q8f_blocked.erase(std::remove_if(q8f_blocked.begin(), q8f_blocked.end(), gone), q8f_blocked.end());
     for (auto it = q8f_seen.begin(); it != q8f_seen.end();) {
-        const char * p = (const char *) it->second;
-        it = it->first == device && p >= lo && p < hi ? q8f_seen.erase(it) : std::next(it);
+        const char * p = (const char *) std::get<1>(*it);
+        it = std::get<0>(*it) == device && p >= lo && p < hi ? q8f_seen.erase(it) : std::next(it);
     }
 }
 
@@ -360,7 +365,7 @@ void ggml_cuda_q8f_prepare(ggml_backend_cuda_context & ctx, const ggml_cgraph * 
                 continue;
             }
             const ggml_tensor * src0 = node->src[0];
-            if (!q8f_seen.insert({ ctx.device, src0->data }).second) {
+            if (!q8f_seen.insert({ ctx.device, src0->data, ggml_nbytes(src0) }).second) {
                 continue;
             }
             const char * lo = (const char *) src0->data;
@@ -409,16 +414,23 @@ void ggml_cuda_q8f_prepare(ggml_backend_cuda_context & ctx, const ggml_cgraph * 
             }
         }
         std::sort(in.begin(), in.end(), [](const q8f_range & a, const q8f_range & b) { return a.lo < b.lo; });
+        // A packed range can also be larger than src0: a graph can multiply by a tensor that spans adjacent weights (a fused
+        // gate/up made of ffn_gate and ffn_up, for example) before it multiplies by one of them. The layout of a row tile does
+        // not depend on the tensor around it, so the part inside src0 is valid if it is made of whole row tiles of src0.
         std::vector<std::pair<const char *, const char *>> gaps;
         const char * p = lo;
         for (const q8f_range & r : in) {
-            if (r.lo < lo || r.hi > hi || (r.lo - lo) % tile_bytes != 0 || (r.hi - lo) % tile_bytes != 0) {
-                GGML_ABORT("%s: a packed range in %s is not made of its row tiles", __func__, src0->name);
+            const char * a = std::max(r.lo, lo);
+            const char * b = std::min(r.hi, hi);
+            if (r.row_bytes != row_bytes || (a - lo) % tile_bytes != 0 || (b - lo) % tile_bytes != 0) {
+                GGML_ABORT("%s: %s (CUDA%d %p..%p, rows of %" PRId64 " B) overlaps packed %s (%p..%p, rows of %" PRId64 " B) not in whole "
+                    "row tiles", __func__, src0->name, ctx.device, (const void *) lo, (const void *) hi, row_bytes,
+                    r.name.c_str(), (const void *) r.lo, (const void *) r.hi, r.row_bytes);
             }
-            if (r.lo > p) {
-                gaps.push_back({ p, r.lo });
+            if (a > p) {
+                gaps.push_back({ p, a });
             }
-            p = r.hi;
+            p = b;
         }
         if (p < hi) {
             gaps.push_back({ p, hi });
@@ -432,7 +444,7 @@ void ggml_cuda_q8f_prepare(ggml_backend_cuda_context & ctx, const ggml_cgraph * 
                 q8f_pack<<<(nthr + 255)/256, 256, 0, stream>>>(tmp, const_cast<char *>(c), row_bytes, nkt, nt);
                 CUDA_CHECK(cudaGetLastError());
             }
-            q8f_ranges.push_back({ ctx.device, gap.first, gap.second });
+            q8f_ranges.push_back({ ctx.device, gap.first, gap.second, row_bytes, src0->name });
             nbytes += gap.second - gap.first;
         }
     }
