@@ -832,7 +832,12 @@ void ggml_backend_cuda_context::q8_1_cache_invalidate(const ggml_tensor * t) {
 // read stale bytes (qengine observed diverging tokens; it fences with cudaEventSynchronize on the host). Here a host
 // callback on the download stream publishes a sequence number in mapped memory once the host has observed the
 // download complete, and the upload stream waits for that value (cuStreamWaitValue32), which keeps the host from
-// blocking.
+// blocking. The upload also waits for a per-chunk event of the download: the driver does not see the order that a
+// value wait makes, and the CUDA documentation requires such an order to also be given with events.
+//
+// Some drivers reject cuStreamWaitValue32 on host memory (CUDA_ERROR_INVALID_VALUE on an RTX 3090 + RTX A5000
+// system until NVreg_EnableStreamMemOPs=1 was set). A probe per device pair detects this, and the upload
+// then waits for the per-chunk events only. GGML_CUDA_XDEV_STAGE_WAIT_VALUE=0 forces the event-only path.
 //
 // Each slot is reused only after the previous copy through it has been uploaded, so the compute streams wait only
 // when more copies are in flight than there are slots.
@@ -851,6 +856,7 @@ struct ggml_cuda_xdev_stage_slot {
     cudaEvent_t snapshot  = nullptr; // source device: the snapshot is complete
     cudaEvent_t download  = nullptr; // source device: the last chunk has been downloaded
     cudaEvent_t upload    = nullptr; // destination device: the last chunk has been uploaded
+    std::vector<cudaEvent_t> chunk_done; // source device: per chunk, the download is complete
     bool        used      = false;
 };
 
@@ -863,6 +869,7 @@ struct ggml_cuda_xdev_stage {
     int          src_device = -1;
     int          dst_device = -1;
     cudaStream_t download_stream = nullptr; // source device
+    bool         wait_value = true; // see ggml_cuda_xdev_stage_wait_value_ok
     ggml_cuda_xdev_stage_slot large[n_large];
     ggml_cuda_xdev_stage_slot small[n_small];
     int          next_large = 0;
@@ -922,6 +929,10 @@ static void ggml_cuda_xdev_stage_free(ggml_cuda_xdev_stage * stage) {
                 CUDA_CHECK(cudaEventDestroy(slot.snapshot));
                 CUDA_CHECK(cudaEventDestroy(slot.download));
             }
+            for (cudaEvent_t ev : slot.chunk_done) {
+                CUDA_CHECK(cudaEventDestroy(ev));
+            }
+            slot.chunk_done.clear();
             if (slot.upload != nullptr) {
                 ggml_cuda_set_device(stage->dst_device);
                 CUDA_CHECK(cudaEventDestroy(slot.upload));
@@ -941,6 +952,41 @@ static void ggml_cuda_xdev_stage_free(ggml_cuda_xdev_stage * stage) {
         CUDA_CHECK(cudaFreeHost(p));
     }
     delete stage;
+}
+
+// true if a stream of dst_device can cuStreamWaitValue32 on host memory mapped with src_device current, as the copy does
+static bool ggml_cuda_xdev_stage_wait_value_ok(int src_device, int dst_device) {
+    static const int mode = [] {
+        const char * env = getenv("GGML_CUDA_XDEV_STAGE_WAIT_VALUE");
+        return env != nullptr ? atoi(env) : -1;
+    }();
+    if (mode >= 0) {
+        return mode != 0;
+    }
+    static int cache[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_DEVICES] = { { 0 } }; // 0 unknown, 1 ok, 2 not ok
+    int & c = cache[src_device][dst_device];
+    if (c == 0) {
+        uint32_t *   word   = nullptr;
+        cudaStream_t stream = nullptr;
+        ggml_cuda_set_device(src_device);
+        CUDA_CHECK(cudaHostAlloc((void **) &word, sizeof(uint32_t), cudaHostAllocPortable | cudaHostAllocMapped));
+        *word = 1;
+        ggml_cuda_set_device(dst_device);
+        CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        const CUresult res = cuStreamWaitValue32((CUstream) stream, (CUdeviceptr) word, 1, CU_STREAM_WAIT_VALUE_GEQ);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(cudaStreamDestroy(stream));
+        CUDA_CHECK(cudaFreeHost(word));
+        c = res == CUDA_SUCCESS ? 1 : 2;
+        if (c == 2) {
+            const char * err = nullptr;
+            cuGetErrorString(res, &err);
+            GGML_LOG_WARN("%s: device %d -> %d: cuStreamWaitValue32 on host memory failed (%s); host-staged cross-device copies use events only. "
+                    "Setting \"options nvidia NVreg_EnableStreamMemOPs=1\" for the nvidia kernel module can enable it.\n",
+                    __func__, src_device, dst_device, err != nullptr ? err : "unknown error");
+        }
+    }
+    return c == 1;
 }
 
 // true if copies from src to dst should be staged explicitly (no peer access); GGML_CUDA_XDEV_STAGE=0/1 overrides
@@ -969,6 +1015,7 @@ static void ggml_cuda_xdev_stage_copy(
         stage = new ggml_cuda_xdev_stage();
         stage->src_device = ctx_src->device;
         stage->dst_device = ctx_dst->device;
+        stage->wait_value = ggml_cuda_xdev_stage_wait_value_ok(stage->src_device, stage->dst_device);
         ggml_cuda_set_device(stage->src_device);
         CUDA_CHECK(cudaStreamCreateWithFlags(&stage->download_stream, cudaStreamNonBlocking));
     }
@@ -1005,6 +1052,11 @@ static void ggml_cuda_xdev_stage_copy(
         slot.n_ready = (int) ((alloc + ggml_cuda_xdev_stage::chunk_size - 1) / ggml_cuda_xdev_stage::chunk_size);
         CUDA_CHECK(cudaHostAlloc((void **) &slot.ready, slot.n_ready * sizeof(uint32_t), cudaHostAllocPortable | cudaHostAllocMapped));
         memset(slot.ready, 0, slot.n_ready * sizeof(uint32_t));
+        while ((int) slot.chunk_done.size() < slot.n_ready) {
+            cudaEvent_t ev = nullptr;
+            CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
+            slot.chunk_done.push_back(ev);
+        }
         slot.size = alloc;
     }
     const int n_chunks = (int) ((size + ggml_cuda_xdev_stage::chunk_size - 1) / ggml_cuda_xdev_stage::chunk_size);
@@ -1031,8 +1083,11 @@ static void ggml_cuda_xdev_stage_copy(
         const size_t len    = std::min(ggml_cuda_xdev_stage::chunk_size, size - offset);
         CUDA_CHECK(cudaMemcpyAsync((char *) slot.host_buf + offset, (const char *) slot.dev_buf + offset, len,
                 cudaMemcpyDeviceToHost, stage->download_stream));
-        CUDA_CHECK(cudaLaunchHostFunc(stage->download_stream, ggml_cuda_xdev_stage_signal,
-                new ggml_cuda_xdev_stage_signal_data { slot.ready + i, seq }));
+        CUDA_CHECK(cudaEventRecord(slot.chunk_done[i], stage->download_stream));
+        if (stage->wait_value) {
+            CUDA_CHECK(cudaLaunchHostFunc(stage->download_stream, ggml_cuda_xdev_stage_signal,
+                    new ggml_cuda_xdev_stage_signal_data { slot.ready + i, seq }));
+        }
     }
     CUDA_CHECK(cudaEventRecord(slot.download, stage->download_stream));
 
@@ -1051,7 +1106,10 @@ static void ggml_cuda_xdev_stage_copy(
     for (int i = 0; i < n_chunks; ++i) {
         const size_t offset = (size_t) i * ggml_cuda_xdev_stage::chunk_size;
         const size_t len    = std::min(ggml_cuda_xdev_stage::chunk_size, size - offset);
-        CU_CHECK(cuStreamWaitValue32((CUstream) upload_stream, (CUdeviceptr) (slot.ready + i), seq, CU_STREAM_WAIT_VALUE_GEQ));
+        CUDA_CHECK(cudaStreamWaitEvent(upload_stream, slot.chunk_done[i], 0));
+        if (stage->wait_value) {
+            CU_CHECK(cuStreamWaitValue32((CUstream) upload_stream, (CUdeviceptr) (slot.ready + i), seq, CU_STREAM_WAIT_VALUE_GEQ));
+        }
         CUDA_CHECK(cudaMemcpyAsync((char *) dst + offset, (const char *) slot.host_buf + offset, len,
                 cudaMemcpyHostToDevice, upload_stream));
     }
