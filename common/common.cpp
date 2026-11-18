@@ -1790,6 +1790,95 @@ void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adap
     llama_set_adapters_lora(ctx, loras.data(), loras.size(), scales.data());
 }
 
+// EAGLE3, DFlash, DSpark and separate MTP assistant drafts use the target's head, token embeddings or layer features,
+// which are on the device of the target's output layer: the last device of the layer split. A draft on another GPU then
+// copies them between devices at every draft step (GLM-5.3 Flash on CMP 170HX, DFlash2 on CUDA0 instead of CUDA2:
+// -13 % decode). Moving the draft's device to the end of the split order puts the last layers and the output layer
+// there and keeps each device's -ts share. Moving only the output layer was worse: the pipeline-parallel prefill then
+// returns to the first device for every ubatch, which serializes it (-25 % on a 10K prompt).
+// LLAMA_SPEC_DRAFT_DEVICE_LAST=0 opts out.
+void common_params_order_devices_for_draft(common_params & params) {
+    const char * env = getenv("LLAMA_SPEC_DRAFT_DEVICE_LAST");
+    if ((env != nullptr && atoi(env) == 0) || !params.speculative.has_dft() || params.split_mode != LLAMA_SPLIT_MODE_LAYER) {
+        return;
+    }
+    const auto & types = params.speculative.types;
+    const bool reads_target = std::any_of(types.begin(), types.end(), [](common_speculative_type t) {
+        return t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP ||
+               t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+    });
+    if (!reads_target) {
+        return;
+    }
+
+    ggml_backend_dev_t dev_draft = nullptr;
+    for (ggml_backend_dev_t d : params.speculative.draft.devices) {
+        if (d == nullptr) {
+            continue;
+        }
+        if (dev_draft != nullptr) {
+            return; // a draft on several devices: keep the order
+        }
+        dev_draft = d;
+    }
+    if (dev_draft == nullptr || ggml_backend_dev_type(dev_draft) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+        return;
+    }
+
+    std::vector<ggml_backend_dev_t> devs;
+    for (ggml_backend_dev_t d : params.devices) {
+        if (d != nullptr) {
+            devs.push_back(d);
+        }
+    }
+    if (params.devices.empty()) {
+        // the default selection of llama_model_load: every GPU once. Keep it when RPC or integrated GPUs take part, as
+        // their place in that order is not reproduced here
+        std::vector<std::string> ids;
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            ggml_backend_dev_t d = ggml_backend_dev_get(i);
+            const auto type = ggml_backend_dev_type(d);
+            if (type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                return;
+            }
+            if (type != GGML_BACKEND_DEVICE_TYPE_GPU) {
+                continue;
+            }
+            if (std::string(ggml_backend_reg_name(ggml_backend_dev_backend_reg(d))) == "RPC") {
+                return;
+            }
+            ggml_backend_dev_props props;
+            ggml_backend_dev_get_props(d, &props);
+            const std::string id = props.device_id ? props.device_id : "";
+            if (!id.empty() && std::find(ids.begin(), ids.end(), id) != ids.end()) {
+                continue;
+            }
+            ids.push_back(id);
+            devs.push_back(d);
+        }
+    }
+
+    if (devs.empty()) {
+        return; // --device none
+    }
+    const auto it = std::find(devs.begin(), devs.end(), dev_draft);
+    if (it == devs.end() || it == devs.end() - 1) {
+        return; // the target does not use the draft's device, or it is last already
+    }
+    const size_t k = it - devs.begin();
+    std::rotate(devs.begin() + k, devs.begin() + k + 1, devs.end());
+    std::rotate(params.tensor_split + k, params.tensor_split + k + 1, params.tensor_split + devs.size());
+
+    std::string order;
+    for (ggml_backend_dev_t d : devs) {
+        order += std::string(order.empty() ? "" : ",") + ggml_backend_dev_name(d);
+    }
+    LOG_INF("%s: the draft reads the target's output layer: target device order %s (draft device last)\n", __func__, order.c_str());
+
+    params.devices = devs;
+    params.devices.push_back(nullptr);
+}
+
 struct llama_model_params common_model_params_to_llama(common_params & params) {
     auto mparams = llama_model_default_params();
 

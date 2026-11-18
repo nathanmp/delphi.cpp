@@ -892,6 +892,8 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         params.mmproj_use_gpu = params.mmproj_device != nullptr;
     }
 
+    common_params_order_devices_for_draft(params);
+
     if (params.prompt_cache_all && (params.interactive || params.interactive_first)) {
         throw std::invalid_argument("error: --prompt-cache-all not supported in interactive mode yet\n");
     }

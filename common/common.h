@@ -1025,6 +1025,10 @@ using common_init_result_ptr = std::unique_ptr<common_init_result>;
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only = false);
 
 struct llama_model_params   common_model_params_to_llama  (      common_params & params);
+
+// for a draft that reads the target's head, embeddings or layer features, move the draft's device to the end of the
+// target's layer split, so that it holds the target's last layers and output layer
+void common_params_order_devices_for_draft(common_params & params);
 struct llama_context_params common_context_params_to_llama(const common_params & params);
 
 // clear LoRA adapters from context, then apply new list of adapters
