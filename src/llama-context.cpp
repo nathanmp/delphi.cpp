@@ -481,6 +481,41 @@ llama_context::llama_context(
             backends.emplace_back(backend);
         }
 
+        // tensors of ctx_other can be on devices that this model does not use. A Gemma4 assistant shares the KV cache
+        // of all its layers; the other drafts read the target's token embeddings, output head and layer features
+        // (on its output device). delphi: unlike upstream, add only those devices: an unused backend still costs
+        // events and synchronizations in every draft graph (GLM-5.3 Flash DFlash2 decode -0.85 % with two of them)
+        if (cparams.ctx_other) {
+            const llama_model * model_other = llama_get_model(cparams.ctx_other);
+            std::vector<ggml_backend_dev_t> devs_needed;
+            if (model.arch == LLM_ARCH_GEMMA4_ASSISTANT) {
+                for (const auto & dev_other : model_other->devices) {
+                    devs_needed.push_back(dev_other.dev);
+                }
+            } else {
+                devs_needed.push_back(model_other->dev_output());
+                for (const ggml_tensor * t : { model_other->tok_embd, model_other->output, model_other->output_s }) {
+                    if (t != nullptr && t->buffer != nullptr) {
+                        devs_needed.push_back(ggml_backend_buft_get_device(ggml_backend_buffer_get_type(t->buffer)));
+                    }
+                }
+            }
+            for (const auto & dev_other : model_other->devices) {
+                const auto uses = [&](ggml_backend_dev_t d) { return d == dev_other.dev; };
+                const bool needed = std::any_of(devs_needed.begin(), devs_needed.end(), uses);
+                const bool found  = std::any_of(model.devices.begin(), model.devices.end(),
+                        [&](const llama_device & dev) { return dev.dev == dev_other.dev; });
+                if (!needed || found) {
+                    continue;
+                }
+                ggml_backend_t backend = ggml_backend_dev_init(dev_other.dev, nullptr);
+                if (backend == nullptr) {
+                    throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev_other.dev)));
+                }
+                backends.emplace_back(backend);
+            }
+        }
+
         // LLAMA_MOE_SPLIT=<device>[:<n>]: compute n routed experts (default half) of each host-resident MoE layer on another
         // device, while the rest run where the scheduler puts them (see llm_graph_context::build_moe_ffn_split)
         if (const char * env = getenv("LLAMA_MOE_SPLIT"); env != nullptr && *env != '\0' && hparams.n_expert > 1) {
