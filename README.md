@@ -1,6 +1,6 @@
 # delphi.cpp: a fork of llama.cpp
 
-delphi.cpp runs large mixture-of-experts (MoE) models on one machine that has much more host RAM than VRAM. The routed experts stay in host memory, and the CPU and the GPUs share the work. Dense weights, attention and the most-used experts go to the GPUs. The main targets are DeepSeek V4.1 Flash, GLM-5.3 Flash and Qwen 3.8 Flash Next, on AVX2 dual-socket CPUs, RDNA4 GPUs (for example the R9700) and SM_80 GPUs (for example the CMP 170HX).
+delphi.cpp focuses on running large mixture-of-experts (MoE) models in hybrid CPU/GPU inference scenarios. The routed experts stay in host memory, and the CPU and the GPU(s) share the work. Dense weights, attention and the most-used experts go to the GPUs. The main targets are DeepSeek V4.1 Flash, GLM-5.3 Flash and Qwen 3.8 Flash Next, on AVX2 CPUs, RDNA4 GPUs (for example the R9700) and SM_80 GPUs (for example the CMP 170HX).
 
 Refer to:
 
