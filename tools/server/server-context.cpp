@@ -2780,6 +2780,40 @@ private:
     // Looks for a checkpoint on disk that reaches further than the best one in memory (n_ram is its n_tokens, 0 if there is none)
     // and reads it into out. A file is usable under the rule of the search in memory, and if the prompt of the slot still starts with
     // the tokens that it was made for.
+    // delphi: after a failed decode, keep the tokens that the memory holds. llama_decode removes the positions of the
+    // failed ubatch (or the whole sequence when it cannot), so the target memory ends at its last computed token. The
+    // draft memory must end at the same position, else its state does not match and the slot starts again.
+    bool slot_keep_computed_prefix(server_slot & slot) {
+        const llama_pos pos_tgt = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+        llama_pos pos_dft = pos_tgt;
+        if (ctx_dft) {
+            common_speculative_wait_ctx(ctx_dft);
+            pos_dft = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), slot.id);
+        }
+        if (pos_tgt < 0 || pos_dft != pos_tgt) {
+            return false;
+        }
+
+        const llama_pos pos_next = pos_tgt + 1;
+        const size_t n_keep = slot.prompt.tokens.size_up_to_pos(pos_next);
+        if (n_keep == 0 || n_keep > slot.prompt.tokens.size() || slot.prompt.tokens.pos_next(n_keep) != pos_next) {
+            return false;
+        }
+        try {
+            slot.prompt.tokens.keep_first(n_keep);
+        } catch (const std::exception &) {
+            return false; // inside a media chunk
+        }
+
+        for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end();) {
+            it = it->pos_max > pos_next ? slot.prompt.checkpoints.erase(it) : std::next(it);
+        }
+        ckpt_spill.erase_beyond(slot.id, pos_next);
+
+        SLT_WRN(slot, "kept %zu cached tokens after the failed decode\n", n_keep);
+        return true;
+    }
+
     bool ckpt_spill_load(server_slot & slot, llama_pos pos_next, llama_pos pos_min_thold, int64_t n_ram, common_prompt_checkpoint & out) {
         if (!ckpt_spill.enabled()) {
             return false;
@@ -5155,11 +5189,14 @@ private:
                     for (auto & slot : slots) {
                         if (slot.is_processing()) {
                             send_error(slot, err);
-                            slot.release();
 
-                            // note: it's complicated to keep track of how much of the current batch has been
-                            //       processed before the error occurred, so we simply clear the entire context
-                            slot.prompt_clear();
+                            // delphi: keep what the memory holds, so that a retry does not process the whole prompt again.
+                            // Before release(): its callbacks can save the prompt.
+                            const bool kept = slot_keep_computed_prefix(slot);
+                            slot.release();
+                            if (!kept) {
+                                slot.prompt_clear();
+                            }
                         }
                     }
 
