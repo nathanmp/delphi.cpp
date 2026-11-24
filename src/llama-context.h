@@ -532,6 +532,9 @@ private:
 
     // env: LLAMA_GRAPH_ALT_MAX_TOKENS, largest ubatch that may use an alternate scheduler (0 disables them)
     uint32_t graph_alt_max_tokens = 32;
+    // largest one-sequence ubatch that may use an alternate scheduler. The alternate schedulers grow their buffers at first
+    // use, after the expert cache took the free memory; a shape whose buffers grow with the context must stay on the main one
+    uint32_t graph_alt_max_tokens_one_seq = UINT32_MAX;
     // env: LLAMA_GRAPH_ALT_SLOTS, number of alternate schedulers
     uint32_t graph_alt_slots = 4;
 

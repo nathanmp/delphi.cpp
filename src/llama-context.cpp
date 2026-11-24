@@ -419,6 +419,11 @@ llama_context::llama_context(
         if (graph_reuse_disable || graph_alt_slots == 0) {
             graph_alt_max_tokens = 0;
         }
+        // DeepSeek-V4.1: a prompt ubatch of one sequence wider than the verify gather takes dense attention. At 260K
+        // context, 17 tokens need ~350 MiB per GPU against ~60 MiB at 16. The main scheduler is reserved for it.
+        if (model.arch == LLM_ARCH_DEEPSEEK41 && !LLAMA_GRAPH_ALT_MAX_TOKENS) {
+            graph_alt_max_tokens_one_seq = (uint32_t) LLAMA_DSV41_GATHER_MAX_QUERIES;
+        }
         graph_slots.resize(1 + (graph_alt_max_tokens > 0 ? graph_alt_slots : 0));
     }
 
@@ -2597,7 +2602,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     };
 
     bool reuse = can_reuse();
-    const bool small = graph_alt_max_tokens > 0 && ubatch.n_tokens <= graph_alt_max_tokens;
+    const bool small = graph_alt_max_tokens > 0 && ubatch.n_tokens <= graph_alt_max_tokens &&
+            (ubatch.n_seqs_unq != 1 || ubatch.n_tokens <= graph_alt_max_tokens_one_seq);
     if (!reuse && (graph_slot_live != 0 || small)) {
         // large ubatches always go to the main scheduler, which is reserved for them. A small one takes the
         // alternate scheduler that holds its graph; else the one whose stale graph has the same topology (e.g.
@@ -6644,6 +6650,10 @@ void llama_context::graph_alt_slots_reserve(uint32_t n_slots, uint32_t n_max_tok
     }
     if (!getenv("LLAMA_GRAPH_ALT_MAX_TOKENS")) {
         graph_alt_max_tokens = std::max(graph_alt_max_tokens, n_max_tokens);
+        // the speculative verify widths keep their graphs, as before the one-sequence cap
+        if (graph_alt_max_tokens_one_seq != UINT32_MAX) {
+            graph_alt_max_tokens_one_seq = std::max(graph_alt_max_tokens_one_seq, n_max_tokens);
+        }
     }
     if (!getenv("LLAMA_GRAPH_ALT_SLOTS")) {
         graph_alt_slots = std::max(graph_alt_slots, n_slots);

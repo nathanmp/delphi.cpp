@@ -8,6 +8,10 @@
 #include <memory>
 #include <vector>
 
+// The most queries of one sequence that DeepSeek-V4.1 attention gathers per query (verify gather). A wider ubatch of one
+// sequence takes the dense path, whose compute buffers grow with the context.
+constexpr int64_t LLAMA_DSV41_GATHER_MAX_QUERIES = 16;
+
 struct llama_context;
 class llama_dsv41_prefill_window;
 struct llama_memory_context_i;

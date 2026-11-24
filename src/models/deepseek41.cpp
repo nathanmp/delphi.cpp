@@ -1097,7 +1097,7 @@ static bool dsv41_verify_compact_enabled(
 
     const int64_t n_tps = n_query/n_stream;
 
-    return n_tps >= 2 && n_tps <= 16;
+    return n_tps >= 2 && n_tps <= LLAMA_DSV41_GATHER_MAX_QUERIES;
 }
 
 // DSpark verification on long contexts. The dense fallback copies the whole compressed stream
@@ -1118,7 +1118,7 @@ static bool dsv41_verify_gather_enabled(
         return env ? (int64_t) std::atoll(env) : (int64_t) 4096;
     }();
 
-    if (min_comp <= 0 || n_comp < min_comp || n_stream != 1 || n_query < 2 || n_query > 16) {
+    if (min_comp <= 0 || n_comp < min_comp || n_stream != 1 || n_query < 2 || n_query > LLAMA_DSV41_GATHER_MAX_QUERIES) {
         return false;
     }
 
