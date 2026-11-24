@@ -172,7 +172,14 @@ public:
     const std::vector<uint32_t> & get_rs_idx() const;
     void reset_rs_idx_for_ubatches(const std::vector<llama_ubatch> & ubatches);
 
+    // remove the cells of seq_id from p0 that a ubatch wrote at apply() without a graph run. The compressor states are
+    // unchanged then, so this is the removal after pos_max. When the ubatch took a pending rollback (rollback_lost), clear the
+    // sequence instead
+    bool seq_rm_unapplied(llama_seq_id seq_id, llama_pos p0, bool rollback_lost);
+
 private:
+    bool seq_rm_tail(llama_seq_id seq_id, llama_pos p0);
+
     llama_hparams hparams_raw;
     llama_hparams hparams_csa;
     llama_hparams hparams_hca;
@@ -430,6 +437,8 @@ public:
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
 
+    bool undo_ubatch(llama_seq_id seq_id, llama_pos p0) override;
+
     //
     // llama_kv_cache_dsv4_context specific API
     //
@@ -454,6 +463,10 @@ private:
     size_t i_next = 0;
 
     std::vector<llama_ubatch> ubatches;
+
+    // the batch context only: the cache, and its pending rollbacks before the plans took them (undo_ubatch)
+    llama_kv_cache_dsv4 * kv = nullptr;
+    std::vector<uint32_t> rs_idx_prev;
 
     std::vector<comp_plan> plans_csa;
     std::vector<comp_plan> plans_hca;

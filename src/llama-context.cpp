@@ -2573,6 +2573,7 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    ubatch_computing = false;
     const uint32_t trace_ubatch_id = ggml_exec_trace_enabled() ? ggml_exec_trace_ubatch_begin(
             ubatch.n_tokens, ubatch.n_seqs, ubatch.n_seqs_unq, n_outputs) : 0;
 
@@ -2725,6 +2726,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     const int64_t t_compute_us0 = build_log ? ggml_time_us() : 0;
+    ubatch_computing = true;
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
@@ -3259,7 +3261,16 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 const llama_pos remove_from = in_window ? -1 : pos_min[s];
                 LLAMA_LOG_WARN("%s: removing memory module entries for seq_id = %d, pos = [%d, +inf)\n", __func__, s, remove_from);
 
-                memory->seq_rm(s, remove_from, -1);
+                // delphi: a graph that did not allocate did not run, so only the cells that apply() wrote must go. A memory
+                // that cannot remove a range (DeepSeek V4 compressed KV) could take it for a rollback of computed tokens.
+                // Never keep positions that no graph computed: the server keeps the prefix up to seq_pos_max().
+                if (status == GGML_STATUS_ALLOC_FAILED && !ubatch_computing && remove_from >= 0 && mctx->undo_ubatch(s, remove_from)) {
+                    continue;
+                }
+                if (!memory->seq_rm(s, remove_from, -1)) {
+                    LLAMA_LOG_WARN("%s: cannot remove them, removing all entries for seq_id = %d\n", __func__, s);
+                    memory->seq_rm(s, -1, -1);
+                }
             }
 
             switch (status) {

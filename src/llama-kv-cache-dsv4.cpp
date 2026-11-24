@@ -1678,17 +1678,7 @@ bool llama_kv_cache_dsv4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
 
         const llama_pos pos_max = kv_raw->seq_pos_max(seq_id);
         if (p0 > pos_max) {
-            bool res = true;
-
-            res = res & kv_raw->seq_rm(seq_id, p0, -1);
-            if (kv_raw_dec) {
-                res = res & kv_raw_dec->seq_rm(seq_id, p0, -1);
-            }
-            res = res & kv_csa->seq_rm(seq_id, p0/row_ratio_csa, -1);
-            res = res & kv_hca->seq_rm(seq_id, p0/row_ratio_hca, -1);
-            res = res & kv_lid->seq_rm(seq_id, p0/row_ratio_lid, -1);
-
-            return res;
+            return seq_rm_tail(seq_id, p0);
         }
 
         if (n_rs_seq == 0) {
@@ -1725,6 +1715,27 @@ bool llama_kv_cache_dsv4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
     }
 
     return res;
+}
+
+bool llama_kv_cache_dsv4::seq_rm_tail(llama_seq_id seq_id, llama_pos p0) {
+    bool res = true;
+
+    res = res & kv_raw->seq_rm(seq_id, p0, -1);
+    if (kv_raw_dec) {
+        res = res & kv_raw_dec->seq_rm(seq_id, p0, -1);
+    }
+    res = res & kv_csa->seq_rm(seq_id, p0/row_ratio_csa, -1);
+    res = res & kv_hca->seq_rm(seq_id, p0/row_ratio_hca, -1);
+    res = res & kv_lid->seq_rm(seq_id, p0/row_ratio_lid, -1);
+
+    return res;
+}
+
+bool llama_kv_cache_dsv4::seq_rm_unapplied(llama_seq_id seq_id, llama_pos p0, bool rollback_lost) {
+    if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max || p0 <= 0 || rollback_lost || !seq_rm_tail(seq_id, p0)) {
+        seq_rm(seq_id, -1, -1);
+    }
+    return true;
 }
 
 void llama_kv_cache_dsv4::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
@@ -2545,6 +2556,8 @@ llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
         std::vector<llama_ubatch> ubatches,
         std::vector<llama_ubatch> ubatches_raw) :
     ubatches(std::move(ubatches)),
+    kv(kv),
+    rs_idx_prev(kv->get_rs_idx()),
     plans_csa(dsv4_build_comp_plans(this->ubatches, kv->get_csa_state()->get_ratio(), kv->get_csa_state()->get_overlap(), kv->get_csa_state()->get_pad_blocks(),
                 kv->get_csa_state()->get_state_size(), kv->get_csa()->get_size(), kv->get_csa_state()->get_n_stream(),
                 kv->get_n_rs_seq(), kv->get_rs_idx())),
@@ -2587,6 +2600,28 @@ llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
 }
 
 llama_kv_cache_dsv4_context::~llama_kv_cache_dsv4_context() = default;
+
+bool llama_kv_cache_dsv4_context::undo_ubatch(llama_seq_id seq_id, llama_pos p0) {
+    if (kv == nullptr || ubatches.empty()) {
+        return false;
+    }
+
+    // the plans of the first ubatch with seq_id take its pending rollback
+    bool rollback_lost = seq_id >= 0 && (size_t) seq_id < rs_idx_prev.size() && rs_idx_prev[seq_id] != 0;
+    for (size_t i = 0; i < i_next && rollback_lost; ++i) {
+        const llama_ubatch & ub = ubatches[i];
+        for (uint32_t t = 0; t < ub.n_tokens && rollback_lost; ++t) {
+            for (int32_t s = 0; s < ub.n_seq_id[t]; ++s) {
+                if (ub.seq_id[t][s] == seq_id) {
+                    rollback_lost = false; // an earlier ubatch ran with it
+                    break;
+                }
+            }
+        }
+    }
+
+    return kv->seq_rm_unapplied(seq_id, p0, rollback_lost);
+}
 
 void llama_kv_cache_dsv4_context::begin_window() {
     ctx_raw->begin_window();

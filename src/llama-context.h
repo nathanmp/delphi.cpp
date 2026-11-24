@@ -530,6 +530,9 @@ private:
     // the KV length of that reservation (variants only)
     uint32_t                            max_prefill_n_kv     = UINT32_MAX;
 
+    // the last process_ubatch() call reached graph_compute(): a failure before it left the memory cells of the ubatch unused
+    bool ubatch_computing = false;
+
     // env: LLAMA_GRAPH_ALT_MAX_TOKENS, largest ubatch that may use an alternate scheduler (0 disables them)
     uint32_t graph_alt_max_tokens = 32;
     // largest one-sequence ubatch that may use an alternate scheduler. The alternate schedulers grow their buffers at first

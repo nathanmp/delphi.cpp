@@ -64,6 +64,15 @@ struct llama_memory_context_i {
 
     // get the status of the memory context - used for error handling and checking if any updates would be applied
     virtual llama_memory_status get_status() const = 0;
+
+    // delphi: the current ubatch was applied but no graph ran (its graph did not allocate). Remove the cells of seq_id from p0
+    // that apply() wrote. Return true if the memory handled the removal: it may clear the whole sequence when it cannot undo
+    // exactly. Return false to let the caller use seq_rm().
+    virtual bool undo_ubatch(llama_seq_id seq_id, llama_pos p0) {
+        (void) seq_id;
+        (void) p0;
+        return false;
+    }
 };
 
 using llama_memory_context_ptr = std::unique_ptr<llama_memory_context_i>;
